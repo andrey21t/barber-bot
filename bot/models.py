@@ -1,0 +1,184 @@
+import uuid
+from datetime import date, datetime
+from decimal import Decimal
+
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Uuid,
+    text,
+)
+from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.sql import func
+
+from bot.db import Base
+
+# SQLAlchemy 2.0 + cross-DB types (Uuid + DateTime(timezone=True) работают на SQLite и Postgres)
+# TODO (Урок 2.6): на Postgres использовать sqlalchemy.dialects.postgresql.TIMESTAMP(timezone=True)
+# для TIMESTAMPTZ — DateTime(timezone=True) на Postgres = TIMESTAMP WITHOUT TZ.
+
+
+class Business(Base):
+    __tablename__ = "businesses"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(255))
+    telegram_owner_id: Mapped[int] = mapped_column(BigInteger)
+    timezone: Mapped[str] = mapped_column(String(50), default="Europe/Moscow")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class Master(Base):
+    __tablename__ = "masters"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("businesses.id"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(255))
+    telegram_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    role: Mapped[str] = mapped_column(String(50), default="barber")
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("idx_masters_business", "business_id", postgresql_where=text("is_active = TRUE")),
+    )
+
+
+class Service(Base):
+    __tablename__ = "services"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("businesses.id"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(255))
+    duration_minutes: Mapped[int] = mapped_column()
+    price: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("duration_minutes > 0", name="ck_service_duration_positive"),
+        Index("idx_services_business", "business_id", postgresql_where=text("is_active = TRUE")),
+    )
+
+
+class Client(Base):
+    __tablename__ = "clients"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True)
+    name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class Slot(Base):
+    __tablename__ = "slots"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    master_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("masters.id", ondelete="CASCADE"), nullable=False
+    )
+    slot_date: Mapped[date] = mapped_column()
+    slot_hour: Mapped[int] = mapped_column()  # LOCAL hour in business.timezone
+    status: Mapped[str] = mapped_column(String(20), default="open")  # open | booked | closed
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("slot_hour BETWEEN 0 AND 23", name="ck_slot_hour_range"),
+        # UNIQUE (master_id, slot_date, slot_hour) — composite unique via Index
+        Index("ux_slots_master_date_hour", "master_id", "slot_date", "slot_hour", unique=True),
+        Index(
+            "idx_slots_master_date",
+            "master_id",
+            "slot_date",
+            postgresql_where=text("status = 'open'"),
+        ),
+    )
+
+
+class Booking(Base):
+    __tablename__ = "bookings"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    slot_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("slots.id"), nullable=False)
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("businesses.id"), nullable=False
+    )
+    master_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("masters.id"), nullable=False
+    )
+    client_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("clients.id"), nullable=False
+    )
+    service_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("services.id"), nullable=True
+    )
+    service_title_snapshot: Mapped[str] = mapped_column(String(255))  # html.escape()'d
+    service_price_snapshot: Mapped[Decimal | None] = mapped_column(
+        Numeric(10, 2), nullable=True
+    )
+    client_name_snapshot: Mapped[str] = mapped_column(String(255))  # html.escape()'d
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))  # UTC
+    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))  # UTC
+    status: Mapped[str] = mapped_column(String(20), default="confirmed")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("end_at > start_at", name="ck_booking_duration_positive"),
+        Index("ux_bookings_slot", "slot_id", unique=True),  # UNIQUE(slot_id) — SQLite fallback
+        Index(
+            "idx_bookings_client",
+            "client_id",
+            postgresql_where=text("status IN ('confirmed', 'transferred')"),
+        ),
+        Index("idx_bookings_master_start", "master_id", "start_at"),
+    )
+
+
+class NotificationLog(Base):
+    __tablename__ = "notifications_log"
+
+    # SQLite не autoincrement на BIGINT — variant на sqlite = INTEGER (autoincrement работает)
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    booking_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("bookings.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(30))
+    # remind_24h | remind_1h | master_new | master_cancel | master_transfer
+    sent_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('remind_24h','remind_1h','master_new','master_cancel','master_transfer')",
+            name="ck_notifications_kind",
+        ),
+        Index("ux_notifications_booking_kind", "booking_id", "kind", unique=True),
+    )

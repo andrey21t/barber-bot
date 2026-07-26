@@ -1,0 +1,293 @@
+---
+description: "Cursor rules that block deprecated aiogram 2.x patterns when project uses aiogram 3.x. Anti-hallucination rules for Telegram bots: Dispatcher filters, handlers decorators, Bot constructor, FSM storage, middlewares, Router API. Built by analogy with nestjs-anti-hallucination from awesome-cursorrules."
+globs: **/*
+alwaysApply: false
+---
+# aiogram 3.x Anti-Hallucination Rules
+
+These rules OVERRIDE all other generation behavior. Check EVERY line of generated code against these rules.
+Built by analogy with `PatrickJS/awesome-cursorrules:rules/nestjs-anti-hallucination-cursorrules-prompt-file.mdc` — adapted for aiogram 3.x.
+
+**Before generating any aiogram code, check `requirements.txt`:**
+- If `aiogram>=3.0` → follow ALL rules below
+- If `aiogram<3.0` (2.x) → DO NOT use these rules, but warn the user that 2.x is EOL
+
+## Banned Imports & Phantom Packages
+
+### NEVER import these in aiogram 3.x — they're 2.x-only:
+```python
+# ❌ aiogram 2.x — DEPRECATED, removed in 3.x
+from aiogram import Bot, Dispatcher
+from aiogram.dispatcher import Dispatcher  # 2.x path
+from aiogram.dispatcher.filters import Command, Text  # 2.x filters
+from aiogram.dispatcher.handler import Handler  # 2.x handler registry
+from aiogram.utils.executor import start_polling  # 2.x executor removed
+from aiogram.contrib.fsm_storage.memory import MemoryStorage  # 2.x contrib
+from aiogram.contrib.fsm_storage.redis import RedisStorage  # 2.x contrib
+```
+
+### Correct imports in aiogram 3.x:
+```python
+# ✅ aiogram 3.x — verified against dev-3.x/docs/migration_2_to_3.rst
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.filters import Command, CommandStart, CommandObject
+from aiogram.filters.callback_data import CallbackData
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.redis import RedisStorage
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+```
+
+## Additional 2.x → 3.x changes (verified in migration rst, supplemented this rule after first version)
+
+These were missing from the first version of this rule. Added after verification against `dev-3.x/docs/migration_2_to_3.rst`:
+
+- **`Executor` removed** — use `Dispatcher.start_polling(bot)` directly
+- **`process_update` → `feed_update`** — for feeding updates to Dispatcher
+- **`skip_updates=True` removed** — call `DeleteWebhook` method directly to skip pending
+- **Throttling method removed** — implement via middlewares
+- **`_handler` suffix removed from all decorators** — `message_handler` → `message`, `callback_query_handler` → `callback_query`
+- **State filter no longer enabled by default** — specify state explicitly if needed
+- **`State.set()` / `.next()` helper methods removed** — set state via `FSMContext.set_state(...)`
+- **State proxy deprecated** — use `state.set_data(...)` / `state.get_data()` (NOT `dp.current_state()`)
+- **`Bot.get_current()` removed** — accept `bot: Bot` as handler arg
+- **Exception classes renamed** — `BadRequest → TelegramBadRequest`, `Unauthorized → TelegramUnauthorizedError`, `Forbidden → TelegramForbiddenError`, `NotFound → TelegramNotFound`, `Conflict → TelegramConflictError`, `ServerError → TelegramServerError`, `NetworkError → TelegramNetworkError`, `MessageNotModified → TelegramBadRequest`, `MessageToEditNotFound → TelegramNotFound`, etc.
+- **`i18n` is now optional** — `pip install aiogram[i18n]` if using translations
+- **API methods are now pydantic classes with validation** — not raw dicts
+
+## Deprecated Patterns — NEVER Generate These
+
+### 1. 2.x handler decorators (removed in 3.x)
+```python
+# ❌ aiogram 2.x — DEPRECATED
+@dp.message_handler(commands=["start"])
+async def start_handler(message: Message):
+    await message.answer("Hi")
+
+@dp.callback_query_handler(lambda c: c.data == "yes")
+async def callback_handler(callback: CallbackQuery):
+    ...
+
+@dp.message_handler(Text(equals="hello"))
+async def text_handler(message: Message):
+    ...
+```
+
+```python
+# ✅ aiogram 3.x — modern Router API
+router = Router()
+
+@router.message(Command("start"))
+async def start_handler(message: Message):
+    await message.answer("Hi")
+
+@router.callback_query(F.data == "yes")
+async def callback_handler(callback: CallbackQuery):
+    ...
+
+@router.message(F.text == "hello")
+async def text_handler(message: Message):
+    ...
+```
+
+### 2. Bot constructor — keyword arg (NOT in migration rst, educated guess)
+```python
+# ❌ aiogram 2.x — positional, deprecated
+bot = Bot("123456:ABC-DEF")
+
+# ✅ aiogram 3.x — keyword arg (verified against aiogram 3.x Bot class API)
+bot = Bot(token="123456:ABC-DEF")
+
+# ✅ with default parse mode (NOT verified in migration rst — verify in your aiogram version)
+# In aiogram 3.x, parse_mode was removed from Bot() and moved to DefaultBotProperties (3.5+)
+# For older 3.x: use explicit parse_mode in send_message calls
+# For 3.5+: bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+```
+
+> ⚠️ `DefaultBotProperties` — educated guess based on aiogram 3.5+ changelog. NOT verified against migration rst. Check your installed aiogram version.
+
+### 3. Dispatcher without router registration
+```python
+# ❌ SUBOPTIMAL — handlers fire but you lose modularity and nested router support
+dp = Dispatcher()
+@dp.message(...)  # works but no Router modularity, harder to test and reuse
+async def handler(message: Message): ...
+
+# ✅ CORRECT — Router + include_router for modularity
+router = Router(name=__name__)
+
+@router.message(Command("start"))
+async def start_handler(message: Message): ...
+
+dp = Dispatcher()
+dp.include_router(router)
+```
+
+### 4. Old FSM storage paths
+```python
+# ❌ aiogram 2.x — removed in 3.x
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+dp = Dispatcher(bot, storage=MemoryStorage())
+
+# ✅ aiogram 3.x
+from aiogram.fsm.storage.memory import MemoryStorage
+dp = Dispatcher(storage=MemoryStorage())  # no bot= in Dispatcher
+```
+
+### 5. Executor removed — use Dispatcher.start_polling
+```python
+# ❌ aiogram 2.x — REMOVED in 3.x
+from aiogram.utils.executor import start_polling
+start_polling(dp, bot, skip_updates=True)  # skip_updates removed too
+
+# ✅ aiogram 3.x — verified against migration rst
+async def main():
+    bot = Bot(token=TOKEN)
+    dp = Dispatcher()
+    # register routers...
+    # To skip pending updates: await bot.delete_webhook() before polling
+    await bot.delete_webhook()  # alternative to skip_updates=True
+    await dp.start_polling(bot)  # no skip_updates kwarg
+```
+
+### 6. Magic filters with strings (use F object)
+```python
+# ❌ aiogram 2.x — Text() with positional args
+@dp.message_handler(Text(equals="hi", ignore_case=True))
+
+# ✅ aiogram 3.x — F magic filter (verified in migration rst line 71)
+@router.message(F.text.lower() == "hi")
+# Note: F.text.func(...) syntax is an advanced pattern — verify in your aiogram version's docs
+```
+
+### 7. ReplyKeyboard without Builder (3.x pattern)
+```python
+# ❌ aiogram 2.x — direct construction (works but verbose)
+kb = ReplyKeyboardMarkup(resize_keyboard=True)
+kb.add("Button 1")
+kb.add("Button 2")
+
+# ✅ aiogram 3.x — Builder pattern
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
+builder = ReplyKeyboardBuilder()
+builder.button(text="Button 1")
+builder.button(text="Button 2")
+builder.adjust(2)  # 2 per row
+kb = builder.as_markup(resize_keyboard=True)
+```
+
+## Type Safety Rules
+
+### NEVER use untyped handler params
+```python
+# ❌ WRONG — untyped event object
+@router.message()
+async def handler(message):  # what type?
+    ...
+
+# ✅ REQUIRED — typed
+from aiogram.types import Message
+@router.message(Command("start"))
+async def handler(message: Message) -> None:
+    await message.answer("Hi")
+```
+
+### NEVER return raw dict from handler
+```python
+# ❌ WRONG
+@router.message()
+async def handler(message: Message):
+    return {"text": "Hi"}  # aiogram doesn't know what to do
+
+# ✅ CORRECT — call answer methods
+@router.message()
+async def handler(message: Message) -> None:
+    await message.answer("Hi")
+```
+
+## FSM (State Management) Safety
+
+### NEVER store large objects in FSM state
+```python
+# ❌ WRONG — full user record in state
+await state.set_data({"user": full_user_record_with_100_fields})
+
+# ✅ CORRECT — store only ID, fetch from DB
+await state.update_data(user_id=user.id)
+# later:
+user_id = await state.get_data()
+user = await db.get_user(user_id["user_id"])
+```
+
+### NEVER forget to clear state
+```python
+# ❌ WRONG — state leaks across flows
+@router.message(Command("cancel"))
+async def cancel_handler(message: Message):
+    await message.answer("Cancelled")  # state still set!
+
+# ✅ CORRECT — clear state
+@router.message(Command("cancel"))
+async def cancel_handler(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Cancelled")
+```
+
+## Middlewares Safety
+
+### NEVER use 2.x middleware API
+```python
+# ❌ aiogram 2.x
+@dp.message_handler()
+async def middleware_handler(message, handler): pass
+
+# ✅ aiogram 3.x — BaseMiddleware class
+from aiogram import BaseMiddleware
+from aiogram.types import TelegramObject
+
+class ThrottlingMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        # logic before
+        result = await handler(event, data)
+        # logic after
+        return result
+```
+
+## Configuration Safety
+
+### NEVER hardcode bot token
+```python
+# ❌ WRONG
+bot = Bot(token="123456:ABC-DEF...")
+
+# ✅ CORRECT — env via pydantic-settings
+from pydantic_settings import BaseSettings
+class Settings(BaseSettings):
+    bot_token: str
+    model_config = SettingsConfigDict(env_file=".env")
+
+bot = Bot(token=Settings().bot_token)
+```
+
+## Remember
+
+- ALWAYS check `requirements.txt` for `aiogram>=3.0` vs `aiogram<3.0` before generating
+- When unsure about a method, check the installed aiogram version's docs
+- aiogram 3.x is NOT backward-compatible with 2.x — pattern rewriting is needed, not patching
+- For webhook mode (not polling), see `dp.feed_update(bot, update)` + aiohttp server
+- For Redis FSM storage, use `RedisStorage.from_url(url)` (3.x) — not `RedisStorage(...)` (2.x)
+
+---
+
+## Sources
+
+- Built by analogy with: `PatrickJS/awesome-cursorrules:rules/nestjs-anti-hallucination-cursorrules-prompt-file.mdc`
+- Donor research: `~/.config/opencode/references/donor-research/topics/cursor-rules.md` INSIGHT-CR-001 (ban-list + ✅/❌ pattern)
+- aiogram 3.x migration (verified 2026-07-04): https://github.com/aiogram/aiogram/blob/dev-3.x/docs/migration_2_to_3.rst — Executor removed, process_update→feed_update, skip_updates→DeleteWebhook, throttling removed, _handler suffix removed, State filter not default, State.set/next removed, Bot.get_current removed, exception classes renamed, i18n optional
+- Educated guesses (NOT verified against migration rst, verify in your aiogram version):
+  - `Bot(token=...)` keyword arg requirement
+  - `DefaultBotProperties` for parse_mode (3.5+)
+  - `RedisStorage.from_url(url)` constructor pattern
+- aiogram 3.x docs: https://docs.aiogram.dev/en/latest/
