@@ -650,6 +650,38 @@ def _make_state() -> MagicMock:
     return state
 
 
+def _make_state_with_call_order(call_log: list[str]) -> MagicMock:
+    """Variant of _make_state that records state.clear calls into a shared
+    call_log list. Used by tests that verify the race protection contract
+    "state.clear() BEFORE service call" (client.py:764).
+
+    Tests using this helper also append "transfer_booking" to the SAME
+    call_log inside their _raise_xxx function (monkey-patched service).
+    After handler invocation, assert
+    `call_log.index("state.clear") < call_log.index("transfer_booking")`.
+    """
+    state = MagicMock(spec=FSMContext)
+    state.set_state = AsyncMock()
+    state.update_data = AsyncMock()
+
+    async def _clear() -> None:
+        call_log.append("state.clear")
+
+    state.clear = AsyncMock(side_effect=_clear)
+
+    state_data: dict[str, Any] = {}
+
+    async def _get_data() -> dict[str, Any]:
+        return dict(state_data)
+
+    async def _update_data(**kwargs: Any) -> None:
+        state_data.update(kwargs)
+
+    state.get_data = AsyncMock(side_effect=_get_data)
+    state.update_data = AsyncMock(side_effect=_update_data)
+    return state
+
+
 def _make_transfer_callback(
     user_id: int,
     booking_id: UUID,
@@ -978,3 +1010,492 @@ async def test_transfer_slot_cb_slot_already_booked(
             select(Booking).where(Booking.id == booking_id)
         )).scalar_one()
         assert b.status == "confirmed"
+
+
+# ============================================================
+# transfer_slot_cb — additional error branches (handler coverage gap)
+# ============================================================
+#
+# These tests cover transfer_slot_cb:776-818 — error branches surfaced by
+# coverage report (handler coverage 45% → target ~85%). Pattern mirrors
+# test_transfer_slot_cb_slot_already_booked: seed booking + slot, simulate
+# service failure via DB state (where possible) or monkey-patch
+# bot.handlers.client.transfer_booking (for service-raised exceptions
+# without natural DB trigger).
+#
+# Why monkey-patch instead of natural trigger: BookingAlreadyTransferredError
+# race requires concurrent transfer (winner committed before our UPDATE).
+# Natural trigger needs 2 sessions + orchestration (covered at service level
+# by test_transfer_booking_concurrent_race_runtime). At handler level we
+# care about error → user-facing text mapping, not race reproduction — so
+# monkey-patch the service to raise the exception.
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_cb_already_transferred(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BookingAlreadyTransferredError (race loser) → handler replies
+    "❌ Запись уже перенесена (конкурентный запрос). /mybookings чтобы увидеть
+    актуальный список". State.clear called BEFORE service call (race condition
+    contract). Master NOT notified, callback.answer is the Telegram ACK.
+
+    Race protection error — surfaced by coverage gap report. Service-level
+    coverage exists (test_transfer_booking_concurrent_race_runtime), this
+    test locks the user-facing error mapping for the handler.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        future_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=3)
+        future_local = future_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=future_local)
+        booking_id = booking.id
+        new_slot = await _seed_open_slot(session, ctx, days_ahead=5, hour_local=15)
+        new_slot_id = new_slot.id
+
+    from bot.services import booking as booking_svc
+
+    call_log: list[str] = []
+
+    async def _raise_transferred(*args, **kwargs):
+        call_log.append("transfer_booking")
+        raise booking_svc.BookingAlreadyTransferredError("race simulation")
+
+    monkeypatch.setattr(client_handlers, "transfer_booking", _raise_transferred)
+
+    bot = AsyncMock()
+    cb, cb_data = _make_slot_callback(user_id=111222333, slot_id=new_slot_id, bot=bot)
+    state = _make_state_with_call_order(call_log)
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_cb(cb, cb_data, state, mock_scheduler)
+
+    bot.send_message.assert_not_called()  # Master NOT notified
+    cb.message.answer.assert_awaited()
+    err_text = _answer_text(cb.message)
+    assert "Запись уже перенесена (конкурентный запрос)" in err_text
+    assert "/mybookings" in err_text
+    cb.answer.assert_awaited()
+    state.clear.assert_awaited()
+    # Race condition contract: state.clear BEFORE service call (client.py:764).
+    assert call_log.index("state.clear") < call_log.index("transfer_booking")
+
+    # DB: booking unchanged (transfer_booking monkey-patched, no DB write)
+    async with session_factory() as verify_session:
+        b = (await verify_session.execute(
+            select(Booking).where(Booking.id == booking_id)
+        )).scalar_one()
+        assert b.status == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_cb_already_cancelled(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BookingAlreadyCancelledError → handler replies "Запись уже отменена"
+    (callback.answer — short text, no message.answer). Booking was cancelled
+    by concurrent request between SELECT and UPDATE.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        future_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=3)
+        future_local = future_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=future_local)
+        booking_id = booking.id
+        new_slot = await _seed_open_slot(session, ctx, days_ahead=5, hour_local=15)
+        new_slot_id = new_slot.id
+
+    from bot.services import booking as booking_svc
+
+    async def _raise_cancelled(*args, **kwargs):
+        raise booking_svc.BookingAlreadyCancelledError("concurrent cancel")
+
+    monkeypatch.setattr(client_handlers, "transfer_booking", _raise_cancelled)
+
+    bot = AsyncMock()
+    cb, cb_data = _make_slot_callback(user_id=111222333, slot_id=new_slot_id, bot=bot)
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_cb(cb, cb_data, state, mock_scheduler)
+
+    bot.send_message.assert_not_called()
+    cb.message.answer.assert_not_awaited()  # short text via callback.answer
+    cb.answer.assert_awaited()
+    answer_text = cb.answer.call_args.args[0] if cb.answer.call_args.args else ""
+    assert "Запись уже отменена" in answer_text
+    state.clear.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_cb_cancel_too_late(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CancelTooLateError → handler replies "❌ Перенос возможен только за 24+ часов
+    до записи" via callback.message.answer. State.clear called BEFORE service call.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        future_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=3)
+        future_local = future_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=future_local)
+        booking_id = booking.id
+        new_slot = await _seed_open_slot(session, ctx, days_ahead=5, hour_local=15)
+        new_slot_id = new_slot.id
+
+    from bot.services import booking as booking_svc
+
+    async def _raise_too_late(*args, **kwargs):
+        raise booking_svc.CancelTooLateError("too late simulation")
+
+    monkeypatch.setattr(client_handlers, "transfer_booking", _raise_too_late)
+
+    bot = AsyncMock()
+    cb, cb_data = _make_slot_callback(user_id=111222333, slot_id=new_slot_id, bot=bot)
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_cb(cb, cb_data, state, mock_scheduler)
+
+    bot.send_message.assert_not_called()
+    cb.message.answer.assert_awaited()
+    err_text = _answer_text(cb.message)
+    assert "Перенос возможен только за 24+ часов" in err_text
+    cb.answer.assert_awaited()
+    state.clear.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_cb_slot_in_past(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SlotInPastError → handler replies "❌ Это время уже прошло."
+    Triggered when user picks a slot whose start_at <= now (past time slot).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        future_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=3)
+        future_local = future_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=future_local)
+        booking_id = booking.id
+        new_slot = await _seed_open_slot(session, ctx, days_ahead=5, hour_local=15)
+        new_slot_id = new_slot.id
+
+    from bot.services import booking as booking_svc
+
+    async def _raise_past(*args, **kwargs):
+        raise booking_svc.SlotInPastError("past slot")
+
+    monkeypatch.setattr(client_handlers, "transfer_booking", _raise_past)
+
+    bot = AsyncMock()
+    cb, cb_data = _make_slot_callback(user_id=111222333, slot_id=new_slot_id, bot=bot)
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_cb(cb, cb_data, state, mock_scheduler)
+
+    bot.send_message.assert_not_called()
+    cb.message.answer.assert_awaited()
+    err_text = _answer_text(cb.message)
+    assert "Это время уже прошло" in err_text
+    cb.answer.assert_awaited()
+    state.clear.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_cb_slot_closed(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SlotClosedError → handler replies "❌ Слот закрыт мастером."
+    Triggered when new_slot.status='closed' (master closed it before user picked).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        future_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=3)
+        future_local = future_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=future_local)
+        booking_id = booking.id
+        new_slot = await _seed_open_slot(session, ctx, days_ahead=5, hour_local=15)
+        new_slot_id = new_slot.id
+
+    from bot.services import booking as booking_svc
+
+    async def _raise_closed(*args, **kwargs):
+        raise booking_svc.SlotClosedError("closed slot")
+
+    monkeypatch.setattr(client_handlers, "transfer_booking", _raise_closed)
+
+    bot = AsyncMock()
+    cb, cb_data = _make_slot_callback(user_id=111222333, slot_id=new_slot_id, bot=bot)
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_cb(cb, cb_data, state, mock_scheduler)
+
+    bot.send_message.assert_not_called()
+    cb.message.answer.assert_awaited()
+    err_text = _answer_text(cb.message)
+    assert "Слот закрыт мастером" in err_text
+    cb.answer.assert_awaited()
+    state.clear.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_cb_booking_not_found(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BookingNotFoundError → handler replies "Запись не найдена" via
+    callback.answer (short text). Simulates booking_id from FSM state pointing
+    to a non-existent booking (e.g. deleted between FSM steps) — service raises
+    BookingNotFoundError, handler maps to user text.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        new_slot = await _seed_open_slot(session, ctx, days_ahead=5, hour_local=15)
+        new_slot_id = new_slot.id
+
+    from bot.services import booking as booking_svc
+
+    async def _raise_not_found(*args, **kwargs):
+        raise booking_svc.BookingNotFoundError("not found")
+
+    monkeypatch.setattr(client_handlers, "transfer_booking", _raise_not_found)
+
+    bot = AsyncMock()
+    random_booking_id = UUID("00000000-0000-0000-0000-000000000001")
+    cb, cb_data = _make_slot_callback(user_id=111222333, slot_id=new_slot_id, bot=bot)
+    state = _make_state()
+    state.get_data = AsyncMock(
+        return_value={"transfer_booking_id": str(random_booking_id)}
+    )
+
+    await client_handlers.transfer_slot_cb(cb, cb_data, state, mock_scheduler)
+
+    bot.send_message.assert_not_called()
+    cb.message.answer.assert_not_awaited()
+    cb.answer.assert_awaited()
+    answer_text = cb.answer.call_args.args[0] if cb.answer.call_args.args else ""
+    assert "Запись не найдена" in answer_text
+    state.clear.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_cb_unknown_user_no_client(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+) -> None:
+    """User with no Client record → handler replies "У вас нет записей" via
+    callback.answer. State is NOT cleared (user may retry after /book).
+    Coverage: client.py:759-762 defensive branch.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        new_slot = await _seed_open_slot(session, ctx, days_ahead=5, hour_local=15)
+        new_slot_id = new_slot.id
+
+    bot = AsyncMock()
+    cb, cb_data = _make_slot_callback(user_id=999888777, slot_id=new_slot_id, bot=bot)
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": "irrelevant"})
+
+    await client_handlers.transfer_slot_cb(cb, cb_data, state, mock_scheduler)
+
+    bot.send_message.assert_not_called()
+    cb.message.answer.assert_not_awaited()
+    cb.answer.assert_awaited()
+    answer_text = cb.answer.call_args.args[0] if cb.answer.call_args.args else ""
+    assert "У вас нет записей" in answer_text
+    state.clear.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_cb_state_data_lost(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+) -> None:
+    """Bot restart mid-FSM → state data lost (transfer_booking_id missing) →
+    handler replies "❌ Данные потеряны. /mybookings чтобы начать" via
+    callback.message.answer. State.clear called BEFORE answer (race condition
+    contract). Coverage: client.py:746-752 FSM edge case.
+    """
+    bot = AsyncMock()
+    cb, cb_data = _make_slot_callback(user_id=111222333, slot_id=UUID(int=1), bot=bot)
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={})
+
+    await client_handlers.transfer_slot_cb(cb, cb_data, state, mock_scheduler)
+
+    bot.send_message.assert_not_called()
+    cb.message.answer.assert_awaited()
+    err_text = _answer_text(cb.message)
+    assert "Данные потеряны" in err_text
+    assert "/mybookings" in err_text
+    cb.answer.assert_awaited()
+    state.clear.assert_awaited()  # cleared BEFORE answer (race condition contract)
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_cb_slot_not_available(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SlotNotAvailableError (defensive) → handler replies "❌ Слот недоступен."
+    Covers the last remaining error branch in transfer_slot_cb (client.py:814-818).
+    SlotNotAvailableError is a defensive catch-all for unexpected slot states
+    not covered by SlotClosedError/SlotAlreadyBookedError.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        future_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=3)
+        future_local = future_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=future_local)
+        booking_id = booking.id
+        new_slot = await _seed_open_slot(session, ctx, days_ahead=5, hour_local=15)
+        new_slot_id = new_slot.id
+
+    from bot.services import booking as booking_svc
+
+    async def _raise_not_avail(*args, **kwargs):
+        raise booking_svc.SlotNotAvailableError("unexpected slot state")
+
+    monkeypatch.setattr(client_handlers, "transfer_booking", _raise_not_avail)
+
+    bot = AsyncMock()
+    cb, cb_data = _make_slot_callback(user_id=111222333, slot_id=new_slot_id, bot=bot)
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_cb(cb, cb_data, state, mock_scheduler)
+
+    bot.send_message.assert_not_called()
+    cb.message.answer.assert_awaited()
+    err_text = _answer_text(cb.message)
+    assert "Слот недоступен" in err_text
+    cb.answer.assert_awaited()
+    state.clear.assert_awaited()
+
+
+# ============================================================
+# transfer_date_cb — date picker for transfer flow (coverage 661-702)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_transfer_date_cb_happy_path(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """User picked a date for transfer → handler fetches available slots for
+    that date, sets FSM state to selecting_slot, shows slot picker inline
+    keyboard. Coverage: client.py:684-702 (happy path of transfer_date_cb).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        # Open slot for the transfer target date (tomorrow at 14:00 Moscow)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = Slot(
+            master_id=ctx["master_id"],
+            slot_date=target_date,
+            slot_hour=14,
+            status="open",
+        )
+        session.add(slot)
+        await session.commit()
+
+    from bot.keyboards.client import BookDateCallbackData
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = BookDateCallbackData(iso=target_date.isoformat())
+
+    state = _make_state()
+
+    await client_handlers.transfer_date_cb(cb, callback_data, state)
+
+    # FSM state set to selecting_slot
+    state.set_state.assert_awaited()
+    assert state.set_state.call_args.args[0] == TransferStates.selecting_slot
+
+    # selected_date saved in state
+    state.update_data.assert_awaited()
+    assert state.update_data.call_args.kwargs.get("selected_date") == target_date.isoformat()
+
+    # Slot picker shown
+    cb.message.answer.assert_awaited()
+    reply_markup = _answer_reply_markup(cb.message)
+    assert isinstance(reply_markup, InlineKeyboardMarkup), (
+        "transfer_date_cb must show slot picker inline keyboard"
+    )
+
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_date_cb_no_slots_on_date(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """User picked a date with no open slots → handler replies "На эту дату
+    нет свободных слотов. Выберите другую дату:" with date picker (retry).
+    FSM state NOT advanced (stays at selecting_date). Coverage: client.py:686-693.
+    """
+    async with session_factory() as session:
+        await _seed_full_stack(session)
+        # No slots created — target date has no open slots
+
+    from bot.keyboards.client import BookDateCallbackData
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    # Date far in the future — no slots exist
+    far_date = (datetime.now(UTC) + timedelta(days=30)).date()
+    callback_data = BookDateCallbackData(iso=far_date.isoformat())
+
+    state = _make_state()
+
+    await client_handlers.transfer_date_cb(cb, callback_data, state)
+
+    # Reply with "no slots" + date picker for retry
+    cb.message.answer.assert_awaited()
+    err_text = _answer_text(cb.message)
+    assert "нет свободных слотов" in err_text
+    reply_markup = _answer_reply_markup(cb.message)
+    assert isinstance(reply_markup, InlineKeyboardMarkup), (
+        "no-slots reply must include date picker for retry"
+    )
+
+    # FSM state NOT advanced (still at selecting_date)
+    state.set_state.assert_not_awaited()
+    state.update_data.assert_not_awaited()
+    cb.answer.assert_awaited()
