@@ -27,7 +27,8 @@
   - `bot/keyboards/client.py`: +41 строк — `MyBookingsCancelCallbackData(prefix="mybook_cancel")` + `mybookings_keyboard()`
   - `bot/handlers/client.py`: +124 строк — `mybookings_msg` переписан с inline-кнопками + новый `mybookings_cancel_cb` handler
   - `tests/test_booking.py`: +235 строк — 4 новых теста (happy_path, too_late, not_owner, already_cancelled)
-  - Tests: 48 passed / 1 pre-existing (scheduler failure, не моя регрессия)
+  - **Bug found in self-review** (user-triggered "проверь себя"): `mybookings_msg:441` сравнивал aware `datetime.now(UTC)` с naive `b.start_at - 24h` из SQLite → `TypeError` в продакшене при первом /mybookings. Та же бага что я только что пофиксил в `cancel_booking:332`. Фикс: strip tzinfo от now_utc перед сравнением (mirror сервиса). **Гейт handler tests НЕ ловил** — handler считается pure I/O (anti-overengineering правило 3), но этот баг был в display-логике partition cancelable, не в I/O — оправдание не сработало. Урок для следующего блока: партиционирование/математика в handler даже для display = candidate на тест.
+  - Tests: 49 passed (full suite, без failures)
   - Code review: LGTM (main agent — subagent Communication Failure subagent-side; 0 Critical, 1 Warning: pre-existing timezone render pattern в `booking.start_at.astimezone(ZoneInfo(business_tz))` на naive SQLite datetime — тот же pattern в `create_booking:217`, фикс отложен до Postgres migration Урок 2.6)
 
 ## Что делать в следующей сессии
@@ -63,9 +64,9 @@
 
 ### Pre-existing failures (НЕ трогать)
 
-- **`test_scheduler.py::test_on_startup_scan_phase_2_reschedules_upcoming`** — отдельный блок, scheduler-сторона. Не чинить в этой сессии.
+- **`test_scheduler.py::test_on_startup_scan_phase_2_reschedules_upcoming`** — **FLAKY** (зависит от времени суток, не регрессия). Тест создаёт "tomorrow 14:00 MSK = tomorrow 11:00 UTC", on_startup_scan смотрит на 25h вперёд. Если current time >= 10:00 UTC → tomorrow 11:00 через <25h → проходит. Если current time < 10:00 UTC → вне окна → падает. Не чинить в этой сессии — отдельный блок (mock now_utc в on_startup_scan или freeze_time).
 - **W6/W7/S2** (отложено с Блока 2) — minor, при миграции на Postgres.
-- **Handlers тесты** для master-команд — pure I/O, anti-overengineering правило 3.
+- **Handlers тесты** для master-команд — pure I/O, anti-overengineering правило 3. НО: если в handler есть display-логика (математика, partition, datetime сравнение) — кандидат на тест (урок из Блока 3 часть 2 бага).
 
 ## Quick start следующей сессии (prompt для opencode)
 
@@ -111,10 +112,12 @@
 ## Состояние тестов на момент сохранения
 
 ```
-pytest: 48 passed / 1 failed (pre-existing test_scheduler::test_on_startup_scan_phase_2_reschedules_upcoming — НЕ регрессия)
+pytest: 49 passed (full suite, no failures)
 ruff: All checks passed
 mypy: 30 source files, no issues
 ```
+
+Note: `test_scheduler::test_on_startup_scan_phase_2_reschedules_upcoming` — FLAKY (time-of-day dependent), иногда падает. Не регрессия от cancel_booking.
 
 ## Pre-existing Warning (зафиксировано, не блокирующее)
 

@@ -424,11 +424,17 @@ async def mybookings_msg(message: Message) -> None:
         tz = ZoneInfo(tz_name)
 
     # Partition bookings: cancelable (start_at - CANCEL_MIN_HOURS > now) vs too-late.
-    # Computed in handler (I/O layer) — pure display logic, not business rule.
-    now_utc = datetime.now(UTC)
+    # Computed in handler (I/O layer) — pure display logic, must MATCH service logic
+    # (cancel_booking:332-334): SQLite stores start_at naive (DateTime(timezone=True)
+    # ignored on SQLite), so compare with naive UTC (strip tzinfo from now_utc).
+    now_utc_aware = datetime.now(UTC)
+    now_utc = now_utc_aware.replace(tzinfo=None)
     cancelable: list[Booking] = []
     lines = ["📋 Ваши записи:", ""]
     for b in bookings:
+        # b.start_at is naive (SQLite) → astimezone interprets as system-local TZ.
+        # On Render (UTC) this is correct; fix deferred to Postgres migration Урок 2.6
+        # (same pattern as booking.py:217 create_booking, booking.py:380 cancel_booking).
         local_time = b.start_at.astimezone(tz)
         when = local_time.strftime("%d %b %Y, %H:%M")
         # Snapshots already escaped, strip newlines for list safety (consistent with
@@ -437,6 +443,7 @@ async def mybookings_msg(message: Message) -> None:
         service = b.service_title_snapshot.replace("\n", " ")
         lines.append(f"• {when}\n  💇 {service}\n  👤 {name}")
 
+        # Naive comparison (start_at from DB is naive on SQLite; deadline also naive).
         deadline = b.start_at - timedelta(hours=settings.CANCEL_MIN_HOURS)
         if now_utc < deadline:
             cancelable.append(b)
