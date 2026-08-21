@@ -20,7 +20,7 @@ Invariants (spec.md + MY-VIBE-RULES.md):
 """
 
 import logging
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from uuid import UUID
 
 from aiogram import F, Router
@@ -36,16 +36,23 @@ from bot.keyboards.client import (
     BookConfirmCallbackData,
     BookDateCallbackData,
     BookSlotCallbackData,
+    MyBookingsCancelCallbackData,
     confirm_keyboard,
     date_picker_keyboard,
+    mybookings_keyboard,
     slot_picker_keyboard,
 )
-from bot.models import Slot
+from bot.models import Booking, Slot
 from bot.schemas import BookingCreate
 from bot.services.booking import (
+    BookingAlreadyCancelledError,
+    BookingNotFoundError,
+    CancelResult,
+    CancelTooLateError,
     SlotAlreadyBookedError,
     SlotClosedError,
     SlotInPastError,
+    cancel_booking,
     create_booking,
 )
 from bot.services.slots import get_available_slots
@@ -374,8 +381,10 @@ async def cancel_msg(message: Message, state: FSMContext) -> None:
 async def mybookings_msg(message: Message) -> None:
     """List confirmed/transferred upcoming bookings for the current user.
 
-    Spec.md 41: `/mybookings` → отмена (>24ч) или перенос (>24ч) — но в этом блоке
-    только список. Отмена/перенос — следующий блок (TODO).
+    Spec.md 41: `/mybookings` → отмена (>24ч) или перенос (>24ч).
+    This handler renders the list AND shows inline [Отменить] buttons for
+    bookings that are still within the cancellation window (start_at - 24h > now).
+    Cancellation itself is performed by mybookings_cancel_cb (next handler).
 
     Resolution: client by telegram_id (booking.py pattern, _select_or_create_client).
     Filter: upcoming (start_at > now UTC), status IN (confirmed, transferred).
@@ -414,22 +423,119 @@ async def mybookings_msg(message: Message) -> None:
         tz_name = business.timezone if business is not None else settings.TIMEZONE
         tz = ZoneInfo(tz_name)
 
-    # Render list — snapshots already escaped, strip newlines for list safety
-    # (consistent with admin._render_bookings — html.escape(quote=False) skips \n).
+    # Partition bookings: cancelable (start_at - CANCEL_MIN_HOURS > now) vs too-late.
+    # Computed in handler (I/O layer) — pure display logic, not business rule.
+    now_utc = datetime.now(UTC)
+    cancelable: list[Booking] = []
     lines = ["📋 Ваши записи:", ""]
     for b in bookings:
         local_time = b.start_at.astimezone(tz)
         when = local_time.strftime("%d %b %Y, %H:%M")
+        # Snapshots already escaped, strip newlines for list safety (consistent with
+        # admin._render_bookings — html.escape(quote=False) skips \n).
         name = b.client_name_snapshot.replace("\n", " ")
         service = b.service_title_snapshot.replace("\n", " ")
         lines.append(f"• {when}\n  💇 {service}\n  👤 {name}")
+
+        deadline = b.start_at - timedelta(hours=settings.CANCEL_MIN_HOURS)
+        if now_utc < deadline:
+            cancelable.append(b)
+        else:
+            lines.append("  ⏰ Отмена недоступна (менее 24ч до записи)")
+
     lines.append("")
-    lines.append("Отмена/перенос — в разработке. Пока напишите мастеру напрямую.")
-    await message.answer("\n".join(lines))
+    if cancelable:
+        lines.append("Чтобы отменить — нажмите кнопку под этим сообщением.")
+        await message.answer(
+            "\n".join(lines),
+            reply_markup=mybookings_keyboard(cancelable, business_timezone=tz_name),
+        )
+    else:
+        lines.append("Отменить запись нельзя — все записи менее чем через 24ч.")
+        await message.answer("\n".join(lines))
 
 
 # ============================================================
-# 9. no_state_fallback — bot restart mid-FSM, state lost
+# 9. mybookings_cancel_cb — inline [Отменить] button callback
+# ============================================================
+@router.callback_query(
+    MyBookingsCancelCallbackData.filter(), StateFilter(None)
+)
+async def mybookings_cancel_cb(
+    callback: CallbackQuery,
+    callback_data: MyBookingsCancelCallbackData,
+    scheduler: AsyncIOScheduler,
+) -> None:
+    """User tapped [Отменить <date>] in /mybookings list — cancel that booking.
+
+    Spec.md 41, 317, 405-407:
+      - Resolve client by telegram_id (defensive: booking_id in callback could
+        belong to another user; cancel_booking enforces ownership via
+        `WHERE client_id=?`).
+      - cancel_booking raises:
+          BookingNotFoundError       → "Запись не найдена"
+          BookingAlreadyCancelledError → "Запись уже отменена"
+          CancelTooLateError         → "❌ Отмена возможна только за 24+ часов до записи"
+      - On success: send master notification + "✅ Запись отменена" to client.
+
+    `scheduler` injected from dp["scheduler"] workflow_data (set in bot.main),
+    same as confirm_cb (line 246). Service calls remove_jobs_for_booking internally.
+    """
+    from sqlalchemy import select
+
+    from bot.models import Client
+
+    if callback.from_user is None:
+        await callback.answer()
+        return
+
+    settings = get_settings()
+    async with async_session_factory() as session:
+        # Resolve client by telegram_id (defense-in-depth: cancel_booking ALSO
+        # checks ownership, but we need client.id to pass to it).
+        stmt_c = select(Client).where(Client.telegram_id == callback.from_user.id)
+        client = (await session.execute(stmt_c)).scalar_one_or_none()
+        if client is None:
+            await callback.answer("У вас нет записей")
+            return
+
+        try:
+            result: CancelResult = await cancel_booking(
+                session,
+                callback_data.booking_id,
+                client.id,
+                scheduler,
+            )
+        except BookingNotFoundError:
+            await callback.answer("Запись не найдена")
+            return
+        except BookingAlreadyCancelledError:
+            await callback.answer("Запись уже отменена")
+            return
+        except CancelTooLateError:
+            if callback.message is not None:
+                await callback.message.answer(
+                    "❌ Отмена возможна только за 24+ часов до записи"
+                )
+            await callback.answer()
+            return
+
+        # Send master notification (Pure/IO — service prepared text, handler sends).
+        # Single-master MVP: master.telegram_id == settings.ADMIN_ID (verified
+        # line 99: Master.telegram_id == settings.ADMIN_ID lookup).
+        if callback.bot is not None:
+            await callback.bot.send_message(
+                chat_id=settings.ADMIN_ID,
+                text=result.master_notification_text,
+            )
+
+    if callback.message is not None:
+        await callback.message.answer("✅ Запись отменена. Мастер уведомлён.")
+    await callback.answer()
+
+
+# ============================================================
+# 10. no_state_fallback — bot restart mid-FSM, state lost
 # ============================================================
 @router.message(StateFilter(None), F.text, ~F.text.startswith("/"))
 async def no_state_fallback(message: Message) -> None:

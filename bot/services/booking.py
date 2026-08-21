@@ -14,6 +14,8 @@ from typing import Any, cast
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from scheduler import remove_jobs_for_booking
 from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
@@ -235,3 +237,172 @@ async def create_booking(
         service_title_snapshot=escaped_service,
         master_notification_text=master_text,
     )
+
+
+# ============================================================
+# Cancel booking (spec.md 41, 298, 317, 405-407)
+# ============================================================
+
+
+class BookingNotFoundError(Exception):
+    """Booking not found OR not owned by this client.
+
+    Defense-in-depth: same error for "no such booking" and "someone else's booking"
+    (avoids leaking existence of bookings the caller doesn't own).
+    """
+
+
+class BookingAlreadyCancelledError(Exception):
+    """Booking status is already 'cancelled' — idempotent retry / double-click / race."""
+
+
+class CancelTooLateError(Exception):
+    """now >= start_at - CANCEL_MIN_HOURS — cancellation window expired (spec.md 406)."""
+
+
+@dataclass(frozen=True)
+class CancelResult:
+    """Result of cancel_booking — passed to handler for Telegram I/O.
+
+    Mirrors BookingCreatedData: snapshots are already html.escape()'d in DB
+    (no re-escape needed when rendering master notification in HTML parse mode).
+    """
+
+    booking_id: UUID
+    slot_id: UUID
+    master_id: UUID
+    business_id: UUID
+    client_name_snapshot: str
+    service_title_snapshot: str
+    start_at: datetime
+    master_notification_text: str
+
+
+async def cancel_booking(
+    session: AsyncSession,
+    booking_id: UUID,
+    client_id: UUID,
+    scheduler: AsyncIOScheduler,
+    *,
+    now_utc: datetime | None = None,
+) -> CancelResult:
+    """Cancel booking (spec.md 41, 298, 317, 405-407).
+
+    Atomic within one transaction (booking UPDATE + slot UPDATE + NotificationLog INSERT).
+    `remove_jobs_for_booking` is called AFTER commit — if commit fails, jobs remain
+    (booking still active, reminders still needed). If commit succeeds, jobs are
+    obsolete (booking cancelled) and removed idempotently (scheduler.remove_job
+    uses suppress(Exception) — see scheduler.py:90-95).
+
+    `now_utc` injected for tests (production uses datetime.now(UTC)).
+
+    Steps:
+      1. SELECT booking WHERE id=? AND client_id=? (ownership + existence check)
+      2. If booking is None → BookingNotFoundError (covers not-found AND not-owner)
+      3. If booking.status == 'cancelled' → BookingAlreadyCancelledError
+      4. If now >= start_at - CANCEL_MIN_HOURS → CancelTooLateError
+      5. UPDATE booking SET status='cancelled' WHERE id=? AND client_id=?
+         AND status IN ('confirmed','transferred') — rowcount check (race protection)
+      6. UPDATE slot SET status='open' WHERE id=booking.slot_id (slot was 'booked')
+      7. INSERT notifications_log(master_cancel) — UNIQUE guard, SAVEPOINT idempotency
+      8. Build CancelResult (booking object alive — fixture uses expire_on_commit=False)
+      9. commit
+     10. remove_jobs_for_booking(scheduler, booking_id) — AFTER commit, idempotent
+     11. Return CancelResult (handler sends master notification + client confirmation)
+    """
+    settings = get_settings()
+    ref = now_utc or datetime.now(UTC)
+
+    # Step 1-2: SELECT booking with ownership filter (covers not-found and not-owner)
+    stmt = select(Booking).where(Booking.id == booking_id, Booking.client_id == client_id)
+    booking = (await session.execute(stmt)).scalar_one_or_none()
+    if booking is None:
+        raise BookingNotFoundError(
+            f"Booking {booking_id} not found for client {client_id}"
+        )
+
+    # Step 3: already cancelled — fast path, no UPDATE needed
+    if booking.status == "cancelled":
+        raise BookingAlreadyCancelledError(f"Booking {booking_id} already cancelled")
+
+    # Step 4: 24h rule (spec.md 406). start_at - 24h is the deadline; past → refuse.
+    # SQLite stores DateTime naive (DateTime(timezone=True) is ignored on SQLite),
+    # so we compare with naive UTC here (pattern from admin.py:155-156, verified
+    # test_admin.py 2026-08-21). start_at from DB is naive; strip ref tzinfo if aware.
+    ref_naive = ref.replace(tzinfo=None) if ref.tzinfo is not None else ref
+    cancel_deadline = booking.start_at - timedelta(hours=settings.CANCEL_MIN_HOURS)
+    if ref_naive >= cancel_deadline:
+        raise CancelTooLateError(
+            f"now={ref_naive} >= cancel_deadline={cancel_deadline} for booking {booking_id}"
+        )
+
+    # Step 5: UPDATE booking SET status='cancelled' + rowcount check (race protection).
+    # WHERE clause includes status IN (...) so a concurrent cancel/transfer
+    # between SELECT and UPDATE results in rowcount=0 → BookingAlreadyCancelledError.
+    upd_b = (
+        update(Booking)
+        .where(
+            Booking.id == booking_id,
+            Booking.client_id == client_id,
+            Booking.status.in_(("confirmed", "transferred")),
+        )
+        .values(status="cancelled")
+    )
+    res_b = await session.execute(upd_b)
+    if cast("CursorResult[Any]", res_b).rowcount == 0:
+        await session.rollback()
+        raise BookingAlreadyCancelledError(
+            f"Booking {booking_id} status changed between SELECT and UPDATE"
+        )
+
+    # Step 6: UPDATE slot SET status='open' — slot was 'booked' (close_slot refuses
+    # to close a booked slot, so during the lifetime of a booking slot.status is
+    # always 'booked'). Releasing to 'open' makes the slot available for new bookings.
+    upd_s = update(Slot).where(Slot.id == booking.slot_id).values(status="open")
+    await session.execute(upd_s)
+
+    # Step 7: NotificationLog master_cancel — SAVEPOINT idempotency (booking.py:198-212
+    # pattern). If IntegrityError (already logged — duplicate retry), only the
+    # savepoint rolls back, main transaction survives.
+    log_entry = NotificationLog(booking_id=booking.id, kind="master_cancel")
+    try:
+        async with session.begin_nested():
+            session.add(log_entry)
+            await session.flush()
+    except IntegrityError:
+        # Already logged — idempotent. Savepoint rolled back, log_entry expunged.
+        pass
+
+    # Step 8: Build master notification text BEFORE commit (booking object alive —
+    # test fixture uses expire_on_commit=False; production engine default also
+    # safe because we read snapshots into the dataclass here, not after commit).
+    business_tz = await _select_business_timezone(session, booking.business_id)
+    local_time = booking.start_at.astimezone(ZoneInfo(business_tz))
+    formatted_time = local_time.strftime("%d %B %Y, %H:%M")
+    master_text = (
+        f"Отмена:\n"
+        f"📅 {formatted_time}\n"
+        f"👤 {booking.client_name_snapshot}\n"
+        f"💇 {booking.service_title_snapshot}"
+    )
+    result = CancelResult(
+        booking_id=booking.id,
+        slot_id=booking.slot_id,
+        master_id=booking.master_id,
+        business_id=booking.business_id,
+        client_name_snapshot=booking.client_name_snapshot,
+        service_title_snapshot=booking.service_title_snapshot,
+        start_at=booking.start_at,
+        master_notification_text=master_text,
+    )
+
+    # Step 9: commit booking + slot UPDATE + NotificationLog INSERT atomically
+    await session.commit()
+
+    # Step 10: scheduler cleanup AFTER commit (atomic: commit fail → jobs remain,
+    # booking still active). remove_jobs_for_booking uses suppress(Exception)
+    # internally — idempotent if jobs already removed (Урок 2.4 retry scenario).
+    remove_jobs_for_booking(scheduler, booking_id)
+
+    # Step 11: return result (handler sends master notification + client confirmation)
+    return result
