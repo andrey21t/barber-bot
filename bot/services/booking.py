@@ -608,8 +608,12 @@ async def transfer_booking(
     res_new_slot = await session.execute(upd_new_slot)
     if cast("CursorResult[Any]", res_new_slot).rowcount == 0:
         await session.rollback()
+        # Use function parameter `new_slot_id` (immutable UUID), NOT `new_slot.id`.
+        # After session.rollback() above, `new_slot` instance attributes are
+        # expired → `new_slot.id` would trigger lazy load → MissingGreenlet
+        # (B3 fix — same pattern as B1 in create_booking).
         raise SlotAlreadyBookedError(
-            f"New slot {new_slot.id} was taken/closed between SELECT and UPDATE"
+            f"New slot {new_slot_id} was taken/closed between SELECT and UPDATE"
         )
 
     # Step 11: NotificationLog master_transfer — SAVEPOINT idempotency (booking.py:198-212 pattern).
