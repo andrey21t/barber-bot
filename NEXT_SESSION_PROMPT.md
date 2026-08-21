@@ -1,7 +1,7 @@
-# NEXT_SESSION_PROMPT — barber-bot Блок 3 часть 3 (перенос записи)
+# NEXT_SESSION_PROMPT — barber-bot тесты cancel_booking + Блок 3 часть 3 (перенос)
 
-> Дата: 2026-08-21 · Сессия: завершена после Блок 3 часть 2 (cancel_booking)
-> Цель следующей сессии: Блок 3 часть 3 — перенос записи клиентом (FSM для новой даты/слота)
+> Дата: 2026-08-21 · Сессия: завершена после self-review fix бага naive datetime в handler
+> Цель следующей сессии: сначала — покрыть cancel_booking тестами (handler + service edge cases), потом — Блок 3 часть 3 (перенос записи)
 
 ## Контекст проекта
 
@@ -10,30 +10,38 @@
 **Спека (SSOT):** `~/PycharmProjects/barber-bot/spec.md` — читай перед каждой задачей, если код расходится со spec — прав spec, не код
 **Формат работы:** `~/PycharmProjects/barber-bot/MY-VIBE-RULES.md` — dev-режим (без педагогики Уровня 2), резюме после блока, гейты: deep-analysis на нетривиальное → реализация → verify → code-review
 
-## Что уже сделано (коммиты в main)
+## Приоритет 1 — покрыть cancel_booking тестами (выявленные пробелы из self-review)
 
-### Предыдущие сессии (до 2026-08-21)
-- MVP skeleton: `bot/main.py`, `bot/handlers/start.py`, `bot/handlers/client.py` (booking flow)
-- Services: `bot/services/booking.py` (create_booking), `bot/services/slots.py`, `bot/services/notifications.py`
-- Middlewares: `bot/middlewares/session_timeout.py`
-- Tests: test_booking.py, test_slots.py, test_notifications.py, test_scheduler.py (1 pre-existing failure: `test_on_startup_scan_phase_2_reschedules_upcoming` — красный, не регрессия, отдельный блок для починки)
+**Контекст:** при self-review пользователь спросил "у нас с тестами покрыт этот функционал???" — ответ был "частично": service покрыт (4 теста), handlers/keyboard/edge cases — НЕТ. Bug в `mybookings_msg:441` (naive vs aware datetime) поймался только self-review, не тестами. Это сигнал — display-математика в handler ≠ pure I/O, exemption по anti-overengineering правило 3 НЕ работает.
 
-### Сессия 2026-08-21 (Блоки 1-3 часть 2)
-- **Блок 1**: Master-команды (`handlers/admin.py` + `services/admin.py` + `keyboards/admin.py` + правки `start.py`/`main.py`)
-- **Блок 2**: Тесты + Code Review (LBTM → 6 фиксов: slot_date past validation, /week 8→7 дней, newline в render, escape service.name, empty hours, name length 255)
-- **Блок 3 часть 1**: `/mybookings` — список записей клиента (без отмены/переноса, отложено)
-- **Блок 3 часть 2**: **cancel_booking** (отмена записи клиентом):
-  - `bot/services/booking.py`: +170 строк — `cancel_booking()` + 3 exception classes + `CancelResult` dataclass
-  - `bot/keyboards/client.py`: +41 строк — `MyBookingsCancelCallbackData(prefix="mybook_cancel")` + `mybookings_keyboard()`
-  - `bot/handlers/client.py`: +124 строк — `mybookings_msg` переписан с inline-кнопками + новый `mybookings_cancel_cb` handler
-  - `tests/test_booking.py`: +235 строк — 4 новых теста (happy_path, too_late, not_owner, already_cancelled)
-  - **Bug found in self-review** (user-triggered "проверь себя"): `mybookings_msg:441` сравнивал aware `datetime.now(UTC)` с naive `b.start_at - 24h` из SQLite → `TypeError` в продакшене при первом /mybookings. Та же бага что я только что пофиксил в `cancel_booking:332`. Фикс: strip tzinfo от now_utc перед сравнением (mirror сервиса). **Гейт handler tests НЕ ловил** — handler считается pure I/O (anti-overengineering правило 3), но этот баг был в display-логике partition cancelable, не в I/O — оправдание не сработало. Урок для следующего блока: партиционирование/математика в handler даже для display = candidate на тест.
-  - Tests: 49 passed (full suite, без failures)
-  - Code review: LGTM (main agent — subagent Communication Failure subagent-side; 0 Critical, 1 Warning: pre-existing timezone render pattern в `booking.start_at.astimezone(ZoneInfo(business_tz))` на naive SQLite datetime — тот же pattern в `create_booking:217`, фикс отложен до Postgres migration Урок 2.6)
+**Что покрыть (~6-8 тестов, ориентир 30-40 мин):**
 
-## Что делать в следующей сессии
+### Service edge cases (tests/test_booking.py)
+1. **`test_cancel_booking_not_found`** — booking_id не существует (random uuid4) → `BookingNotFoundError`. Сейчас покрыт только "чужой client_id". Различие: "чужой" должен идти через `WHERE client_id=?` (defense-in-depth), "не существует" — `WHERE id=?` возвращает None.
+2. **`test_cancel_booking_transferred_status`** — booking.status='transferred' (NOT 'confirmed') → cancel должен пройти (UPDATE WHERE status IN ('confirmed', 'transferred')). Сейчас покрыт только confirmed.
+3. **`test_cancel_booking_now_utc_default`** — `now_utc=None` (production path, default `datetime.now(UTC)`). Может потребоваться slot далеко в будущем (>24h от now), чтобы не упасть с CancelTooLateError.
 
-### Блок 3 часть 3 — ПЕРЕНОС записи клиентом
+### Handler tests (tests/test_client_handlers.py — НОВЫЙ файл, pattern из conftest.py mock_bot + dp.feed_update)
+4. **`test_mybookings_msg_with_cancelable_booking`** — seed booking завтра 14:00, вызов `/mybookings`, проверить что в ответе есть inline-кнопка `Отменить`. Этот тест поймал бы naive-datetime баг из self-review.
+5. **`test_mybookings_msg_with_too_late_booking`** — seed booking сегодня через 1 час, `/mybookings`, проверить что в ответе есть `⏰ Отмена недоступна`, НЕТ кнопки.
+6. **`test_mybookings_msg_no_bookings`** — клиент без записей → "У вас нет активных записей. /book чтобы записаться"
+7. **`test_mybookings_cancel_cb_happy_path`** — callback `mybook_cancel:<booking_id>`, проверить что booking.status='cancelled' после callback, мастеру отправлено сообщение "Отмена:".
+8. **`test_mybookings_cancel_cb_too_late`** — slot сегодня (статус confirmed), callback → `CancelTooLateError` → ответ "❌ Отмена возможна только за 24+ часов до записи"
+9. **`test_mybookings_cancel_cb_not_owner`** — stranger client_id → "Запись не найдена" (callback.answer с этим текстом)
+
+### Keyboard test (можно в test_client_handlers.py или новый test_keyboards.py)
+10. **`test_mybookings_keyboard_buttons`** — передать 2 booking → 2 кнопки в markup, callback_data корректный `mybook_cancel:<uuid>`
+
+### Интеграционный тест (опционально, если есть ресурс)
+11. **`test_full_cancel_flow`** — create_booking → /mybookings (видит кнопку) → tap [Отменить] → /mybookings снова (пусто, "У вас нет активных записей")
+
+**Pattern для handler тестов:** `conftest.py:mock_bot` уже есть (`AsyncMock(Bot) + dp.feed_update(bot, update)`). Глянь `tests/test_admin.py` для handler-теста pattern если есть, или используй mock_bot + вручную вызвать `mybookings_msg(message=mock_message)` с mock message.
+
+**Сложность:** средняя. Handler тесты в aiogram 3.x требуют mock Message/CallbackQuery — нетривиально. Если застрянешь на моках — coverage priority: test #4 (catch naive datetime bug), #7 (cancel_cb happy path), #1 (not_found), #2 (transferred). Остальные можно опустить если времени не хватит.
+
+**Гейты:** verify (pytest + ruff + mypy) → code-review (если logic change — но это тесты, можно main agent review).
+
+## Приоритет 2 — Блок 3 часть 3 — ПЕРЕНОС записи клиентом
 
 **Spec.md** (строки 41, 318, 408-409):
 - `/mybookings` → inline-кнопка «Перенести» возле каждой записи (аналогично «Отменить», новый callback prefix `mybook_transfer`)
@@ -71,17 +79,24 @@
 ## Quick start следующей сессии (prompt для opencode)
 
 ```
-Продолжаем barber-bot Блок 3 часть 3 — перенос записи клиентом.
+Продолжаем barber-bot — покрыть cancel_booking тестами (Приоритет 1), потом Блок 3 часть 3 перенос записи (Приоритет 2, если хватит ресурса).
 
-Прочитай ~/PycharmProjects/barber-bot/NEXT_SESSION_PROMPT.md (этот файл) — там полный контекст.
-Затем открой spec.md строки 41, 318, 408-409 — контракты переноса.
-Потом bot/services/booking.py — там свежий pattern для cancel_booking (UPDATE + rowcount + NotificationLog SAVEPOINT + remove_jobs_for_booking). Transfer_booking — это cancel_booking (для старого slot/scheduler) + create_booking (для нового slot/scheduler) в одной транзакции.
+Прочитай ~/PycharmProjects/barber-bot/NEXT_SESSION_PROMPT.md (этот файл) — там полный контекст с приоритетами и списком тестов.
 
-Сделай deep-analysis (Pass 1-4) на transfer_booking — это state-change + scheduler side effects (remove старые + add новые jobs).
-Реализуй: service transfer_booking → keyboard button «Перенести» → FSM handlers для выбора новой даты/слота → tests на service.
-Гейты: verify (pytest+ruff+mypy зелёные) → code-review subagent → резюме блока.
+ПРИОРИТЕТ 1 — тесты (~30-40 мин, ~6-8 тестов):
+- Service edge cases в tests/test_booking.py: not_found, transferred_status, now_utc_default
+- Handler tests в новом tests/test_client_handlers.py (pattern: conftest.py mock_bot + dp.feed_update):
+  mybookings_msg с cancelable/too-late/no-bookings, mybookings_cancel_cb happy/too_late/not_owner
+- Test #4 (mybookings_msg with cancelable booking) — ОСОБЫЙ приоритет, поймал бы naive-datetime баг из self-review
+- Гейты: pytest + ruff + mypy зелёные. Tests = не logic change, code-review опционален (main agent review).
 
-Если останется ресурс — почини pre-existing test_scheduler failure (но это отдельный блок, не основная задача).
+ПРИОРИТЕТ 2 — Блок 3 часть 3 перенос (если останется ресурс):
+- spec.md строки 41, 318, 408-409 — контракты переноса
+- bot/services/booking.py — pattern cancel_booking (UPDATE + rowcount + NotificationLog SAVEPOINT + remove_jobs_for_booking). Transfer = cancel (для старого slot) + create (для нового slot) в одной транзакции.
+- ⚠️ ВНИМАНИЕ: transfer FSM handler тоже будет делать partition как mybookings_msg — НЕ забыть naive datetime в handler (урок из self-review баги)
+- Гейты: deep-analysis (Pass 1-4) → verify → code-review subagent
+
+Если останется ресурс — почини pre-existing FLAKY test_scheduler (но это отдельный блок, не основная задача).
 ```
 
 ## Файлы для быстрого ориентирования
