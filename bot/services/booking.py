@@ -90,9 +90,7 @@ def _build_end_at(
     return start_at + timedelta(minutes=duration)
 
 
-async def _select_service(
-    session: AsyncSession, service_id: UUID | None
-) -> Service | None:
+async def _select_service(session: AsyncSession, service_id: UUID | None) -> Service | None:
     if service_id is None:
         return None
     stmt = select(Service).where(Service.id == service_id)
@@ -100,9 +98,7 @@ async def _select_service(
     return result.scalar_one_or_none()
 
 
-async def _select_or_create_client(
-    session: AsyncSession, telegram_id: int
-) -> Client:
+async def _select_or_create_client(session: AsyncSession, telegram_id: int) -> Client:
     stmt = select(Client).where(Client.telegram_id == telegram_id)
     result = await session.execute(stmt)
     client = result.scalar_one_or_none()
@@ -115,8 +111,13 @@ async def _select_or_create_client(
     except IntegrityError:
         # Race: another concurrent request created this client between our
         # SELECT and INSERT. UNIQUE(telegram_id) — see bot/models.py:84.
-        # Safe to rollback whole session here: slot is persistent (SELECT only),
-        # booking not yet added, no uncommitted side effects to preserve.
+        # Rollback here is safe in terms of data (no uncommitted writes to lose
+        # — slot was SELECT'd read-only, booking not yet added), BUT it expires
+        # all attached instances (including slot from create_booking:145).
+        # Callers MUST capture any slot attributes they need BEFORE calling
+        # this function — see create_booking:152 (B1 fix). Accessing slot.id
+        # after this rollback would trigger MissingGreenlet (sync lazy load on
+        # async session).
         await session.rollback()
         result = await session.execute(stmt)
         client = result.scalar_one()
@@ -147,6 +148,13 @@ async def create_booking(
     settings = get_settings()
 
     slot = await _select_open_slot(session, payload.slot_id)
+    # Capture slot_id BEFORE any rollback-prone call (B1 fix).
+    # `_select_or_create_client` (line 167) may call `session.rollback()` on
+    # concurrent client INSERT race (line 116) → SQLAlchemy expires all
+    # attached instances → subsequent `slot.id` access triggers lazy load
+    # → MissingGreenlet (sync access to async session). UUID is immutable and
+    # already loaded from SELECT → safe to capture here.
+    slot_id = slot.id
     business_tz = await _select_business_timezone(session, business_id)
     start_at = _build_start_at(slot, business_tz)
 
@@ -163,7 +171,7 @@ async def create_booking(
     client = await _select_or_create_client(session, telegram_id)
 
     booking = Booking(
-        slot_id=slot.id,
+        slot_id=slot_id,
         business_id=business_id,
         master_id=master_id,
         client_id=client.id,
@@ -179,23 +187,15 @@ async def create_booking(
         await session.flush()
     except IntegrityError as exc:
         await session.rollback()
-        raise SlotAlreadyBookedError(
-            f"Slot {slot.id} already booked (UNIQUE constraint)"
-        ) from exc
+        raise SlotAlreadyBookedError(f"Slot {slot_id} already booked (UNIQUE constraint)") from exc
 
     # SQLite race protection: UPDATE ... WHERE status='open' + rowcount check
-    upd = (
-        update(Slot)
-        .where(Slot.id == slot.id, Slot.status == "open")
-        .values(status="booked")
-    )
+    upd = update(Slot).where(Slot.id == slot_id, Slot.status == "open").values(status="booked")
     res = await session.execute(upd)
     if cast("CursorResult[Any]", res).rowcount == 0:
         # Lost race: slot was closed/booked between SELECT and UPDATE
         await session.rollback()
-        raise SlotAlreadyBookedError(
-            f"Slot {slot.id} was taken/closed between SELECT and UPDATE"
-        )
+        raise SlotAlreadyBookedError(f"Slot {slot_id} was taken/closed between SELECT and UPDATE")
 
     # notifications_log idempotency — UNIQUE(booking_id, kind)
     # SAVEPOINT isolates log_entry INSERT from main transaction (booking + slot):
@@ -218,16 +218,11 @@ async def create_booking(
     # Format notification text for master (rendered in HTML parse mode, no re-escape needed)
     local_time = start_at.astimezone(ZoneInfo(business_tz))
     formatted_time = local_time.strftime("%d %B %Y, %H:%M")
-    master_text = (
-        f"Новая запись:\n"
-        f"📅 {formatted_time}\n"
-        f"👤 {escaped_name}\n"
-        f"💇 {escaped_service}"
-    )
+    master_text = f"Новая запись:\n📅 {formatted_time}\n👤 {escaped_name}\n💇 {escaped_service}"
 
     return BookingCreatedData(
         booking_id=booking.id,
-        slot_id=slot.id,
+        slot_id=slot_id,
         master_id=master_id,
         business_id=business_id,
         client_id=client.id,
@@ -317,9 +312,7 @@ async def cancel_booking(
     stmt = select(Booking).where(Booking.id == booking_id, Booking.client_id == client_id)
     booking = (await session.execute(stmt)).scalar_one_or_none()
     if booking is None:
-        raise BookingNotFoundError(
-            f"Booking {booking_id} not found for client {client_id}"
-        )
+        raise BookingNotFoundError(f"Booking {booking_id} not found for client {client_id}")
 
     # Step 3: already cancelled — fast path, no UPDATE needed
     if booking.status == "cancelled":
@@ -519,9 +512,7 @@ async def transfer_booking(
     stmt_b = select(Booking).where(Booking.id == booking_id, Booking.client_id == client_id)
     booking = (await session.execute(stmt_b)).scalar_one_or_none()
     if booking is None:
-        raise BookingNotFoundError(
-            f"Booking {booking_id} not found for client {client_id}"
-        )
+        raise BookingNotFoundError(f"Booking {booking_id} not found for client {client_id}")
     if booking.status == "cancelled":
         raise BookingAlreadyCancelledError(f"Booking {booking_id} is cancelled, cannot transfer")
 
@@ -555,9 +546,7 @@ async def transfer_booking(
     # rule check for the OLD booking's start_at). Mixing ref here would break
     # tests that inject ref in far past to bypass 24h rule (e.g. test_slot_in_past).
     if new_start_at <= datetime.now(UTC):
-        raise SlotInPastError(
-            f"New slot {new_slot_id} start_at={new_start_at} is in the past"
-        )
+        raise SlotInPastError(f"New slot {new_slot_id} start_at={new_start_at} is in the past")
 
     # Look up service for end_at duration (booking.service_id may be None — fallback to default).
     service = await _select_service(session, booking.service_id)
@@ -593,9 +582,7 @@ async def transfer_booking(
         # re-check, concurrent cancel would surface as "Запись уже перенесена" —
         # misleading (user sees the booking is gone, not transferred).
         await session.rollback()
-        recheck = await session.execute(
-            select(Booking.status).where(Booking.id == booking_id)
-        )
+        recheck = await session.execute(select(Booking.status).where(Booking.id == booking_id))
         current_status = recheck.scalar_one_or_none()
         if current_status == "cancelled":
             raise BookingAlreadyCancelledError(
@@ -609,24 +596,24 @@ async def transfer_booking(
     # Step 9: Release OLD slot → 'open' (idempotent: if new_slot == old_slot,
     # step 10 below re-bumps it back to 'booked'). Use captured old_slot_id —
     # booking.slot_id was mutated by step 8 UPDATE to new_slot.id.
-    upd_old_slot = (
-        update(Slot).where(Slot.id == old_slot_id).values(status="open")
-    )
+    upd_old_slot = update(Slot).where(Slot.id == old_slot_id).values(status="open")
     await session.execute(upd_old_slot)
 
     # Step 10: Book NEW slot — SQLite race protection (UPDATE WHERE status='open' + rowcount).
     # Pattern from create_booking:184-196. If slot was taken between SELECT (step 5)
     # and UPDATE (here) → rowcount=0 → rollback → SlotAlreadyBookedError.
     upd_new_slot = (
-        update(Slot)
-        .where(Slot.id == new_slot.id, Slot.status == "open")
-        .values(status="booked")
+        update(Slot).where(Slot.id == new_slot.id, Slot.status == "open").values(status="booked")
     )
     res_new_slot = await session.execute(upd_new_slot)
     if cast("CursorResult[Any]", res_new_slot).rowcount == 0:
         await session.rollback()
+        # Use function parameter `new_slot_id` (immutable UUID), NOT `new_slot.id`.
+        # After session.rollback() above, `new_slot` instance attributes are
+        # expired → `new_slot.id` would trigger lazy load → MissingGreenlet
+        # (B3 fix — same pattern as B1 in create_booking).
         raise SlotAlreadyBookedError(
-            f"New slot {new_slot.id} was taken/closed between SELECT and UPDATE"
+            f"New slot {new_slot_id} was taken/closed between SELECT and UPDATE"
         )
 
     # Step 11: NotificationLog master_transfer — SAVEPOINT idempotency (booking.py:198-212 pattern).
