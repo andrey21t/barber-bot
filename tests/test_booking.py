@@ -23,7 +23,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from bot.models import Booking, NotificationLog, Slot
+from bot.models import Booking, Business, Client, Master, NotificationLog, Slot
 from bot.schemas import BookingCreate
 from bot.services.booking import (
     BookingAlreadyCancelledError,
@@ -38,7 +38,8 @@ from bot.services.booking import (
     create_booking,
 )
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql.selectable import Select
 
 
 async def _make_payload(slot_id: UUID) -> BookingCreate:
@@ -1075,3 +1076,206 @@ async def test_transfer_booking_concurrent_transfer_race_protection(
     # Sanity: BookingAlreadyTransferredError is exported (handler maps it to user-facing text).
     assert BookingAlreadyTransferredError is not None
     assert SlotNotAvailableError is not None
+
+
+@pytest.mark.asyncio
+async def test_transfer_booking_concurrent_race_runtime(
+    session_factory_concurrent: async_sessionmaker[AsyncSession],
+) -> None:
+    """Runtime race protection — faithful replacement of static-invariant lock.
+
+    Closes Pass 3 [blocker] finding: verifies transfer_booking's WHERE-clause
+    pin (`Booking.start_at == old_start_at` in UPDATE WHERE) actually rejects
+    the loser at runtime, not just by inspect.getsource.
+
+    Approach (deterministic, no asyncio.gather):
+      1. Seed business/master/client/2 new slots through s_seed (committed).
+         Create confirmed booking via _seed_confirmed_booking (committed).
+      2. Open s_snapshot — SELECT booking, capture stale snapshot (status=
+         'confirmed', start_at=old_start_at) BEFORE B's concurrent transfer.
+         Build a detached stale_booking Booking object with these fields.
+      3. Open s_b — call transfer_booking(s_b, ...) with new_slot_b. B wins
+         fully: SELECT (sees committed 'confirmed'), UPDATE (rowcount=1),
+         commit. DB now has booking with status='transferred', start_at=
+         new_B_start_at.
+      4. Open s_a — patch its execute to return stale_booking on first
+         SELECT FROM booking (simulates A captured snapshot before B's
+         commit, then resumes). Call transfer_booking(s_a, ...) with
+         new_slot_a. Service's SELECT returns stale_booking (status=
+         'confirmed', start_at=old_start_at). Service's UPDATE WHERE
+         start_at=old_start_at runs against actual DB (now has new_B_start_at
+         from B's commit) → rowcount=0 → recheck status → not 'cancelled'
+         → raise BookingAlreadyTransferredError.
+      5. Verify final DB state: only B's transfer succeeded.
+
+    Faithfulness: tests the actual service's UPDATE WHERE clause behavior at
+    runtime. If `Booking.start_at ==` were removed from WHERE, A's UPDATE
+    would match on id+client_id+status (status IN ('confirmed','transferred')
+    matches 'transferred' too) and succeed (loser would overwrite winner —
+    race condition not caught).
+
+    Why not asyncio.gather: asyncio.gather doesn't guarantee both SELECTs
+    happen before either UPDATE — A might fully win before B starts (B then
+    re-transfers successfully, race not triggered). Manual orchestration via
+    patched SELECT gives deterministic race scenario.
+
+    Why file-based SQLite (not in-memory): default in-memory + QueuePool gives
+    each connection its own DB (sessions can't share state). File-based allows
+    multiple connections to same DB — B's commit is visible to A's UPDATE.
+    """
+    # Step 1: Seed context + booking through s_seed (committed)
+    async with session_factory_concurrent() as s_seed:
+        biz = Business(
+            name="Race Barbershop",
+            telegram_owner_id=461355056,
+            timezone="Europe/Moscow",
+        )
+        s_seed.add(biz)
+        await s_seed.flush()
+        master = Master(business_id=biz.id, name="Тестер", telegram_id=461355056, role="owner")
+        s_seed.add(master)
+        await s_seed.flush()
+        client = Client(telegram_id=111222333, name="Паша")
+        s_seed.add(client)
+        await s_seed.flush()
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = Slot(master_id=master.id, slot_date=tomorrow, slot_hour=14, status="open")
+        s_seed.add(slot)
+        await s_seed.commit()
+        seed_data_local: dict[str, Any] = {
+            "business": biz,
+            "master": master,
+            "client": client,
+            "slot": slot,
+            "business_id": biz.id,
+            "master_id": master.id,
+            "client_telegram_id": 111222333,
+            "slot_date": tomorrow,
+        }
+        booking = await _seed_confirmed_booking(s_seed, seed_data_local)
+        new_slot_b = await _make_open_slot(s_seed, seed_data_local, days_ahead=5, hour_local=16)
+        new_slot_a = await _make_open_slot(s_seed, seed_data_local, days_ahead=6, hour_local=15)
+        await s_seed.commit()
+        booking_id = booking.id
+        new_slot_b_id = new_slot_b.id
+        new_slot_a_id = new_slot_a.id
+        client_id = client.id
+
+    # Step 2: Capture A's stale snapshot BEFORE B's transfer
+    async with session_factory_concurrent() as s_snapshot:
+        stmt = select(Booking).where(Booking.id == booking_id)
+        booking_snapshot = (await s_snapshot.execute(stmt)).scalar_one()
+        # Build detached stale_booking object with snapshot fields (simulates
+        # A's service-internal SELECT returning the row captured before B's
+        # concurrent commit).
+        stale_booking = Booking(
+            id=booking_snapshot.id,
+            client_id=booking_snapshot.client_id,
+            business_id=booking_snapshot.business_id,
+            master_id=booking_snapshot.master_id,
+            slot_id=booking_snapshot.slot_id,
+            start_at=booking_snapshot.start_at,  # STALE: old_start_at
+            end_at=booking_snapshot.end_at,
+            status=booking_snapshot.status,  # 'confirmed'
+            service_id=booking_snapshot.service_id,
+            client_name_snapshot=booking_snapshot.client_name_snapshot,
+            service_title_snapshot=booking_snapshot.service_title_snapshot,
+        )
+        assert stale_booking.status == "confirmed"
+
+    # Step 3: B wins fully — call transfer_booking(s_b, ...)
+    async with session_factory_concurrent() as s_b:
+        mock_scheduler_b = _mock_scheduler()
+        ref = datetime.now(UTC) - timedelta(days=10)
+        result_b = await transfer_booking(
+            s_b,
+            booking_id=booking_id,
+            new_slot_id=new_slot_b_id,
+            client_id=client_id,
+            scheduler=mock_scheduler_b,
+            now_utc=ref,
+        )
+        assert isinstance(result_b, TransferResult)
+        assert result_b.new_slot_id == new_slot_b_id
+
+    # DB now has: booking.status='transferred', start_at=new_B, slot_id=new_slot_b
+
+    # Step 4: A's transfer_booking — patch s_a's SELECT to return stale_booking
+    # (simulates A captured snapshot before B's commit, then resumes)
+    async with session_factory_concurrent() as s_a:
+        original_execute = s_a.execute
+        patch_active = True
+
+        async def patched_execute(statement, *args, **kwargs):
+            nonlocal patch_active
+            if patch_active and isinstance(statement, Select):
+                # Detect SELECT FROM Booking — first booking lookup in transfer_booking.
+                # If entity detection fails (e.g., SQLAlchemy API change), raise
+                # explicitly — silent bypass would let A see B's committed state,
+                # re-transfer successfully, and test would fail with confusing
+                # "DID NOT RAISE" instead of clear "patched_execute entity
+                # detection failed: ...". (Code-review W2.)
+                try:
+                    entities = [d.get("entity") for d in statement.column_descriptions]
+                    if any(isinstance(e, type) and issubclass(e, Booking) for e in entities):
+                        patch_active = False  # only first SELECT (booking lookup)
+                        # _FakeResult implements only scalar_one_or_none — the only
+                        # method transfer_booking:520 calls on the first SELECT result.
+                        # If service refactors to .one()/.first()/.scalars().first(),
+                        # this would raise AttributeError — add the method here. (W1.)
+                        class _FakeResult:
+                            def scalar_one_or_none(self):
+                                return stale_booking
+                        return _FakeResult()
+                except (KeyError, AttributeError, TypeError) as e:
+                    raise AssertionError(
+                        f"patched_execute entity detection failed: {e!r} — "
+                        f"SQLAlchemy column_descriptions API may have changed"
+                    ) from e
+            return await original_execute(statement, *args, **kwargs)
+
+        s_a.execute = patched_execute  # type: ignore[method-assign]  # test patch
+        try:
+            mock_scheduler_a = _mock_scheduler()
+            with pytest.raises(BookingAlreadyTransferredError):
+                await transfer_booking(
+                    s_a,
+                    booking_id=booking_id,
+                    new_slot_id=new_slot_a_id,
+                    client_id=client_id,
+                    scheduler=mock_scheduler_a,
+                    now_utc=ref,
+                )
+        finally:
+            s_a.execute = original_execute  # type: ignore[method-assign]
+
+    # Step 5: Verify final DB state — only B's transfer succeeded
+    async with session_factory_concurrent() as s_verify:
+        stmt_b = select(Booking).where(Booking.id == booking_id)
+        booking_after = (await s_verify.execute(stmt_b)).scalar_one()
+        assert booking_after.status == "transferred"
+        assert booking_after.slot_id == new_slot_b_id  # B's slot, not A's
+        assert booking_after.start_at != stale_booking.start_at
+
+        # B's new slot is booked, A's would-be new slot is still open
+        stmt_b_slot = select(Slot.status).where(Slot.id == new_slot_b_id)
+        assert (await s_verify.execute(stmt_b_slot)).scalar_one() == "booked"
+
+        stmt_a_slot = select(Slot.status).where(Slot.id == new_slot_a_id)
+        assert (await s_verify.execute(stmt_a_slot)).scalar_one() == "open"
+
+        # Original slot (booking's source before transfer) released by B's step 9
+        original_slot_id = stale_booking.slot_id
+        stmt_orig_slot = select(Slot.status).where(Slot.id == original_slot_id)
+        assert (await s_verify.execute(stmt_orig_slot)).scalar_one() == "open"
+
+        # NotificationLog: only one master_transfer row (B's); A didn't reach INSERT
+        stmt_n = (
+            select(NotificationLog)
+            .where(
+                NotificationLog.booking_id == booking_id,
+                NotificationLog.kind == "master_transfer",
+            )
+        )
+        notif_rows = (await s_verify.execute(stmt_n)).scalars().all()
+        assert len(notif_rows) == 1

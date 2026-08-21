@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -44,6 +45,35 @@ async def session_factory(
     engine: AsyncEngine,
 ) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+
+@pytest_asyncio.fixture
+async def engine_concurrent(tmp_path: Path) -> AsyncIterator[AsyncEngine]:
+    """File-based SQLite engine for concurrent-race tests.
+
+    In-memory SQLite + default QueuePool gives each new connection its own DB
+    (sessions can't share state). File-based SQLite supports multiple real
+    connections to the same file — each session has its own connection, and
+    writes serialize via SQLite's database-level lock. After a writer commits,
+    new statements on other connections see the committed state.
+
+    Used by test_transfer_booking_concurrent_race_runtime to faithfully test
+    the WHERE-clause pin (Booking.start_at ==) at runtime, replacing the
+    static-invariant test (inspect.getsource). Closes Pass 3 [blocker] finding.
+    """
+    db_file = tmp_path / "test_concurrent.db"
+    eng = create_async_engine(f"sqlite+aiosqlite:///{db_file}", future=True)
+    async with eng.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield eng
+    await eng.dispose()
+
+
+@pytest_asyncio.fixture
+async def session_factory_concurrent(
+    engine_concurrent: AsyncEngine,
+) -> async_sessionmaker[AsyncSession]:
+    return async_sessionmaker(engine_concurrent, expire_on_commit=False, class_=AsyncSession)
 
 
 @pytest_asyncio.fixture
