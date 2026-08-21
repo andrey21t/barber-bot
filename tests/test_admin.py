@@ -20,6 +20,7 @@ import pytest
 from bot.models import Booking, Service, Slot
 from bot.services.admin import (
     create_service,
+    get_client_bookings,
     get_today_bookings,
     get_week_bookings,
 )
@@ -543,3 +544,160 @@ async def test_get_today_extreme_timezone_utc_plus_12(
     result = await get_today_bookings(session, seed_data["master_id"], tz, now_utc=now_utc)
     assert len(result) == 1
     assert result[0].start_at == _utc_naive(today_local, 11, tz)
+
+
+# ============================================================
+# get_client_bookings — W2 fix: naive datetime must be UTC (T3)
+# ============================================================
+# Coverage (AUTONOMOUS_COVERAGE_PROMPT.md T3):
+#   ref = now_utc or datetime.now(tz=None) — naive LOCAL on non-UTC system.
+#   Booking.start_at is naive UTC → comparison off by TZ offset on dev Mac (MSK).
+#   Fix: datetime.now(UTC) → strip tzinfo (mirror of W1 fix, commit bfab1fb).
+#   Tests inject now_utc (aware UTC) for deterministic verification of the contract.
+#   Regression test on the original bug requires non-UTC system TZ (freezegun's
+#   datetime.now(tz=None) returns frozen time, not system-local) — not reproducible
+#   in CI without TZ env manipulation, so we test the post-fix contract directly.
+
+
+@pytest.mark.asyncio
+async def test_get_client_bookings_filters_past_naive(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """W2 fix contract: booking in past (naive UTC) excluded by default."""
+    past_utc_naive = datetime(2025, 1, 1, 12, 0)  # naive UTC, in the past
+    slot = await _make_slot(
+        session,
+        master_id=seed_data["master_id"],
+        slot_date_local=datetime(2025, 1, 1, 12, 0, tzinfo=UTC),
+        hour_local=12,
+    )
+    await _make_booking(
+        session,
+        slot_id=slot.id,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        client_id=seed_data["client"].id,
+        start_at_utc=past_utc_naive,
+        status="confirmed",
+    )
+
+    now_utc = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
+    result = await get_client_bookings(
+        session, seed_data["client"].id, now_utc=now_utc
+    )
+    assert len(result) == 0, "past booking (naive UTC) must be excluded by default"
+
+
+@pytest.mark.asyncio
+async def test_get_client_bookings_returns_upcoming_naive_utc(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """W2 fix contract: booking in future (naive UTC) returned as upcoming."""
+    now_utc = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
+    future_utc = now_utc + timedelta(days=1)
+    future_naive = future_utc.replace(
+        hour=15, minute=0, second=0, microsecond=0, tzinfo=None
+    )
+
+    slot = await _make_slot(
+        session,
+        master_id=seed_data["master_id"],
+        slot_date_local=future_utc.replace(
+            hour=15, minute=0, second=0, microsecond=0
+        ),
+        hour_local=15,
+    )
+    await _make_booking(
+        session,
+        slot_id=slot.id,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        client_id=seed_data["client"].id,
+        start_at_utc=future_naive,
+        status="confirmed",
+    )
+
+    result = await get_client_bookings(
+        session, seed_data["client"].id, now_utc=now_utc
+    )
+    assert len(result) == 1
+    assert result[0].start_at == future_naive
+
+
+@pytest.mark.asyncio
+async def test_get_client_bookings_include_past_returns_all(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """include_past=True → no date filter, all confirmed/transferred returned
+    (covers the `if not include_past` branch=False path).
+    """
+    past_naive = datetime(2025, 1, 1, 12, 0)  # naive UTC, in the past
+    slot = await _make_slot(
+        session,
+        master_id=seed_data["master_id"],
+        slot_date_local=datetime(2025, 1, 1, 12, 0, tzinfo=UTC),
+        hour_local=12,
+    )
+    await _make_booking(
+        session,
+        slot_id=slot.id,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        client_id=seed_data["client"].id,
+        start_at_utc=past_naive,
+        status="confirmed",
+    )
+
+    result = await get_client_bookings(
+        session, seed_data["client"].id, include_past=True
+    )
+    assert len(result) == 1
+    assert result[0].start_at == past_naive
+
+
+@pytest.mark.asyncio
+async def test_get_client_bookings_default_now_utc_uses_utc_not_local(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """W2 fix contract: when now_utc not passed, service uses datetime.now(UTC)
+    (NOT datetime.now(tz=None)) so ref is UTC even on non-UTC system.
+
+    Seed booking exactly at now_utc, call without now_utc. After fix:
+    ref = datetime.now(UTC).replace(tzinfo=None) ≈ now UTC.
+    Filter `start_at > ref` strict → booking at exactly now excluded.
+
+    freeze_time fixes 'now' on both sides — deterministic.
+    """
+    from freezegun import freeze_time
+
+    with freeze_time("2026-08-21 12:00:00", tz_offset=0):
+        now_utc = datetime.now(UTC)
+        start_at_naive = now_utc.replace(tzinfo=None)
+        slot = await _make_slot(
+            session,
+            master_id=seed_data["master_id"],
+            slot_date_local=now_utc,
+            hour_local=12,
+        )
+        await _make_booking(
+            session,
+            slot_id=slot.id,
+            business_id=seed_data["business_id"],
+            master_id=seed_data["master_id"],
+            client_id=seed_data["client"].id,
+            start_at_utc=start_at_naive,
+            status="confirmed",
+        )
+
+        # No now_utc passed — service falls back to datetime.now(UTC) (post-fix)
+        result = await get_client_bookings(session, seed_data["client"].id)
+
+    # start_at == now (strict >) → excluded
+    assert len(result) == 0, (
+        "Booking at exactly now_utc must be excluded (strict >). "
+        "If this fails, datetime.now(UTC) was not used — bug W2 regression."
+    )
