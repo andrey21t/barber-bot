@@ -22,7 +22,9 @@ async def add_slots(
 
     Returns list of newly created slots (existing ones skipped).
     """
-    if not 0 <= min(hours, default=0) <= 23 or not 0 <= max(hours, default=0) <= 23:
+    if not hours:
+        raise ValueError("at least one hour required")
+    if not 0 <= min(hours) <= 23 or not 0 <= max(hours) <= 23:
         raise ValueError("slot_hour must be 0-23")
 
     # Get already-open slots on this date for this master

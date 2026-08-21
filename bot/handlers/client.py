@@ -368,7 +368,68 @@ async def cancel_msg(message: Message, state: FSMContext) -> None:
 
 
 # ============================================================
-# 8. no_state_fallback — bot restart mid-FSM, state lost
+# 8. mybookings_msg — /mybookings (StateFilter(None)) — list client bookings
+# ============================================================
+@router.message(Command("mybookings"), StateFilter(None))
+async def mybookings_msg(message: Message) -> None:
+    """List confirmed/transferred upcoming bookings for the current user.
+
+    Spec.md 41: `/mybookings` → отмена (>24ч) или перенос (>24ч) — но в этом блоке
+    только список. Отмена/перенос — следующий блок (TODO).
+
+    Resolution: client by telegram_id (booking.py pattern, _select_or_create_client).
+    Filter: upcoming (start_at > now UTC), status IN (confirmed, transferred).
+    """
+    from zoneinfo import ZoneInfo
+
+    from sqlalchemy import select
+
+    from bot.config import get_settings
+    from bot.models import Business, Client
+    from bot.services.admin import get_client_bookings
+
+    if message.from_user is None:
+        return
+    user_id = message.from_user.id
+
+    settings = get_settings()
+    async with async_session_factory() as session:
+        # Resolve client by telegram_id (auth-register pattern from booking.py:101)
+        stmt_c = select(Client).where(Client.telegram_id == user_id)
+        client = (await session.execute(stmt_c)).scalar_one_or_none()
+        if client is None:
+            await message.answer("У вас пока нет записей. /book чтобы записаться")
+            return
+
+        bookings = await get_client_bookings(session, client.id)
+
+        if not bookings:
+            await message.answer("У вас нет активных записей. /book чтобы записаться")
+            return
+
+        # Resolve business.timezone for rendering local time (single-master MVP —
+        # all bookings belong to the same business; we take tz from the first booking).
+        stmt_b = select(Business).where(Business.id == bookings[0].business_id).limit(1)
+        business = (await session.execute(stmt_b)).scalar_one_or_none()
+        tz_name = business.timezone if business is not None else settings.TIMEZONE
+        tz = ZoneInfo(tz_name)
+
+    # Render list — snapshots already escaped, strip newlines for list safety
+    # (consistent with admin._render_bookings — html.escape(quote=False) skips \n).
+    lines = ["📋 Ваши записи:", ""]
+    for b in bookings:
+        local_time = b.start_at.astimezone(tz)
+        when = local_time.strftime("%d %b %Y, %H:%M")
+        name = b.client_name_snapshot.replace("\n", " ")
+        service = b.service_title_snapshot.replace("\n", " ")
+        lines.append(f"• {when}\n  💇 {service}\n  👤 {name}")
+    lines.append("")
+    lines.append("Отмена/перенос — в разработке. Пока напишите мастеру напрямую.")
+    await message.answer("\n".join(lines))
+
+
+# ============================================================
+# 9. no_state_fallback — bot restart mid-FSM, state lost
 # ============================================================
 @router.message(StateFilter(None), F.text, ~F.text.startswith("/"))
 async def no_state_fallback(message: Message) -> None:

@@ -23,6 +23,7 @@ from scheduler import build_scheduler, on_startup_scan
 
 from bot.config import get_settings
 from bot.db import async_session_factory
+from bot.handlers.admin import router as admin_router
 from bot.handlers.client import router as client_router
 from bot.handlers.start import router as start_router
 from bot.middlewares.session_timeout import SessionTimeoutMiddleware
@@ -79,9 +80,13 @@ async def main() -> None:
     # `scheduler: AsyncIOScheduler` via aiogram's _prepare_kwargs filter.
     dp["scheduler"] = scheduler
 
-    # Register routers — order: start_router first (/start caught before
-    # /book /cancel), client_router second (booking flow + /cancel + fallback)
+    # Register routers — order: start_router first (/start caught before /book),
+    # admin_router second (master commands: /addslots /closeslot /today /week /services),
+    # client_router last (booking flow + /cancel + fallback).
+    # /cancel registered in client_router catches StateFilter("*") — works for admin too
+    # because admin commands run StateFilter(None) — no state to cancel.
     dp.include_router(start_router)
+    dp.include_router(admin_router)
     dp.include_router(client_router)
 
     # Register FSM timeout middleware on BOTH message + callback_query.
