@@ -15,7 +15,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from scheduler import remove_jobs_for_booking
+from scheduler import remove_jobs_for_booking, schedule_for_booking
 from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
@@ -405,4 +405,249 @@ async def cancel_booking(
     remove_jobs_for_booking(scheduler, booking_id)
 
     # Step 11: return result (handler sends master notification + client confirmation)
+    return result
+
+
+# ============================================================
+# Transfer booking (spec.md 41, 318, 408-409 — Блок 3 часть 3)
+# ============================================================
+
+
+class SlotNotAvailableError(Exception):
+    """New slot is not 'open' (closed, booked, or not found) — transfer rejected."""
+
+
+class BookingAlreadyTransferredError(Exception):
+    """Concurrent transfer race: booking.start_at changed between SELECT and UPDATE.
+
+    Raised when `UPDATE booking SET ... WHERE id=? AND client_id=? AND status IN
+    ('confirmed','transferred') AND start_at=?` returns rowcount=0 — another
+    concurrent transfer updated start_at between our SELECT and UPDATE. Distinct
+    from BookingAlreadyCancelledError (which fires on a stale SELECT'd status).
+    """
+
+
+@dataclass(frozen=True)
+class TransferResult:
+    """Result of transfer_booking — passed to handler for Telegram I/O.
+
+    Mirrors CancelResult: snapshots already escaped in DB (no re-escape needed).
+    Carries both old and new start_at so the handler can render "X → Y" in
+    master and client messages (spec.md 318: "Перенос: ... → ...").
+    """
+
+    booking_id: UUID
+    old_slot_id: UUID
+    new_slot_id: UUID
+    master_id: UUID
+    business_id: UUID
+    client_name_snapshot: str
+    service_title_snapshot: str
+    old_start_at: datetime
+    new_start_at: datetime
+    master_notification_text: str
+
+
+async def transfer_booking(
+    session: AsyncSession,
+    booking_id: UUID,
+    new_slot_id: UUID,
+    client_id: UUID,
+    scheduler: AsyncIOScheduler,
+    *,
+    now_utc: datetime | None = None,
+) -> TransferResult:
+    """Transfer booking to a new slot (spec.md 41, 318, 408-409).
+
+    Atomic within one transaction:
+      - UPDATE booking SET status='transferred', slot_id, start_at, end_at
+      - UPDATE old slot SET status='open' (release old)
+      - UPDATE new slot SET status='booked' WHERE status='open' (race protection)
+      - INSERT notifications_log(master_transfer) — SAVEPOINT idempotency
+
+    Scheduler side-effects (AFTER commit, like cancel_booking):
+      - remove_jobs_for_booking(scheduler, booking_id) — old reminder jobs
+      - schedule_for_booking(scheduler, booking_id, new_start_at) — new jobs
+        (replace_existing=True, idempotent if job already exists)
+
+    Race protection (deep-analysis Pass 3, [blocker] finding):
+    Concurrent transfer callbacks on same booking → both SELECTs see same
+    booking.start_at; winner UPDATEs (status, slot_id, start_at, end_at); loser's
+    UPDATE WHERE start_at=<old value from SELECT> no longer matches (winner
+    already changed start_at) → rowcount=0 → BookingAlreadyTransferredError.
+    This is the invariant that distinguishes transfer from cancel: cancel uses
+    status IN ('confirmed','transferred') alone (idempotent on double-cancel
+    because second UPDATE WHERE status='cancelled' returns 0), but transfer
+    needs the start_at pin because status stays IN ('confirmed','transferred')
+    after the winner's UPDATE.
+
+    Re-transfer (status='transferred' → transfer again) is allowed: the
+    status IN ('confirmed','transferred') clause accepts 'transferred' too.
+
+    `now_utc` injected for tests (production uses datetime.now(UTC)).
+
+    Steps:
+      1. SELECT booking WHERE id=? AND client_id=? (ownership + existence)
+      2. If None → BookingNotFoundError
+      3. If status='cancelled' → BookingAlreadyCancelledError (defensive)
+      4. If now >= start_at - CANCEL_MIN_HOURS → CancelTooLateError (24h rule)
+      5. SELECT new slot WHERE id=? AND status='open' (race protection)
+         - If closed/not found → SlotNotAvailableError
+         - If status='booked' → SlotAlreadyBookedError (reuse)
+      6. Build new_start_at (UTC) + new_end_at (default duration)
+      7. If new_start_at <= now → SlotInPastError
+      8. UPDATE booking SET status='transferred', slot_id, start_at, end_at
+         WHERE id=? AND client_id=? AND status IN ('confirmed','transferred')
+         AND start_at=<captured at SELECT> — rowcount check (concurrent race)
+      9. UPDATE old slot SET status='open' WHERE id=<old slot_id>
+     10. UPDATE new slot SET status='booked' WHERE id=? AND status='open'
+         — rowcount check (race protection, like create_booking:184-196)
+     11. INSERT NotificationLog(master_transfer) — SAVEPOINT idempotency
+     12. Build TransferResult (old + new start_at for "X → Y" message)
+     13. commit
+     14. remove_jobs_for_booking + schedule_for_booking (AFTER commit)
+     15. Return TransferResult
+    """
+    settings = get_settings()
+    ref = now_utc or datetime.now(UTC)
+
+    # Step 1-3: SELECT booking with ownership + status check.
+    stmt_b = select(Booking).where(Booking.id == booking_id, Booking.client_id == client_id)
+    booking = (await session.execute(stmt_b)).scalar_one_or_none()
+    if booking is None:
+        raise BookingNotFoundError(
+            f"Booking {booking_id} not found for client {client_id}"
+        )
+    if booking.status == "cancelled":
+        raise BookingAlreadyCancelledError(f"Booking {booking_id} is cancelled, cannot transfer")
+
+    # Step 4: 24h rule (same as cancel_booking). Naive UTC comparison (SQLite stores naive).
+    ref_naive = ref.replace(tzinfo=None) if ref.tzinfo is not None else ref
+    # Capture OLD slot_id and start_at BEFORE step 8 UPDATE booking — SQLAlchemy
+    # auto-mutates booking.slot_id and booking.start_at after UPDATE (synchronize_session
+    # default). Without this capture, step 9 would release the NEW slot (already 'booked'
+    # from step 10) and TransferResult.old_slot_id would carry the new_slot_id.
+    old_slot_id = booking.slot_id
+    old_start_at = booking.start_at  # naive UTC (captured for race-protected UPDATE)
+    cancel_deadline = old_start_at - timedelta(hours=settings.CANCEL_MIN_HOURS)
+    if ref_naive >= cancel_deadline:
+        raise CancelTooLateError(
+            f"now={ref_naive} >= transfer_deadline={cancel_deadline} for booking {booking_id}"
+        )
+
+    # Step 5: SELECT new slot — re-use create_booking's _select_open_slot helper.
+    # It raises SlotClosedError (slot not found OR closed) or SlotAlreadyBookedError
+    # (slot already booked). Caller (handler) maps these to user-facing messages.
+    new_slot = await _select_open_slot(session, new_slot_id)
+
+    # Step 6: Build new_start_at (UTC) from new_slot.slot_hour (LOCAL in business tz).
+    business_tz = await _select_business_timezone(session, booking.business_id)
+    new_start_at = _build_start_at(new_slot, business_tz)
+
+    # Step 7: new_start_at must be in the future (re-use SlotInPastError).
+    if new_start_at <= datetime.now(UTC):
+        raise SlotInPastError(
+            f"New slot {new_slot_id} start_at={new_start_at} is in the past"
+        )
+
+    # Look up service for end_at duration (booking.service_id may be None — fallback to default).
+    service = await _select_service(session, booking.service_id)
+    new_end_at = _build_end_at(new_start_at, service, settings.SERVICE_DEFAULT_DURATION_MIN)
+
+    # Step 8: UPDATE booking with start_at-in-WHERE for concurrent-transfer race protection.
+    # Loser's WHERE clause `start_at = <old_start_at captured at SELECT>` fails after
+    # winner's UPDATE changed start_at → rowcount=0 → BookingAlreadyTransferredError.
+    upd_b = (
+        update(Booking)
+        .where(
+            Booking.id == booking_id,
+            Booking.client_id == client_id,
+            Booking.status.in_(("confirmed", "transferred")),
+            Booking.start_at == old_start_at,  # race-protection pin (Pass 3 [blocker] finding)
+        )
+        .values(
+            status="transferred",
+            slot_id=new_slot.id,
+            start_at=new_start_at.replace(tzinfo=None),  # store naive UTC for SQLite consistency
+            end_at=new_end_at.replace(tzinfo=None),
+        )
+    )
+    res_b = await session.execute(upd_b)
+    if cast("CursorResult[Any]", res_b).rowcount == 0:
+        # Concurrent transfer (or concurrent cancel) updated start_at between SELECT and UPDATE.
+        await session.rollback()
+        raise BookingAlreadyTransferredError(
+            f"Booking {booking_id} start_at changed between SELECT and UPDATE "
+            "(concurrent transfer or cancel)"
+        )
+
+    # Step 9: Release OLD slot → 'open' (idempotent: if new_slot == old_slot,
+    # step 10 below re-bumps it back to 'booked'). Use captured old_slot_id —
+    # booking.slot_id was mutated by step 8 UPDATE to new_slot.id.
+    upd_old_slot = (
+        update(Slot).where(Slot.id == old_slot_id).values(status="open")
+    )
+    await session.execute(upd_old_slot)
+
+    # Step 10: Book NEW slot — SQLite race protection (UPDATE WHERE status='open' + rowcount).
+    # Pattern from create_booking:184-196. If slot was taken between SELECT (step 5)
+    # and UPDATE (here) → rowcount=0 → rollback → SlotAlreadyBookedError.
+    upd_new_slot = (
+        update(Slot)
+        .where(Slot.id == new_slot.id, Slot.status == "open")
+        .values(status="booked")
+    )
+    res_new_slot = await session.execute(upd_new_slot)
+    if cast("CursorResult[Any]", res_new_slot).rowcount == 0:
+        await session.rollback()
+        raise SlotAlreadyBookedError(
+            f"New slot {new_slot.id} was taken/closed between SELECT and UPDATE"
+        )
+
+    # Step 11: NotificationLog master_transfer — SAVEPOINT idempotency (booking.py:198-212 pattern).
+    log_entry = NotificationLog(booking_id=booking.id, kind="master_transfer")
+    try:
+        async with session.begin_nested():
+            session.add(log_entry)
+            await session.flush()
+    except IntegrityError:
+        # Already logged — idempotent. Savepoint rolled back, log_entry expunged.
+        pass
+
+    # Step 12: Build master notification text "Перенос: <old> → <new>" (spec.md 318).
+    # Use snapshots (already html.escape'd in DB) for client/service lines.
+    old_local_time = old_start_at.astimezone(ZoneInfo(business_tz))
+    new_local_time = new_start_at.astimezone(ZoneInfo(business_tz))
+    old_formatted = old_local_time.strftime("%d %B %Y, %H:%M")
+    new_formatted = new_local_time.strftime("%d %B %Y, %H:%M")
+    master_text = (
+        f"Перенос:\n"
+        f"📅 {old_formatted} → {new_formatted}\n"
+        f"👤 {booking.client_name_snapshot}\n"
+        f"💇 {booking.service_title_snapshot}"
+    )
+    result = TransferResult(
+        booking_id=booking.id,
+        old_slot_id=old_slot_id,
+        new_slot_id=new_slot.id,
+        master_id=booking.master_id,
+        business_id=booking.business_id,
+        client_name_snapshot=booking.client_name_snapshot,
+        service_title_snapshot=booking.service_title_snapshot,
+        old_start_at=old_start_at,
+        new_start_at=new_start_at,
+        master_notification_text=master_text,
+    )
+
+    # Step 13: commit booking UPDATE + 2 slot UPDATEs + NotificationLog atomically.
+    await session.commit()
+
+    # Step 14: scheduler side-effects AFTER commit (atomic: commit fail → jobs remain,
+    # booking still active at OLD start_at with old reminders). remove_jobs_for_booking
+    # uses suppress(Exception) internally — idempotent. schedule_for_booking uses
+    # replace_existing=True — idempotent (safe to call after remove_jobs).
+    remove_jobs_for_booking(scheduler, booking_id)
+    schedule_for_booking(scheduler, booking_id, new_start_at)
+
+    # Step 15: return result (handler sends master notification + client confirmation).
     return result
