@@ -456,3 +456,169 @@ async def test_cancel_booking_already_cancelled(
     # scheduler.remove_job called twice total (once per first cancel — 2 jobs),
     # NOT a third+fourth time on the failed second cancel.
     assert mock_scheduler.remove_job.call_count == 2
+
+
+# ============================================================
+# cancel_booking edge cases (NEXT_SESSION_PROMPT.md service gaps)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_cancel_booking_not_found_random_uuid(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Random uuid4 (no such booking in DB) → BookingNotFoundError.
+
+    Distinct from `test_cancel_booking_not_owner` (which seeds a booking and
+    uses a stranger client_id → also raises BookingNotFoundError via the same
+    `WHERE id=? AND client_id=?` clause). Defense-in-depth: same error class
+    for both cases — caller cannot distinguish "no such booking" from
+    "not your booking" (avoids leaking existence of bookings).
+    """
+    mock_scheduler = _mock_scheduler()
+    ref = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # No booking seeded — random uuid4 hits "no row matches WHERE id=?" path.
+    with pytest.raises(BookingNotFoundError):
+        await cancel_booking(
+            session,
+            booking_id=uuid4(),
+            client_id=seed_data["client"].id,
+            scheduler=mock_scheduler,
+            now_utc=ref,
+        )
+
+    # No DB changes (only SELECT performed — no rollback needed).
+    mock_scheduler.remove_job.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cancel_booking_transferred_status(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Booking.status='transferred' (NOT 'confirmed') → cancel succeeds.
+
+    Spec.md 41: cancel/transfer allowed for status IN ('confirmed', 'transferred').
+    cancel_booking UPDATE WHERE status IN ('confirmed','transferred') must accept
+    'transferred' — the same rule as 'confirmed' (pending Блок 3 часть 3 introduces
+    transfer; this test locks the contract ahead of implementation).
+    """
+    slot = seed_data["slot"]
+    # Build naive UTC start_at matching slot.slot_hour LOCAL Moscow (14:00 MSK = 11:00 UTC).
+    # Pattern from test_admin.py `_utc_naive` (round-trip aware → naive for SQLite storage).
+    from datetime import time as dtime
+    from zoneinfo import ZoneInfo
+
+    local_dt = datetime.combine(
+        slot.slot_date, dtime(hour=slot.slot_hour), tzinfo=ZoneInfo("Europe/Moscow")
+    )
+    start_at_naive = local_dt.astimezone(UTC).replace(tzinfo=None)
+    booking = Booking(
+        slot_id=slot.id,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        client_id=seed_data["client"].id,
+        service_id=None,
+        service_title_snapshot="Стрижка",
+        service_price_snapshot=None,
+        client_name_snapshot="Паша",
+        start_at=start_at_naive,
+        end_at=start_at_naive + timedelta(minutes=60),
+        status="transferred",
+    )
+    # Set slot.status='booked' to match transferred-booking invariant
+    # (close_slot refuses to close a booked slot → during booking lifetime
+    # slot.status is always 'booked' regardless of booking.status).
+    slot.status = "booked"
+    session.add(booking)
+    await session.commit()
+    booking_id = booking.id
+    slot_id = slot.id
+
+    mock_scheduler = _mock_scheduler()
+    # Use far-past ref to ensure deadline check passes (start_at > 24h from ref).
+    ref = datetime.now(UTC) - timedelta(days=10)
+
+    result = await cancel_booking(
+        session,
+        booking_id=booking_id,
+        client_id=seed_data["client"].id,
+        scheduler=mock_scheduler,
+        now_utc=ref,
+    )
+
+    assert isinstance(result, CancelResult)
+    assert result.booking_id == booking_id
+    assert result.slot_id == slot_id
+
+    # Booking now 'cancelled' (UPDATE WHERE status IN ('confirmed','transferred') matched).
+    await session.rollback()
+    stmt_b = select(Booking).where(Booking.id == booking_id)
+    booking_after = (await session.execute(stmt_b)).scalar_one()
+    assert booking_after.status == "cancelled"
+
+    # Slot released back to 'open' (mirrors confirmed-booking cancel path).
+    stmt_s = select(Slot.status).where(Slot.id == slot_id)
+    assert (await session.execute(stmt_s)).scalar_one() == "open"
+
+
+@pytest.mark.asyncio
+async def test_cancel_booking_now_utc_default_production_path(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """now_utc=None (default → datetime.now(UTC) inside service).
+
+    Production path: caller omits now_utc, service uses real current time.
+    To pass the 24h-rule check, slot.start_at must be >24h from now → use
+    a slot 48h ahead (seed_data slot is only ~24h ahead — too borderline).
+
+    This test exercises the default-arg branch (line booking.py:314 `now_utc or datetime.now(UTC)`)
+    to ensure no TypeError when ref has tzinfo=UTC (must be stripped to naive
+    before comparison with booking.start_at naive-from-SQLite).
+    """
+    # Build a slot 48h ahead so deadline = start_at - 24h > now (any time of day).
+    future_date = (datetime.now(UTC) + timedelta(hours=48)).date()
+    slot = Slot(
+        master_id=seed_data["master_id"],
+        slot_date=future_date,
+        slot_hour=14,
+        status="open",
+    )
+    session.add(slot)
+    await session.commit()
+
+    payload = await _make_payload(slot.id)
+    create_result = await create_booking(
+        session,
+        payload,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=seed_data["client_telegram_id"],
+    )
+    booking_id = create_result.booking_id
+
+    mock_scheduler = _mock_scheduler()
+
+    # now_utc=None → service calls datetime.now(UTC) internally.
+    # Booking start_at is ~48h ahead, so deadline (~24h ahead) is well in the future.
+    result = await cancel_booking(
+        session,
+        booking_id=booking_id,
+        client_id=seed_data["client"].id,
+        scheduler=mock_scheduler,
+        now_utc=None,
+    )
+
+    assert isinstance(result, CancelResult)
+    assert result.booking_id == booking_id
+    # Booking cancelled (production default path works end-to-end).
+    await session.rollback()
+    stmt_b = select(Booking.status).where(Booking.id == booking_id)
+    assert (await session.execute(stmt_b)).scalar_one() == "cancelled"
+    # Scheduler jobs removed (default now_utc doesn't skip cleanup).
+    expected_calls = {f"remind_24h_{booking_id}", f"remind_1h_{booking_id}"}
+    actual_job_ids = {call.args[0] for call in mock_scheduler.remove_job.call_args_list}
+    assert actual_job_ids == expected_calls
