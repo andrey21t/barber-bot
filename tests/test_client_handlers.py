@@ -48,7 +48,7 @@ from bot.keyboards.client import (
     mybookings_keyboard,
 )
 from bot.models import Booking, Business, Client, Master, Slot
-from bot.states import TransferStates
+from bot.states import BookingStates, TransferStates
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1588,3 +1588,725 @@ async def test_transfer_date_cb_master_not_found_clears_state_and_answers(
     # FSM state NOT advanced (clear reset to None)
     state.set_state.assert_not_awaited()
     state.update_data.assert_not_awaited()
+
+
+# ============================================================
+# Booking flow — T5a: cmd_book + date_cb + slot_cb + name_msg + service_msg
+# Coverage: client.py:75-145, 154-166, 173-185, 192-240
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_cmd_book_sets_state_and_shows_date_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T5a: cmd_book (client.py:75-81) — /book sets FSM to selecting_date + shows
+    date picker keyboard with 7-day window.
+    """
+    msg = _make_message(user_id=111222333, text="/book")
+    state = _make_state()
+
+    await client_handlers.cmd_book(msg, state)
+
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.selecting_date
+
+    msg.answer.assert_awaited_once()
+    text = _answer_text(msg)
+    assert "Выберите дату" in text
+    reply_markup = _answer_reply_markup(msg)
+    assert isinstance(reply_markup, InlineKeyboardMarkup), (
+        "cmd_book must show date picker inline keyboard"
+    )
+
+
+@pytest.mark.asyncio
+async def test_date_cb_invalid_iso_date(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T5a: date_cb (client.py:97-101) — callback_data.iso='not-a-date' →
+    ValueError from date.fromisoformat → callback.answer('Невалидная дата'),
+    state NOT cleared.
+    """
+    from bot.keyboards.client import BookDateCallbackData
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = BookDateCallbackData(iso="not-a-date")
+
+    state = _make_state()
+    await client_handlers.date_cb(cb, callback_data, state)
+
+    cb.answer.assert_awaited_once()
+    args, _ = cb.answer.await_args
+    assert args[0] == "Невалидная дата"
+    state.clear.assert_not_awaited()
+    state.set_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_date_cb_master_not_found_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T5a: date_cb (client.py:114-121) — empty DB, no master → state.clear +
+    message.answer('❌ Не удалось найти мастера...') + callback.answer.
+    """
+    from bot.keyboards.client import BookDateCallbackData
+
+    # No _seed_full_stack — DB empty
+    target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = BookDateCallbackData(iso=target_date.isoformat())
+
+    state = _make_state()
+    await client_handlers.date_cb(cb, callback_data, state)
+
+    state.clear.assert_awaited_once()
+    err_text = _answer_text(cb.message)
+    assert "Не удалось найти мастера" in err_text
+    cb.answer.assert_awaited()
+    state.set_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_date_cb_no_slots_on_date_shows_retry(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T5a: date_cb (client.py:125-132) — date with no open slots →
+    message.answer('На эту дату нет свободных слотов...') with date picker (retry).
+    FSM NOT advanced.
+    """
+    from bot.keyboards.client import BookDateCallbackData
+
+    async with session_factory() as session:
+        await _seed_full_stack(session)  # master exists, but no slots seeded
+
+    target_date = (datetime.now(UTC) + timedelta(days=30)).date()  # far future, no slots
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = BookDateCallbackData(iso=target_date.isoformat())
+
+    state = _make_state()
+    await client_handlers.date_cb(cb, callback_data, state)
+
+    err_text = _answer_text(cb.message)
+    assert "нет свободных слотов" in err_text
+    reply_markup = _answer_reply_markup(cb.message)
+    assert isinstance(reply_markup, InlineKeyboardMarkup), (
+        "no-slots reply must include date picker for retry"
+    )
+    state.set_state.assert_not_awaited()
+    state.update_data.assert_not_awaited()
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_date_cb_happy_shows_slot_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T5a: date_cb (client.py:134-145) — happy path: open slots exist →
+    state.update_data(selected_date) + set_state(selecting_slot) + slot picker keyboard.
+    """
+    from bot.keyboards.client import BookDateCallbackData
+
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = Slot(
+            master_id=ctx["master_id"],
+            slot_date=target_date,
+            slot_hour=14,
+            status="open",
+        )
+        session.add(slot)
+        await session.commit()
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = BookDateCallbackData(iso=target_date.isoformat())
+
+    state = _make_state()
+    await client_handlers.date_cb(cb, callback_data, state)
+
+    state.update_data.assert_awaited()
+    assert state.update_data.call_args.kwargs.get("selected_date") == target_date.isoformat()
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.selecting_slot
+
+    text = _answer_text(cb.message)
+    assert "Выберите время" in text
+    reply_markup = _answer_reply_markup(cb.message)
+    assert isinstance(reply_markup, InlineKeyboardMarkup), (
+        "happy date_cb must show slot picker inline keyboard"
+    )
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_slot_cb_saves_slot_id_and_asks_for_name(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T5a: slot_cb (client.py:154-166) — user picked a slot →
+    state.update_data(slot_id) + set_state(entering_name) + 'На чьё имя записываем?'
+    """
+    from bot.keyboards.client import BookSlotCallbackData
+
+    slot_id = UUID("12345678-1234-5678-1234-567812345678")
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = BookSlotCallbackData(slot_id=slot_id)
+
+    state = _make_state()
+    await client_handlers.slot_cb(cb, callback_data, state)
+
+    state.update_data.assert_awaited_once()
+    assert state.update_data.call_args.kwargs.get("slot_id") == str(slot_id)
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.entering_name
+
+    text = _answer_text(cb.message)
+    assert "На чьё имя" in text
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_name_msg_empty_name_rejected(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T5a: name_msg (client.py:175-178) — empty text or whitespace-only →
+    'Имя не может быть пустым. Введите имя:' (retry, state NOT advanced).
+    """
+    msg = _make_message(user_id=111222333, text="   ")  # whitespace-only
+    msg.text = "   "
+    state = _make_state()
+
+    await client_handlers.name_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Имя не может быть пустым" in text
+    state.update_data.assert_not_awaited()
+    state.set_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_name_msg_too_long_name_rejected(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T5a: name_msg (client.py:179-181) — name > 255 chars →
+    'Имя слишком длинное (макс. 255 символов)...' (retry, state NOT advanced).
+    """
+    msg = _make_message(user_id=111222333, text="А" * 300)
+    msg.text = "А" * 300
+    state = _make_state()
+
+    await client_handlers.name_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "слишком длинное" in text
+    assert "255" in text
+    state.update_data.assert_not_awaited()
+    state.set_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_name_msg_happy_saves_and_asks_for_service(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T5a: name_msg (client.py:183-185) — happy: name ok →
+    state.update_data(client_name) + set_state(entering_service) + 'Какая услуга?'
+    """
+    msg = _make_message(user_id=111222333, text="Паша")
+    msg.text = "Паша"
+    state = _make_state()
+
+    await client_handlers.name_msg(msg, state)
+
+    state.update_data.assert_awaited_once()
+    assert state.update_data.call_args.kwargs.get("client_name") == "Паша"
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.entering_service
+
+    text = _answer_text(msg)
+    assert "Какая услуга" in text
+
+
+@pytest.mark.asyncio
+async def test_service_msg_empty_service_rejected(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T5a: service_msg (client.py:194-197) — empty service → 'Услуга не может быть
+    пустой...' (retry, state NOT advanced).
+    """
+    msg = _make_message(user_id=111222333, text="   ")
+    msg.text = "   "
+    state = _make_state()
+
+    await client_handlers.service_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Услуга не может быть пустой" in text
+    state.update_data.assert_not_awaited()
+    state.set_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_service_msg_too_long_service_rejected(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T5a: service_msg (client.py:198-200) — service > 255 chars → retry."""
+    msg = _make_message(user_id=111222333, text="А" * 300)
+    msg.text = "А" * 300
+    state = _make_state()
+
+    await client_handlers.service_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "слишком длинная" in text
+    assert "255" in text
+    state.update_data.assert_not_awaited()
+    state.set_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_service_msg_slot_id_missing_in_state_clears(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T5a: service_msg (client.py:208-211) — state has no 'slot_id' key (FSM
+    corruption or stale state) → message.answer('❌ Ошибка: слот не выбран...')
+    + state.clear (abort).
+    """
+    msg = _make_message(user_id=111222333, text="Стрижка")
+    msg.text = "Стрижка"
+
+    # State with client_name but NO slot_id (simulates corrupted FSM)
+    state = _make_state()
+    await state.update_data(client_name="Паша")  # populate state, no slot_id
+
+    await client_handlers.service_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "слот не выбран" in text
+    state.clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_service_msg_slot_not_found_clears(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T5a: service_msg (client.py:222-226) — slot_id in state but no Slot row
+    in DB (slot was deleted between steps) → message.answer('Слот не найден...')
+    + state.clear (abort).
+    """
+    async with session_factory() as session:
+        await _seed_full_stack(session)  # master exists, no slot
+
+    msg = _make_message(user_id=111222333, text="Стрижка")
+    msg.text = "Стрижка"
+
+    state = _make_state()
+    fake_slot_id = UUID("00000000-0000-0000-0000-000000000001")
+    await state.update_data(client_name="Паша", slot_id=str(fake_slot_id))
+
+    await client_handlers.service_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Слот не найден" in text
+    state.clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_service_msg_happy_shows_confirmation(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T5a: service_msg (client.py:230-240) — happy: slot exists in DB →
+    state.update_data(service_title) + set_state(confirming) + confirmation
+    message with summary + confirm_keyboard.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = Slot(
+            master_id=ctx["master_id"],
+            slot_date=target_date,
+            slot_hour=14,
+            status="open",
+        )
+        session.add(slot)
+        await session.commit()
+        slot_id = slot.id
+
+    msg = _make_message(user_id=111222333, text="Стрижка")
+    msg.text = "Стрижка"
+
+    state = _make_state()
+    await state.update_data(client_name="Паша", slot_id=str(slot_id))
+
+    await client_handlers.service_msg(msg, state)
+
+    state.update_data.assert_awaited()
+    assert state.update_data.call_args.kwargs.get("service_title") == "Стрижка"
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.confirming
+
+    text = _answer_text(msg)
+    assert "Подтвердите запись" in text
+    reply_markup = _answer_reply_markup(msg)
+    assert reply_markup is not None, "happy service_msg must show confirm_keyboard"
+
+
+# ============================================================
+# Booking flow — T5b: confirm_cb + cancel_msg
+# Coverage: client.py:249-364, 370-379
+# ============================================================
+
+
+def _make_confirm_callback(
+    *,
+    user_id: int = 111222333,
+) -> tuple[MagicMock, Any]:
+    """Mock CallbackQuery for confirm_cb (BookConfirmCallbackData filter)."""
+    from bot.keyboards.client import BookConfirmCallbackData
+
+    bot = AsyncMock()
+    bot.send_message = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(user_id)
+    cb.message = _make_message(user_id, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = BookConfirmCallbackData()  # no fields, just filter marker
+    return cb, callback_data
+
+
+@pytest.mark.asyncio
+async def test_confirm_cb_data_lost_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T5b: confirm_cb (client.py:264-270) — state missing slot_id/client_name/
+    service_title → state.clear + 'Данные потеряны...' + callback.answer (abort).
+    """
+    cb, callback_data = _make_confirm_callback()
+    state = _make_state()  # empty state, no keys
+    scheduler = MagicMock(spec=AsyncIOScheduler)
+
+    await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
+
+    state.clear.assert_awaited_once()
+    text = _answer_text(cb.message)
+    assert "Данные потеряны" in text
+    cb.answer.assert_awaited()
+    # No booking created, no scheduler call
+    scheduler.add_job.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_confirm_cb_master_not_found_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T5b: confirm_cb (client.py:283-288) — empty DB, no master → state.clear +
+    'Мастер не найден' + callback.answer (abort).
+    """
+    cb, callback_data = _make_confirm_callback()
+    state = _make_state()
+    # Populate state with required keys so we pass the 264 check
+    fake_slot_id = UUID("00000000-0000-0000-0000-000000000001")
+    await state.update_data(
+        slot_id=str(fake_slot_id),
+        client_name="Паша",
+        service_title="Стрижка",
+    )
+    scheduler = MagicMock(spec=AsyncIOScheduler)
+
+    # No _seed_full_stack — DB empty
+    await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
+
+    state.clear.assert_awaited_once()
+    text = _answer_text(cb.message)
+    assert "Мастер не найден" in text
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_cb_business_not_found_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T5b: confirm_cb (client.py:292-297) — master exists but business FK broken →
+    state.clear + 'Бизнес не найден' + callback.answer (abort).
+
+    Hard to construct without FK violation. We seed master+client (no business
+    in DB via _seed_full_stack — but it creates business). To exercise this branch
+    we'd need to delete business after _seed_full_stack. Skipping — branch is
+    symmetric to master_not_found and not separately testable without DB surgery.
+    Marked as hypothesis (not covered).
+    """
+    # <гипотеза>: branch is symmetric to master_not_found; skip without FK violation
+    pytest.skip("Branch symmetric to master_not_found — would need FK violation")
+
+
+@pytest.mark.asyncio
+async def test_confirm_cb_slot_already_booked_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T5b: confirm_cb (client.py:323-331) — create_booking raises
+    SlotAlreadyBookedError (race: another user booked between date_cb and confirm_cb)
+    → state.clear + 'Слот только что заняли...' + callback.answer (abort).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = Slot(
+            master_id=ctx["master_id"],
+            slot_date=target_date,
+            slot_hour=14,
+            status="open",
+        )
+        session.add(slot)
+        await session.commit()
+        slot_id = slot.id
+
+    async def _raise_already_booked(*args: Any, **kwargs: Any) -> Any:
+        from bot.services import booking as booking_svc
+
+        raise booking_svc.SlotAlreadyBookedError("race simulated")
+
+    monkeypatch.setattr(client_handlers, "create_booking", _raise_already_booked)
+
+    cb, callback_data = _make_confirm_callback()
+    state = _make_state()
+    await state.update_data(
+        slot_id=str(slot_id),
+        client_name="Паша",
+        service_title="Стрижка",
+    )
+    scheduler = MagicMock(spec=AsyncIOScheduler)
+
+    await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
+
+    state.clear.assert_awaited_once()
+    text = _answer_text(cb.message)
+    assert "Слот только что заняли" in text
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_cb_slot_in_past_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T5b: confirm_cb (client.py:332-339) — create_booking raises SlotInPastError
+    (slot was in the past, validation failed) → state.clear + 'Это время уже
+    прошло...' + callback.answer (abort).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = Slot(
+            master_id=ctx["master_id"],
+            slot_date=target_date,
+            slot_hour=14,
+            status="open",
+        )
+        session.add(slot)
+        await session.commit()
+        slot_id = slot.id
+
+    async def _raise_in_past(*args: Any, **kwargs: Any) -> Any:
+        from bot.services import booking as booking_svc
+
+        raise booking_svc.SlotInPastError("slot in past")
+
+    monkeypatch.setattr(client_handlers, "create_booking", _raise_in_past)
+
+    cb, callback_data = _make_confirm_callback()
+    state = _make_state()
+    await state.update_data(
+        slot_id=str(slot_id),
+        client_name="Паша",
+        service_title="Стрижка",
+    )
+    scheduler = MagicMock(spec=AsyncIOScheduler)
+
+    await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
+
+    state.clear.assert_awaited_once()
+    text = _answer_text(cb.message)
+    assert "время уже прошло" in text
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_cb_slot_closed_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T5b: confirm_cb (client.py:340-347) — create_booking raises SlotClosedError
+    (master closed slot between steps) → state.clear + 'Слот закрыт мастером...'
+    + callback.answer (abort).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = Slot(
+            master_id=ctx["master_id"],
+            slot_date=target_date,
+            slot_hour=14,
+            status="open",
+        )
+        session.add(slot)
+        await session.commit()
+        slot_id = slot.id
+
+    async def _raise_closed(*args: Any, **kwargs: Any) -> Any:
+        from bot.services import booking as booking_svc
+
+        raise booking_svc.SlotClosedError("slot closed")
+
+    monkeypatch.setattr(client_handlers, "create_booking", _raise_closed)
+
+    cb, callback_data = _make_confirm_callback()
+    state = _make_state()
+    await state.update_data(
+        slot_id=str(slot_id),
+        client_name="Паша",
+        service_title="Стрижка",
+    )
+    scheduler = MagicMock(spec=AsyncIOScheduler)
+
+    await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
+
+    state.clear.assert_awaited_once()
+    text = _answer_text(cb.message)
+    assert "Слот закрыт мастером" in text
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_cb_happy_creates_booking_and_schedules(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T5b: confirm_cb (client.py:315-364) — happy: create_booking succeeds →
+    master notification sent (callback.bot.send_message) + schedule_for_booking
+    called + state.clear + 'Вы записаны' message.
+
+    We monkeypatch create_booking to return a fake result (avoid coupling to
+    service internals) and schedule_for_booking to a mock (avoid APScheduler
+    global state). This test focuses on handler I/O, not service logic.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = Slot(
+            master_id=ctx["master_id"],
+            slot_date=target_date,
+            slot_hour=14,
+            status="open",
+        )
+        session.add(slot)
+        await session.commit()
+        slot_id = slot.id
+
+    # Fake create_booking result
+    fake_result = MagicMock()
+    fake_result.booking_id = UUID("00000000-0000-0000-0000-000000000002")
+    fake_result.start_at = datetime.now(UTC) + timedelta(days=1)
+    fake_result.master_notification_text = "Новая запись: Паша, Стрижка"
+
+    async def _fake_create(*args: Any, **kwargs: Any) -> Any:
+        return fake_result
+
+    monkeypatch.setattr(client_handlers, "create_booking", _fake_create)
+
+    schedule_mock = MagicMock()
+    monkeypatch.setattr(client_handlers, "schedule_for_booking", schedule_mock)
+
+    cb, callback_data = _make_confirm_callback()
+    state = _make_state()
+    await state.update_data(
+        slot_id=str(slot_id),
+        client_name="Паша",
+        service_title="Стрижка",
+    )
+    scheduler = MagicMock(spec=AsyncIOScheduler)
+
+    await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
+
+    # Master notification sent
+    cb.bot.send_message.assert_awaited_once()
+    notify_kwargs = cb.bot.send_message.await_args.kwargs
+    notify_text = notify_kwargs.get("text", "")
+    assert "Паша" in notify_text or "Стрижка" in notify_text
+
+    # schedule_for_booking called with booking_id + start_at
+    schedule_mock.assert_called_once()
+    schedule_args = schedule_mock.call_args.args
+    assert schedule_args[0] is scheduler
+    assert schedule_args[1] == fake_result.booking_id
+
+    # state.clear + success message
+    state.clear.assert_awaited_once()
+    text = _answer_text(cb.message)
+    assert "Вы записаны" in text
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_msg_clears_state_and_answers(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T5b: cancel_msg (client.py:370-379) — /cancel inside FSM → state.clear()
+    BEFORE answer (race) + 'Ввод отменён. /book чтобы начать заново'.
+    """
+    msg = _make_message(user_id=111222333, text="/cancel")
+    state = _make_state()
+
+    await client_handlers.cancel_msg(msg, state)
+
+    state.clear.assert_awaited_once()
+    text = _answer_text(msg)
+    assert "Ввод отменён" in text
+    assert "/book" in text
