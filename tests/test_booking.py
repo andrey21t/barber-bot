@@ -327,12 +327,9 @@ async def test_cancel_booking_happy_path(
     assert slot_status == "open"
 
     # Acceptance: NotificationLog has exactly one master_cancel row (UNIQUE guard)
-    stmt_n = (
-        select(NotificationLog)
-        .where(
-            NotificationLog.booking_id == booking_id,
-            NotificationLog.kind == "master_cancel",
-        )
+    stmt_n = select(NotificationLog).where(
+        NotificationLog.booking_id == booking_id,
+        NotificationLog.kind == "master_cancel",
     )
     notif_rows = (await session.execute(stmt_n)).scalars().all()
     assert len(notif_rows) == 1
@@ -462,6 +459,7 @@ async def test_cancel_booking_already_cancelled(
 # ============================================================
 # cancel_booking edge cases (NEXT_SESSION_PROMPT.md service gaps)
 # ============================================================
+
 
 @pytest.mark.asyncio
 async def test_cancel_booking_not_found_random_uuid(
@@ -724,12 +722,9 @@ async def test_transfer_booking_happy_path(
     assert (await session.execute(stmt_new)).scalar_one() == "booked"
 
     # NotificationLog master_transfer exactly one row (UNIQUE guard).
-    stmt_n = (
-        select(NotificationLog)
-        .where(
-            NotificationLog.booking_id == booking_id,
-            NotificationLog.kind == "master_transfer",
-        )
+    stmt_n = select(NotificationLog).where(
+        NotificationLog.booking_id == booking_id,
+        NotificationLog.kind == "master_transfer",
     )
     notif_rows = (await session.execute(stmt_n)).scalars().all()
     assert len(notif_rows) == 1
@@ -770,15 +765,19 @@ async def test_transfer_booking_re_transfer_from_transferred_status(
     mock_scheduler = _mock_scheduler()
     ref = datetime.now(UTC) - timedelta(days=10)
     await transfer_booking(
-        session, booking_id=booking_id, new_slot_id=new_slot_v1.id,
-        client_id=seed_data["client"].id, scheduler=mock_scheduler, now_utc=ref,
+        session,
+        booking_id=booking_id,
+        new_slot_id=new_slot_v1.id,
+        client_id=seed_data["client"].id,
+        scheduler=mock_scheduler,
+        now_utc=ref,
     )
 
     # Second transfer: transferred → transferred (different new_slot).
     await session.rollback()  # invalidate stale booking object
-    booking_v2 = (await session.execute(
-        select(Booking).where(Booking.id == booking_id)
-    )).scalar_one()
+    booking_v2 = (
+        await session.execute(select(Booking).where(Booking.id == booking_id))
+    ).scalar_one()
     assert booking_v2.status == "transferred"
     old_slot_id_v2 = booking_v2.slot_id  # new_slot_v1.id (from previous transfer)
     assert old_slot_id_v2 == new_slot_v1.id
@@ -786,8 +785,12 @@ async def test_transfer_booking_re_transfer_from_transferred_status(
     new_slot_v2 = await _make_open_slot(session, seed_data, days_ahead=7, hour_local=16)
     mock_scheduler_v2 = _mock_scheduler()
     result_v2 = await transfer_booking(
-        session, booking_id=booking_id, new_slot_id=new_slot_v2.id,
-        client_id=seed_data["client"].id, scheduler=mock_scheduler_v2, now_utc=ref,
+        session,
+        booking_id=booking_id,
+        new_slot_id=new_slot_v2.id,
+        client_id=seed_data["client"].id,
+        scheduler=mock_scheduler_v2,
+        now_utc=ref,
     )
 
     assert isinstance(result_v2, TransferResult)
@@ -796,34 +799,40 @@ async def test_transfer_booking_re_transfer_from_transferred_status(
 
     # DB: still 'transferred' (not double-marked), slot_id = newest.
     await session.rollback()
-    booking_after = (await session.execute(
-        select(Booking).where(Booking.id == booking_id)
-    )).scalar_one()
+    booking_after = (
+        await session.execute(select(Booking).where(Booking.id == booking_id))
+    ).scalar_one()
     assert booking_after.status == "transferred"
     assert booking_after.slot_id == new_slot_v2.id
 
     # Slots: original (v0) is 'open' (released in first transfer), v1 is 'open'
     # (released in second transfer), v2 is 'booked' (current).
-    slot_v0_status = (await session.execute(
-        select(Slot.status).where(Slot.id == old_slot_id_v1)
-    )).scalar_one()
-    slot_v1_status = (await session.execute(
-        select(Slot.status).where(Slot.id == new_slot_v1.id)
-    )).scalar_one()
-    slot_v2_status = (await session.execute(
-        select(Slot.status).where(Slot.id == new_slot_v2.id)
-    )).scalar_one()
+    slot_v0_status = (
+        await session.execute(select(Slot.status).where(Slot.id == old_slot_id_v1))
+    ).scalar_one()
+    slot_v1_status = (
+        await session.execute(select(Slot.status).where(Slot.id == new_slot_v1.id))
+    ).scalar_one()
+    slot_v2_status = (
+        await session.execute(select(Slot.status).where(Slot.id == new_slot_v2.id))
+    ).scalar_one()
     assert slot_v0_status == "open"
     assert slot_v1_status == "open"
     assert slot_v2_status == "booked"
 
     # master_transfer still exactly one row (UNIQUE guard, idempotent SAVEPOINT).
-    notif_count = len((await session.execute(
-        select(NotificationLog).where(
-            NotificationLog.booking_id == booking_id,
-            NotificationLog.kind == "master_transfer",
+    notif_count = len(
+        (
+            await session.execute(
+                select(NotificationLog).where(
+                    NotificationLog.booking_id == booking_id,
+                    NotificationLog.kind == "master_transfer",
+                )
+            )
         )
-    )).scalars().all())
+        .scalars()
+        .all()
+    )
     assert notif_count == 1
 
 
@@ -845,8 +854,12 @@ async def test_transfer_booking_too_late(
 
     with pytest.raises(CancelTooLateError):
         await transfer_booking(
-            session, booking_id=booking_id, new_slot_id=new_slot.id,
-            client_id=seed_data["client"].id, scheduler=mock_scheduler, now_utc=ref,
+            session,
+            booking_id=booking_id,
+            new_slot_id=new_slot.id,
+            client_id=seed_data["client"].id,
+            scheduler=mock_scheduler,
+            now_utc=ref,
         )
 
     # No DB changes — booking still 'confirmed', old slot still 'booked', new slot still 'open'.
@@ -873,8 +886,12 @@ async def test_transfer_booking_not_found(
 
     with pytest.raises(BookingNotFoundError):
         await transfer_booking(
-            session, booking_id=uuid4(), new_slot_id=new_slot.id,
-            client_id=seed_data["client"].id, scheduler=mock_scheduler, now_utc=ref,
+            session,
+            booking_id=uuid4(),
+            new_slot_id=new_slot.id,
+            client_id=seed_data["client"].id,
+            scheduler=mock_scheduler,
+            now_utc=ref,
         )
     mock_scheduler.remove_job.assert_not_called()
 
@@ -896,8 +913,12 @@ async def test_transfer_booking_not_owner(
 
     with pytest.raises(BookingNotFoundError):
         await transfer_booking(
-            session, booking_id=booking_id, new_slot_id=new_slot.id,
-            client_id=stranger_client_id, scheduler=mock_scheduler, now_utc=ref,
+            session,
+            booking_id=booking_id,
+            new_slot_id=new_slot.id,
+            client_id=stranger_client_id,
+            scheduler=mock_scheduler,
+            now_utc=ref,
         )
     # No DB changes (only SELECT performed, no rollback needed).
     stmt_b = select(Booking.status).where(Booking.id == booking_id)
@@ -921,27 +942,34 @@ async def test_transfer_booking_already_cancelled(
 
     # First: cancel the booking (service sets status='cancelled').
     await cancel_booking(
-        session, booking_id=booking_id, client_id=seed_data["client"].id,
-        scheduler=_mock_scheduler(), now_utc=ref,
+        session,
+        booking_id=booking_id,
+        client_id=seed_data["client"].id,
+        scheduler=_mock_scheduler(),
+        now_utc=ref,
     )
 
     # Then: try to transfer the cancelled booking → must raise.
     mock_scheduler_v2 = _mock_scheduler()
     with pytest.raises(BookingAlreadyCancelledError):
         await transfer_booking(
-            session, booking_id=booking_id, new_slot_id=new_slot_id,
-            client_id=seed_data["client"].id, scheduler=mock_scheduler_v2, now_utc=ref,
+            session,
+            booking_id=booking_id,
+            new_slot_id=new_slot_id,
+            client_id=seed_data["client"].id,
+            scheduler=mock_scheduler_v2,
+            now_utc=ref,
         )
     # No DB changes from transfer attempt — booking still 'cancelled'.
     await session.rollback()
-    booking_status = (await session.execute(
-        select(Booking.status).where(Booking.id == booking_id)
-    )).scalar_one()
+    booking_status = (
+        await session.execute(select(Booking.status).where(Booking.id == booking_id))
+    ).scalar_one()
     assert booking_status == "cancelled"
     # New slot was not touched by transfer (status='open' or default).
-    new_slot_status = (await session.execute(
-        select(Slot.status).where(Slot.id == new_slot_id)
-    )).scalar_one()
+    new_slot_status = (
+        await session.execute(select(Slot.status).where(Slot.id == new_slot_id))
+    ).scalar_one()
     assert new_slot_status == "open"
     mock_scheduler_v2.remove_job.assert_not_called()
 
@@ -972,8 +1000,12 @@ async def test_transfer_booking_slot_in_past(
 
     with pytest.raises(SlotInPastError):
         await transfer_booking(
-            session, booking_id=booking_id, new_slot_id=past_slot.id,
-            client_id=seed_data["client"].id, scheduler=mock_scheduler, now_utc=ref,
+            session,
+            booking_id=booking_id,
+            new_slot_id=past_slot.id,
+            client_id=seed_data["client"].id,
+            scheduler=mock_scheduler,
+            now_utc=ref,
         )
     # No DB changes — booking still 'confirmed', past slot still 'open'.
     stmt_b = select(Booking.status).where(Booking.id == booking_id)
@@ -1002,8 +1034,12 @@ async def test_transfer_booking_slot_closed(
 
     with pytest.raises(SlotClosedError):
         await transfer_booking(
-            session, booking_id=booking_id, new_slot_id=closed_slot.id,
-            client_id=seed_data["client"].id, scheduler=mock_scheduler, now_utc=ref,
+            session,
+            booking_id=booking_id,
+            new_slot_id=closed_slot.id,
+            client_id=seed_data["client"].id,
+            scheduler=mock_scheduler,
+            now_utc=ref,
         )
     stmt_b = select(Booking.status).where(Booking.id == booking_id)
     assert (await session.execute(stmt_b)).scalar_one() == "confirmed"
@@ -1029,8 +1065,12 @@ async def test_transfer_booking_slot_already_booked(
 
     with pytest.raises(SlotAlreadyBookedError):
         await transfer_booking(
-            session, booking_id=booking_id, new_slot_id=booked_slot.id,
-            client_id=seed_data["client"].id, scheduler=mock_scheduler, now_utc=ref,
+            session,
+            booking_id=booking_id,
+            new_slot_id=booked_slot.id,
+            client_id=seed_data["client"].id,
+            scheduler=mock_scheduler,
+            now_utc=ref,
         )
     stmt_b = select(Booking.status).where(Booking.id == booking_id)
     assert (await session.execute(stmt_b)).scalar_one() == "confirmed"
@@ -1219,6 +1259,7 @@ async def test_transfer_booking_concurrent_race_runtime(
                     entities = [d.get("entity") for d in statement.column_descriptions]
                     if any(isinstance(e, type) and issubclass(e, Booking) for e in entities):
                         patch_active = False  # only first SELECT (booking lookup)
+
                         # _FakeResult implements only scalar_one_or_none — the only
                         # method transfer_booking:520 calls on the first SELECT result.
                         # If service refactors to .one()/.first()/.scalars().first(),
@@ -1226,6 +1267,7 @@ async def test_transfer_booking_concurrent_race_runtime(
                         class _FakeResult:  # type: ignore[no-redef]  # type: ignore[no-redef]
                             def scalar_one_or_none(self):
                                 return stale_booking
+
                         return _FakeResult()
                 except (KeyError, AttributeError, TypeError) as e:
                     raise AssertionError(
@@ -1270,12 +1312,9 @@ async def test_transfer_booking_concurrent_race_runtime(
         assert (await s_verify.execute(stmt_orig_slot)).scalar_one() == "open"
 
         # NotificationLog: only one master_transfer row (B's); A didn't reach INSERT
-        stmt_n = (
-            select(NotificationLog)
-            .where(
-                NotificationLog.booking_id == booking_id,
-                NotificationLog.kind == "master_transfer",
-            )
+        stmt_n = select(NotificationLog).where(
+            NotificationLog.booking_id == booking_id,
+            NotificationLog.kind == "master_transfer",
         )
         notif_rows = (await s_verify.execute(stmt_n)).scalars().all()
         assert len(notif_rows) == 1
@@ -1301,6 +1340,7 @@ from sqlalchemy.exc import IntegrityError as SAIntegrityError  # noqa: E402
 from sqlalchemy.sql.dml import Update  # noqa: E402
 
 # --- Group A: trivial paths (no race) ---
+
 
 @pytest.mark.asyncio
 async def test_create_booking_service_id_random_not_in_db(
@@ -1448,16 +1488,7 @@ async def test_cancel_booking_notification_log_idempotency_integrity_error(
 
 # --- Group B: race via asyncio.gather ---
 
-@pytest.mark.skip(
-    reason=(
-        "Production bug: create_booking line 166 accesses `slot.id` on an "
-        "expired (post-rollback) instance after _select_or_create_client's "
-        "internal rollback (lines 111-123 race path). Triggers MissingGreenlet "
-        "in async SQLAlchemy. Recording in NEXT_COVERAGE_GAPS.md as production "
-        "bug B1. Test will pass once production code captures `slot.id` before "
-        "_select_or_create_client call (or uses a local variable)."
-    ),
-)
+
 @pytest.mark.asyncio
 async def test_create_booking_client_race_integrity_error(
     session_factory_concurrent: async_sessionmaker[AsyncSession],
@@ -1542,30 +1573,29 @@ async def test_create_booking_client_race_integrity_error(
 
     errors = [r for r in results if isinstance(r, Exception)]
     success = [r for r in results if not isinstance(r, Exception)]
-    assert len(success) == 2, (
-        f"both should succeed (race recoverable), got: {results!r}"
-    )
+    assert len(success) == 2, f"both should succeed (race recoverable), got: {results!r}"
     assert len(errors) == 0
 
     # Both bookings share the same client_id (winner of client race created it)
     async with session_factory_concurrent() as s_verify:
         clients = (
-            await s_verify.execute(
-                select(Client).where(Client.telegram_id == new_telegram_id)
-            )
-        ).scalars().all()
+            (await s_verify.execute(select(Client).where(Client.telegram_id == new_telegram_id)))
+            .scalars()
+            .all()
+        )
         assert len(clients) == 1, f"only one client should exist, got {len(clients)}"
         winner_client_id = clients[0].id
 
         bookings = (
-            await s_verify.execute(
-                select(Booking).where(Booking.client_id == winner_client_id)
-            )
-        ).scalars().all()
+            (await s_verify.execute(select(Booking).where(Booking.client_id == winner_client_id)))
+            .scalars()
+            .all()
+        )
         assert len(bookings) == 2, f"two bookings expected, got {len(bookings)}"
 
 
 # --- Group C: race via manual orchestration (patched_execute) ---
+
 
 @pytest.mark.asyncio
 async def test_create_booking_concurrent_race_integrity_error(
@@ -1809,6 +1839,7 @@ async def test_cancel_booking_concurrent_race_booking_already_cancelled(
 
 # --- Group D: transfer_booking race branches ---
 
+
 @pytest.mark.asyncio
 async def test_transfer_booking_concurrent_cancel_race_raises_already_cancelled(
     session: AsyncSession,
@@ -1954,9 +1985,7 @@ async def test_transfer_booking_concurrent_new_slot_taken_raises_slot_already_bo
 
     # Re-read fresh state
     await session.rollback()
-    new_slot_row = (
-        await session.execute(select(Slot).where(Slot.id == new_slot_id))
-    ).scalar_one()
+    new_slot_row = (await session.execute(select(Slot).where(Slot.id == new_slot_id))).scalar_one()
     assert new_slot_row.status == "booked"
 
     stale_new_slot = Slot(
@@ -1989,10 +2018,7 @@ async def test_transfer_booking_concurrent_new_slot_taken_raises_slot_already_bo
             return _FakeResult()
 
         # UPDATE on Slot table: 1st = step 9 (release old), 2nd = step 10 (book new)
-        if (
-            isinstance(statement, Update)
-            and statement.table == Slot.__table__
-        ):
+        if isinstance(statement, Update) and statement.table == Slot.__table__:
             patch_state["slot_update_count"] += 1
             if patch_state["slot_update_count"] == 2:
                 # Step 10: UPDATE new_slot WHERE status='open' → rowcount=0 (taken)
