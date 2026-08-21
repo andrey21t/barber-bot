@@ -11,7 +11,7 @@ Contract (spec.md 200-213, 307-309):
   только upcoming + active status (confirmed/transferred), без past/cancelled.
 """
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
@@ -149,7 +149,12 @@ async def get_client_bookings(
         )
     )
     if not include_past:
-        ref = now_utc or datetime.now(tz=None)  # naive comparison — SQLite stores naive
+        # ref must be UTC (not system-local). On dev Mac (TZ=Europe/Moscow)
+        # datetime.now(tz=None) returns naive MSK time, but Booking.start_at is
+        # stored as naive UTC (SQLite) — naive comparison would be off by 3 hours,
+        # excluding upcoming bookings from /mybookings. Fix mirrors W1 (commit bfab1fb):
+        # explicitly use datetime.now(UTC), then strip tzinfo for SQLite comparison.
+        ref = now_utc or datetime.now(UTC)
         # Filter on Booking.start_at (UTC). SQLite stores datetime naive (verified
         # test_admin.py 2026-08-21), so compare with naive UTC.
         if ref.tzinfo is not None:
