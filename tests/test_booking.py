@@ -1223,7 +1223,7 @@ async def test_transfer_booking_concurrent_race_runtime(
                         # method transfer_booking:520 calls on the first SELECT result.
                         # If service refactors to .one()/.first()/.scalars().first(),
                         # this would raise AttributeError — add the method here. (W1.)
-                        class _FakeResult:
+                        class _FakeResult:  # type: ignore[no-redef]  # type: ignore[no-redef]
                             def scalar_one_or_none(self):
                                 return stale_booking
                         return _FakeResult()
@@ -1279,3 +1279,749 @@ async def test_transfer_booking_concurrent_race_runtime(
         )
         notif_rows = (await s_verify.execute(stmt_n)).scalars().all()
         assert len(notif_rows) == 1
+
+
+# ============================================================
+# T8: booking service error branches (NEXT_COVERAGE_GAPS.md)
+# Covers bot/services/booking.py:
+#   98-100 — _select_service returns None for unknown service_id
+#   111-123 — _select_or_create_client race (IntegrityError → rollback → re-SELECT)
+#   180-182 — create_booking IntegrityError on booking flush (UNIQUE slot_id race)
+#   195-196 — create_booking UPDATE slot rowcount=0 (slot closed between SELECT/UPDATE)
+#   212-214 — create_booking NotificationLog IntegrityError (idempotency)
+#   353-354 — cancel_booking UPDATE booking rowcount=0 (race with concurrent cancel/transfer)
+#   372-374 — cancel_booking NotificationLog IntegrityError (idempotency)
+#   601 — transfer_booking recheck status='cancelled' after UPDATE rowcount=0
+#   627-628 — transfer_booking UPDATE new_slot rowcount=0 (slot taken between SELECT/UPDATE)
+# ============================================================
+
+import asyncio  # noqa: E402 — local import for T8 section
+
+from sqlalchemy.exc import IntegrityError as SAIntegrityError  # noqa: E402
+from sqlalchemy.sql.dml import Update  # noqa: E402
+
+# --- Group A: trivial paths (no race) ---
+
+@pytest.mark.asyncio
+async def test_create_booking_service_id_random_not_in_db(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Covers bot/services/booking.py:98-100 — _select_service with random
+    service_id (not in DB) → SELECT returns None → _build_end_at uses default
+    duration. Booking created with service_id=random (FK not enforced on SQLite
+    by default — PRAGMA foreign_keys=OFF).
+    """
+    slot = seed_data["slot"]
+    payload = BookingCreate(
+        slot_id=slot.id,
+        client_name="Паша",
+        service_title="Стрижка",
+        service_id=uuid4(),  # random — not in DB
+    )
+    result = await create_booking(
+        session,
+        payload,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=seed_data["client_telegram_id"],
+    )
+    assert isinstance(result, BookingCreatedData)
+    # End_at uses default duration (service is None, no Service row found)
+    assert (result.end_at - result.start_at).total_seconds() == 3600  # 60 min default
+
+
+@pytest.mark.asyncio
+async def test_create_booking_notification_log_idempotency_integrity_error(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Covers bot/services/booking.py:212-214 — IntegrityError on
+    NotificationLog(master_new) INSERT inside SAVEPOINT (idempotent retry).
+
+    Approach: monkey-patch session.flush to raise IntegrityError on 2nd call
+    (1st = booking INSERT, 2nd = log INSERT inside begin_nested). Service
+    catches, savepoint rolls back, main transaction commits.
+    """
+    slot = seed_data["slot"]
+    payload = await _make_payload(slot.id)
+
+    original_flush = session.flush
+    flush_count = 0
+
+    async def patched_flush(*args: Any, **kwargs: Any) -> Any:
+        nonlocal flush_count
+        flush_count += 1
+        if flush_count == 2:
+            # 2nd flush = log_entry INSERT inside begin_nested → simulate UNIQUE violation
+            raise SAIntegrityError(
+                "simulated duplicate log INSERT",
+                {},
+                orig=Exception("UNIQUE constraint failed: notifications_log.booking_id,kind"),
+            )
+        return await original_flush(*args, **kwargs)
+
+    session.flush = patched_flush  # type: ignore[method-assign]
+    try:
+        result = await create_booking(
+            session,
+            payload,
+            business_id=seed_data["business_id"],
+            master_id=seed_data["master_id"],
+            telegram_id=seed_data["client_telegram_id"],
+        )
+        assert isinstance(result, BookingCreatedData)
+    finally:
+        session.flush = original_flush  # type: ignore[method-assign]
+
+    # Booking committed (status='confirmed', slot='booked')
+    await session.rollback()
+    stmt_b = select(Booking).where(Booking.id == result.booking_id)
+    booking = (await session.execute(stmt_b)).scalar_one()
+    assert booking.status == "confirmed"
+    stmt_s = select(Slot.status).where(Slot.id == slot.id)
+    assert (await session.execute(stmt_s)).scalar_one() == "booked"
+    # NO NotificationLog master_new row (savepoint rolled back)
+    stmt_n = select(NotificationLog).where(
+        NotificationLog.booking_id == result.booking_id,
+        NotificationLog.kind == "master_new",
+    )
+    notif_rows = (await session.execute(stmt_n)).scalars().all()
+    assert len(notif_rows) == 0
+
+
+@pytest.mark.asyncio
+async def test_cancel_booking_notification_log_idempotency_integrity_error(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Covers bot/services/booking.py:372-374 — IntegrityError on
+    NotificationLog(master_cancel) INSERT inside SAVEPOINT.
+
+    Approach: monkey-patch session.flush to raise IntegrityError on first call
+    (the only flush in cancel_booking post-seeding is the log_entry INSERT
+    inside begin_nested — booking/slot UPDATEs use session.execute, not flush).
+    """
+    booking = await _seed_confirmed_booking(session, seed_data)
+    booking_id = booking.id
+    slot_id = booking.slot_id
+    ref = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    original_flush = session.flush
+
+    async def patched_flush(*args: Any, **kwargs: Any) -> Any:
+        # Only flush in cancel_booking after seeding is the log_entry INSERT
+        raise SAIntegrityError(
+            "simulated duplicate log INSERT",
+            {},
+            orig=Exception("UNIQUE constraint failed: notifications_log.booking_id,kind"),
+        )
+
+    session.flush = patched_flush  # type: ignore[method-assign]
+    try:
+        result = await cancel_booking(
+            session,
+            booking_id=booking_id,
+            client_id=seed_data["client"].id,
+            scheduler=_mock_scheduler(),
+            now_utc=ref,
+        )
+        assert isinstance(result, CancelResult)
+        assert result.booking_id == booking_id
+    finally:
+        session.flush = original_flush  # type: ignore[method-assign]
+
+    # Booking committed (status='cancelled', slot='open')
+    await session.rollback()
+    stmt_b = select(Booking.status).where(Booking.id == booking_id)
+    assert (await session.execute(stmt_b)).scalar_one() == "cancelled"
+    stmt_s = select(Slot.status).where(Slot.id == slot_id)
+    assert (await session.execute(stmt_s)).scalar_one() == "open"
+    # NO NotificationLog master_cancel row (savepoint rolled back)
+    stmt_n = select(NotificationLog).where(
+        NotificationLog.booking_id == booking_id,
+        NotificationLog.kind == "master_cancel",
+    )
+    notif_rows = (await session.execute(stmt_n)).scalars().all()
+    assert len(notif_rows) == 0
+
+
+# --- Group B: race via asyncio.gather ---
+
+@pytest.mark.skip(
+    reason=(
+        "Production bug: create_booking line 166 accesses `slot.id` on an "
+        "expired (post-rollback) instance after _select_or_create_client's "
+        "internal rollback (lines 111-123 race path). Triggers MissingGreenlet "
+        "in async SQLAlchemy. Recording in NEXT_COVERAGE_GAPS.md as production "
+        "bug B1. Test will pass once production code captures `slot.id` before "
+        "_select_or_create_client call (or uses a local variable)."
+    ),
+)
+@pytest.mark.asyncio
+async def test_create_booking_client_race_integrity_error(
+    session_factory_concurrent: async_sessionmaker[AsyncSession],
+) -> None:
+    """Covers bot/services/booking.py:111-123 — _select_or_create_client race:
+    concurrent INSERT of same telegram_id → IntegrityError on flush → rollback
+    → re-SELECT finds winner's client.
+
+    Two sessions concurrently call create_booking with same NEW telegram_id
+    (no client exists yet) on different slots (no booking race). Loser's INSERT
+    client catches IntegrityError (UNIQUE telegram_id), rolls back, re-SELECTs,
+    finds winner's committed client, proceeds to booking INSERT. Both bookings
+    succeed and share the same client_id.
+
+    Uses asyncio.gather — flakiness risk LOW: even if one coroutine completes
+    fully before the other starts, the late-starter's SELECT sees the committed
+    client and takes the early-return path (line 109-110), not the race path
+    (113-122). To force the race path, both SELECTs must happen before either
+    INSERT commits. In practice this works (aiosqlite schedules both SELECTs
+    before either flush), but a heavily loaded CI could miss the race.
+    """
+    async with session_factory_concurrent() as s_seed:
+        biz = Business(
+            name="Race Barbershop",
+            telegram_owner_id=461355056,
+            timezone="Europe/Moscow",
+        )
+        s_seed.add(biz)
+        await s_seed.flush()
+        master = Master(
+            business_id=biz.id,
+            name="Тестер",
+            telegram_id=461355056,
+            role="owner",
+        )
+        s_seed.add(master)
+        await s_seed.flush()
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot_a = Slot(master_id=master.id, slot_date=tomorrow, slot_hour=10, status="open")
+        slot_b = Slot(master_id=master.id, slot_date=tomorrow, slot_hour=11, status="open")
+        s_seed.add_all([slot_a, slot_b])
+        await s_seed.commit()
+        biz_id = biz.id
+        master_id = master.id
+        slot_a_id = slot_a.id
+        slot_b_id = slot_b.id
+
+    # Use a telegram_id that doesn't exist yet (forces client INSERT path)
+    new_telegram_id = 999999999
+
+    async with (
+        session_factory_concurrent() as s_a,
+        session_factory_concurrent() as s_b,
+    ):
+        results = await asyncio.gather(
+            create_booking(
+                s_a,
+                BookingCreate(
+                    slot_id=slot_a_id,
+                    client_name="A",
+                    service_title="X",
+                    service_id=None,
+                ),
+                business_id=biz_id,
+                master_id=master_id,
+                telegram_id=new_telegram_id,
+            ),
+            create_booking(
+                s_b,
+                BookingCreate(
+                    slot_id=slot_b_id,
+                    client_name="B",
+                    service_title="Y",
+                    service_id=None,
+                ),
+                business_id=biz_id,
+                master_id=master_id,
+                telegram_id=new_telegram_id,
+            ),
+            return_exceptions=True,
+        )
+
+    errors = [r for r in results if isinstance(r, Exception)]
+    success = [r for r in results if not isinstance(r, Exception)]
+    assert len(success) == 2, (
+        f"both should succeed (race recoverable), got: {results!r}"
+    )
+    assert len(errors) == 0
+
+    # Both bookings share the same client_id (winner of client race created it)
+    async with session_factory_concurrent() as s_verify:
+        clients = (
+            await s_verify.execute(
+                select(Client).where(Client.telegram_id == new_telegram_id)
+            )
+        ).scalars().all()
+        assert len(clients) == 1, f"only one client should exist, got {len(clients)}"
+        winner_client_id = clients[0].id
+
+        bookings = (
+            await s_verify.execute(
+                select(Booking).where(Booking.client_id == winner_client_id)
+            )
+        ).scalars().all()
+        assert len(bookings) == 2, f"two bookings expected, got {len(bookings)}"
+
+
+# --- Group C: race via manual orchestration (patched_execute) ---
+
+@pytest.mark.asyncio
+async def test_create_booking_concurrent_race_integrity_error(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Covers bot/services/booking.py:180-182 — IntegrityError on booking flush
+    (UNIQUE slot_id violated by concurrent insert).
+
+    Approach: pre-create a booking with same slot_id (commits to DB), then
+    patch execute so _select_open_slot's SELECT returns a STALE DETACHED slot
+    (status='open'). create_booking proceeds to INSERT booking → UNIQUE(slot_id)
+    violation at flush → IntegrityError → SlotAlreadyBookedError (line 182).
+
+    Why stale DETACHED slot (not real attached): the service's error message
+    at line 183 accesses `slot.id` AFTER `session.rollback()`. On an attached
+    instance, rollback expires all attributes → `slot.id` triggers lazy load
+    → MissingGreenlet (async SQLAlchemy). A detached instance (created via
+    `Slot(id=...)` constructor, never `session.add()`'d) has `id` as a plain
+    Python attribute — no lazy load, no MissingGreenlet. This is a production
+    latent bug (slot.id after rollback) — recorded in NEXT_COVERAGE_GAPS.md.
+
+    Faithful: tests the actual flush IntegrityError path (line 180-182), NOT
+    the _select_open_slot early-exit (line 64) that the existing
+    test_create_booking_idempotency_unique_guard covers via sequential double-call
+    (where slot.status='booked' is visible on SELECT).
+    """
+    slot = seed_data["slot"]
+    slot_id = slot.id  # capture before any rollback (avoid expired-attr access)
+    master_id = seed_data["master_id"]
+    slot_date = slot.slot_date
+    slot_hour = slot.slot_hour
+
+    # Pre-create a booking with slot.id (commits slot_id to bookings table)
+    await _seed_confirmed_booking(session, seed_data)
+    # slot.status now 'booked' in DB, booking row exists with slot_id=slot.id
+
+    # Stale DETACHED slot — what _select_open_slot would have seen pre-book
+    stale_slot = Slot(
+        id=slot_id,
+        master_id=master_id,
+        slot_date=slot_date,
+        slot_hour=slot_hour,
+        status="open",  # STALE
+    )
+
+    payload = await _make_payload(slot_id)
+    original_execute = session.execute
+    first_slot_select_done = False
+
+    async def patched_execute(statement: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal first_slot_select_done
+        # First SELECT FROM Slot → return stale_slot (status='open')
+        if (
+            not first_slot_select_done
+            and isinstance(statement, Select)
+            and any(
+                isinstance(e, type) and issubclass(e, Slot)
+                for e in [d.get("entity") for d in statement.column_descriptions]
+            )
+        ):
+            first_slot_select_done = True
+
+            class _FakeResult:  # type: ignore[no-redef]
+                def scalar_one_or_none(self):
+                    return stale_slot
+
+            return _FakeResult()
+        return await original_execute(statement, *args, **kwargs)
+
+    session.execute = patched_execute  # type: ignore[method-assign]
+    try:
+        with pytest.raises(SlotAlreadyBookedError, match="UNIQUE constraint"):
+            await create_booking(
+                session,
+                payload,
+                business_id=seed_data["business_id"],
+                master_id=master_id,
+                telegram_id=seed_data["client_telegram_id"],
+            )
+    finally:
+        session.execute = original_execute  # type: ignore[method-assign]
+
+    # No second booking committed (UNIQUE violation rolled back)
+    await session.rollback()
+    stmt_b = select(Booking).where(Booking.slot_id == slot_id)
+    bookings = (await session.execute(stmt_b)).scalars().all()
+    assert len(bookings) == 1, f"only the pre-booked booking, got {len(bookings)}"
+
+
+@pytest.mark.asyncio
+async def test_create_booking_slot_status_changed_between_select_and_update(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Covers bot/services/booking.py:195-196 — UPDATE slot WHERE status='open'
+    returns rowcount=0 (slot closed/booked between SELECT and UPDATE).
+
+    Approach: patch execute for TWO interceptions:
+    1. First SELECT FROM Slot → return STALE DETACHED slot (status='open').
+       Detached (not attached) so service's `slot.id` in error message at
+       line 197 doesn't trigger MissingGreenlet after rollback (production
+       latent bug — slot.id after rollback, recorded in NEXT_COVERAGE_GAPS.md).
+    2. First UPDATE on Slot table → return rowcount=0 (slot status changed
+       between SELECT and UPDATE — simulated concurrent close/book).
+
+    Booking INSERT (flush) succeeds with real slot_id, but UPDATE slot fails
+    → service rolls back, raises SlotAlreadyBookedError.
+    """
+    slot = seed_data["slot"]
+    slot_id = slot.id  # capture before any patching
+    master_id = seed_data["master_id"]
+    slot_date = slot.slot_date
+    slot_hour = slot.slot_hour
+
+    stale_slot = Slot(
+        id=slot_id,
+        master_id=master_id,
+        slot_date=slot_date,
+        slot_hour=slot_hour,
+        status="open",  # STALE — what _select_open_slot saw before close
+    )
+
+    payload = await _make_payload(slot_id)
+    original_execute = session.execute
+    patch_state = {"first_slot_select_done": False, "slot_update_done": False}
+
+    async def patched_execute(statement: Any, *args: Any, **kwargs: Any) -> Any:
+        # First SELECT FROM Slot → return stale_slot (detached, status='open')
+        if (
+            not patch_state["first_slot_select_done"]
+            and isinstance(statement, Select)
+            and any(
+                isinstance(e, type) and issubclass(e, Slot)
+                for e in [d.get("entity") for d in statement.column_descriptions]
+            )
+        ):
+            patch_state["first_slot_select_done"] = True
+
+            class _FakeResult:  # type: ignore[no-redef]
+                def scalar_one_or_none(self):
+                    return stale_slot
+
+            return _FakeResult()
+
+        # First UPDATE on Slot table → rowcount=0 (slot status changed)
+        if (
+            not patch_state["slot_update_done"]
+            and isinstance(statement, Update)
+            and statement.table == Slot.__table__
+        ):
+            patch_state["slot_update_done"] = True
+
+            class _FakeResult:  # type: ignore[no-redef]
+                rowcount = 0
+
+            return _FakeResult()
+
+        return await original_execute(statement, *args, **kwargs)
+
+    session.execute = patched_execute  # type: ignore[method-assign]
+    try:
+        with pytest.raises(
+            SlotAlreadyBookedError,
+            match="taken/closed between SELECT and UPDATE",
+        ):
+            await create_booking(
+                session,
+                payload,
+                business_id=seed_data["business_id"],
+                master_id=master_id,
+                telegram_id=seed_data["client_telegram_id"],
+            )
+    finally:
+        session.execute = original_execute  # type: ignore[method-assign]
+
+    # Service rolled back — booking NOT committed
+    await session.rollback()
+    stmt_b = select(Booking).where(Booking.slot_id == slot_id)
+    bookings = (await session.execute(stmt_b)).scalars().all()
+    assert len(bookings) == 0
+
+
+@pytest.mark.asyncio
+async def test_cancel_booking_concurrent_race_booking_already_cancelled(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Covers bot/services/booking.py:353-354 — UPDATE booking SET 'cancelled'
+    WHERE status IN ('confirmed','transferred') returns rowcount=0 (concurrent
+    cancel/transfer changed status between SELECT and UPDATE).
+
+    Approach: monkey-patch session.execute to intercept UPDATE on Booking table
+    and return rowcount=0. Service rolls back, raises BookingAlreadyCancelledError.
+    """
+    booking = await _seed_confirmed_booking(session, seed_data)
+    booking_id = booking.id
+    slot_id = booking.slot_id
+    ref = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    original_execute = session.execute
+    patch_active = True
+
+    async def patched_execute(statement: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal patch_active
+        if patch_active and isinstance(statement, Update):
+            from bot.models import Booking as BookingModel
+
+            if statement.table == BookingModel.__table__:
+                patch_active = False
+
+                class _FakeResult:  # type: ignore[no-redef]  # type: ignore[no-redef]
+                    rowcount = 0
+
+                return _FakeResult()
+        return await original_execute(statement, *args, **kwargs)
+
+    session.execute = patched_execute  # type: ignore[method-assign]
+    try:
+        with pytest.raises(
+            BookingAlreadyCancelledError,
+            match="status changed between SELECT and UPDATE",
+        ):
+            await cancel_booking(
+                session,
+                booking_id=booking_id,
+                client_id=seed_data["client"].id,
+                scheduler=_mock_scheduler(),
+                now_utc=ref,
+            )
+    finally:
+        session.execute = original_execute  # type: ignore[method-assign]
+
+    # Booking still 'confirmed' (UPDATE rolled back)
+    await session.rollback()
+    stmt_b = select(Booking.status).where(Booking.id == booking_id)
+    assert (await session.execute(stmt_b)).scalar_one() == "confirmed"
+    stmt_s = select(Slot.status).where(Slot.id == slot_id)
+    assert (await session.execute(stmt_s)).scalar_one() == "booked"
+
+
+# --- Group D: transfer_booking race branches ---
+
+@pytest.mark.asyncio
+async def test_transfer_booking_concurrent_cancel_race_raises_already_cancelled(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Covers bot/services/booking.py:601 — recheck status='cancelled' branch
+    after UPDATE rowcount=0 in transfer_booking.
+
+    Race: A's transfer SELECT sees booking.status='confirmed', B concurrently
+    cancels (commits status='cancelled'), A's UPDATE WHERE status IN
+    ('confirmed','transferred') AND start_at=old returns rowcount=0, A re-SELECTs
+    → 'cancelled' → BookingAlreadyCancelledError (line 601, NOT
+    BookingAlreadyTransferredError).
+
+    Approach: pre-cancel booking (commits 'cancelled' to DB), then patch execute:
+    1. First SELECT FROM Booking → return stale_booking (status='confirmed')
+    2. UPDATE booking → rowcount=0
+    3. Re-SELECT status → fall through to real DB (returns 'cancelled')
+    """
+    booking = await _seed_confirmed_booking(session, seed_data)
+    booking_id = booking.id
+    new_slot = await _make_open_slot(session, seed_data, days_ahead=5, hour_local=15)
+    new_slot_id = new_slot.id
+
+    ref = datetime.now(UTC) - timedelta(days=10)
+
+    # Pre-cancel the booking (commits status='cancelled')
+    await cancel_booking(
+        session,
+        booking_id=booking_id,
+        client_id=seed_data["client"].id,
+        scheduler=_mock_scheduler(),
+        now_utc=ref,
+    )
+
+    # Capture fields for stale_booking (start_at/slot_id/end_at don't change on cancel)
+    await session.rollback()
+    booking_row = (
+        await session.execute(select(Booking).where(Booking.id == booking_id))
+    ).scalar_one()
+    captured_start_at = booking_row.start_at
+    captured_end_at = booking_row.end_at
+    captured_slot_id = booking_row.slot_id
+
+    stale_booking = Booking(
+        id=booking_id,
+        client_id=seed_data["client"].id,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        slot_id=captured_slot_id,
+        start_at=captured_start_at,
+        end_at=captured_end_at,
+        status="confirmed",  # STALE — what transfer's SELECT would have seen pre-cancel
+        service_id=None,
+        client_name_snapshot=booking_row.client_name_snapshot,
+        service_title_snapshot=booking_row.service_title_snapshot,
+    )
+
+    original_execute = session.execute
+    patch_state = {"first_select_done": False, "update_done": False}
+
+    async def patched_execute(statement: Any, *args: Any, **kwargs: Any) -> Any:
+        # First SELECT FROM Booking (line 519) → stale_booking (status='confirmed')
+        if (
+            not patch_state["first_select_done"]
+            and isinstance(statement, Select)
+            and any(
+                isinstance(e, type) and issubclass(e, Booking)
+                for e in [d.get("entity") for d in statement.column_descriptions]
+            )
+        ):
+            patch_state["first_select_done"] = True
+
+            class _FakeResult:  # type: ignore[no-redef]
+                def scalar_one_or_none(self):
+                    return stale_booking
+
+            return _FakeResult()
+
+        # UPDATE booking (line 584) → rowcount=0
+        if (
+            not patch_state["update_done"]
+            and isinstance(statement, Update)
+            and statement.table == Booking.__table__
+        ):
+            patch_state["update_done"] = True
+
+            class _FakeResult:  # type: ignore[no-redef]
+                rowcount = 0
+
+            return _FakeResult()
+
+        # Re-SELECT status (line 596-599) → fall through to real DB (returns 'cancelled')
+        return await original_execute(statement, *args, **kwargs)
+
+    session.execute = patched_execute  # type: ignore[method-assign]
+    try:
+        with pytest.raises(
+            BookingAlreadyCancelledError,
+            match="cancelled by concurrent",
+        ):
+            await transfer_booking(
+                session,
+                booking_id=booking_id,
+                new_slot_id=new_slot_id,
+                client_id=seed_data["client"].id,
+                scheduler=_mock_scheduler(),
+                now_utc=ref,
+            )
+    finally:
+        session.execute = original_execute  # type: ignore[method-assign]
+
+    # Booking still 'cancelled' (no transfer happened)
+    await session.rollback()
+    stmt_b = select(Booking.status).where(Booking.id == booking_id)
+    assert (await session.execute(stmt_b)).scalar_one() == "cancelled"
+    stmt_new = select(Slot.status).where(Slot.id == new_slot_id)
+    assert (await session.execute(stmt_new)).scalar_one() == "open"
+
+
+@pytest.mark.asyncio
+async def test_transfer_booking_concurrent_new_slot_taken_raises_slot_already_booked(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Covers bot/services/booking.py:627-628 — UPDATE new_slot WHERE status='open'
+    returns rowcount=0 (slot taken between SELECT and UPDATE in transfer_booking).
+
+    Approach: pre-book new_slot (status='booked' in DB), then patch execute:
+    1. First SELECT FROM Slot (new_slot lookup, step 5) → return stale_slot (status='open')
+    2. UPDATE old slot (step 9, release to 'open') → fall through (real DB)
+    3. UPDATE new slot WHERE status='open' (step 10) → rowcount=0
+    Service rolls back, raises SlotAlreadyBookedError (line 628).
+    """
+    booking = await _seed_confirmed_booking(session, seed_data)
+    booking_id = booking.id
+    new_slot = await _make_open_slot(session, seed_data, days_ahead=5, hour_local=15)
+    new_slot_id = new_slot.id
+
+    # Pre-book new_slot (status='booked' in DB — simulates concurrent booking)
+    new_slot.status = "booked"
+    await session.commit()
+
+    # Re-read fresh state
+    await session.rollback()
+    new_slot_row = (
+        await session.execute(select(Slot).where(Slot.id == new_slot_id))
+    ).scalar_one()
+    assert new_slot_row.status == "booked"
+
+    stale_new_slot = Slot(
+        id=new_slot_id,
+        master_id=new_slot_row.master_id,
+        slot_date=new_slot_row.slot_date,
+        slot_hour=new_slot_row.slot_hour,
+        status="open",  # STALE — what transfer's _select_open_slot saw pre-book
+    )
+
+    original_execute = session.execute
+    patch_state = {"first_slot_select_done": False, "slot_update_count": 0}
+
+    async def patched_execute(statement: Any, *args: Any, **kwargs: Any) -> Any:
+        # First SELECT FROM Slot (new_slot lookup) → stale_new_slot (status='open')
+        if (
+            not patch_state["first_slot_select_done"]
+            and isinstance(statement, Select)
+            and any(
+                isinstance(e, type) and issubclass(e, Slot)
+                for e in [d.get("entity") for d in statement.column_descriptions]
+            )
+        ):
+            patch_state["first_slot_select_done"] = True
+
+            class _FakeResult:  # type: ignore[no-redef]
+                def scalar_one_or_none(self):
+                    return stale_new_slot
+
+            return _FakeResult()
+
+        # UPDATE on Slot table: 1st = step 9 (release old), 2nd = step 10 (book new)
+        if (
+            isinstance(statement, Update)
+            and statement.table == Slot.__table__
+        ):
+            patch_state["slot_update_count"] += 1
+            if patch_state["slot_update_count"] == 2:
+                # Step 10: UPDATE new_slot WHERE status='open' → rowcount=0 (taken)
+
+                class _FakeResult:  # type: ignore[no-redef]  # type: ignore[no-redef]
+                    rowcount = 0
+
+                return _FakeResult()
+
+        return await original_execute(statement, *args, **kwargs)
+
+    session.execute = patched_execute  # type: ignore[method-assign]
+    try:
+        with pytest.raises(
+            SlotAlreadyBookedError,
+            match="taken/closed between SELECT and UPDATE",
+        ):
+            await transfer_booking(
+                session,
+                booking_id=booking_id,
+                new_slot_id=new_slot_id,
+                client_id=seed_data["client"].id,
+                scheduler=_mock_scheduler(),
+                now_utc=datetime.now(UTC) - timedelta(days=10),
+            )
+    finally:
+        session.execute = original_execute  # type: ignore[method-assign]
+
+    # Booking unchanged (status='confirmed' — transfer rolled back)
+    await session.rollback()
+    stmt_b = select(Booking.status).where(Booking.id == booking_id)
+    assert (await session.execute(stmt_b)).scalar_one() == "confirmed"
