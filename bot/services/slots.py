@@ -28,9 +28,7 @@ async def add_slots(
         raise ValueError("slot_hour must be 0-23")
 
     # Get already-open slots on this date for this master
-    existing_stmt = select(Slot).where(
-        Slot.master_id == master_id, Slot.slot_date == slot_date
-    )
+    existing_stmt = select(Slot).where(Slot.master_id == master_id, Slot.slot_date == slot_date)
     existing = await session.execute(existing_stmt)
     existing_hours = {s.slot_hour for s in existing.scalars().all()}
 
@@ -46,10 +44,12 @@ async def add_slots(
         try:
             await session.flush()
         except IntegrityError as exc:
-            # Composite unique (master_id, slot_date, slot_hour) violated by concurrent insert
+            # Composite unique (master_id, slot_date, slot_hour) violated by concurrent insert.
+            # Don't reference `hour` loop variable here — it carries the last iterated value,
+            # not the conflicting hour (B2 fix). Generalise the message instead.
             await session.rollback()
             raise SlotAlreadyExistsError(
-                f"Slot {master_id}/{slot_date}/{hour} already exists"
+                f"Slot {master_id}/{slot_date} — one of hours already exists"
             ) from exc
     await session.commit()
     return new_slots
