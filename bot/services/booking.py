@@ -377,7 +377,11 @@ async def cancel_booking(
     # test fixture uses expire_on_commit=False; production engine default also
     # safe because we read snapshots into the dataclass here, not after commit).
     business_tz = await _select_business_timezone(session, booking.business_id)
-    local_time = booking.start_at.astimezone(ZoneInfo(business_tz))
+    # booking.start_at is naive UTC (SQLite stores naive); explicitly mark as UTC before
+    # astimezone — otherwise Python interprets naive as system-local TZ (Mac default
+    # Europe/Moscow would render wrong time in master notification; Render TZ=UTC is
+    # correct by accident). Mirror of transfer_booking fix at line 644.
+    local_time = booking.start_at.replace(tzinfo=UTC).astimezone(ZoneInfo(business_tz))
     formatted_time = local_time.strftime("%d %B %Y, %H:%M")
     master_text = (
         f"Отмена:\n"
