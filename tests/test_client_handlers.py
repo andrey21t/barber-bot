@@ -1499,3 +1499,92 @@ async def test_transfer_date_cb_no_slots_on_date(
     state.set_state.assert_not_awaited()
     state.update_data.assert_not_awaited()
     cb.answer.assert_awaited()
+
+
+# ============================================================
+# transfer_date_cb — error branches (T4: client.py:664-666, 678-682)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_transfer_date_cb_invalid_iso_date(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T4 — client.py:664-666: callback_data.iso='not-a-date' → date.fromisoformat
+    raises ValueError → callback.answer('Невалидная дата') + state NOT cleared
+    (stays at selecting_date for retry).
+    """
+    from bot.keyboards.client import BookDateCallbackData
+
+    async with session_factory() as session:
+        await _seed_full_stack(session)  # master exists — handler proceeds past FSM check
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    # Invalid ISO string — date.fromisoformat raises ValueError
+    callback_data = BookDateCallbackData(iso="not-a-date")
+
+    state = _make_state()
+
+    await client_handlers.transfer_date_cb(cb, callback_data, state)
+
+    # Error answer sent via callback.answer (popup, NOT message.answer)
+    cb.answer.assert_awaited_once()
+    args, _ = cb.answer.await_args
+    assert args[0] == "Невалидная дата"
+
+    # State must NOT be cleared (user can retry with valid date)
+    state.clear.assert_not_awaited()
+    # FSM state NOT advanced
+    state.set_state.assert_not_awaited()
+    # No DB query made (handler returns before async_session_factory block)
+    cb.message.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_date_cb_master_not_found_clears_state_and_answers(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T4 — client.py:678-682: master not found in DB → state.clear() +
+    callback.message.answer('❌ Не удалось найти мастера.') + callback.answer.
+
+    Setup: empty DB (no _seed_full_stack) — get_settings().ADMIN_ID matches no
+    master row → select(Master).where(Master.telegram_id == ADMIN_ID) returns None.
+    """
+    from bot.keyboards.client import BookDateCallbackData
+
+    # No _seed_full_stack — DB empty, no master row
+    target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = BookDateCallbackData(iso=target_date.isoformat())
+
+    state = _make_state()
+
+    await client_handlers.transfer_date_cb(cb, callback_data, state)
+
+    # state.clear() called — FSM aborted (no retry, user must /book again)
+    state.clear.assert_awaited_once()
+
+    # Error message via callback.message.answer
+    cb.message.answer.assert_awaited_once()
+    err_text = _answer_text(cb.message)
+    assert "Не удалось найти мастера" in err_text
+
+    # callback.answer() called (close the loading spinner)
+    cb.answer.assert_awaited()
+
+    # FSM state NOT advanced (clear reset to None)
+    state.set_state.assert_not_awaited()
+    state.update_data.assert_not_awaited()
