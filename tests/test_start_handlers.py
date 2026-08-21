@@ -11,12 +11,10 @@ AUTONOMOUS_COVERAGE_PROMPT.md T6).
 
 from __future__ import annotations
 
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiogram.types import Message, User
-
 from bot.config import get_settings
 from bot.handlers import start as start_handlers
 
