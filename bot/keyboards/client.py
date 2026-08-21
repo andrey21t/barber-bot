@@ -10,6 +10,8 @@ CallbackData factories (aiogram 3.x):
 - BookConfirmCallbackData: prefix="book_confirm"
 - BookCancelCallbackData: prefix="book_cancel"  (booking flow cancel — no payload)
 - MyBookingsCancelCallbackData: prefix="mybook_cancel", booking_id: UUID  (cancel existing booking)
+- MyBookingsTransferCallbackData: prefix="mybook_transfer", booking_id: UUID
+  (transfer existing booking — re-uses date/slot pickers in subsequent FSM steps)
 
 Note: prefix uses '_' not ':' — aiogram 3.x forbids separator ':' inside prefix
 (ValueError: "Separator symbol ':' can not be used inside prefix").
@@ -51,6 +53,18 @@ class MyBookingsCancelCallbackData(CallbackData, prefix="mybook_cancel"):
 
     Distinct prefix from BookCancelCallbackData (which cancels the FSM input flow,
     not a persisted booking). StateFilter(None) — cancel works only outside FSM.
+    """
+
+    booking_id: UUID
+
+
+class MyBookingsTransferCallbackData(CallbackData, prefix="mybook_transfer"):
+    """Transfer an existing booking via /mybookings inline button — payload is booking UUID.
+
+    Re-uses BookDateCallbackData / BookSlotCallbackData in subsequent FSM steps
+    (date + slot pickers), but the entry-point button uses this distinct prefix so
+    handler can resolve booking_id and validate it's still cancelable (>24h).
+    StateFilter(None) — entry works only outside FSM (consistent with mybook_cancel).
     """
 
     booking_id: UUID
@@ -114,22 +128,31 @@ def mybookings_keyboard(
     bookings: list[Booking],
     business_timezone: str = "Europe/Moscow",
 ) -> InlineKeyboardMarkup:
-    """Build [Отменить] inline buttons for client's cancelable bookings.
+    """Build [❌ Отменить] + [🔄 Перенести] inline buttons for client's cancelable bookings.
 
-    One button per booking, labeled with local date+time (matches the line in
-    /mybookings text list). Adjust(1) — one button per row, easy to tap.
+    Two buttons per booking in one row (adjust(2)) — pairs [Отменить <date>] with
+    [Перенести <date>] so user can pick either action. Each button labeled with
+    local date+time (matches the line in /mybookings text list).
 
     Caller responsibility: filter bookings where `start_at - CANCEL_MIN_HOURS > now`
-    (handler computes deadline, only passes cancelable bookings here).
+    (handler computes deadline, only passes cancelable bookings here). Both cancel
+    and transfer share the same 24h window (spec.md 41 — "отмена (>24ч) или перенос
+    (>24ч)"), so one cancelable list drives both buttons.
     """
     tz = ZoneInfo(business_timezone)
     builder = InlineKeyboardBuilder()
     for b in bookings:
         local_time = b.start_at.astimezone(tz)
-        label = f"❌ Отменить {local_time.strftime('%d %b %H:%M')}"
-        cb = MyBookingsCancelCallbackData(booking_id=b.id)
-        builder.button(text=label, callback_data=cb.pack())
-    builder.adjust(1)
+        when = local_time.strftime("%d %b %H:%M")
+        builder.button(
+            text=f"❌ Отменить {when}",
+            callback_data=MyBookingsCancelCallbackData(booking_id=b.id).pack(),
+        )
+        builder.button(
+            text=f"🔄 Перенести {when}",
+            callback_data=MyBookingsTransferCallbackData(booking_id=b.id).pack(),
+        )
+    builder.adjust(2)  # 2 buttons per row: [Отменить] [Перенести] for each booking
     return builder.as_markup()
 
 

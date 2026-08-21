@@ -1,13 +1,19 @@
-"""Tests for bot.handlers.client — mybookings_msg + mybookings_cancel_cb.
+"""Tests for bot.handlers.client — mybookings_msg + mybookings_cancel_cb + transfer flow.
 
-Coverage (NEXT_SESSION_PROMPT.md Приоритет 1 — handler gaps surfaced by self-review):
+Coverage (NEXT_SESSION_PROMPT.md Приоритет 1 + 3 — handler gaps surfaced by self-review):
 - mybookings_msg: cancelable booking shows [Отменить] inline button (test #4)
 - mybookings_msg: too-late booking shows "⏰ Отмена недоступна" + NO button (test #5)
 - mybookings_msg: no bookings → "У вас нет активных записей" (test #6)
 - mybookings_cancel_cb: happy path → booking.status='cancelled' + master notified (test #7)
 - mybookings_cancel_cb: too-late → CancelTooLateError → "Отмена возможна только за 24+" (test #8)
 - mybookings_cancel_cb: not-owner (stranger telegram_id) → "Запись не найдена" (test #9)
-- mybookings_keyboard: N bookings → N buttons with correct callback_data (test #10)
+- mybookings_keyboard: N bookings → 2N buttons (cancel + transfer) (test #10)
+- mybookings_transfer_cb: happy path → FSM selecting_date + date picker shown (test #11)
+- mybookings_transfer_cb: too-late → "Перенос возможен только за 24+" (test #12)
+- mybookings_transfer_cb: unknown user (no Client) → "У вас нет записей" (test #13)
+- mybookings_transfer_cb: not-owner (stranger Client) → "Запись не найдена" (test #14)
+- transfer_slot_cb: happy path → transfer_booking succeeds, status='transferred' (test #15)
+- transfer_slot_cb: slot already booked → "Слот только что заняли" (test #16)
 
 Why handler tests (not just service tests, AGENTS.md § anti-overengineering rule 3):
 mybookings_msg contains a partition decision (cancelable vs too-late) computed in
@@ -19,8 +25,8 @@ Pattern (NEXT_SESSION_PROMPT.md 38): direct handler invocation with mock Message
 CallbackQuery + monkeypatch of `bot.handlers.client.async_session_factory` so the
 handler reads/writes our in-memory test SQLite engine (NOT the global prod engine
 pointed at by bot.db.async_session_factory). Avoids `dp.feed_update` ceremony —
-no Dispatcher/MemoryStorage/router-wiring needed for these stateless handlers
-(both mybookings_msg and mybookings_cancel_cb use StateFilter(None) only).
+no Dispatcher/MemoryStorage/router-wiring needed (transfer flow uses a mock FSMContext
+that records set_state/update_data calls for assertion).
 """
 
 from __future__ import annotations
@@ -32,14 +38,17 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import pytest
+from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, User
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bot.handlers import client as client_handlers
 from bot.keyboards.client import (
     MyBookingsCancelCallbackData,
+    MyBookingsTransferCallbackData,
     mybookings_keyboard,
 )
 from bot.models import Booking, Business, Client, Master, Slot
+from bot.states import TransferStates
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -257,17 +266,27 @@ async def test_mybookings_msg_with_cancelable_booking(
         "cancelable booking must produce an inline keyboard with [Отменить] button"
     )
     # InlineKeyboardMarkup has .inline_keyboard: list[list[InlineKeyboardButton]]
+    # mybookings_keyboard emits 2 buttons per booking: [Отменить] + [Перенести].
     buttons = [btn for row in reply_markup.inline_keyboard for btn in row]
-    assert len(buttons) == 1, "exactly one [Отменить] button for one cancelable booking"
-    button = buttons[0]
-    assert "Отменить" in button.text
+    assert len(buttons) == 2, (
+        "one cancelable booking → 2 buttons: [Отменить] + [Перенести]"
+    )
+    cancel_btn = buttons[0]
+    transfer_btn = buttons[1]
+    assert "Отменить" in cancel_btn.text
+    assert "Перенести" in transfer_btn.text
     # callback_data packs MyBookingsCancelCallbackData(booking_id=<uuid>)
     # InlineKeyboardButton.callback_data is typed `str | None` in aiogram stubs;
     # mybookings_keyboard always packs a real callback_data string, so assert
     # non-None before unpack to satisfy mypy without losing the runtime check.
-    assert button.callback_data is not None
-    cb_data = MyBookingsCancelCallbackData.unpack(button.callback_data)
-    assert cb_data.booking_id == booking.id
+    assert cancel_btn.callback_data is not None
+    assert transfer_btn.callback_data is not None
+    cancel_cb_data = MyBookingsCancelCallbackData.unpack(cancel_btn.callback_data)
+    assert cancel_cb_data.booking_id == booking.id
+    from bot.keyboards.client import MyBookingsTransferCallbackData
+
+    transfer_cb_data = MyBookingsTransferCallbackData.unpack(transfer_btn.callback_data)
+    assert transfer_cb_data.booking_id == booking.id
 
 
 @pytest.mark.asyncio
@@ -540,13 +559,19 @@ async def test_mybookings_cancel_cb_unknown_user_no_client(
 async def test_mybookings_keyboard_buttons_match_bookings(
     session_factory: Any,
 ) -> None:
-    """Test #10: mybookings_keyboard(bookings) → N buttons with correct
-    callback_data packing MyBookingsCancelCallbackData(booking_id=<uuid>).
+    """Test #10: mybookings_keyboard(bookings) → 2N buttons (N cancel + N transfer)
+    with correct callback_data packing.
+
+    Two buttons per booking in one row (adjust(2)): [❌ Отменить <date>]
+    packs MyBookingsCancelCallbackData(booking_id=<uuid>); [🔄 Перенести <date>]
+    packs MyBookingsTransferCallbackData(booking_id=<uuid>).
 
     Pure keyboard test — no handler invocation, no DB patch. Verifies the
     rendering layer that mybookings_msg relies on (test #4 implicitly covers
     this via end-to-end, but explicit keyboard test isolates the contract).
     """
+    from bot.keyboards.client import MyBookingsTransferCallbackData
+
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
         b1 = await _seed_booking(
@@ -572,17 +597,384 @@ async def test_mybookings_keyboard_buttons_match_bookings(
     markup = mybookings_keyboard(bookings, business_timezone="Europe/Moscow")
     assert isinstance(markup, InlineKeyboardMarkup)
     buttons = [btn for row in markup.inline_keyboard for btn in row]
-    assert len(buttons) == 2, "two bookings → two [Отменить] buttons"
+    assert len(buttons) == 4, "two bookings → 4 buttons (2 cancel + 2 transfer)"
 
-    # Each button text starts with "❌ Отменить", callback_data packs the booking_id.
-    for button, expected_booking in zip(buttons, bookings, strict=True):
-        assert button.text.startswith("❌ Отменить")
-        # button.callback_data is `str | None` in aiogram stubs — keyboard builder
-        # always packs a non-None string; assert narrows type for mypy.
-        assert button.callback_data is not None
-        cb_data = MyBookingsCancelCallbackData.unpack(button.callback_data)
-        assert cb_data.booking_id == expected_booking.id
+    # Each booking produces a [Отменить] + [Перенести] pair.
+    # buttons are flattened row-by-row; row order = [cancel, transfer] per booking.
+    for cancel_btn, transfer_btn, expected_booking in zip(
+        buttons[0::2], buttons[1::2], bookings, strict=True
+    ):
+        assert cancel_btn.text.startswith("❌ Отменить")
+        assert transfer_btn.text.startswith("🔄 Перенести")
+        # callback_data packs the booking_id (cancel and transfer share same booking).
+        assert cancel_btn.callback_data is not None
+        assert transfer_btn.callback_data is not None
+        cancel_cb = MyBookingsCancelCallbackData.unpack(cancel_btn.callback_data)
+        transfer_cb = MyBookingsTransferCallbackData.unpack(transfer_btn.callback_data)
+        assert cancel_cb.booking_id == expected_booking.id
+        assert transfer_cb.booking_id == expected_booking.id
 
-    # adjust(1) — one button per row → 2 rows for 2 bookings.
+    # adjust(2) — 2 buttons per row → 2 rows for 2 bookings (one row each).
     assert len(markup.inline_keyboard) == 2
-    assert all(len(row) == 1 for row in markup.inline_keyboard)
+    assert all(len(row) == 2 for row in markup.inline_keyboard)
+
+
+# ============================================================
+# mybookings_transfer_cb — [🔄 Перенести] entry (test #11-14)
+# ============================================================
+
+
+def _make_state() -> MagicMock:
+    """Mock aiogram FSMContext — records set_state/update_data/clear calls.
+
+    `state.get_data()` returns a dict that persists between handler invocations
+    (so multi-step FSM flow tests can chain mybookings_transfer_cb → transfer_date_cb
+    → transfer_slot_cb). For single-handler tests, override `state.get_data` with
+    a fixed return value before invoking the handler.
+    """
+    state = MagicMock(spec=FSMContext)
+    state.set_state = AsyncMock()
+    state.update_data = AsyncMock()
+    state.clear = AsyncMock()
+    # Mutable dict closure for state persistence between handler calls.
+    state_data: dict[str, Any] = {}
+
+    async def _get_data() -> dict[str, Any]:
+        return dict(state_data)
+
+    async def _update_data(**kwargs: Any) -> None:
+        state_data.update(kwargs)
+
+    state.get_data = AsyncMock(side_effect=_get_data)
+    state.update_data = AsyncMock(side_effect=_update_data)
+    return state
+
+
+def _make_transfer_callback(
+    user_id: int,
+    booking_id: UUID,
+    bot: AsyncMock | None = None,
+) -> tuple[MagicMock, MyBookingsTransferCallbackData]:
+    """Mock aiogram.CallbackQuery for mybookings_transfer_cb + matching callback_data.
+
+    Same shape as _make_callback but for MyBookingsTransferCallbackData (booking_id
+    payload, prefix="mybook_transfer").
+    """
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(user_id)
+    cb.message = _make_message(user_id, text="<unused for transfer cb>")
+    cb.answer = AsyncMock()
+    cb.bot = bot or AsyncMock()
+    cb.bot.send_message = AsyncMock()
+    callback_data = MyBookingsTransferCallbackData(booking_id=booking_id)
+    return cb, callback_data
+
+
+@pytest.mark.asyncio
+async def test_mybookings_transfer_cb_happy_path(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Test #11: user taps [🔄 Перенести] for a cancelable booking → handler sets
+    FSM state to TransferStates.selecting_date, saves booking_id in state data,
+    and shows date_picker_keyboard for the new date selection.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        future_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=3)
+        future_local = future_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=future_local)
+        booking_id = booking.id
+
+    bot = AsyncMock()
+    cb, cb_data = _make_transfer_callback(user_id=111222333, booking_id=booking_id, bot=bot)
+    state = _make_state()
+
+    await client_handlers.mybookings_transfer_cb(cb, cb_data, state)
+
+    # FSM state set to selecting_date (transfer FSM entry).
+    state.set_state.assert_awaited()
+    set_state_arg = state.set_state.call_args.args[0]
+    assert set_state_arg == TransferStates.selecting_date
+
+    # booking_id saved in FSM data (as string — consistent with confirm_cb:155).
+    state.update_data.assert_awaited()
+    update_data_kwargs = state.update_data.call_args.kwargs
+    assert update_data_kwargs.get("transfer_booking_id") == str(booking_id)
+
+    # Date picker shown via message.answer with reply_markup.
+    cb.message.answer.assert_awaited()
+    reply_markup = _answer_reply_markup(cb.message)
+    assert isinstance(reply_markup, InlineKeyboardMarkup), (
+        "transfer entry must show date picker inline keyboard"
+    )
+
+    # callback.answer called (Telegram ACK).
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mybookings_transfer_cb_too_late(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Test #12: booking within 24h → "❌ Перенос возможен только за 24+ часов до записи",
+    FSM state NOT set (handler early-returns after the 24h check).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        soon_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(hours=12)
+        soon_local = soon_local.replace(minute=0, second=0, microsecond=0)
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=soon_local)
+        booking_id = booking.id
+
+    bot = AsyncMock()
+    cb, cb_data = _make_transfer_callback(user_id=111222333, booking_id=booking_id, bot=bot)
+    state = _make_state()
+
+    await client_handlers.mybookings_transfer_cb(cb, cb_data, state)
+
+    # Client gets the "too late" reply on callback.message.
+    cb.message.answer.assert_awaited()
+    err_text = _answer_text(cb.message)
+    assert "❌ Перенос возможен только за 24+ часов до записи" in err_text
+
+    # FSM state NOT set (early-return before set_state).
+    state.set_state.assert_not_awaited()
+    state.update_data.assert_not_awaited()
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mybookings_transfer_cb_unknown_user(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Test #13: telegram_id with no Client row → handler early return via
+    `if client is None:` → callback.answer("У вас нет записей"). FSM NOT entered.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session, client_telegram_id=111222333)
+        future_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=3)
+        future_local = future_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=future_local)
+        booking_id = booking.id
+
+    bot = AsyncMock()
+    # 555444333 — no Client row exists for this telegram_id.
+    cb, cb_data = _make_transfer_callback(user_id=555444333, booking_id=booking_id, bot=bot)
+    state = _make_state()
+
+    await client_handlers.mybookings_transfer_cb(cb, cb_data, state)
+
+    cb.answer.assert_awaited()
+    answer_args = cb.answer.call_args.args
+    assert answer_args and "У вас нет записей" in answer_args[0]
+    cb.message.answer.assert_not_called()
+    state.set_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mybookings_transfer_cb_not_owner(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Test #14: stranger telegram_id (different Client row) taps [Перенести] →
+    booking lookup `WHERE id=? AND client_id=?` returns no row → handler early
+    return → callback.answer("Запись не найдена"). FSM NOT entered.
+
+    Defense-in-depth: same error text as cancel flow (test #9).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session, client_telegram_id=111222333)
+        future_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=3)
+        future_local = future_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=future_local)
+        booking_id = booking.id
+
+    # ALSO seed a second Client under a different telegram_id.
+    async with session_factory() as session:
+        session.add(Client(telegram_id=999888777, name="Stranger"))
+        await session.commit()
+
+    bot = AsyncMock()
+    cb, cb_data = _make_transfer_callback(user_id=999888777, booking_id=booking_id, bot=bot)
+    state = _make_state()
+
+    await client_handlers.mybookings_transfer_cb(cb, cb_data, state)
+
+    cb.answer.assert_awaited()
+    answer_args = cb.answer.call_args.args
+    assert answer_args and "Запись не найдена" in answer_args[0]
+    cb.message.answer.assert_not_called()
+    state.set_state.assert_not_awaited()
+
+
+# ============================================================
+# transfer_slot_cb — final step → transfer_booking service call (test #15-16)
+# ============================================================
+
+
+def _make_slot_callback(
+    user_id: int,
+    slot_id: UUID,
+    bot: AsyncMock | None = None,
+) -> tuple[MagicMock, Any]:
+    """Mock aiogram.CallbackQuery for transfer_slot_cb (BookSlotCallbackData)."""
+    from bot.keyboards.client import BookSlotCallbackData
+
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(user_id)
+    cb.message = _make_message(user_id, text="<unused for slot cb>")
+    cb.answer = AsyncMock()
+    cb.bot = bot or AsyncMock()
+    cb.bot.send_message = AsyncMock()
+    callback_data = BookSlotCallbackData(slot_id=slot_id)
+    return cb, callback_data
+
+
+async def _seed_open_slot(
+    session: AsyncSession,
+    ctx: dict[str, Any],
+    *,
+    days_ahead: int = 5,
+    hour_local: int = 15,
+) -> Slot:
+    """Insert a single 'open' slot at days_ahead, hour_local — for transfer target."""
+    slot_date = (datetime.now(UTC) + timedelta(days=days_ahead)).date()
+    slot = Slot(
+        master_id=ctx["master_id"],
+        slot_date=slot_date,
+        slot_hour=hour_local,
+        status="open",
+    )
+    session.add(slot)
+    await session.commit()
+    return slot
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_cb_happy_path(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+) -> None:
+    """Test #15: user picked a new slot → transfer_booking succeeds →
+    booking.status='transferred', slot_id updated, master notified via
+    callback.bot.send_message, client gets "✅ Запись перенесена на ...".
+
+    Direct test of the final FSM step (skips mybookings_transfer_cb entry —
+    that's covered by test #11). Pre-populates state with transfer_booking_id
+    so transfer_slot_cb can resolve the booking.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        future_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=3)
+        future_local = future_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=future_local)
+        booking_id = booking.id
+        new_slot = await _seed_open_slot(session, ctx, days_ahead=5, hour_local=15)
+        new_slot_id = new_slot.id
+
+    bot = AsyncMock()
+    cb, cb_data = _make_slot_callback(user_id=111222333, slot_id=new_slot_id, bot=bot)
+    state = _make_state()
+    # Pre-populate FSM data as if mybookings_transfer_cb + transfer_date_cb ran.
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_cb(cb, cb_data, state, mock_scheduler)
+
+    # Master notification sent (text starts with "Перенос:" per transfer_booking contract).
+    bot.send_message.assert_called_once()
+    sent_kwargs = bot.send_message.call_args.kwargs
+    assert sent_kwargs["text"].startswith("Перенос:"), (
+        "master notification text must start with 'Перенос:' (transfer_booking contract)"
+    )
+    assert sent_kwargs["chat_id"] == 461355056  # ADMIN_ID
+
+    # Client gets confirmation.
+    cb.message.answer.assert_awaited()
+    assert "✅ Запись перенесена" in _answer_text(cb.message)
+
+    # state.clear() called BEFORE service call (race condition, MY-VIBE-RULES.md 24).
+    state.clear.assert_awaited()
+
+    # callback.answer called (Telegram ACK).
+    cb.answer.assert_awaited()
+
+    # DB: booking.status now 'transferred', slot_id points to new_slot.
+    async with session_factory() as verify_session:
+        b = (await verify_session.execute(
+            select(Booking).where(Booking.id == booking_id)
+        )).scalar_one()
+        assert b.status == "transferred"
+        assert b.slot_id == new_slot_id
+
+    # Old slot released to 'open', new slot booked.
+    async with session_factory() as verify_session:
+        # Old slot_id from booking's first slot — re-fetch via the slot we created.
+        # The seed_booking inserted a Slot with status='booked'; after transfer, that
+        # slot must be 'open'. We fetch by booking's new slot_id (different row).
+        new_slot_row = (await verify_session.execute(
+            select(Slot).where(Slot.id == new_slot_id)
+        )).scalar_one()
+        assert new_slot_row.status == "booked"
+
+    # Scheduler: remove_job called for old reminders, add_job for new ones.
+    actual_remove = {c.args[0] for c in mock_scheduler.remove_job.call_args_list}
+    assert actual_remove == {f"remind_24h_{booking_id}", f"remind_1h_{booking_id}"}
+    actual_add = {c.kwargs.get("id") for c in mock_scheduler.add_job.call_args_list}
+    assert actual_add == {f"remind_24h_{booking_id}", f"remind_1h_{booking_id}"}
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_cb_slot_already_booked(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+) -> None:
+    """Test #16: user picked a slot, but another caller booked it between SELECT
+    and UPDATE → SlotAlreadyBookedError → handler replies "Слот только что заняли",
+    booking stays 'confirmed' (no transfer), master NOT notified.
+
+    Simulates the race condition transfer_booking protects against at the slot
+    level (UPDATE WHERE status='open' + rowcount=0). For this test we mark the
+    target slot as 'booked' before invoking transfer_slot_cb — simulating the
+    winner's commit happening before our UPDATE.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        future_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=3)
+        future_local = future_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=future_local)
+        booking_id = booking.id
+        new_slot = await _seed_open_slot(session, ctx, days_ahead=5, hour_local=15)
+        new_slot_id = new_slot.id
+        # Mark new_slot as already 'booked' (simulating concurrent winner).
+        new_slot.status = "booked"
+        await session.commit()
+
+    bot = AsyncMock()
+    cb, cb_data = _make_slot_callback(user_id=111222333, slot_id=new_slot_id, bot=bot)
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_cb(cb, cb_data, state, mock_scheduler)
+
+    # Master NOT notified (SlotAlreadyBookedError raised before send_message).
+    bot.send_message.assert_not_called()
+    # Client gets the "slot taken" reply.
+    cb.message.answer.assert_awaited()
+    err_text = _answer_text(cb.message)
+    assert "Слот только что заняли" in err_text
+    cb.answer.assert_awaited()
+
+    # state.clear() called BEFORE service call (even on error — race condition).
+    state.clear.assert_awaited()
+
+    # DB: booking STILL 'confirmed' (transfer_booking rolled back on SlotAlreadyBookedError).
+    async with session_factory() as verify_session:
+        b = (await verify_session.execute(
+            select(Booking).where(Booking.id == booking_id)
+        )).scalar_one()
+        assert b.status == "confirmed"

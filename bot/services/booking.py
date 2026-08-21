@@ -545,6 +545,11 @@ async def transfer_booking(
     new_start_at = _build_start_at(new_slot, business_tz)
 
     # Step 7: new_start_at must be in the future (re-use SlotInPastError).
+    # Uses real datetime.now(UTC), NOT injected `ref` — semantic: the new slot
+    # must be after the REAL current time (booking a slot in the past relative
+    # to now is always wrong, regardless of `ref` which only controls the 24h
+    # rule check for the OLD booking's start_at). Mixing ref here would break
+    # tests that inject ref in far past to bypass 24h rule (e.g. test_slot_in_past).
     if new_start_at <= datetime.now(UTC):
         raise SlotInPastError(
             f"New slot {new_slot_id} start_at={new_start_at} is in the past"
@@ -574,11 +579,27 @@ async def transfer_booking(
     )
     res_b = await session.execute(upd_b)
     if cast("CursorResult[Any]", res_b).rowcount == 0:
-        # Concurrent transfer (or concurrent cancel) updated start_at between SELECT and UPDATE.
+        # rowcount=0 means WHERE clause didn't match — three possible causes:
+        #   1. Concurrent transfer (winner changed start_at) → BookingAlreadyTransferredError
+        #   2. Concurrent cancel (winner changed status to 'cancelled') →
+        #      BookingAlreadyCancelledError
+        #   3. Concurrent booking deletion (rare in MVP — no DELETE in current code)
+        # Re-SELECT to disambiguate: if status='cancelled' → cancel race; otherwise
+        # (status='transferred' OR booking gone) → transfer race. Without this
+        # re-check, concurrent cancel would surface as "Запись уже перенесена" —
+        # misleading (user sees the booking is gone, not transferred).
         await session.rollback()
+        recheck = await session.execute(
+            select(Booking.status).where(Booking.id == booking_id)
+        )
+        current_status = recheck.scalar_one_or_none()
+        if current_status == "cancelled":
+            raise BookingAlreadyCancelledError(
+                f"Booking {booking_id} was cancelled by concurrent request"
+            )
         raise BookingAlreadyTransferredError(
             f"Booking {booking_id} start_at changed between SELECT and UPDATE "
-            "(concurrent transfer or cancel)"
+            "(concurrent transfer — winner's UPDATE already committed)"
         )
 
     # Step 9: Release OLD slot → 'open' (idempotent: if new_slot == old_slot,
@@ -616,7 +637,11 @@ async def transfer_booking(
 
     # Step 12: Build master notification text "Перенос: <old> → <new>" (spec.md 318).
     # Use snapshots (already html.escape'd in DB) for client/service lines.
-    old_local_time = old_start_at.astimezone(ZoneInfo(business_tz))
+    # old_start_at is naive UTC (SQLite stores naive); explicitly mark as UTC before
+    # astimezone — otherwise Python interprets naive as system-local TZ (Mac default
+    # Europe/Moscow would render wrong old time; Render TZ=UTC is correct by accident).
+    # new_start_at is already aware UTC (built by _build_start_at).
+    old_local_time = old_start_at.replace(tzinfo=UTC).astimezone(ZoneInfo(business_tz))
     new_local_time = new_start_at.astimezone(ZoneInfo(business_tz))
     old_formatted = old_local_time.strftime("%d %B %Y, %H:%M")
     new_formatted = new_local_time.strftime("%d %B %Y, %H:%M")
@@ -634,7 +659,9 @@ async def transfer_booking(
         business_id=booking.business_id,
         client_name_snapshot=booking.client_name_snapshot,
         service_title_snapshot=booking.service_title_snapshot,
-        old_start_at=old_start_at,
+        # Store old_start_at as aware UTC (replace tzinfo) so handler's
+        # result.old_start_at.astimezone(...) is correct on all system TZs.
+        old_start_at=old_start_at.replace(tzinfo=UTC),
         new_start_at=new_start_at,
         master_notification_text=master_text,
     )

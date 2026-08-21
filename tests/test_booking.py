@@ -691,12 +691,15 @@ async def test_transfer_booking_happy_path(
     )
 
     # Acceptance: TransferResult has all fields, old + new start_at.
+    # result.old_start_at is aware UTC (service marks naive SQLite value as UTC
+    # for cross-system TZ correctness — see booking.py step 12 comment).
+    # Test's local old_start_at is naive (from booking.start_at); compare aware.
     assert isinstance(result, TransferResult)
     assert result.booking_id == booking_id
     assert result.old_slot_id == old_slot_id
     assert result.new_slot_id == new_slot_id
-    assert result.old_start_at == old_start_at
-    assert result.new_start_at != old_start_at
+    assert result.old_start_at == old_start_at.replace(tzinfo=UTC)
+    assert result.new_start_at != old_start_at.replace(tzinfo=UTC)
     # Master notification text follows spec.md 318: "Перенос: <old> → <new>".
     assert result.master_notification_text.startswith("Перенос:")
     assert "→" in result.master_notification_text

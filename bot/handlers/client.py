@@ -37,6 +37,7 @@ from bot.keyboards.client import (
     BookDateCallbackData,
     BookSlotCallbackData,
     MyBookingsCancelCallbackData,
+    MyBookingsTransferCallbackData,
     confirm_keyboard,
     date_picker_keyboard,
     mybookings_keyboard,
@@ -46,17 +47,21 @@ from bot.models import Booking, Slot
 from bot.schemas import BookingCreate
 from bot.services.booking import (
     BookingAlreadyCancelledError,
+    BookingAlreadyTransferredError,
     BookingNotFoundError,
     CancelResult,
     CancelTooLateError,
     SlotAlreadyBookedError,
     SlotClosedError,
     SlotInPastError,
+    SlotNotAvailableError,
+    TransferResult,
     cancel_booking,
     create_booking,
+    transfer_booking,
 )
 from bot.services.slots import get_available_slots
-from bot.states import BookingStates
+from bot.states import BookingStates, TransferStates
 
 logger = logging.getLogger(__name__)
 
@@ -548,3 +553,285 @@ async def mybookings_cancel_cb(
 async def no_state_fallback(message: Message) -> None:
     """Catch text when no FSM state active (bot restart mid-FSM, MemoryStorage lost state)."""
     await message.answer("Начните запись через /book")
+
+
+# ============================================================
+# 11. mybookings_transfer_cb — [🔄 Перенести] entry (StateFilter(None))
+# ============================================================
+@router.callback_query(
+    MyBookingsTransferCallbackData.filter(), StateFilter(None)
+)
+async def mybookings_transfer_cb(
+    callback: CallbackQuery,
+    callback_data: MyBookingsTransferCallbackData,
+    state: FSMContext,
+) -> None:
+    """User tapped [🔄 Перенести <date>] in /mybookings — start transfer FSM.
+
+    Validates the booking is still cancelable (start_at - 24h > now). Transfer
+    shares the same 24h window as cancel (spec.md 41 — "отмена (>24ч) или перенос
+    (>24ч)"), so we re-use the partition logic from mybookings_msg.
+
+    Saves booking_id in FSM data so subsequent date_cb / slot_cb can resolve it
+    (FSM data survives between handler invocations — MemoryStorage in dev,
+    RedisStorage in prod).
+
+    state.set_state(TransferStates.selecting_date) so the existing BookDateCallbackData
+    picker re-uses this state instead of BookingStates.selecting_date (handlers branch
+    on StateFilter — see transfer_date_cb / transfer_slot_cb below).
+    """
+    from sqlalchemy import select
+
+    from bot.models import Client
+
+    if callback.from_user is None:
+        await callback.answer()
+        return
+
+    settings = get_settings()
+    async with async_session_factory() as session:
+        # Resolve client by telegram_id (same as mybookings_cancel_cb).
+        stmt_c = select(Client).where(Client.telegram_id == callback.from_user.id)
+        client = (await session.execute(stmt_c)).scalar_one_or_none()
+        if client is None:
+            await callback.answer("У вас нет записей")
+            return
+
+        # Re-fetch booking to validate ownership + cancel-window (defensive — the
+        # booking_id in callback could be stale; user might have cancelled via web
+        # or admin between /mybookings render and this tap).
+        stmt_b = select(Booking).where(
+            Booking.id == callback_data.booking_id,
+            Booking.client_id == client.id,
+        )
+        booking = (await session.execute(stmt_b)).scalar_one_or_none()
+        if booking is None:
+            await callback.answer("Запись не найдена")
+            return
+        if booking.status == "cancelled":
+            await callback.answer("Запись уже отменена")
+            return
+
+        # 24h rule — same partition as mybookings_msg:430-448 (naive UTC comparison).
+        # We re-check here (NOT in service) to give a clear error before entering FSM
+        # (transfer_booking also raises CancelTooLateError, but we want a popup now,
+        # not after the user has picked a date+slot).
+        now_utc = datetime.now(UTC).replace(tzinfo=None)
+        deadline = booking.start_at - timedelta(hours=settings.CANCEL_MIN_HOURS)
+        if now_utc >= deadline:
+            if callback.message is not None:
+                await callback.message.answer(
+                    "❌ Перенос возможен только за 24+ часов до записи"
+                )
+            await callback.answer()
+            return
+
+    # Save booking_id in FSM (state.set_state AFTER save — order is safe because
+    # state.update_data doesn't trigger handlers, set_state does).
+    await state.update_data(transfer_booking_id=str(callback_data.booking_id))
+    await state.set_state(TransferStates.selecting_date)
+    if callback.message is not None:
+        await callback.message.answer(
+            "📅 Выберите новую дату для переноса:",
+            reply_markup=date_picker_keyboard(days_ahead=7),
+        )
+    await callback.answer()
+
+
+# ============================================================
+# 12. transfer_date_cb — user picked a date (StateFilter(TransferStates.selecting_date))
+# ============================================================
+# Re-uses BookDateCallbackData picker (same prefix="book_date") but branches on
+# TransferStates.selecting_date (distinct from BookingStates.selecting_date → date_cb).
+# aiogram dispatches by state filter, so the two handlers coexist without conflict.
+@router.callback_query(
+    BookDateCallbackData.filter(), StateFilter(TransferStates.selecting_date)
+)
+async def transfer_date_cb(
+    callback: CallbackQuery,
+    callback_data: BookDateCallbackData,
+    state: FSMContext,
+) -> None:
+    """User selected a new date for transfer — show available slots for that date.
+
+    Mirrors date_cb (booking flow) but skips master lookup checks (transfer keeps
+    the same master — we re-use booking.master_id implicitly via slot.master_id
+    in get_available_slots). State transitions: selecting_date → selecting_slot.
+    """
+    iso = callback_data.iso
+    try:
+        slot_date = date.fromisoformat(iso)
+    except ValueError:
+        await callback.answer("Невалидная дата")
+        return
+
+    settings = get_settings()
+    async with async_session_factory() as session:
+        from sqlalchemy import select
+
+        from bot.models import Master
+
+        # Single-master MVP — same lookup as date_cb:99-116.
+        stmt = select(Master).where(Master.telegram_id == settings.ADMIN_ID).limit(1)
+        master = (await session.execute(stmt)).scalar_one_or_none()
+        if master is None:
+            await state.clear()
+            if callback.message is not None:
+                await callback.message.answer("❌ Не удалось найти мастера.")
+            await callback.answer()
+            return
+
+        slots = await get_available_slots(session, master.id, slot_date)
+
+    if not slots:
+        if callback.message is not None:
+            await callback.message.answer(
+                "На эту дату нет свободных слотов. Выберите другую дату:",
+                reply_markup=date_picker_keyboard(days_ahead=7),
+            )
+        await callback.answer()
+        return
+
+    await state.update_data(selected_date=iso)
+    await state.set_state(TransferStates.selecting_slot)
+    if callback.message is not None:
+        await callback.message.answer(
+            "Выберите новое время:",
+            reply_markup=slot_picker_keyboard(slots),
+        )
+    await callback.answer()
+
+
+# ============================================================
+# 13. transfer_slot_cb — user picked a slot → call transfer_booking
+# ============================================================
+@router.callback_query(
+    BookSlotCallbackData.filter(), StateFilter(TransferStates.selecting_slot)
+)
+async def transfer_slot_cb(
+    callback: CallbackQuery,
+    callback_data: BookSlotCallbackData,
+    state: FSMContext,
+    scheduler: AsyncIOScheduler,
+) -> None:
+    """User selected a new slot — call transfer_booking service, handle all 7 errors.
+
+    Error mapping (spec.md 41, 318, 408-409 + service contracts):
+      BookingNotFoundError            → "Запись не найдена"
+      BookingAlreadyCancelledError     → "Запись уже отменена"
+      CancelTooLateError               → "❌ Перенос возможен только за 24+ часов"
+      BookingAlreadyTransferredError   → "❌ Запись уже перенесена (конкурентный запрос)"
+      SlotAlreadyBookedError            → "😔 Слот только что заняли, выберите другой"
+      SlotInPastError                  → "❌ Это время уже прошло"
+      SlotClosedError                  → "❌ Слот закрыт мастером"
+      SlotNotAvailableError            → "❌ Слот недоступен" (defensive — _select_open_slot
+                                         raises SlotClosedError or SlotAlreadyBookedError
+                                         for known cases; SlotNotAvailableError covers
+                                         unexpected states like slot not found at all)
+
+    `scheduler` injected from dp["scheduler"] workflow_data (same as confirm_cb).
+    state.clear() BEFORE service call (race condition, MY-VIBE-RULES.md 24 — same as
+    confirm_cb:355 and mybookings_cancel_cb does NOT clear because it has no FSM state).
+    """
+    from sqlalchemy import select
+
+    from bot.models import Client
+
+    if callback.from_user is None:
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    booking_id_str = data.get("transfer_booking_id")
+    if not booking_id_str:
+        # state.clear() BEFORE answer (race condition)
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer("❌ Данные потеряны. /mybookings чтобы начать")
+        await callback.answer()
+        return
+
+    settings = get_settings()
+    async with async_session_factory() as session:
+        # Resolve client by telegram_id (same as mybookings_cancel_cb:491-507).
+        stmt_c = select(Client).where(Client.telegram_id == callback.from_user.id)
+        client = (await session.execute(stmt_c)).scalar_one_or_none()
+        if client is None:
+            # No FSM clear here — user has no records at all; state stays for retry.
+            await callback.answer("У вас нет записей")
+            return
+
+        # state.clear() BEFORE service call (race condition, MY-VIBE-RULES.md 24).
+        # transfer_booking is idempotent on race (start_at pin), but if user taps
+        # twice in quick succession, the second tap should NOT reuse stale state.
+        await state.clear()
+        try:
+            result: TransferResult = await transfer_booking(
+                session,
+                UUID(booking_id_str),
+                callback_data.slot_id,
+                client.id,
+                scheduler,
+            )
+        except BookingNotFoundError:
+            await callback.answer("Запись не найдена")
+            return
+        except BookingAlreadyCancelledError:
+            await callback.answer("Запись уже отменена")
+            return
+        except CancelTooLateError:
+            if callback.message is not None:
+                await callback.message.answer(
+                    "❌ Перенос возможен только за 24+ часов до записи"
+                )
+            await callback.answer()
+            return
+        except BookingAlreadyTransferredError:
+            if callback.message is not None:
+                await callback.message.answer(
+                    "❌ Запись уже перенесена (конкурентный запрос). "
+                    "/mybookings чтобы увидеть актуальный список"
+                )
+            await callback.answer()
+            return
+        except SlotAlreadyBookedError:
+            if callback.message is not None:
+                await callback.message.answer(
+                    "😔 Слот только что заняли. /mybookings чтобы выбрать другой"
+                )
+            await callback.answer()
+            return
+        except SlotInPastError:
+            if callback.message is not None:
+                await callback.message.answer("❌ Это время уже прошло.")
+            await callback.answer()
+            return
+        except SlotClosedError:
+            if callback.message is not None:
+                await callback.message.answer("❌ Слот закрыт мастером.")
+            await callback.answer()
+            return
+        except SlotNotAvailableError:
+            if callback.message is not None:
+                await callback.message.answer("❌ Слот недоступен.")
+            await callback.answer()
+            return
+
+        # Send master notification (Pure/IO — service prepared text, handler sends).
+        # Single-master MVP: master.telegram_id == settings.ADMIN_ID.
+        if callback.bot is not None:
+            await callback.bot.send_message(
+                chat_id=settings.ADMIN_ID,
+                text=result.master_notification_text,
+            )
+
+    if callback.message is not None:
+        # Render client confirmation using result.new_start_at (UTC) → LOCAL.
+        # new_start_at is aware UTC (transfer_booking returns aware); convert to
+        # business tz for display (same pattern as cancel_booking:380).
+        from zoneinfo import ZoneInfo
+
+        new_local = result.new_start_at.astimezone(ZoneInfo(settings.TIMEZONE))
+        when = new_local.strftime("%d %b %Y, %H:%M")
+        await callback.message.answer(f"✅ Запись перенесена на {when}. Мастер уведомлён.")
+    await callback.answer()
