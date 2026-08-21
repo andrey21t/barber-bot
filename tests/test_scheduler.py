@@ -15,6 +15,7 @@ from uuid import uuid4
 import pytest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bot.models import Booking, Business, Client, Master, Slot
+from freezegun import freeze_time
 from scheduler import (
     build_scheduler,
     on_startup_scan,
@@ -178,29 +179,39 @@ async def test_schedule_for_booking_run_date_is_24h_before(
 async def test_on_startup_scan_phase_2_reschedules_upcoming(
     session_factory: Any, session: AsyncSession, scheduler: AsyncIOScheduler
 ) -> None:
-    """on_startup_scan Phase 2: schedule_for_booking for ALL upcoming bookings."""
-    _start_scheduler(scheduler)
+    """on_startup_scan Phase 2: schedule_for_booking for ALL upcoming bookings.
 
-    # Tomorrow at 14:00 Moscow → 11:00 UTC
-    tomorrow_date = (datetime.now(UTC) + timedelta(days=1)).date()
-    from datetime import time as dtime
-    from zoneinfo import ZoneInfo
+    Frozen at 2026-01-15T12:00:00Z to make the test deterministic.
+    Without freeze, `start_at = tomorrow 14:00 MSK` lands at tomorrow 11:00 UTC, so
+    `start_at - now` ranges 23h..25h+ depending on current UTC time. When run in
+    UTC 10:00..11:00 window, `start_at - now` >= 25h and booking falls outside the
+    `start_at < now + 25h` upcoming filter (notifications.py:80-82) — Phase 2 returns
+    empty list, no jobs scheduled, test fails. freezegun pins `now` to 12:00 UTC so
+    `start_at - now` = 23h deterministically, always inside the upcoming window.
+    """
+    with freeze_time("2026-01-15T12:00:00Z"):
+        _start_scheduler(scheduler)
 
-    start_at = datetime.combine(
-        tomorrow_date, dtime(hour=14), tzinfo=ZoneInfo("Europe/Moscow")
-    ).astimezone(UTC)
+        # Tomorrow at 14:00 Moscow → 11:00 UTC (frozen now = 2026-01-15 12:00 UTC)
+        tomorrow_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        from datetime import time as dtime
+        from zoneinfo import ZoneInfo
 
-    booking = await _seed_booking(session, start_at)
+        start_at = datetime.combine(
+            tomorrow_date, dtime(hour=14), tzinfo=ZoneInfo("Europe/Moscow")
+        ).astimezone(UTC)
 
-    # Run on_startup_scan
-    await on_startup_scan(scheduler, session_factory)
+        booking = await _seed_booking(session, start_at)
 
-    # Phase 2 should have scheduled 2 jobs for this booking
-    jobs = scheduler.get_jobs()
-    assert len(jobs) == 2
-    assert f"remind_24h_{booking.id}" in {j.id for j in jobs}
+        # Run on_startup_scan
+        await on_startup_scan(scheduler, session_factory)
 
-    scheduler.shutdown(wait=False)
+        # Phase 2 should have scheduled 2 jobs for this booking
+        jobs = scheduler.get_jobs()
+        assert len(jobs) == 2
+        assert f"remind_24h_{booking.id}" in {j.id for j in jobs}
+
+        scheduler.shutdown(wait=False)
 
 
 @pytest.mark.asyncio
