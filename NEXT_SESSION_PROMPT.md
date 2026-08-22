@@ -1,8 +1,8 @@
-# NEXT_SESSION_PROMPT — Tier 2 (T9+T10) закрыт. Что дальше после coverage 94%.
+# NEXT_SESSION_PROMPT — Coverage 99% достигнут. Что дальше.
 
-> Дата: 2026-08-22 · Сессия завершена: T9 admin + T10 client + bonus keyboards + FK surgery fix.
-> 205 тестов, 0 skipped, ruff + mypy чисто. Coverage 92% → 94% (103 miss → 79 miss, 24 stmts).
-> Code-review subagent VERDICT LGTM, 3 фикса применены (W1, S1, S3).
+> Дата: 2026-08-22 · 3 коммита: dead code removal + main.py/session.py coverage + S1 fix.
+> 217 тестов, 0 skipped, ruff + mypy чисто. Coverage 94% → 99% (79 miss → 8 miss, 71 stmt).
+> Independent review: code-reviewer LGTM (0 critical, 0 warnings), S1 применён.
 > Цель следующей сессии: выбрать направление из списка ниже (нет блокирующих багов).
 
 ## Контекст проекта
@@ -14,111 +14,143 @@
 
 ## Состояние на момент сохранения
 
-### Завершено в этой сессии (1 коммит `7e86793`)
+### Завершено в этой сессии (3 коммита)
 
-Tier 2 coverage sweep — 13 новых тестов в 2 файлах (+477 строк):
-- **T9 admin** (3 теста): `cmd_addslots` master not found, `cmd_closeslot` returns False race (monkeypatch), `_resolve_master_and_business` business FK broken (raw DELETE)
-- **T10 client** (7 тестов): `from_user is None` early-return ×3 (`mybookings_msg`, `mybookings_cancel_cb`, `mybookings_transfer_cb`, `transfer_slot_cb`), `BookingAlreadyCancelledError` race (monkeypatch `cancel_booking`), `no_state_fallback`, `mybookings_transfer_cb` booking.status='cancelled'
-- **Bonus keyboards** (2 теста): `slot_picker_keyboard([])` noop button, `_no_op_button()` helper unit
-- **S1 fix**: `confirm_cb` business is None FK surgery (closed pre-existing skip line 2079) — mirrors admin.py:66 raw DELETE pattern
+**`8ca8282` — Dead code removal (admin.py refactor)**
+- `cmd_addslots`: убран `if not hours:` (недостижим после `len(args) < 2`)
+- `cmd_addslots` / `cmd_closeslot` / `cmd_services`: `if admin_id is None: return` → `assert admin_id is not None` (type narrowing для mypy, паттерн из `client.py:302-304`)
+- admin.py: 98% → 100%
 
-Code-review fixes:
-- **W1**: misleading docstring на `_no_op_button` test (helper НЕ вызывается в `slot_picker_keyboard` — independent implementations)
-- **S3**: `state.clear.assert_not_awaited()` добавлен в `mybookings_transfer_cb` from_user None test (defense-in-depth)
+**`80d7690` — main.py / session.py coverage (12 тестов)**
+- `tests/test_session.py` (6 тестов): `build_ssl_context` 4 ветки + `CorpAiohttpSession.__init__` (ssl в `_connector_init`, kwargs forwarding)
+- `tests/test_main.py` (6 тестов): `setup_logging`, `_on_startup`, `_on_shutdown`, `main()` wiring (3 routers identity check, 2 middleware, 2 hooks, scheduler workflow_data, finally session.close), error path
+- Паттерн: `monkeypatch bot.main.{Bot,Dispatcher,CorpAiohttpSession,scheduler,setup_logging}` → вызов `main()` → assertions на wiring
+
+**`ba39d6a` — S1 fix (test isolation)**
+- `test_corp_aiohttp_session_init_*`: добавлена изоляция `~/okko-ca.pem` + `BARBER_SSL_CA_BUNDLE` env
+- S1 от code-reviewer: на dev машине `~/okko-ca.pem` существует (corp CA, 130 certs), на CI — нет. Assertions проходили в обоих, но тест был impure.
 
 ### Состояние тестов
 
 ```
-pytest: 205 passed, 0 skipped in 3.47s
+pytest: 217 passed, 0 skipped in ~3.5s
 ruff check: All checks passed
-ruff format: All clean
-mypy: 34 source files, no issues
-coverage: 94% (1281 stmts, 79 miss)
+ruff format --check: 9 pre-existing files would be reformatted (НЕ мои, ruff 0.15 новая компактификация)
+mypy: 23-24 source files, no issues
+coverage: 99% (1275 stmts, 8 miss)
 ```
 
-Pre-existing flaky: `test_add_slots_concurrent_race_raises_slot_exists` (одиночный 1 из 10 запусков — `asyncio.gather` nondeterminism, не блокирующее).
+Pre-existing flaky: `test_add_slots_concurrent_race_raises_slot_exists` (1 из 10 запусков — `asyncio.gather` nondeterminism, не блокирующее).
 
 ### Финальный coverage breakdown
 
 ```
-bot/handlers/admin.py     218   5   98%   128-129, 133, 210, 345  (dead code)
+bot/handlers/admin.py     212   0  100%   ← было 98% (5 dead code)
 bot/handlers/client.py   386   0  100%
 bot/keyboards/client.py   63   0  100%
 bot/services/booking.py  229   0  100%
 bot/services/slots.py      51   0  100%
 bot/services/admin.py      47   0  100%
-bot/services/notifications.py 33   0  100%
+bot/services/notifications.py 33 0 100%
 bot/middlewares/session_timeout.py 27 0 100%
-bot/models.py              73   0  100%
-bot/schemas.py             26   0  100%
-bot/config.py              15   0  100%
-bot/states.py              10   0  100%
-bot/db.py                  20   6   70%   22-23, 28-29, 33, 43  (dev/test utilities)
-bot/main.py                44  44    0%   16-112  (bootstrap)
-bot/session.py             24  24    0%   1-40  (aiogram internals)
-TOTAL                     1281  79   94%
+bot/main.py               44   2   95%   110-112 (if __name__ block, нужен subprocess)
+bot/session.py            24   0  100%   ← было 0%
+bot/models.py             73   0  100%
+bot/schemas.py            26   0  100%
+bot/config.py             15   0  100%
+bot/states.py             10   0  100%
+bot/db.py                 20   6   70%   22-23, 28-29, 33, 43 (dev/test utilities)
+TOTAL                   1275   8   99%
 ```
 
-## Что НЕ сделано (опционально, не блокирующее)
+### Что НЕ покрыто (8 miss)
 
-### Опц. 1 — main.py / session.py coverage (mock aiogram internals)
-
-44+24 = 68 stmts (заведёт coverage до ~99%):
-- `bot/main.py` — bootstrap (build_scheduler, include_router, SessionTimeoutMiddleware wiring, scheduler.start). Нужен mock aiogram Dispatcher.
-- `bot/session.py` — aiogram-internal utilities (low value, обёртки над aiogram API).
-- Сложность: medium (~1-2 часа, требует aiogram testing patterns — `dp.feed_update` или unittest mock).
-
-### Опц. 2 — Урок 2.6 Postgres migration (наиболее значимое)
-
-Pre-existing warning (зафиксировано, не блокирующее на dev):
-- `booking.start_at.astimezone(ZoneInfo(business_tz))` на naive datetime из SQLite интерпретирует naive как system-local TZ. На Render (TZ=UTC) — корректно. Баг проявится при миграции на Postgres с TIMESTAMP WITHOUT TZ на сервере вне UTC.
-- `get_client_bookings` в admin.py:152 — `datetime.now(tz=None)` возвращает NAIVE LOCAL (не UTC). Pre-existing warning — handler mybookings_msg:430-431 уже обходит это (использует `datetime.now(UTC)` и strip tzinfo). Service-уровень всё ещё naive local для filter.
-
-Фикс — миграция на Postgres с TIMESTAMP WITH TZ (или явная конвертация naive → aware UTC в service). Это Урок 2.6, большая задача. High-stakes → нужен `deep-analysis-critic` subagent.
-
-### Опц. 3 — Урок 2.5 aiogram_calendar month-navigation
-
-Сейчас `date_picker_keyboard(days_ahead=7)` — простые 7 кнопок. aiogram_calendar в deps для будущей month-navigation. Не блокирующее — 7 дней хватает для MVP.
-
-### Опц. 4 — Stabilise FLAKY test_add_slots_concurrent_race_raises_slot_exists
-
-`asyncio.gather` nondeterminism — иногда 2 winner вместо 1 (UNIQUE constraint race). Можно стабилизировать через patched SELECT (как в `test_transfer_booking_concurrent_race_runtime`) или оставить как есть (1 из 10 запусков — acceptable для dev).
-
-### Опц. 5 — Dead code 5 строк в admin.py
-
-```
-admin.py:128-129  — if not hours (unreachable после len(args) >= 2 check)
-admin.py:133, 210, 345 — if admin_id is None (unreachable после _is_admin True)
-```
-Можно удалить (dead code removal) или оставить как defense-in-depth. Не критично.
+- `bot/main.py:110-112` (3 строки) — `if __name__ == "__main__": asyncio.run(main())` — нужен subprocess test, low value
+- `bot/db.py:22-23, 28-29, 33, 43` (6 строк) — `create_all()`, `drop_all()`, `dispose()`, `utcnow()` — dev/test utilities
 
 ## Что делать следующей сессии
 
 Нет блокирующих багов. Выбери направление (по приоритету ресурса):
 
-1. **Если есть ресурс ~5-10 мин → Опц. 5** (dead code removal) — убрать 5 unreachable строк из admin.py.
-2. **Если есть ресурс ~1-2 часа → Опц. 1** (main.py / session.py coverage) — mock aiogram Dispatcher, ~99% coverage.
-3. **Если хочется большой фичи → Опц. 2** (Postgres migration, Урок 2.6) — отдельная сессия, big-stakes, нужен deep-analysis-critic.
+### Опц. A — Урок 2.6 Postgres migration (наиболее значимое, high-stakes)
 
-### Quick start prompt для opencode
+**Pre-existing warning** (зафиксировано, не блокирующее на dev):
+- `booking.start_at.astimezone(ZoneInfo(business_tz))` на naive datetime из SQLite интерпретирует naive как system-local TZ. На Render (TZ=UTC) — корректно. Баг проявится при миграции на Postgres с TIMESTAMP WITHOUT TZ на сервере вне UTC.
+- `get_client_bookings` в admin.py:152 — `datetime.now(tz=None)` возвращает NAIVE LOCAL (не UTC). Handler `mybookings_msg:430-431` обходит через `datetime.now(UTC)` + strip tzinfo. Service-уровень всё ещё naive local для filter.
+
+**Фикс** — миграция на Postgres с TIMESTAMP WITH TZ (или явная конвертация naive → aware UTC в service).
+
+**Сложность:** большая задача, отдельная сессия.
+**Гейты:** high-stakes → `deep-analysis-protocol` Pass 1-4 + `deep-analysis-critic` subagent обязателен.
+**Примерный объём:** 4-8 часов (schema migration + service fixes + tests update + Render deployment).
+
+### Опц. B — Stabilise FLAKY test_add_slots_concurrent_race_raises_slot_exists
+
+`asyncio.gather` nondeterminism — иногда 2 winner вместо 1 (UNIQUE constraint race). 1 из 10 запусков.
+**Стабилизация:** patched SELECT паттерн (как `test_transfer_booking_concurrent_race_runtime`) — сериализация через DB-level lock или снижение concurrency до 1 (точная race simulation через два последовательных add с проверкой UNIQUE).
+**Сложность:** ~30-60 минут, logic-класс.
+**Гейты:** `deep-analysis` Pass 1-4 (logic), без critic.
+
+### Опц. C — db.py coverage (6 miss lines → 100% TOTAL)
+
+`create_all`, `drop_all`, `dispose`, `utcnow` — dev/test utilities. Покрытие ~30 минут.
+- `create_all` / `drop_all` — запустить на in-memory engine, проверить что таблицы создаются/удаляются
+- `dispose` — `await engine.dispose()` + проверить `engine.disposed` flag
+- `utcnow` — простая функция, один assert `isinstance(utcnow(), datetime)`
+
+**Сложность:** trivial, без deep-analysis.
+**Coverage:** 99% → ~100% (формально, но 2 miss в `if __name__` останутся).
+
+### Опц. D — main.py `if __name__` block (3 miss lines → 100%)
+
+Тест через subprocess: `subprocess.run([sys.executable, "bot/main.py"], env=mock_env, timeout=2)` → проверить что процесс запустился и упал по timeout (или подключился к polling).
+**Сложность:** ~20 минут, но subprocess test хрупкий (cross-platform, env isolation).
+**Гейты:** deep-analysis Pass 1-4 (subprocess + process lifecycle = state risk).
+
+### Опц. E — Урок 2.5 aiogram_calendar month-navigation
+
+Сейчас `date_picker_keyboard(days_ahead=7)` — простые 7 кнопок. aiogram_calendar в deps для будущей month-navigation.
+**Не блокирующее** — 7 дней хватает для MVP.
+**Сложность:** medium (~2-3 часа), UX change.
+
+### Опц. F — Pre-existing ruff format drift (9 файлов)
+
+`ruff 0.15` компактирует многострочные string'и до 100 символов. 9 файлов требуют reformat:
+`bot/handlers/client.py`, `bot/handlers/start.py`, `bot/keyboards/client.py`, `bot/middlewares/session_timeout.py`, `bot/models.py`, `bot/services/notifications.py`, `tests/test_admin.py`, `tests/test_notifications.py`, `tests/test_scheduler.py`.
+
+**Исправление:** `.venv/bin/ruff format bot/ tests/` + commit.
+**Риск:** trivial (reformat не меняет AST), но diff будет на 9 файлах → code-review желателен.
+**Сложность:** 5 минут + гейты.
+
+## Рекомендация
+
+| Если есть ресурс | Что делать | Почему |
+|---|---|---|
+| 5-10 мин | **Опц. F** (ruff format) | Тривиальный reformat, гейты `--check` снова зелёные |
+| 30 мин | **Опц. C** (db.py) | Закроет coverage до ~100%, trivial |
+| 1 час | **Опц. B** (flaky stabilize) | Уберёт последний известный flaky |
+| 4-8 часов | **Опц. A** (Postgres) | Главная техническая задача проекта |
+
+## Quick start prompt для opencode
 
 ```
-Продолжаем barber-bot Блок 3 — что после Tier 2 (T9+T10 закрыт).
+Продолжаем barber-bot Блок 4 — coverage 99% достигнут (3 коммита сессии 2026-08-22).
 
 Прочитай ~/PycharmProjects/barber-bot/NEXT_SESSION_PROMPT.md — там полный контекст:
-- Tier 2 coverage sweep завершён (commit 7e86793): 205 тестов, 0 skipped, coverage 94%
-- Code-review subagent VERDICT LGTM, 3 фикса применены (W1, S1, S3)
-- Все гейты зелёные: ruff + mypy + pytest 205 passed
+- Сессия 2026-08-22: dead code (8ca8282) + main/session coverage (80d7690) + S1 fix (ba39d6a)
+- 217 тестов, 0 skipped, coverage 99% (8 miss: 3 main.py __name__ + 6 db.py utilities)
+- Code-reviewer LGTM, S1 применён, independent review подтвердил
 
 Нет блокирующих багов. Выбери направление:
-1. Dead code removal (~5-10 мин) — убрать 5 unreachable строк из admin.py
-2. main.py / session.py coverage (~1-2 часа) — mock aiogram Dispatcher, ~99%
-3. Урок 2.6 — Postgres migration (отдельная сессия, high-stakes, deep-analysis-critic)
+A. Postgres migration (Урок 2.6, 4-8 часов, high-stakes, deep-analysis-critic)
+B. Stabilise flaky test_add_slots_concurrent_race (~30-60 мин, logic, deep-analysis)
+C. db.py coverage 6 miss → ~100% (30 мин, trivial)
+D. main.py __name__ block subprocess test (20 мин, state risk)
+E. aiogram_calendar month-navigation (~2-3 часа, UX)
+F. ruff format drift 9 файлов (5 мин, trivial)
 
-Гейты: deep-analysis НЕ нужен для Опц. 5 (trivial dead code). Для Опц. 1 —
-deep-analysis Pass 1-4 (новый fixture aiogram mock). Для Опц. 2 — high-stakes
-+ deep-analysis-critic subagent. Pre-push НЕ нужен (личный репо).
-Коммитить свободно (pet-проект, AGENTS.md § git-repo-categories).
+Гейты: deep-analysis для B/D (logic/state), critic для A (high-stakes).
+Skip для C/F (trivial). Pre-push НЕ нужен (личный репо). Коммитить свободно.
 ```
 
 ## Файлы для быстрого ориентирования
@@ -128,7 +160,7 @@ deep-analysis Pass 1-4 (новый fixture aiogram mock). Для Опц. 2 — h
 | `spec.md` | SSOT — контракты переноса (реализованы) | 541 |
 | `MY-VIBE-RULES.md` | Формат работы + FSM edge cases + rules | 79 |
 | `bot/handlers/client.py` | Booking flow + /mybookings + cancel + transfer FSM | 837 |
-| `bot/handlers/admin.py` | /addslots, /closeslot, /today, /week, /services + 3 helpers | 389 |
+| `bot/handlers/admin.py` | /addslots, /closeslot, /today, /week, /services + 3 helpers | 383 |
 | `bot/services/booking.py` | create_booking + cancel_booking + transfer_booking | ~660 |
 | `bot/services/admin.py` | get_today/week_bookings, create_service, get_client_bookings | 160 |
 | `bot/services/slots.py` | add_slots, close_slot, get_available_slots | 102 |
@@ -136,11 +168,16 @@ deep-analysis Pass 1-4 (новый fixture aiogram mock). Для Опц. 2 — h
 | `bot/models.py` | 7 таблиц — Booking (status confirmed/transferred/cancelled), Slot, NotificationLog | 184 |
 | `bot/states.py` | BookingStates + TransferStates | 28 |
 | `bot/config.py` | Settings: CANCEL_MIN_HOURS=24, REMINDER_24H_BEFORE, REMINDER_1H_BEFORE | 29 |
+| `bot/main.py` | Entry point: Bot, Dispatcher, scheduler lifecycle, polling | 112 |
+| `bot/session.py` | CorpAiohttpSession — corp CA bundle auto-detection | 40 |
+| `bot/db.py` | Base, engine, async_session_factory, create_all/drop_all/dispose/utcnow | 43 |
 | `scheduler.py` | build_scheduler, schedule_for_booking, remove_jobs_for_booking, on_startup_scan | 126 |
 | `tests/test_booking.py` | booking service tests + 12 transfer tests + concurrent race runtime | ~2053 |
-| `tests/test_admin_handlers.py` | admin handlers tests (94 теста + T9) | 1282 |
-| `tests/test_client_handlers.py` | client handlers tests (57 тестов + T10 + bonus) | ~2600 |
+| `tests/test_admin_handlers.py` | admin handlers tests (94 + T9) | 1282 |
+| `tests/test_client_handlers.py` | client handlers tests (57 + T10 + bonus) | ~2600 |
 | `tests/test_admin.py` | services/admin tests (timezone edge cases, _utc_naive helper) | 703 |
+| `tests/test_main.py` | bot/main.py wiring + lifecycle (6 тестов) | 158 |
+| `tests/test_session.py` | bot/session.py ssl context + CorpAiohttpSession (6 тестов) | 124 |
 
 ## Гейты (напоминание)
 
@@ -160,6 +197,14 @@ deep-analysis Pass 1-4 (новый fixture aiogram mock). Для Опц. 2 — h
 
 `datetime.now(tz=None)` возвращает NAIVE LOCAL. Handler `mybookings_msg:430-431` обходит через `datetime.now(UTC)` + strip tzinfo. Service-уровень всё ещё naive local. Фикс — Урок 2.6.
 
+### W3 — assert в production при python -O (admin.py:129, 205, 339)
+
+`assert admin_id is not None` strip'ается при `python -O`. Graceful degradation: `_resolve_master_and_business(None)` → `Master.telegram_id == None` → no rows → "Мастер не найден" (не crash). Acceptable для pet-проекта без `-O` в deploy. Альтернатива: `if admin_id is None: return` для defense-in-depth.
+
 ### FLAKY — test_add_slots_concurrent_race_raises_slot_exists
 
-`asyncio.gather` nondeterminism — 1 из 10 запусков даёт 2 winner вместо 1 (UNIQUE race). Не блокирующее (dev-only, single-threaded локально). Для stabilise — patched SELECT паттерн (как `test_transfer_booking_concurrent_race_runtime`).
+`asyncio.gather` nondeterminism — 1 из 10 запусков даёт 2 winner вместо 1 (UNIQUE race). Не блокирующее (dev-only, single-threaded локально). Для стабилизации — patched SELECT паттерн (как `test_transfer_booking_concurrent_race_runtime`).
+
+### RUFF FORMAT DRIFT — 9 файлов (ruff 0.15 новая компактификация)
+
+`ruff 0.15` компактирует многострочные string'и до 100 символов. 9 файлов не отформатированы под новую версию. Не влияет на AST и runtime. Fix: `.venv/bin/ruff format bot/ tests/` + commit (Опц. F).
