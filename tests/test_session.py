@@ -74,16 +74,36 @@ def test_build_ssl_context_env_sserror_continues_to_home_pem(
     assert mock_load.call_count == 2
 
 
-def test_corp_aiohttp_session_init_sets_ssl_in_connector() -> None:
-    """CorpAiohttpSession() — _connector_init['ssl'] is replaced with build_ssl_context() result."""
+def test_corp_aiohttp_session_init_sets_ssl_in_connector(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """CorpAiohttpSession() — _connector_init['ssl'] is replaced with build_ssl_context() result.
+
+    Isolates ~/okko-ca.pem + BARBER_SSL_CA_BUNDLE env (S1 from code-review):
+    on dev machine ~/okko-ca.pem exists (corp CA), on CI it doesn't — test must pass
+    in both environments without relying on real file presence.
+    """
+    monkeypatch.delenv("BARBER_SSL_CA_BUNDLE", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
     session = CorpAiohttpSession()
 
     assert "ssl" in session._connector_init
     assert isinstance(session._connector_init["ssl"], ssl.SSLContext)
 
 
-def test_corp_aiohttp_session_init_passes_kwargs_to_super() -> None:
-    """CorpAiohttpSession(limit=42) — kwargs forwarded to AiohttpSession.__init__."""
+def test_corp_aiohttp_session_init_passes_kwargs_to_super(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """CorpAiohttpSession(limit=42) — kwargs forwarded to AiohttpSession.__init__.
+
+    Isolation: see test_corp_aiohttp_session_init_sets_ssl_in_connector (S1).
+    """
+    monkeypatch.delenv("BARBER_SSL_CA_BUNDLE", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
     session = CorpAiohttpSession(limit=42)
 
     assert session._connector_init["limit"] == 42
