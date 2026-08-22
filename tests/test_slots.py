@@ -1,6 +1,5 @@
 """Tests for bot.services.slots."""
 
-import asyncio
 from datetime import UTC, date, datetime
 from typing import Any
 from uuid import uuid4
@@ -14,6 +13,7 @@ from bot.services.slots import (
     get_available_slots,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql.selectable import Select
 
 
 @pytest.mark.asyncio
@@ -146,34 +146,40 @@ async def test_add_slots_empty_hours_raises_value_error(
 async def test_add_slots_concurrent_race_raises_slot_exists(
     session_factory_concurrent: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Concurrent add_slots with same (master_id, slot_date, slot_hour) —
-    loser catches IntegrityError and raises SlotAlreadyExistsError.
+    """Runtime race protection — deterministic replacement of asyncio.gather.
 
-    Covers bot/services/slots.py:48-51 — IntegrityError catch + rollback +
+    Covers bot/services/slots.py:44-53 — IntegrityError catch + rollback +
     re-raise as SlotAlreadyExistsError. The composite unique constraint
-    `ux_slots_master_date_hour` rejects the loser's INSERT at commit time.
+    `ux_slots_master_date_hour` rejects the loser's INSERT at flush time.
 
-    Uses asyncio.gather: both coroutines start, both SELECT existing (none
-    committed yet), both INSERT. SQLite file-based serializes writes — the
-    loser's flush() blocks on the writer lock (default sqlite3 timeout 5.0s,
-    passed through aiosqlite), waits for the winner's COMMIT to release the
-    lock, then sees the now-visible unique constraint and raises
-    IntegrityError. add_slots catches it (slots.py:48) and re-raises as
-    SlotAlreadyExistsError.
+    Flaky history: the previous asyncio.gather version flaked 1/10 —
+    asyncio.gather doesn't guarantee both SELECTs fire before either
+    INSERT. If A fully wins (SELECT+INSERT+COMMIT) before B's SELECT, B sees
+    A's committed slot and takes the idempotent path (slots.py:37-38),
+    returning [] — `len(success) == 2` would fail the test.
 
-    Manual orchestration (like test_booking.py:1082) is overkill here —
-    no WHERE-clause pin to verify, just unique constraint enforcement.
-    asyncio.gather is sufficient and simpler.
+    Approach (deterministic, no asyncio.gather — pattern from
+    test_booking.py:1122 `test_transfer_booking_concurrent_race_runtime`):
+      1. Seed business + master through s_seed (committed).
+      2. s_a: real add_slots(s_a, master_id, slot_date, [14]) — SELECT empty,
+         INSERT, COMMIT. slot_a now in DB.
+      3. s_b: patch first SELECT FROM Slot → return empty _FakeResult
+         (simulates B captured snapshot before A's commit, then resumes).
+         add_slots(s_b, master_id, slot_date, [14]) — SELECT returns empty
+         (patched), INSERT slot_b same hour → UNIQUE constraint violation
+         (slot_a committed) → IntegrityError catch (slots.py:46) → rollback
+         → SlotAlreadyExistsError.
+      4. Verify final DB state: exactly one slot (slot_a, hour=14).
 
-    Flakiness risk (LOW): if asyncio.gather runs coroutine A to full
-    completion (SELECT+INSERT+COMMIT) before B's SELECT starts, B sees A's
-    committed slot and takes the idempotent path (slots.py:39-40), returning
-    [] — `len(success) == 2` would fail the test. In practice both SELECTs
-    fire before either flush, but a heavily loaded CI could trigger this.
-    If observed, switch to manual orchestration (s_a INSERT without commit,
-    s_b add_slots inside `async with s_a`).
+    Faithfulness: tests the actual service's IntegrityError catch + rollback
+    + re-raise behavior at runtime. If the catch were removed, slot_b's
+    INSERT would propagate IntegrityError unchanged.
+
+    Why file-based SQLite (not in-memory): default in-memory + QueuePool gives
+    each connection its own DB (sessions can't share state). File-based allows
+    multiple connections to same DB — A's commit is visible to B's INSERT.
     """
-    # Seed business + master (no slots yet) through a dedicated session
+    # Step 1: Seed business + master (no slots yet) through s_seed
     async with session_factory_concurrent() as s_seed:
         biz = Business(
             name="Race Barbershop",
@@ -194,33 +200,73 @@ async def test_add_slots_concurrent_race_raises_slot_exists(
 
     slot_date = datetime.now(UTC).date()
 
-    # Two concurrent sessions, same (master_id, slot_date, hour=14)
-    async with (
-        session_factory_concurrent() as s_a,
-        session_factory_concurrent() as s_b,
-    ):
-        results = await asyncio.gather(
-            add_slots(s_a, master_id, slot_date, [14]),
-            add_slots(s_b, master_id, slot_date, [14]),
-            return_exceptions=True,
-        )
+    # Step 2: s_a wins fully — real add_slots, slot_a committed to DB
+    async with session_factory_concurrent() as s_a:
+        result_a = await add_slots(s_a, master_id, slot_date, [14])
+        assert len(result_a) == 1
+        assert result_a[0].slot_hour == 14
 
-    success = [r for r in results if not isinstance(r, Exception)]
-    errors = [r for r in results if isinstance(r, Exception)]
-    assert len(success) == 1, f"expected 1 winner, got {len(success)}: {results!r}"
-    assert len(errors) == 1, f"expected 1 loser, got {len(errors)}: {results!r}"
-    assert isinstance(errors[0], SlotAlreadyExistsError), (
-        f"expected SlotAlreadyExistsError, got {type(errors[0]).__name__}: {errors[0]!r}"
-    )
+    # DB now has: slot(master_id, slot_date, hour=14, status='open')
 
-    # Verify exactly one slot was committed to DB
+    # Step 3: s_b — patch first SELECT FROM Slot to return empty (stale
+    # snapshot, simulates B captured SELECT before A's commit, then resumes)
+    async with session_factory_concurrent() as s_b:
+        original_execute = s_b.execute
+        patch_active = True
+
+        async def patched_execute(statement, *args, **kwargs):
+            nonlocal patch_active
+            if patch_active and isinstance(statement, Select):
+                # Detect SELECT FROM Slot — first existing-slots lookup in add_slots.
+                # If entity detection fails (e.g. SQLAlchemy API change), raise
+                # explicitly — silent bypass would let B see A's committed slot,
+                # take the idempotent path, return [] — test would fail with
+                # confusing "DID NOT RAISE" instead of clear "patched_execute
+                # entity detection failed: ..." (pattern from test_booking.py:1258).
+                try:
+                    entities = [d.get("entity") for d in statement.column_descriptions]
+                    if any(isinstance(e, type) and issubclass(e, Slot) for e in entities):
+                        patch_active = False  # only first SELECT (existing slots lookup)
+
+                        # _FakeResult implements only scalars().all() — the only
+                        # method add_slots:33 calls on the SELECT result. If service
+                        # refactors to .one()/.first()/.scalar_one(), this would raise
+                        # AttributeError — add the method here. (W1 analogue.)
+                        class _FakeResult:  # type: ignore[no-redef]
+                            def scalars(self):
+                                class _Scalars:
+                                    def all(self):
+                                        return []  # stale snapshot: no slots yet
+
+                                return _Scalars()
+
+                        return _FakeResult()
+                except (KeyError, AttributeError, TypeError) as e:
+                    raise AssertionError(
+                        f"patched_execute entity detection failed: {e!r} — "
+                        f"SQLAlchemy column_descriptions API may have changed"
+                    ) from e
+            return await original_execute(statement, *args, **kwargs)
+
+        s_b.execute = patched_execute  # type: ignore[method-assign]  # test patch
+        try:
+            with pytest.raises(SlotAlreadyExistsError):
+                await add_slots(s_b, master_id, slot_date, [14])
+        finally:
+            s_b.execute = original_execute  # type: ignore[method-assign]  # test patch
+
+    # Step 4: Verify final DB state — exactly one slot (slot_a, hour=14).
+    # Filter by (master_id, slot_date) without pinning slot_hour — catches
+    # hypothetical future bugs where add_slots creates extra slots with
+    # different hours (currently it doesn't, but defensive verify is cheap).
     async with session_factory_concurrent() as s_verify:
         from sqlalchemy import select
 
         stmt = select(Slot).where(
             Slot.master_id == master_id,
             Slot.slot_date == slot_date,
-            Slot.slot_hour == 14,
         )
         slots = (await s_verify.execute(stmt)).scalars().all()
         assert len(slots) == 1, f"expected 1 slot in DB, got {len(slots)}"
+        assert slots[0].slot_hour == 14
+        assert slots[0].status == "open"
