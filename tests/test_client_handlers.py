@@ -31,7 +31,7 @@ that records set_state/update_data calls for assertion).
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
@@ -40,6 +40,8 @@ from zoneinfo import ZoneInfo
 import pytest
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, User
+from aiogram_calendar import SimpleCalendarCallback
+from aiogram_calendar.schemas import SimpleCalAct
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bot.handlers import client as client_handlers
 from bot.keyboards.client import (
@@ -1397,200 +1399,8 @@ async def test_transfer_slot_cb_slot_not_available(
 
 
 # ============================================================
-# transfer_date_cb — date picker for transfer flow (coverage 661-702)
-# ============================================================
-
-
-@pytest.mark.asyncio
-async def test_transfer_date_cb_happy_path(
-    session_factory: Any,
-    patched_session_factory: Any,
-) -> None:
-    """User picked a date for transfer → handler fetches available slots for
-    that date, sets FSM state to selecting_slot, shows slot picker inline
-    keyboard. Coverage: client.py:684-702 (happy path of transfer_date_cb).
-    """
-    async with session_factory() as session:
-        ctx = await _seed_full_stack(session)
-        # Open slot for the transfer target date (tomorrow at 14:00 Moscow)
-        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
-        slot = Slot(
-            master_id=ctx["master_id"],
-            slot_date=target_date,
-            slot_hour=14,
-            status="open",
-        )
-        session.add(slot)
-        await session.commit()
-
-    from bot.keyboards.client import BookDateCallbackData
-
-    bot = AsyncMock()
-    cb = MagicMock(spec=CallbackQuery)
-    cb.from_user = _make_user(111222333)
-    cb.message = _make_message(111222333, text="<unused>")
-    cb.answer = AsyncMock()
-    cb.bot = bot
-    callback_data = BookDateCallbackData(iso=target_date.isoformat())
-
-    state = _make_state()
-
-    await client_handlers.transfer_date_cb(cb, callback_data, state)
-
-    # FSM state set to selecting_slot
-    state.set_state.assert_awaited()
-    assert state.set_state.call_args.args[0] == TransferStates.selecting_slot
-
-    # selected_date saved in state
-    state.update_data.assert_awaited()
-    assert state.update_data.call_args.kwargs.get("selected_date") == target_date.isoformat()
-
-    # Slot picker shown
-    cb.message.answer.assert_awaited()
-    reply_markup = _answer_reply_markup(cb.message)
-    assert isinstance(reply_markup, InlineKeyboardMarkup), (
-        "transfer_date_cb must show slot picker inline keyboard"
-    )
-
-    cb.answer.assert_awaited()
-
-
-@pytest.mark.asyncio
-async def test_transfer_date_cb_no_slots_on_date(
-    session_factory: Any,
-    patched_session_factory: Any,
-) -> None:
-    """User picked a date with no open slots → handler replies "На эту дату
-    нет свободных слотов. Выберите другую дату:" with date picker (retry).
-    FSM state NOT advanced (stays at selecting_date). Coverage: client.py:686-693.
-    """
-    async with session_factory() as session:
-        await _seed_full_stack(session)
-        # No slots created — target date has no open slots
-
-    from bot.keyboards.client import BookDateCallbackData
-
-    bot = AsyncMock()
-    cb = MagicMock(spec=CallbackQuery)
-    cb.from_user = _make_user(111222333)
-    cb.message = _make_message(111222333, text="<unused>")
-    cb.answer = AsyncMock()
-    cb.bot = bot
-    # Date far in the future — no slots exist
-    far_date = (datetime.now(UTC) + timedelta(days=30)).date()
-    callback_data = BookDateCallbackData(iso=far_date.isoformat())
-
-    state = _make_state()
-
-    await client_handlers.transfer_date_cb(cb, callback_data, state)
-
-    # Reply with "no slots" + date picker for retry
-    cb.message.answer.assert_awaited()
-    err_text = _answer_text(cb.message)
-    assert "нет свободных слотов" in err_text
-    reply_markup = _answer_reply_markup(cb.message)
-    assert isinstance(reply_markup, InlineKeyboardMarkup), (
-        "no-slots reply must include date picker for retry"
-    )
-
-    # FSM state NOT advanced (still at selecting_date)
-    state.set_state.assert_not_awaited()
-    state.update_data.assert_not_awaited()
-    cb.answer.assert_awaited()
-
-
-# ============================================================
-# transfer_date_cb — error branches (T4: client.py:664-666, 678-682)
-# ============================================================
-
-
-@pytest.mark.asyncio
-async def test_transfer_date_cb_invalid_iso_date(
-    session_factory: Any,
-    patched_session_factory: Any,
-) -> None:
-    """T4 — client.py:664-666: callback_data.iso='not-a-date' → date.fromisoformat
-    raises ValueError → callback.answer('Невалидная дата') + state NOT cleared
-    (stays at selecting_date for retry).
-    """
-    from bot.keyboards.client import BookDateCallbackData
-
-    async with session_factory() as session:
-        await _seed_full_stack(session)  # master exists — handler proceeds past FSM check
-
-    bot = AsyncMock()
-    cb = MagicMock(spec=CallbackQuery)
-    cb.from_user = _make_user(111222333)
-    cb.message = _make_message(111222333, text="<unused>")
-    cb.answer = AsyncMock()
-    cb.bot = bot
-    # Invalid ISO string — date.fromisoformat raises ValueError
-    callback_data = BookDateCallbackData(iso="not-a-date")
-
-    state = _make_state()
-
-    await client_handlers.transfer_date_cb(cb, callback_data, state)
-
-    # Error answer sent via callback.answer (popup, NOT message.answer)
-    cb.answer.assert_awaited_once()
-    args, _ = cb.answer.await_args
-    assert args[0] == "Невалидная дата"
-
-    # State must NOT be cleared (user can retry with valid date)
-    state.clear.assert_not_awaited()
-    # FSM state NOT advanced
-    state.set_state.assert_not_awaited()
-    # No DB query made (handler returns before async_session_factory block)
-    cb.message.answer.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_transfer_date_cb_master_not_found_clears_state_and_answers(
-    session_factory: Any,
-    patched_session_factory: Any,
-) -> None:
-    """T4 — client.py:678-682: master not found in DB → state.clear() +
-    callback.message.answer('❌ Не удалось найти мастера.') + callback.answer.
-
-    Setup: empty DB (no _seed_full_stack) — get_settings().ADMIN_ID matches no
-    master row → select(Master).where(Master.telegram_id == ADMIN_ID) returns None.
-    """
-    from bot.keyboards.client import BookDateCallbackData
-
-    # No _seed_full_stack — DB empty, no master row
-    target_date = (datetime.now(UTC) + timedelta(days=1)).date()
-
-    bot = AsyncMock()
-    cb = MagicMock(spec=CallbackQuery)
-    cb.from_user = _make_user(111222333)
-    cb.message = _make_message(111222333, text="<unused>")
-    cb.answer = AsyncMock()
-    cb.bot = bot
-    callback_data = BookDateCallbackData(iso=target_date.isoformat())
-
-    state = _make_state()
-
-    await client_handlers.transfer_date_cb(cb, callback_data, state)
-
-    # state.clear() called — FSM aborted (no retry, user must /book again)
-    state.clear.assert_awaited_once()
-
-    # Error message via callback.message.answer
-    cb.message.answer.assert_awaited_once()
-    err_text = _answer_text(cb.message)
-    assert "Не удалось найти мастера" in err_text
-
-    # callback.answer() called (close the loading spinner)
-    cb.answer.assert_awaited()
-
-    # FSM state NOT advanced (clear reset to None)
-    state.set_state.assert_not_awaited()
-    state.update_data.assert_not_awaited()
-
-
-# ============================================================
-# Booking flow — T5a: cmd_book + date_cb + slot_cb + name_msg + service_msg
-# Coverage: client.py:75-145, 154-166, 173-185, 192-240
+# Booking flow — T5a: cmd_book + simple_calendar_cb + slot_cb + name_msg + service_msg
+# Coverage: client.py:75-218, 226-238, 245-257, 264-312
 # ============================================================
 
 
@@ -1619,121 +1429,66 @@ async def test_cmd_book_sets_state_and_shows_date_picker(
     )
 
 
-@pytest.mark.asyncio
-async def test_date_cb_invalid_iso_date(
-    session_factory: Any,
-    patched_session_factory: Any,
-) -> None:
-    """T5a: date_cb (client.py:97-101) — callback_data.iso='not-a-date' →
-    ValueError from date.fromisoformat → callback.answer('Невалидная дата'),
-    state NOT cleared.
+# ============================================================
+# simple_calendar_cb — aiogram_calendar (booking flow, BookingStates.selecting_date)
+# and transfer_simple_calendar_cb (transfer flow, TransferStates.selecting_date).
+# Replaces test_date_cb_* (deleted with BookDateCallbackData).
+# ============================================================
+
+
+def _make_simple_calendar_callback(
+    act: SimpleCalAct,
+    *,
+    year: int | None = None,
+    month: int | None = None,
+    day: int | None = None,
+) -> SimpleCalendarCallback:
+    """Build a SimpleCalendarCallback with given act + date fields.
+
+    All fields default to today (in business TZ) — caller overrides for
+    navigation tests (today + diff-month check needs explicit year/month).
     """
-    from bot.keyboards.client import BookDateCallbackData
-
-    bot = AsyncMock()
-    cb = MagicMock(spec=CallbackQuery)
-    cb.from_user = _make_user(111222333)
-    cb.message = _make_message(111222333, text="<unused>")
-    cb.answer = AsyncMock()
-    cb.bot = bot
-    callback_data = BookDateCallbackData(iso="not-a-date")
-
-    state = _make_state()
-    await client_handlers.date_cb(cb, callback_data, state)
-
-    cb.answer.assert_awaited_once()
-    args, _ = cb.answer.await_args
-    assert args[0] == "Невалидная дата"
-    state.clear.assert_not_awaited()
-    state.set_state.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_date_cb_master_not_found_clears_state(
-    session_factory: Any,
-    patched_session_factory: Any,
-) -> None:
-    """T5a: date_cb (client.py:114-121) — empty DB, no master → state.clear +
-    message.answer('❌ Не удалось найти мастера...') + callback.answer.
-    """
-    from bot.keyboards.client import BookDateCallbackData
-
-    # No _seed_full_stack — DB empty
-    target_date = (datetime.now(UTC) + timedelta(days=1)).date()
-    bot = AsyncMock()
-    cb = MagicMock(spec=CallbackQuery)
-    cb.from_user = _make_user(111222333)
-    cb.message = _make_message(111222333, text="<unused>")
-    cb.answer = AsyncMock()
-    cb.bot = bot
-    callback_data = BookDateCallbackData(iso=target_date.isoformat())
-
-    state = _make_state()
-    await client_handlers.date_cb(cb, callback_data, state)
-
-    state.clear.assert_awaited_once()
-    err_text = _answer_text(cb.message)
-    assert "Не удалось найти мастера" in err_text
-    cb.answer.assert_awaited()
-    state.set_state.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_date_cb_no_slots_on_date_shows_retry(
-    session_factory: Any,
-    patched_session_factory: Any,
-) -> None:
-    """T5a: date_cb (client.py:125-132) — date with no open slots →
-    message.answer('На эту дату нет свободных слотов...') with date picker (retry).
-    FSM NOT advanced.
-    """
-    from bot.keyboards.client import BookDateCallbackData
-
-    async with session_factory() as session:
-        await _seed_full_stack(session)  # master exists, but no slots seeded
-
-    target_date = (datetime.now(UTC) + timedelta(days=30)).date()  # far future, no slots
-    bot = AsyncMock()
-    cb = MagicMock(spec=CallbackQuery)
-    cb.from_user = _make_user(111222333)
-    cb.message = _make_message(111222333, text="<unused>")
-    cb.answer = AsyncMock()
-    cb.bot = bot
-    callback_data = BookDateCallbackData(iso=target_date.isoformat())
-
-    state = _make_state()
-    await client_handlers.date_cb(cb, callback_data, state)
-
-    err_text = _answer_text(cb.message)
-    assert "нет свободных слотов" in err_text
-    reply_markup = _answer_reply_markup(cb.message)
-    assert isinstance(reply_markup, InlineKeyboardMarkup), (
-        "no-slots reply must include date picker for retry"
+    today = datetime.now(ZoneInfo("Europe/Moscow")).replace(tzinfo=None)
+    return SimpleCalendarCallback(
+        act=act,
+        year=year or today.year,
+        month=month or today.month,
+        day=day or today.day,
     )
-    state.set_state.assert_not_awaited()
-    state.update_data.assert_not_awaited()
-    cb.answer.assert_awaited()
+
+
+def _patch_process_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    selected: bool,
+    selected_date: datetime | None = None,
+) -> None:
+    """Patch SimpleCalendar.process_selection to return (selected, date) tuple.
+
+    For act=day: lib returns (True, datetime(...)) on in-range click,
+    (False, None) on out-of-range (F7 fix). For other acts: (False, None).
+    """
+    from aiogram_calendar import SimpleCalendar
+
+    async def _fake(self, callback, data):  # noqa: ARG001
+        return selected, selected_date
+
+    monkeypatch.setattr(SimpleCalendar, "process_selection", _fake)
 
 
 @pytest.mark.asyncio
-async def test_date_cb_happy_shows_slot_picker(
+async def test_simple_calendar_cb_day_select_happy_shows_slot_picker(
     session_factory: Any,
     patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """T5a: date_cb (client.py:134-145) — happy path: open slots exist →
-    state.update_data(selected_date) + set_state(selecting_slot) + slot picker keyboard.
+    """simple_calendar_cb act=day, in-range, slots exist →
+    state.update_data(selected_date) + set_state(selecting_slot) + slot picker.
     """
-    from bot.keyboards.client import BookDateCallbackData
-
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
         target_date = (datetime.now(UTC) + timedelta(days=1)).date()
-        slot = Slot(
-            master_id=ctx["master_id"],
-            slot_date=target_date,
-            slot_hour=14,
-            status="open",
-        )
+        slot = Slot(master_id=ctx["master_id"], slot_date=target_date, slot_hour=14, status="open")
         session.add(slot)
         await session.commit()
 
@@ -1743,10 +1498,14 @@ async def test_date_cb_happy_shows_slot_picker(
     cb.message = _make_message(111222333, text="<unused>")
     cb.answer = AsyncMock()
     cb.bot = bot
-    callback_data = BookDateCallbackData(iso=target_date.isoformat())
 
+    # Patch process_selection to simulate user clicked target_date (in-range)
+    target_dt = datetime.combine(target_date, time(12, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
     state = _make_state()
-    await client_handlers.date_cb(cb, callback_data, state)
+    await client_handlers.simple_calendar_cb(cb, callback_data, state)
 
     state.update_data.assert_awaited()
     assert state.update_data.call_args.kwargs.get("selected_date") == target_date.isoformat()
@@ -1756,10 +1515,338 @@ async def test_date_cb_happy_shows_slot_picker(
     text = _answer_text(cb.message)
     assert "Выберите время" in text
     reply_markup = _answer_reply_markup(cb.message)
-    assert isinstance(reply_markup, InlineKeyboardMarkup), (
-        "happy date_cb must show slot picker inline keyboard"
-    )
+    assert isinstance(reply_markup, InlineKeyboardMarkup)
     cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_simple_calendar_cb_day_select_master_not_found_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """simple_calendar_cb act=day, in-range, NO master in DB →
+    state.clear + '❌ Не удалось найти мастера...' + callback.answer.
+    """
+
+    # No _seed_full_stack — DB empty
+    target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+    target_dt = datetime.combine(target_date, time(12, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
+
+    state = _make_state()
+    await client_handlers.simple_calendar_cb(cb, callback_data, state)
+
+    state.clear.assert_awaited_once()
+    assert "Не удалось найти мастера" in _answer_text(cb.message)
+    cb.answer.assert_awaited()
+    state.set_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_simple_calendar_cb_day_select_no_slots_shows_retry(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """simple_calendar_cb act=day, in-range, master exists, NO open slots →
+    'На эту дату нет свободных слотов...' + calendar_keyboard retry.
+    FSM NOT advanced.
+    """
+
+    async with session_factory() as session:
+        await _seed_full_stack(session)  # master exists, but no slots seeded
+
+    target_date = (datetime.now(UTC) + timedelta(days=30)).date()
+    target_dt = datetime.combine(target_date, time(12, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
+
+    state = _make_state()
+    await client_handlers.simple_calendar_cb(cb, callback_data, state)
+
+    assert "нет свободных слотов" in _answer_text(cb.message)
+    assert isinstance(_answer_reply_markup(cb.message), InlineKeyboardMarkup)
+    state.set_state.assert_not_awaited()
+    state.update_data.assert_not_awaited()
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_simple_calendar_cb_day_out_of_range_returns_silently(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """simple_calendar_cb act=day, OUT-of-range (lib returned selected=False) →
+    handler returns without answering (F7 fix — lib already answered alert).
+    """
+
+    _patch_process_selection(monkeypatch, selected=False, selected_date=None)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
+
+    state = _make_state()
+    await client_handlers.simple_calendar_cb(cb, callback_data, state)
+
+    # F7 fix: handler did NOT answer (lib answered alert) and did NOT touch state
+    cb.answer.assert_not_awaited()
+    state.clear.assert_not_awaited()
+    state.set_state.assert_not_awaited()
+    cb.message.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_simple_calendar_cb_cancel_clears_state_and_answers(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """simple_calendar_cb act=cancel →
+    state.clear() BEFORE callback.answer (race condition, MY-VIBE-RULES.md:23) +
+    'Ввод отменён. /book чтобы начать заново' (booking flow, is_transfer=False).
+    """
+
+    _patch_process_selection(monkeypatch, selected=False, selected_date=None)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.cancel)
+
+    state = _make_state_with_call_order([])  # tracks call order for race condition check
+    await client_handlers.simple_calendar_cb(cb, callback_data, state)
+
+    assert "Ввод отменён" in _answer_text(cb.message)
+    assert "/book" in _answer_text(cb.message)
+    state.clear.assert_awaited_once()
+    cb.answer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_simple_calendar_cb_navigation_answers(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """simple_calendar_cb act=next_m (navigation) → lib did edit_reply_markup,
+    handler answers (F1 fix). State NOT touched.
+    """
+
+    _patch_process_selection(monkeypatch, selected=False, selected_date=None)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.next_m)
+
+    state = _make_state()
+    await client_handlers.simple_calendar_cb(cb, callback_data, state)
+
+    # F1 fix: navigation actions need handler.answer (lib did not answer)
+    cb.answer.assert_awaited_once()
+    state.clear.assert_not_awaited()
+    state.set_state.assert_not_awaited()
+    # Navigation does NOT advance FSM — calendar stays on selecting_date
+    cb.message.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_simple_calendar_cb_today_same_month_answers_explicitly(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """simple_calendar_cb act=today, SAME month as callback_data →
+    handler answers cache_time=60 explicitly (skips lib for this branch).
+    No state change.
+
+    Uses system-local datetime.now() (NOT Moscow TZ) — handler's check at
+    client.py:140 uses `datetime.now().replace(tzinfo=None)` (system-local).
+    If we used Moscow TZ here and CI runs in UTC at month boundary, the
+    year/month could differ → test would take the diff-month branch and
+    fail (W2 from code-reviewer, flaky at 21:00-00:00 UTC last day of month).
+    """
+    _patch_process_selection(monkeypatch, selected=False, selected_date=None)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    # Match handler's check — system-local year/month (not Moscow TZ)
+    sys_now = datetime.now().replace(tzinfo=None)
+    callback_data = _make_simple_calendar_callback(
+        SimpleCalAct.today, year=sys_now.year, month=sys_now.month
+    )
+
+    state = _make_state()
+    await client_handlers.simple_calendar_cb(cb, callback_data, state)
+
+    # Handler answers cache_time=60 (replaces lib's answer — lib is skipped)
+    cb.answer.assert_awaited_once()
+    _args, kwargs = cb.answer.await_args
+    assert kwargs.get("cache_time") == 60
+    state.clear.assert_not_awaited()
+    cb.message.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_simple_calendar_cb_ignore_answers_explicitly(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """simple_calendar_cb act=ignore → handler answers cache_time=60 explicitly
+    (skips lib for this branch, replaces lib's query.answer). Covers client.py:136.
+    """
+    _patch_process_selection(monkeypatch, selected=False, selected_date=None)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.ignore)
+
+    state = _make_state()
+    await client_handlers.simple_calendar_cb(cb, callback_data, state)
+
+    cb.answer.assert_awaited_once()
+    args, kwargs = cb.answer.await_args
+    assert kwargs.get("cache_time") == 60
+    state.clear.assert_not_awaited()
+    state.set_state.assert_not_awaited()
+    cb.message.answer.assert_not_awaited()
+
+
+# ============================================================
+# transfer_simple_calendar_cb — aiogram_calendar for transfer flow
+# (mirrors booking tests, but with is_transfer=True and TransferStates)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_transfer_simple_calendar_cb_day_select_happy_shows_slot_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """transfer_simple_calendar_cb act=day, in-range, slots exist →
+    set_state(TransferStates.selecting_slot) + 'Выберите новое время:' (is_transfer=True).
+    """
+
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = Slot(master_id=ctx["master_id"], slot_date=target_date, slot_hour=14, status="open")
+        session.add(slot)
+        await session.commit()
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+
+    target_dt = datetime.combine(target_date, time(12, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
+
+    state = _make_state()
+    await client_handlers.transfer_simple_calendar_cb(cb, callback_data, state)
+
+    assert state.set_state.call_args.args[0] == TransferStates.selecting_slot
+    assert "Выберите новое время" in _answer_text(cb.message)  # is_transfer=True branch
+    assert isinstance(_answer_reply_markup(cb.message), InlineKeyboardMarkup)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_simple_calendar_cb_cancel_clears_state_with_transfer_message(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """transfer_simple_calendar_cb act=cancel →
+    state.clear + 'Перенос отменён. /mybookings чтобы начать заново' (is_transfer=True).
+    """
+
+    _patch_process_selection(monkeypatch, selected=False, selected_date=None)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.cancel)
+
+    state = _make_state()
+    await client_handlers.transfer_simple_calendar_cb(cb, callback_data, state)
+
+    assert "Перенос отменён" in _answer_text(cb.message)
+    assert "/mybookings" in _answer_text(cb.message)
+    state.clear.assert_awaited_once()
+    cb.answer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_transfer_simple_calendar_cb_navigation_answers(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """transfer_simple_calendar_cb act=prev_y (navigation) → handler answers,
+    state NOT touched (F1 fix, same as booking flow).
+    """
+
+    _patch_process_selection(monkeypatch, selected=False, selected_date=None)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.prev_y)
+
+    state = _make_state()
+    await client_handlers.transfer_simple_calendar_cb(cb, callback_data, state)
+
+    cb.answer.assert_awaited_once()
+    state.clear.assert_not_awaited()
+    state.set_state.assert_not_awaited()
 
 
 @pytest.mark.asyncio

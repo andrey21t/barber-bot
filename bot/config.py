@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     CANCEL_MIN_HOURS: int = 24
     MISFIRE_GRACE_TIME: int = 3600  # Render free tier sleep 15 мин = 900 сек → 3600 сек запас
     SERVICE_DEFAULT_DURATION_MIN: int = 60
+    MAX_BOOKING_DAYS_AHEAD: int = 60  # aiogram_calendar range (today..today+N days)
 
 
 def get_settings() -> Settings:

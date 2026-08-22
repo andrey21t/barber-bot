@@ -2,15 +2,18 @@
 
 Contract (deep-analysis-protocol Pass 3):
 - NO business logic in handlers — validation, html.escape, timezone conversion live in services
-- 7 handlers + 1 fallback (no_state_fallback for State(None) after bot restart):
+- 8 handlers + 1 fallback (no_state_fallback for State(None) after bot restart):
   1. cmd_book: /book, StateFilter(None) → selecting_date
-  2. date_cb: callback book_date:<iso>, StateFilter(selecting_date) → selecting_slot
+  2. simple_calendar_cb: callback simple_calendar, StateFilter(selecting_date) → selecting_slot
+     (aiogram_calendar month navigation, callback.answer contract verified against lib source)
   3. slot_cb: callback book_slot:<uuid>, StateFilter(selecting_slot) → entering_name
   4. name_msg: text, StateFilter(entering_name) → entering_service
   5. service_msg: text, StateFilter(entering_service) → confirming
   6. confirm_cb: callback book_confirm, StateFilter(confirming) → State(None) + create_booking
   7. cancel_msg: /cancel, StateFilter("*") → state.clear() + message
-  + no_state_fallback: State(None), F.text, ~F.text.startswith("/") → "Начните через /book"
+  + mybookings_msg / mybookings_cancel_cb / mybookings_transfer_cb / transfer_simple_calendar_cb
+  + transfer_slot_cb + no_state_fallback: State(None), F.text, ~F.text.startswith("/")
+    → "Начните через /book"
 
 Invariants (spec.md + MY-VIBE-RULES.md):
 - state.clear() BEFORE event.answer (race condition)
@@ -20,26 +23,29 @@ Invariants (spec.md + MY-VIBE-RULES.md):
 """
 
 import logging
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State
 from aiogram.types import CallbackQuery, Message
+from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback
+from aiogram_calendar.schemas import SimpleCalAct
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from scheduler import schedule_for_booking
 
-from bot.config import get_settings
+from bot.config import Settings, get_settings
 from bot.db import async_session_factory
 from bot.keyboards.client import (
     BookConfirmCallbackData,
-    BookDateCallbackData,
     BookSlotCallbackData,
     MyBookingsCancelCallbackData,
     MyBookingsTransferCallbackData,
+    calendar_keyboard,
     confirm_keyboard,
-    date_picker_keyboard,
     mybookings_keyboard,
     slot_picker_keyboard,
 )
@@ -68,79 +74,156 @@ logger = logging.getLogger(__name__)
 router = Router(name="client")
 
 
+def _calendar_range(settings: Settings) -> tuple[datetime, datetime]:
+    """Compute (min_date, max_date) for SimpleCalendar — NAIVE local in business TZ.
+
+    aiogram_calendar's process_day_select (common.py:56) builds
+    `datetime(year, month, day)` — naive, AT MIDNIGHT. If min_date has a time
+    component (e.g. 13:45), then `min_date > date` for today → user clicking
+    "Сегодня" gets alert "date have to be later <today>". So we strip time
+    too: min_date = today @ 00:00:00, max_date = (today + N days) @ 00:00:00.
+
+    Also strip tzinfo — aiogram_calendar compares with naive datetime
+    (TypeError comparing aware vs naive).
+
+    Returns (today_naive_local_midnight, today + MAX_BOOKING_DAYS_AHEAD naive local midnight).
+    """
+    tz = ZoneInfo(settings.TIMEZONE)
+    today_local = datetime.now(tz).replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
+    max_local = today_local + timedelta(days=settings.MAX_BOOKING_DAYS_AHEAD)
+    return today_local, max_local
+
+
 # ============================================================
 # 1. cmd_book — entry point (/book)
 # ============================================================
 @router.message(Command("book"), StateFilter(None))
 async def cmd_book(message: Message, state: FSMContext) -> None:
-    """Show date picker — next 7 days."""
+    """Show SimpleCalendar (month navigation) for date selection."""
+    settings = get_settings()
     await state.set_state(BookingStates.selecting_date)
     await message.answer(
         "📅 Выберите дату записи:",
-        reply_markup=date_picker_keyboard(days_ahead=7),
+        reply_markup=await calendar_keyboard(*_calendar_range(settings)),
     )
 
 
 # ============================================================
-# 2. date_cb — user picked a date → show available slots
+# 2. simple_calendar_cb — user navigated/picked date (aiogram_calendar)
 # ============================================================
-@router.callback_query(BookDateCallbackData.filter(), StateFilter(BookingStates.selecting_date))
-async def date_cb(
+# callback.answer() contract (verified from aiogram_calendar 0.6.0 source):
+#   - act=ignore: lib calls query.answer(cache_time=60) → handler skips lib,
+#     answers explicitly
+#   - act=today + same-month: lib calls query.answer(cache_time=60) → handler
+#     skips lib, answers explicitly
+#   - act=today + diff-month: lib calls edit_reply_markup (no answer) → handler answers
+#   - act=prev_y/next_y/prev_m/next_m: lib calls edit_reply_markup (no answer) → handler answers
+#   - act=cancel: lib calls delete_reply_markup (no answer) → handler answers + state.clear()
+#   - act=day + out-of-range: lib calls query.answer(alert) → handler returns (selected=False)
+#   - act=day + in-range: lib calls delete_reply_markup (no answer) → handler answers + fetch slots
+async def _handle_simple_calendar(
     callback: CallbackQuery,
-    callback_data: BookDateCallbackData,
+    callback_data: SimpleCalendarCallback,
     state: FSMContext,
+    selecting_slot_state: State,
+    is_transfer: bool,
 ) -> None:
-    """User selected a date — show available slots for that date."""
-    iso = callback_data.iso
-    try:
-        slot_date = date.fromisoformat(iso)
-    except ValueError:
-        await callback.answer("Невалидная дата")
-        return
+    """Shared logic for booking + transfer SimpleCalendar handlers.
 
+    Branches on callback_data.act to call callback.answer() only when lib has
+    not already answered (F1 fix). For act=day: fetches slots, transitions FSM
+    to selecting_slot. For act=cancel: clears FSM state.
+    """
     settings = get_settings()
-    async with async_session_factory() as session:
-        # Single-master MVP: master_id from settings (or first active master)
-        # TODO Урок 2.4: real master lookup via business.telegram_owner_id
-        from sqlalchemy import select
 
-        from bot.models import Master
+    # For act=ignore and act=today+same-month: lib calls query.answer(cache_time=60)
+    # (simple_calendar.py:147, 177). Handler does NOT call lib for these branches
+    # (early return before cal.process_selection) — so handler must answer explicitly
+    # to avoid Telegram spinner (~10s timeout). cache_time=60 matches lib's contract.
+    if callback_data.act == SimpleCalAct.ignore:
+        await callback.answer(cache_time=60)
+        return
+    if callback_data.act == SimpleCalAct.today:
+        # lib uses system-local datetime.now() for same-month check (simple_calendar.py:173);
+        # handler matches to avoid TZ-mismatch double-answer at month boundary (N1 fix).
+        today_sys = datetime.now().replace(tzinfo=None)
+        if today_sys.year == callback_data.year and today_sys.month == callback_data.month:
+            await callback.answer(cache_time=60)
+            return  # same-month: lib would answer cache_time=60, handler does it instead
 
-        stmt = select(Master).where(Master.telegram_id == settings.ADMIN_ID).limit(1)
-        result = await session.execute(stmt)
-        master = result.scalar_one_or_none()
-        if master is None:
-            await state.clear()
+    cal = SimpleCalendar(locale="ru_RU", cancel_btn="Отмена", today_btn="Сегодня")
+    cal.set_dates_range(*_calendar_range(settings))
+    selected, selected_date = await cal.process_selection(callback, callback_data)
+
+    if callback_data.act == SimpleCalAct.day:
+        if not selected:
+            return  # F7 fix: out-of-range, lib answered alert, do nothing
+        slot_date = selected_date.date()
+        async with async_session_factory() as session:
+            from sqlalchemy import select
+
+            from bot.models import Master
+
+            stmt = select(Master).where(Master.telegram_id == settings.ADMIN_ID).limit(1)
+            master = (await session.execute(stmt)).scalar_one_or_none()
+            if master is None:
+                await state.clear()
+                if callback.message is not None:
+                    await callback.message.answer(
+                        "❌ Не удалось найти мастера. Обратитесь к администратору."
+                    )
+                await callback.answer()
+                return
+            slots = await get_available_slots(session, master.id, slot_date)
+        if not slots:
             if callback.message is not None:
                 await callback.message.answer(
-                    "❌ Не удалось найти мастера. Обратитесь к администратору."
+                    "На эту дату нет свободных слотов. Выберите другую дату:",
+                    reply_markup=await calendar_keyboard(*_calendar_range(settings)),
                 )
             await callback.answer()
             return
-
-        slots = await get_available_slots(session, master.id, slot_date)
-
-    if not slots:
+        await state.update_data(selected_date=slot_date.isoformat())
+        await state.set_state(selecting_slot_state)
         if callback.message is not None:
             await callback.message.answer(
-                "На эту дату нет свободных слотов. Выберите другую дату:",
-                reply_markup=date_picker_keyboard(days_ahead=7),
+                "Выберите новое время:" if is_transfer else "Выберите время:",
+                reply_markup=slot_picker_keyboard(slots),
             )
         await callback.answer()
         return
 
-    # Save selected date in FSM for later use.
-    # NOTE: master_id intentionally NOT saved here — confirm_cb re-fetches master
-    # via Master.telegram_id == settings.ADMIN_ID (lines 264-267). Storing it would
-    # be dead data (master could be deactivated between steps; re-fetch is canonical).
-    await state.update_data(selected_date=iso)
-    await state.set_state(BookingStates.selecting_slot)
-    if callback.message is not None:
-        await callback.message.answer(
-            "Выберите время:",
-            reply_markup=slot_picker_keyboard(slots),
-        )
+    if callback_data.act == SimpleCalAct.cancel:
+        # state.clear() BEFORE callback.answer (race condition, MY-VIBE-RULES.md:23)
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer(
+                "Перенос отменён. /mybookings чтобы начать заново"
+                if is_transfer
+                else "Ввод отменён. /book чтобы начать заново"
+            )
+        await callback.answer()
+        return
+
+    # Navigation actions (prev_y/next_y/prev_m/next_m/today-diff-month):
+    # lib did edit_reply_markup, no answer from lib → handler answers (F1 fix)
     await callback.answer()
+
+
+@router.callback_query(SimpleCalendarCallback.filter(), StateFilter(BookingStates.selecting_date))
+async def simple_calendar_cb(
+    callback: CallbackQuery,
+    callback_data: SimpleCalendarCallback,
+    state: FSMContext,
+) -> None:
+    """SimpleCalendar navigation + day select for booking flow (cmd_book)."""
+    await _handle_simple_calendar(
+        callback=callback,
+        callback_data=callback_data,
+        state=state,
+        selecting_slot_state=BookingStates.selecting_slot,
+        is_transfer=False,
+    )
 
 
 # ============================================================
@@ -556,13 +639,13 @@ async def mybookings_transfer_cb(
     shares the same 24h window as cancel (spec.md 41 — "отмена (>24ч) или перенос
     (>24ч)"), so we re-use the partition logic from mybookings_msg.
 
-    Saves booking_id in FSM data so subsequent date_cb / slot_cb can resolve it
-    (FSM data survives between handler invocations — MemoryStorage in dev,
-    RedisStorage in prod).
+    Saves booking_id in FSM data so subsequent simple_calendar_cb (transfer) /
+    slot_cb (transfer) can resolve it (FSM data survives between handler
+    invocations — MemoryStorage in dev, RedisStorage in prod).
 
-    state.set_state(TransferStates.selecting_date) so the existing BookDateCallbackData
-    picker re-uses this state instead of BookingStates.selecting_date (handlers branch
-    on StateFilter — see transfer_date_cb / transfer_slot_cb below).
+    state.set_state(TransferStates.selecting_date) so the SimpleCalendar picker
+    dispatches to transfer_simple_calendar_cb (not simple_calendar_cb which is
+    StateFilter(BookingStates.selecting_date)).
     """
     from sqlalchemy import select
 
@@ -615,71 +698,31 @@ async def mybookings_transfer_cb(
     if callback.message is not None:
         await callback.message.answer(
             "📅 Выберите новую дату для переноса:",
-            reply_markup=date_picker_keyboard(days_ahead=7),
+            reply_markup=await calendar_keyboard(*_calendar_range(settings)),
         )
     await callback.answer()
 
 
 # ============================================================
-# 12. transfer_date_cb — user picked a date (StateFilter(TransferStates.selecting_date))
+# 12. transfer_simple_calendar_cb — user navigated/picked date (aiogram_calendar)
 # ============================================================
-# Re-uses BookDateCallbackData picker (same prefix="book_date") but branches on
-# TransferStates.selecting_date (distinct from BookingStates.selecting_date → date_cb).
+# Same callback.answer contract as simple_calendar_cb (booking flow) but dispatched
+# on TransferStates.selecting_date (distinct from BookingStates.selecting_date).
 # aiogram dispatches by state filter, so the two handlers coexist without conflict.
-@router.callback_query(BookDateCallbackData.filter(), StateFilter(TransferStates.selecting_date))
-async def transfer_date_cb(
+@router.callback_query(SimpleCalendarCallback.filter(), StateFilter(TransferStates.selecting_date))
+async def transfer_simple_calendar_cb(
     callback: CallbackQuery,
-    callback_data: BookDateCallbackData,
+    callback_data: SimpleCalendarCallback,
     state: FSMContext,
 ) -> None:
-    """User selected a new date for transfer — show available slots for that date.
-
-    Mirrors date_cb (booking flow) but skips master lookup checks (transfer keeps
-    the same master — we re-use booking.master_id implicitly via slot.master_id
-    in get_available_slots). State transitions: selecting_date → selecting_slot.
-    """
-    iso = callback_data.iso
-    try:
-        slot_date = date.fromisoformat(iso)
-    except ValueError:
-        await callback.answer("Невалидная дата")
-        return
-
-    settings = get_settings()
-    async with async_session_factory() as session:
-        from sqlalchemy import select
-
-        from bot.models import Master
-
-        # Single-master MVP — same lookup as date_cb:99-116.
-        stmt = select(Master).where(Master.telegram_id == settings.ADMIN_ID).limit(1)
-        master = (await session.execute(stmt)).scalar_one_or_none()
-        if master is None:
-            await state.clear()
-            if callback.message is not None:
-                await callback.message.answer("❌ Не удалось найти мастера.")
-            await callback.answer()
-            return
-
-        slots = await get_available_slots(session, master.id, slot_date)
-
-    if not slots:
-        if callback.message is not None:
-            await callback.message.answer(
-                "На эту дату нет свободных слотов. Выберите другую дату:",
-                reply_markup=date_picker_keyboard(days_ahead=7),
-            )
-        await callback.answer()
-        return
-
-    await state.update_data(selected_date=iso)
-    await state.set_state(TransferStates.selecting_slot)
-    if callback.message is not None:
-        await callback.message.answer(
-            "Выберите новое время:",
-            reply_markup=slot_picker_keyboard(slots),
-        )
-    await callback.answer()
+    """SimpleCalendar navigation + day select for transfer flow (mybookings_transfer_cb)."""
+    await _handle_simple_calendar(
+        callback=callback,
+        callback_data=callback_data,
+        state=state,
+        selecting_slot_state=TransferStates.selecting_slot,
+        is_transfer=True,
+    )
 
 
 # ============================================================

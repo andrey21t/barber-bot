@@ -1,37 +1,34 @@
 """Inline keyboards for booking flow — date picker, slot picker, confirm.
 
-AI calendar: using simple 7-day picker (next 7 days from today) instead of aiogram_calendar
-in Шаге 3 — simpler to test, 0 navigation state. aiogram_calendar available in deps for
-future month-navigation in Урок 2.5+.
+Date picker: aiogram_calendar.SimpleCalendar (month navigation, ru_RU locale,
+Russian cancel/today labels) replaces the old 7-day button list. Range is
+bounded by min_date/max_date (today..today+MAX_BOOKING_DAYS_AHEAD in business
+timezone). Caller must strip tzinfo via .replace(tzinfo=None) — aiogram_calendar
+compares with naive datetime(year, month, day) internally (common.py:56).
 
 CallbackData factories (aiogram 3.x):
-- BookDateCallbackData: prefix="book_date", iso: str (ISO date)
 - BookSlotCallbackData: prefix="book_slot", slot_id: UUID
 - BookConfirmCallbackData: prefix="book_confirm"
 - BookCancelCallbackData: prefix="book_cancel"  (booking flow cancel — no payload)
 - MyBookingsCancelCallbackData: prefix="mybook_cancel", booking_id: UUID  (cancel existing booking)
 - MyBookingsTransferCallbackData: prefix="mybook_transfer", booking_id: UUID
-  (transfer existing booking — re-uses date/slot pickers in subsequent FSM steps)
+  (transfer existing booking — re-uses SimpleCalendar picker in subsequent FSM steps)
 
 Note: prefix uses '_' not ':' — aiogram 3.x forbids separator ':' inside prefix
 (ValueError: "Separator symbol ':' can not be used inside prefix").
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
+from typing import cast
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram_calendar import SimpleCalendar
 
 from bot.models import Booking, Slot
-
-
-class BookDateCallbackData(CallbackData, prefix="book_date"):
-    """Date picker callback — payload is ISO date string."""
-
-    iso: str
 
 
 class BookSlotCallbackData(CallbackData, prefix="book_slot"):
@@ -61,45 +58,35 @@ class MyBookingsCancelCallbackData(CallbackData, prefix="mybook_cancel"):
 class MyBookingsTransferCallbackData(CallbackData, prefix="mybook_transfer"):
     """Transfer an existing booking via /mybookings inline button — payload is booking UUID.
 
-    Re-uses BookDateCallbackData / BookSlotCallbackData in subsequent FSM steps
-    (date + slot pickers), but the entry-point button uses this distinct prefix so
-    handler can resolve booking_id and validate it's still cancelable (>24h).
-    StateFilter(None) — entry works only outside FSM (consistent with mybook_cancel).
+    Re-uses SimpleCalendar picker (SimpleCalendarCallback) in subsequent FSM steps,
+    but the entry-point button uses this distinct prefix so handler can resolve
+    booking_id and validate it's still cancelable (>24h). StateFilter(None) —
+    entry works only outside FSM (consistent with mybook_cancel).
     """
 
     booking_id: UUID
 
 
-def date_picker_keyboard(days_ahead: int = 7) -> InlineKeyboardMarkup:
-    """Build inline keyboard with next N days.
+async def calendar_keyboard(min_date: datetime, max_date: datetime) -> InlineKeyboardMarkup:
+    """Build SimpleCalendar markup with date range.
 
-    Each button shows date in human-readable format (e.g. "17 марта"),
-    callback_data carries ISO date string.
+    Args:
+        min_date, max_date: NAIVE datetimes (no tzinfo) in business timezone.
+        Caller must strip tzinfo via .replace(tzinfo=None) — aiogram_calendar
+        compares with naive datetime(year, month, day) internally (common.py:56).
+
+    Returns:
+        InlineKeyboardMarkup with month grid + navigation (<<, <, >, >>) +
+        Russian "Отмена" / "Сегодня" buttons.
     """
-    builder = InlineKeyboardBuilder()
-    today = datetime.now(UTC).date()
-    month_names = [
-        "",
-        "января",
-        "февраля",
-        "марта",
-        "апреля",
-        "мая",
-        "июня",
-        "июля",
-        "августа",
-        "сентября",
-        "октября",
-        "ноября",
-        "декабря",
-    ]
-    for i in range(days_ahead):
-        d = today + timedelta(days=i)
-        cb = BookDateCallbackData(iso=d.isoformat())
-        label = f"{d.day} {month_names[d.month]}"
-        builder.button(text=label, callback_data=cb.pack())
-    builder.adjust(2)  # 2 buttons per row
-    return builder.as_markup()
+    cal = SimpleCalendar(
+        locale="ru_RU",
+        cancel_btn="Отмена",
+        today_btn="Сегодня",
+    )
+    cal.set_dates_range(min_date=min_date, max_date=max_date)
+    # aiogram_calendar has no type stubs — cast to satisfy mypy (lib returns InlineKeyboardMarkup).
+    return cast(InlineKeyboardMarkup, await cal.start_calendar())
 
 
 def slot_picker_keyboard(slots: list[Slot]) -> InlineKeyboardMarkup:
