@@ -316,9 +316,7 @@ async def test_cmd_addslots_happy_creates_slots(
     assert "11" in text and "12" in text and "13" in text
 
     async with session_factory() as verify:
-        slots = (await verify.execute(
-            select(Slot).order_by(Slot.slot_hour)
-        )).scalars().all()
+        slots = (await verify.execute(select(Slot).order_by(Slot.slot_hour))).scalars().all()
         assert [s.slot_hour for s in slots] == [11, 12, 13]
         assert all(s.status == "open" for s in slots)
 
@@ -478,9 +476,7 @@ async def test_cmd_addslots_dedups_duplicate_hours_in_request(
     assert "✅ Открыты слоты" in text
 
     async with session_factory() as verify:
-        slots = (await verify.execute(
-            select(Slot).order_by(Slot.slot_hour)
-        )).scalars().all()
+        slots = (await verify.execute(select(Slot).order_by(Slot.slot_hour))).scalars().all()
         assert [s.slot_hour for s in slots] == [11, 12]  # dedup, not 3 rows
 
 
@@ -1174,3 +1170,110 @@ def test_render_bookings_strips_newlines_in_snapshots() -> None:
     assert "\n" not in bullet_line  # the bullet is on a single line
     assert "Паша Вторник" in bullet_line  # newline → space
     assert "Стрижка VIP" in bullet_line
+
+
+# ============================================================
+# Tier 2 (T9) — admin handler edge branches (NEXT_COVERAGE_GAPS.md)
+# Covers bot/handlers/admin.py:
+#   66  — _resolve_master_and_business business is None (broken FK)
+#   136-137 — cmd_addslots resolved is None (master not in DB for admin_id)
+#   242 — cmd_closeslot slot already closed (idempotent re-close)
+# Dead code (NOT covered, unreachable):
+#   128-129 — `if not hours` (args[1:] never empty after len(args) >= 2 check)
+#   133, 210, 345 — `if admin_id is None` (admin_id never None after _is_admin True)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_cmd_addslots_master_not_found_when_admin_id_not_in_db(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Covers admin.py:136-137 — admin_id (settings.ADMIN_ID) resolves to no
+    master in DB → _resolve_master_and_business returns None → handler shows
+    'Мастер не найден'.
+
+    Setup: seed admin stack under NON_ADMIN_TG_ID (not settings.ADMIN_ID).
+    Then invoke cmd_addslots as ADMIN_TG_ID (passes _is_admin) — but
+    _resolve_master_and_business(ADMIN_TG_ID) finds no master row.
+    """
+    async with session_factory() as session:
+        # Seed admin stack under a DIFFERENT telegram_id — so ADMIN_TG_ID has
+        # no master in DB. _is_admin still True (settings.ADMIN_ID == ADMIN_TG_ID
+        # via conftest env), but _resolve_master_and_business returns None.
+        await _seed_admin_stack(session, admin_telegram_id=NON_ADMIN_TG_ID)
+
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+    msg = _make_message(user_id=ADMIN_TG_ID, text=f"/addslots {tomorrow} 11")
+    await admin_handlers.cmd_addslots(msg, _make_command(f"{tomorrow} 11"))
+
+    text = _answer_text(msg)
+    assert "Мастер не найден" in text
+
+    # No slots created (handler early-returned before service call).
+    async with session_factory() as verify:
+        slots = (await verify.execute(select(Slot))).scalars().all()
+        assert len(slots) == 0
+
+
+@pytest.mark.asyncio
+async def test_cmd_closeslot_returns_false_race_else_branch(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Covers admin.py:242 — close_slot returns False (slot deleted between
+    handler SELECT and close_slot SELECT — race) → handler shows
+    'Слот уже был закрыт' (the else-branch of `if updated`).
+
+    Note: close_slot actually returns True for already-closed (idempotent in
+    service line 78, covered by test_cmd_closeslot_already_closed_idempotent
+    above), so this handler branch is reachable only via race or monkeypatch.
+    We monkeypatch close_slot to return False to exercise the handler's
+    else-branch (line 242) — testing handler logic, not service.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        await _seed_slot(
+            session, master_id=ctx["master_id"], slot_date=tomorrow, hour=14, status="open"
+        )
+
+    async def _return_false(*args: Any, **kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(admin_handlers, "close_slot", _return_false)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text=f"/closeslot {tomorrow} 14")
+    await admin_handlers.cmd_closeslot(msg, _make_command(f"{tomorrow} 14"))
+
+    text = _answer_text(msg)
+    assert "уже был закрыт" in text
+
+
+@pytest.mark.asyncio
+async def test_resolve_master_and_business_returns_none_when_business_fk_broken(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Covers admin.py:66 — master exists but business_id FK broken (business
+    row deleted out of band) → business is None → return None (defense in depth).
+
+    SQLite has PRAGMA foreign_keys=OFF by default in our engine setup, so we
+    can DELETE FROM businesses leaving a dangling master.business_id. In prod
+    (Postgres with FK ON), this branch is hit only on referential corruption —
+    the handler still guards against it rather than crashing on
+    `business.timezone` access.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session, admin_telegram_id=ADMIN_TG_ID)
+        biz_id = ctx["business_id"]
+        # Delete the business row, leaving master.business_id dangling
+        # (PRAGMA foreign_keys=OFF in aiosqlite by default — DELETE succeeds).
+        from sqlalchemy import delete
+
+        await session.execute(delete(Business).where(Business.id == biz_id))
+        await session.commit()
+
+    result = await admin_handlers._resolve_master_and_business(ADMIN_TG_ID)
+    assert result is None

@@ -153,9 +153,7 @@ async def _seed_full_stack(
     session.add(biz)
     await session.flush()
 
-    master = Master(
-        business_id=biz.id, name="Екатерина", telegram_id=461355056, role="owner"
-    )
+    master = Master(business_id=biz.id, name="Екатерина", telegram_id=461355056, role="owner")
     session.add(master)
     await session.flush()
 
@@ -246,9 +244,9 @@ async def test_mybookings_msg_with_cancelable_booking(
 
     # Sanity: booking exists, start_at is naive UTC in SQLite.
     async with session_factory() as verify_session:
-        b = (await verify_session.execute(
-            select(Booking).where(Booking.id == booking.id)
-        )).scalar_one()
+        b = (
+            await verify_session.execute(select(Booking).where(Booking.id == booking.id))
+        ).scalar_one()
         assert b.status == "confirmed"
         assert b.start_at.tzinfo is None  # SQLite stores naive
 
@@ -268,9 +266,7 @@ async def test_mybookings_msg_with_cancelable_booking(
     # InlineKeyboardMarkup has .inline_keyboard: list[list[InlineKeyboardButton]]
     # mybookings_keyboard emits 2 buttons per booking: [Отменить] + [Перенести].
     buttons = [btn for row in reply_markup.inline_keyboard for btn in row]
-    assert len(buttons) == 2, (
-        "one cancelable booking → 2 buttons: [Отменить] + [Перенести]"
-    )
+    assert len(buttons) == 2, "one cancelable booking → 2 buttons: [Отменить] + [Перенести]"
     cancel_btn = buttons[0]
     transfer_btn = buttons[1]
     assert "Отменить" in cancel_btn.text
@@ -415,9 +411,9 @@ async def test_mybookings_cancel_cb_happy_path(
 
     # DB: booking.status now 'cancelled' (cancel_booking committed).
     async with session_factory() as verify_session:
-        b = (await verify_session.execute(
-            select(Booking).where(Booking.id == booking_id)
-        )).scalar_one()
+        b = (
+            await verify_session.execute(select(Booking).where(Booking.id == booking_id))
+        ).scalar_one()
         assert b.status == "cancelled"
 
     # Scheduler.remove_job called for both remind_24h and remind_1h.
@@ -457,9 +453,9 @@ async def test_mybookings_cancel_cb_too_late(
 
     # DB: booking STILL 'confirmed' (cancel_booking raised before UPDATE commit).
     async with session_factory() as verify_session:
-        b = (await verify_session.execute(
-            select(Booking).where(Booking.id == booking_id)
-        )).scalar_one()
+        b = (
+            await verify_session.execute(select(Booking).where(Booking.id == booking_id))
+        ).scalar_one()
         assert b.status == "confirmed"
 
     # Scheduler NOT touched (service raised before remove_jobs_for_booking).
@@ -513,9 +509,9 @@ async def test_mybookings_cancel_cb_not_owner(
 
     # DB: booking STILL 'confirmed' (cancel_booking rejected on ownership).
     async with session_factory() as verify_session:
-        b = (await verify_session.execute(
-            select(Booking).where(Booking.id == booking_id)
-        )).scalar_one()
+        b = (
+            await verify_session.execute(select(Booking).where(Booking.id == booking_id))
+        ).scalar_one()
         assert b.status == "confirmed"
 
 
@@ -589,10 +585,14 @@ async def test_mybookings_keyboard_buttons_match_bookings(
     # (mybookings_keyboard reads .start_at and .id — needs attached-or-loaded rows).
     async with session_factory() as session:
         bookings = (
-            await session.execute(
-                select(Booking).where(Booking.id.in_([b1.id, b2.id])).order_by(Booking.start_at)
+            (
+                await session.execute(
+                    select(Booking).where(Booking.id.in_([b1.id, b2.id])).order_by(Booking.start_at)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
     markup = mybookings_keyboard(bookings, business_timezone="Europe/Moscow")
     assert isinstance(markup, InlineKeyboardMarkup)
@@ -936,9 +936,9 @@ async def test_transfer_slot_cb_happy_path(
 
     # DB: booking.status now 'transferred', slot_id points to new_slot.
     async with session_factory() as verify_session:
-        b = (await verify_session.execute(
-            select(Booking).where(Booking.id == booking_id)
-        )).scalar_one()
+        b = (
+            await verify_session.execute(select(Booking).where(Booking.id == booking_id))
+        ).scalar_one()
         assert b.status == "transferred"
         assert b.slot_id == new_slot_id
 
@@ -947,9 +947,9 @@ async def test_transfer_slot_cb_happy_path(
         # Old slot_id from booking's first slot — re-fetch via the slot we created.
         # The seed_booking inserted a Slot with status='booked'; after transfer, that
         # slot must be 'open'. We fetch by booking's new slot_id (different row).
-        new_slot_row = (await verify_session.execute(
-            select(Slot).where(Slot.id == new_slot_id)
-        )).scalar_one()
+        new_slot_row = (
+            await verify_session.execute(select(Slot).where(Slot.id == new_slot_id))
+        ).scalar_one()
         assert new_slot_row.status == "booked"
 
     # Scheduler: remove_job called for old reminders, add_job for new ones.
@@ -1006,9 +1006,9 @@ async def test_transfer_slot_cb_slot_already_booked(
 
     # DB: booking STILL 'confirmed' (transfer_booking rolled back on SlotAlreadyBookedError).
     async with session_factory() as verify_session:
-        b = (await verify_session.execute(
-            select(Booking).where(Booking.id == booking_id)
-        )).scalar_one()
+        b = (
+            await verify_session.execute(select(Booking).where(Booking.id == booking_id))
+        ).scalar_one()
         assert b.status == "confirmed"
 
 
@@ -1085,9 +1085,9 @@ async def test_transfer_slot_cb_already_transferred(
 
     # DB: booking unchanged (transfer_booking monkey-patched, no DB write)
     async with session_factory() as verify_session:
-        b = (await verify_session.execute(
-            select(Booking).where(Booking.id == booking_id)
-        )).scalar_one()
+        b = (
+            await verify_session.execute(select(Booking).where(Booking.id == booking_id))
+        ).scalar_one()
         assert b.status == "confirmed"
 
 
@@ -1284,9 +1284,7 @@ async def test_transfer_slot_cb_booking_not_found(
     random_booking_id = UUID("00000000-0000-0000-0000-000000000001")
     cb, cb_data = _make_slot_callback(user_id=111222333, slot_id=new_slot_id, bot=bot)
     state = _make_state()
-    state.get_data = AsyncMock(
-        return_value={"transfer_booking_id": str(random_booking_id)}
-    )
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(random_booking_id)})
 
     await client_handlers.transfer_slot_cb(cb, cb_data, state, mock_scheduler)
 
@@ -2068,17 +2066,60 @@ async def test_confirm_cb_business_not_found_clears_state(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """T5b: confirm_cb (client.py:292-297) — master exists but business FK broken →
-    state.clear + 'Бизнес не найден' + callback.answer (abort).
+    """T5b: confirm_cb (client.py:292-297) — master exists but business_id FK
+    broken (business row deleted out of band) → state.clear + 'Бизнес не найден'
+    + callback.answer (abort).
 
-    Hard to construct without FK violation. We seed master+client (no business
-    in DB via _seed_full_stack — but it creates business). To exercise this branch
-    we'd need to delete business after _seed_full_stack. Skipping — branch is
-    symmetric to master_not_found and not separately testable without DB surgery.
-    Marked as hypothesis (not covered).
+    Setup mirrors admin test
+    `test_resolve_master_and_business_returns_none_when_business_fk_broken`:
+    seed full stack under settings.ADMIN_ID, then raw DELETE the business row
+    (SQLite PRAGMA foreign_keys=OFF by default allows this, leaving
+    master.business_id dangling).
+
+    In prod (Postgres with FK ON), this branch is hit only on referential
+    corruption — handler guards against `business.timezone` AttributeError.
     """
-    # <гипотеза>: branch is symmetric to master_not_found; skip without FK violation
-    pytest.skip("Branch symmetric to master_not_found — would need FK violation")
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session, client_telegram_id=111222333)
+        biz_id = ctx["business_id"]
+        # Seed an open slot (confirm_cb needs slot_id in state for the lookup
+        # path, though we won't reach the booking service — the branch aborts
+        # at business is None before any service call).
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = Slot(
+            master_id=ctx["master_id"],
+            slot_date=tomorrow,
+            slot_hour=14,
+            status="open",
+        )
+        session.add(slot)
+        await session.flush()
+        slot_id = slot.id
+        # Delete the business row, leaving master.business_id dangling
+        # (PRAGMA foreign_keys=OFF in aiosqlite by default — DELETE succeeds).
+        from sqlalchemy import delete
+
+        await session.execute(delete(Business).where(Business.id == biz_id))
+        await session.commit()
+
+    cb, callback_data = _make_confirm_callback(user_id=461355056)
+    state = _make_state()
+    await state.update_data(
+        slot_id=str(slot_id),
+        client_name="Паша",
+        service_title="Стрижка",
+    )
+    scheduler = MagicMock(spec=AsyncIOScheduler)
+
+    await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
+
+    state.clear.assert_awaited_once()
+    text = _answer_text(cb.message)
+    assert "Бизнес не найден" in text
+    cb.answer.assert_awaited()
+    # No service call (handler aborts before create_booking)
+    scheduler.remove_job.assert_not_called()
+    cb.bot.send_message.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2310,3 +2351,285 @@ async def test_cancel_msg_clears_state_and_answers(
     text = _answer_text(msg)
     assert "Ввод отменён" in text
     assert "/book" in text
+
+
+# ============================================================
+# Tier 2 (T10) — client handler edge branches (NEXT_COVERAGE_GAPS.md)
+# Covers bot/handlers/client.py:
+#   406      — mybookings_msg from_user is None (channel_post edge)
+#   501-502  — mybookings_cancel_cb from_user is None (channel_post edge)
+#   525-526  — mybookings_cancel_cb BookingAlreadyCancelledError (concurrent cancel)
+#   555      — no_state_fallback: text without state, without /, → "Начните через /book"
+#   588-589  — mybookings_transfer_cb from_user is None (channel_post edge)
+#   612-613  — mybookings_transfer_cb booking.status == 'cancelled' (already cancelled)
+#   741-742  — transfer_slot_cb from_user is None (channel_post edge)
+# Skipped (FK surgery, separate task):
+#   293-297  — confirm_cb business is None (broken FK)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_mybookings_msg_from_user_is_none_early_return(
+    patched_session_factory: Any,
+) -> None:
+    """Covers client.py:406 — `if message.from_user is None: return` in
+    mybookings_msg. Edge case: channel_post triggers Command filter with no
+    from_user (rare but defensive). Handler must early-return without crash.
+
+    Setup: message.from_user = None (MagicMock spec=Message allows this).
+    Assert: no message.answer call, no exception raised.
+    """
+    msg = MagicMock(spec=Message)
+    msg.from_user = None
+    msg.text = "/mybookings"
+    msg.answer = AsyncMock()
+
+    await client_handlers.mybookings_msg(msg)
+
+    msg.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mybookings_cancel_cb_from_user_none_early_return(
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+) -> None:
+    """Covers client.py:501-502 — `if callback.from_user is None: callback.answer();
+    return` in mybookings_cancel_cb. Edge case: callback_query without from_user
+    (defensive — Telegram always populates from_user for callback queries,
+    but the guard prevents AttributeError if Bot API changes).
+
+    Setup: callback.from_user = None. Assert: callback.answer called, no
+    message.answer, no DB query, no scheduler call.
+    """
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = None
+    cb.message = MagicMock(spec=Message)
+    cb.message.answer = AsyncMock()
+    cb.answer = AsyncMock()
+    cb.bot = AsyncMock()
+    cb.bot.send_message = AsyncMock()
+    cb_data = MyBookingsCancelCallbackData(booking_id=UUID("00000000-0000-0000-0000-000000000000"))
+
+    await client_handlers.mybookings_cancel_cb(cb, cb_data, mock_scheduler)
+
+    cb.answer.assert_awaited_once()
+    cb.message.answer.assert_not_awaited()
+    cb.bot.send_message.assert_not_called()
+    mock_scheduler.remove_job.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_mybookings_cancel_cb_booking_already_cancelled_race(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Covers client.py:525-526 — `except BookingAlreadyCancelledError:
+    callback.answer('Запись уже отменена'); return`.
+
+    Race scenario: user taps [Отменить], but a concurrent request (or admin
+    via /closeslot triggering cancel_booking) already cancelled the booking
+    between handler SELECT of client and UPDATE in cancel_booking service.
+    cancel_booking raises BookingAlreadyCancelledError → handler shows
+    short popup (callback.answer, NOT message.answer — short text).
+
+    Setup: seed booking, monkeypatch cancel_booking to raise.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        future_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=3)
+        future_local = future_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=future_local)
+        booking_id = booking.id
+
+    from bot.services import booking as booking_svc
+
+    async def _raise_already_cancelled(*args: Any, **kwargs: Any) -> Any:
+        raise booking_svc.BookingAlreadyCancelledError("concurrent cancel race")
+
+    monkeypatch.setattr(client_handlers, "cancel_booking", _raise_already_cancelled)
+
+    bot = AsyncMock()
+    cb, cb_data = _make_callback(user_id=111222333, booking_id=booking_id, bot=bot)
+
+    await client_handlers.mybookings_cancel_cb(cb, cb_data, mock_scheduler)
+
+    # Short popup via callback.answer (NOT message.answer — short text per
+    # handler contract for 'already cancelled' / 'not found' cases).
+    cb.answer.assert_awaited()
+    answer_args = cb.answer.call_args.args
+    assert answer_args and "Запись уже отменена" in answer_args[0]
+    cb.message.answer.assert_not_awaited()
+    bot.send_message.assert_not_called()
+    mock_scheduler.remove_job.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_no_state_fallback_text_without_state_answers_hint(
+    patched_session_factory: Any,
+) -> None:
+    """Covers client.py:555 — no_state_fallback handler: when user sends text
+    (not a /command) while FSM is in State(None) (bot restart mid-FSM, lost
+    MemoryStorage state), handler replies 'Начните запись через /book'.
+
+    Direct handler invocation (no FSMContext needed — handler doesn't read
+    state, just message.answer).
+    """
+    msg = _make_message(user_id=111222333, text="привет")
+
+    await client_handlers.no_state_fallback(msg)
+
+    text = _answer_text(msg)
+    assert "Начните запись через /book" in text
+
+
+@pytest.mark.asyncio
+async def test_mybookings_transfer_cb_from_user_none_early_return(
+    patched_session_factory: Any,
+) -> None:
+    """Covers client.py:588-589 — `if callback.from_user is None: callback.answer();
+    return` in mybookings_transfer_cb. Symmetric to mybookings_cancel_cb guard.
+
+    Setup: callback.from_user = None, no state needed (handler early-returns
+    before state access).
+    """
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = None
+    cb.message = MagicMock(spec=Message)
+    cb.message.answer = AsyncMock()
+    cb.answer = AsyncMock()
+    cb.bot = AsyncMock()
+    cb.bot.send_message = AsyncMock()
+    cb_data = MyBookingsTransferCallbackData(
+        booking_id=UUID("00000000-0000-0000-0000-000000000000")
+    )
+    state = _make_state()
+
+    await client_handlers.mybookings_transfer_cb(cb, cb_data, state)
+
+    cb.answer.assert_awaited_once()
+    cb.message.answer.assert_not_awaited()
+    state.set_state.assert_not_awaited()
+    state.update_data.assert_not_awaited()
+    state.clear.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mybookings_transfer_cb_booking_already_cancelled(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Covers client.py:612-613 — `if booking.status == 'cancelled':
+    callback.answer('Запись уже отменена'); return` in mybookings_transfer_cb.
+
+    Scenario: user had a booking, cancelled it via /mybookings, then tapped
+    [🔄 Перенести] on a stale keyboard (rendered before cancel). Handler
+    re-fetches booking, sees status='cancelled', early-returns with short
+    popup.
+
+    Setup: seed booking, mark status='cancelled' (cancelled state), invoke
+    transfer entry. Assert: short popup, no FSM state change.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        future_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=3)
+        future_local = future_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        booking = await _seed_booking(
+            session, ctx=ctx, start_at_local=future_local, status="cancelled"
+        )
+        booking_id = booking.id
+
+    bot = AsyncMock()
+    cb, cb_data = _make_transfer_callback(user_id=111222333, booking_id=booking_id, bot=bot)
+    state = _make_state()
+
+    await client_handlers.mybookings_transfer_cb(cb, cb_data, state)
+
+    cb.answer.assert_awaited()
+    answer_args = cb.answer.call_args.args
+    assert answer_args and "Запись уже отменена" in answer_args[0]
+    cb.message.answer.assert_not_awaited()
+    state.set_state.assert_not_awaited()
+    state.update_data.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_cb_from_user_none_early_return(
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+) -> None:
+    """Covers client.py:741-742 — `if callback.from_user is None: callback.answer();
+    return` in transfer_slot_cb. Symmetric guard to other callback handlers.
+
+    Setup: callback.from_user = None. Handler early-returns before state
+    access, before transfer_booking call.
+    """
+    from bot.keyboards.client import BookSlotCallbackData
+
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = None
+    cb.message = MagicMock(spec=Message)
+    cb.message.answer = AsyncMock()
+    cb.answer = AsyncMock()
+    cb.bot = AsyncMock()
+    cb.bot.send_message = AsyncMock()
+    cb_data = BookSlotCallbackData(slot_id=UUID("00000000-0000-0000-0000-000000000000"))
+    state = _make_state()
+
+    await client_handlers.transfer_slot_cb(cb, cb_data, state, mock_scheduler)
+
+    cb.answer.assert_awaited_once()
+    cb.message.answer.assert_not_awaited()
+    cb.bot.send_message.assert_not_called()
+    state.clear.assert_not_awaited()
+    mock_scheduler.remove_job.assert_not_called()
+
+
+# ============================================================
+# Tier 2 (Bonus) — keyboards edges (NEXT_COVERAGE_GAPS.md)
+# Covers bot/keyboards/client.py:
+#   102-103 — slot_picker_keyboard([]) → "Нет свободных слотов" noop button
+#   124     — _no_op_button() helper (used in tests + empty-slots branch)
+# ============================================================
+
+
+def test_slot_picker_keyboard_empty_slots_returns_noop_button() -> None:
+    """Covers keyboards/client.py:102-103 — `if not slots: button("Нет свободных
+    слотов", callback_data="noop"); return markup`.
+
+    Empty slots list → single disabled-style button with noop callback (no
+    slot to select). Verifies the edge case branch (vs the for-loop default
+    path that builds per-slot buttons).
+    """
+    from bot.keyboards.client import slot_picker_keyboard
+
+    markup = slot_picker_keyboard([])
+
+    assert isinstance(markup, InlineKeyboardMarkup)
+    # Single button "Нет свободных слотов" with callback_data="noop"
+    buttons = markup.inline_keyboard
+    assert len(buttons) == 1
+    assert len(buttons[0]) == 1
+    button = buttons[0][0]
+    assert button.text == "Нет свободных слотов"
+    assert button.callback_data == "noop"
+
+
+def test_no_op_button_helper_returns_noop_inline_button() -> None:
+    """Covers keyboards/client.py:124 — _no_op_button() helper returns an
+    InlineKeyboardButton with text="Нет свободных слотов" and callback_data="noop".
+
+    NOTE: this helper is currently NOT called by slot_picker_keyboard (which
+    uses builder.button() directly at keyboards/client.py:102). The helper
+    is a standalone contract reference (defined "used in tests" per its own
+    docstring). The two share the same button text/callback_data contract
+    but are independent implementations.
+    """
+    from bot.keyboards.client import _no_op_button
+
+    button = _no_op_button()
+
+    assert button.text == "Нет свободных слотов"
+    assert button.callback_data == "noop"
