@@ -31,9 +31,7 @@ class Business(Base):
     name: Mapped[str] = mapped_column(String(255))
     telegram_owner_id: Mapped[int] = mapped_column(BigInteger)
     timezone: Mapped[str] = mapped_column(String(50), default="Europe/Moscow")
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class Master(Base):
@@ -47,9 +45,7 @@ class Master(Base):
     telegram_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     role: Mapped[str] = mapped_column(String(50), default="barber")
     is_active: Mapped[bool] = mapped_column(default=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
         Index("idx_masters_business", "business_id", postgresql_where=text("is_active = TRUE")),
@@ -67,9 +63,7 @@ class Service(Base):
     duration_minutes: Mapped[int] = mapped_column()
     price: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     is_active: Mapped[bool] = mapped_column(default=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
         CheckConstraint("duration_minutes > 0", name="ck_service_duration_positive"),
@@ -84,9 +78,7 @@ class Client(Base):
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True)
     name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class Slot(Base):
@@ -99,9 +91,7 @@ class Slot(Base):
     slot_date: Mapped[date] = mapped_column()
     slot_hour: Mapped[int] = mapped_column()  # LOCAL hour in business.timezone
     status: Mapped[str] = mapped_column(String(20), default="open")  # open | booked | closed
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
         CheckConstraint("slot_hour BETWEEN 0 AND 23", name="ck_slot_hour_range"),
@@ -124,26 +114,18 @@ class Booking(Base):
     business_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("businesses.id"), nullable=False
     )
-    master_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, ForeignKey("masters.id"), nullable=False
-    )
-    client_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, ForeignKey("clients.id"), nullable=False
-    )
+    master_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("masters.id"), nullable=False)
+    client_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("clients.id"), nullable=False)
     service_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("services.id"), nullable=True
     )
     service_title_snapshot: Mapped[str] = mapped_column(String(255))  # html.escape()'d
-    service_price_snapshot: Mapped[Decimal | None] = mapped_column(
-        Numeric(10, 2), nullable=True
-    )
+    service_price_snapshot: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
     client_name_snapshot: Mapped[str] = mapped_column(String(255))  # html.escape()'d
     start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))  # UTC
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))  # UTC
     status: Mapped[str] = mapped_column(String(20), default="confirmed")
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
         CheckConstraint("end_at > start_at", name="ck_booking_duration_positive"),
@@ -171,9 +153,7 @@ class NotificationLog(Base):
     )
     kind: Mapped[str] = mapped_column(String(30))
     # remind_24h | remind_1h | master_new | master_cancel | master_transfer
-    sent_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
         CheckConstraint(

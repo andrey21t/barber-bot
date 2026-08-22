@@ -28,9 +28,7 @@ async def _seed_booking(session: AsyncSession, start_at: datetime) -> Booking:
     session.add_all([master, client])
     await session.flush()
 
-    slot = Slot(
-        master_id=master.id, slot_date=start_at.date(), slot_hour=14, status="booked"
-    )
+    slot = Slot(master_id=master.id, slot_date=start_at.date(), slot_hour=14, status="booked")
     session.add(slot)
     await session.flush()
 
@@ -139,12 +137,8 @@ async def test_get_upcoming_filters_by_window(session: AsyncSession) -> None:
 @pytest.mark.asyncio
 async def test_get_upcoming_default_look_ahead_25h(session: AsyncSession) -> None:
     """Default look_ahead is 25h (per spec.md 374-380)."""
-    just_in_window = await _seed_booking(
-        session, datetime.now(UTC) + timedelta(hours=24)
-    )
-    out_of_window = await _seed_booking(
-        session, datetime.now(UTC) + timedelta(hours=26)
-    )
+    just_in_window = await _seed_booking(session, datetime.now(UTC) + timedelta(hours=24))
+    out_of_window = await _seed_booking(session, datetime.now(UTC) + timedelta(hours=26))
 
     upcoming = await get_upcoming_bookings_for_reschedule(session, datetime.now(UTC))
 

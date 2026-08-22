@@ -41,13 +41,10 @@ async def get_overdue_bookings_without_remind_24h(
     NOT EXISTS notifications_log(booking_id, kind='remind_24h')
     """
     window_start = now - timedelta(hours=24)
-    stmt = (
-        select(Booking)
-        .where(
-            Booking.status == "confirmed",
-            Booking.start_at > window_start,
-            Booking.start_at < now,
-        )
+    stmt = select(Booking).where(
+        Booking.status == "confirmed",
+        Booking.start_at > window_start,
+        Booking.start_at < now,
     )
     result = await session.execute(stmt)
     bookings = list(result.scalars().all())
@@ -73,13 +70,10 @@ async def get_upcoming_bookings_for_reschedule(
     Limited to 25h window to avoid MemoryJobStore overflow (job per booking).
     """
     window_end = now + timedelta(hours=look_ahead_hours)
-    stmt = (
-        select(Booking)
-        .where(
-            Booking.status == "confirmed",
-            Booking.start_at > now,
-            Booking.start_at < window_end,
-        )
+    stmt = select(Booking).where(
+        Booking.status == "confirmed",
+        Booking.start_at > now,
+        Booking.start_at < window_end,
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())

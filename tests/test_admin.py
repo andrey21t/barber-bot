@@ -62,9 +62,9 @@ async def _make_booking(
     from sqlalchemy import update
 
     await session.execute(
-        update(Slot).where(Slot.id == slot_id).values(
-            status="booked" if status in ("confirmed", "transferred") else "open"
-        )
+        update(Slot)
+        .where(Slot.id == slot_id)
+        .values(status="booked" if status in ("confirmed", "transferred") else "open")
     )
     await session.commit()
     return booking
@@ -124,7 +124,8 @@ async def test_get_today_returns_only_today_confirmed(
 
     # Booking today at 14:00 Moscow (confirmed)
     slot_today = await _make_slot(
-        session, master_id=seed_data["master_id"],
+        session,
+        master_id=seed_data["master_id"],
         slot_date_local=datetime.fromisoformat(f"{today_local}T00:00:00+03:00"),
         hour_local=14,
     )
@@ -140,7 +141,8 @@ async def test_get_today_returns_only_today_confirmed(
 
     # Booking tomorrow at 15:00 Moscow (should NOT appear)
     slot_tomorrow = await _make_slot(
-        session, master_id=seed_data["master_id"],
+        session,
+        master_id=seed_data["master_id"],
         slot_date_local=datetime.fromisoformat("2026-03-16T00:00:00+03:00"),
         hour_local=15,
     )
@@ -156,7 +158,8 @@ async def test_get_today_returns_only_today_confirmed(
 
     # Booking today at 16:00 Moscow (cancelled — should NOT appear)
     slot_today_cancel = await _make_slot(
-        session, master_id=seed_data["master_id"],
+        session,
+        master_id=seed_data["master_id"],
         slot_date_local=datetime.fromisoformat(f"{today_local}T00:00:00+03:00"),
         hour_local=16,
     )
@@ -192,7 +195,8 @@ async def test_get_today_timezone_edge_case(
     today_local = "2026-03-16"
 
     slot = await _make_slot(
-        session, master_id=seed_data["master_id"],
+        session,
+        master_id=seed_data["master_id"],
         slot_date_local=datetime.fromisoformat(f"{today_local}T00:00:00+03:00"),
         hour_local=11,
     )
@@ -222,7 +226,8 @@ async def test_get_today_returns_transferred_status(
     today_local = "2026-03-15"
 
     slot = await _make_slot(
-        session, master_id=seed_data["master_id"],
+        session,
+        master_id=seed_data["master_id"],
         slot_date_local=datetime.fromisoformat(f"{today_local}T00:00:00+03:00"),
         hour_local=14,
     )
@@ -271,49 +276,65 @@ async def test_get_week_returns_7_day_window(
 
     # Day 0 — today
     slot_d0 = await _make_slot(
-        session, master_id=seed_data["master_id"],
+        session,
+        master_id=seed_data["master_id"],
         slot_date_local=datetime.fromisoformat(f"{base}T00:00:00+03:00"),
         hour_local=10,
     )
     await _make_booking(
-        session, slot_id=slot_d0.id, business_id=seed_data["business_id"],
-        master_id=seed_data["master_id"], client_id=seed_data["client"].id,
+        session,
+        slot_id=slot_d0.id,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        client_id=seed_data["client"].id,
         start_at_utc=_utc_naive(base, 10, tz),
     )
 
     # Day 3
     slot_d3 = await _make_slot(
-        session, master_id=seed_data["master_id"],
+        session,
+        master_id=seed_data["master_id"],
         slot_date_local=datetime.fromisoformat("2026-03-18T00:00:00+03:00"),
         hour_local=11,
     )
     await _make_booking(
-        session, slot_id=slot_d3.id, business_id=seed_data["business_id"],
-        master_id=seed_data["master_id"], client_id=seed_data["client"].id,
+        session,
+        slot_id=slot_d3.id,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        client_id=seed_data["client"].id,
         start_at_utc=_utc_naive("2026-03-18", 11, tz),
     )
 
     # Day 6 — last day in 7-day window (today + 6)
     slot_d6 = await _make_slot(
-        session, master_id=seed_data["master_id"],
+        session,
+        master_id=seed_data["master_id"],
         slot_date_local=datetime.fromisoformat("2026-03-21T00:00:00+03:00"),
         hour_local=12,
     )
     await _make_booking(
-        session, slot_id=slot_d6.id, business_id=seed_data["business_id"],
-        master_id=seed_data["master_id"], client_id=seed_data["client"].id,
+        session,
+        slot_id=slot_d6.id,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        client_id=seed_data["client"].id,
         start_at_utc=_utc_naive("2026-03-21", 12, tz),
     )
 
     # Day 7 — outside 7-day window (today + 7 = 8th day, excluded)
     slot_d7 = await _make_slot(
-        session, master_id=seed_data["master_id"],
+        session,
+        master_id=seed_data["master_id"],
         slot_date_local=datetime.fromisoformat("2026-03-22T00:00:00+03:00"),
         hour_local=13,
     )
     await _make_booking(
-        session, slot_id=slot_d7.id, business_id=seed_data["business_id"],
-        master_id=seed_data["master_id"], client_id=seed_data["client"].id,
+        session,
+        slot_id=slot_d7.id,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        client_id=seed_data["client"].id,
         start_at_utc=_utc_naive("2026-03-22", 13, tz),
     )
 
@@ -333,13 +354,17 @@ async def test_get_week_excludes_cancelled(
     now_utc = _local_dt("2026-03-15", 12, tz)
 
     slot = await _make_slot(
-        session, master_id=seed_data["master_id"],
+        session,
+        master_id=seed_data["master_id"],
         slot_date_local=datetime.fromisoformat("2026-03-16T00:00:00+03:00"),
         hour_local=10,
     )
     await _make_booking(
-        session, slot_id=slot.id, business_id=seed_data["business_id"],
-        master_id=seed_data["master_id"], client_id=seed_data["client"].id,
+        session,
+        slot_id=slot.id,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        client_id=seed_data["client"].id,
         start_at_utc=_utc_naive("2026-03-16", 10, tz),
         status="cancelled",
     )
@@ -362,13 +387,17 @@ async def test_get_week_orders_by_date_then_hour(
     # Insert out-of-order: day2 16:00, day1 11:00, day2 10:00
     for date_str, hour in [("2026-03-17", 16), ("2026-03-16", 11), ("2026-03-17", 10)]:
         slot = await _make_slot(
-            session, master_id=seed_data["master_id"],
+            session,
+            master_id=seed_data["master_id"],
             slot_date_local=datetime.fromisoformat(f"{date_str}T00:00:00+03:00"),
             hour_local=hour,
         )
         await _make_booking(
-            session, slot_id=slot.id, business_id=seed_data["business_id"],
-            master_id=seed_data["master_id"], client_id=seed_data["client"].id,
+            session,
+            slot_id=slot.id,
+            business_id=seed_data["business_id"],
+            master_id=seed_data["master_id"],
+            client_id=seed_data["client"].id,
             start_at_utc=_utc_naive(date_str, hour, tz),
         )
 
@@ -529,13 +558,17 @@ async def test_get_today_extreme_timezone_utc_plus_12(
     today_local = "2026-03-16"
 
     slot = await _make_slot(
-        session, master_id=seed_data["master_id"],
+        session,
+        master_id=seed_data["master_id"],
         slot_date_local=datetime.fromisoformat(f"{today_local}T00:00:00+12:00"),
         hour_local=11,
     )
     await _make_booking(
-        session, slot_id=slot.id, business_id=seed_data["business_id"],
-        master_id=seed_data["master_id"], client_id=seed_data["client"].id,
+        session,
+        slot_id=slot.id,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        client_id=seed_data["client"].id,
         # 11:00 Kamchatka = 23:00 UTC previous day (2026-03-15)
         start_at_utc=_utc_naive(today_local, 11, tz),
         status="confirmed",
@@ -583,9 +616,7 @@ async def test_get_client_bookings_filters_past_naive(
     )
 
     now_utc = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
-    result = await get_client_bookings(
-        session, seed_data["client"].id, now_utc=now_utc
-    )
+    result = await get_client_bookings(session, seed_data["client"].id, now_utc=now_utc)
     assert len(result) == 0, "past booking (naive UTC) must be excluded by default"
 
 
@@ -597,16 +628,12 @@ async def test_get_client_bookings_returns_upcoming_naive_utc(
     """W2 fix contract: booking in future (naive UTC) returned as upcoming."""
     now_utc = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
     future_utc = now_utc + timedelta(days=1)
-    future_naive = future_utc.replace(
-        hour=15, minute=0, second=0, microsecond=0, tzinfo=None
-    )
+    future_naive = future_utc.replace(hour=15, minute=0, second=0, microsecond=0, tzinfo=None)
 
     slot = await _make_slot(
         session,
         master_id=seed_data["master_id"],
-        slot_date_local=future_utc.replace(
-            hour=15, minute=0, second=0, microsecond=0
-        ),
+        slot_date_local=future_utc.replace(hour=15, minute=0, second=0, microsecond=0),
         hour_local=15,
     )
     await _make_booking(
@@ -619,9 +646,7 @@ async def test_get_client_bookings_returns_upcoming_naive_utc(
         status="confirmed",
     )
 
-    result = await get_client_bookings(
-        session, seed_data["client"].id, now_utc=now_utc
-    )
+    result = await get_client_bookings(session, seed_data["client"].id, now_utc=now_utc)
     assert len(result) == 1
     assert result[0].start_at == future_naive
 
@@ -651,9 +676,7 @@ async def test_get_client_bookings_include_past_returns_all(
         status="confirmed",
     )
 
-    result = await get_client_bookings(
-        session, seed_data["client"].id, include_past=True
-    )
+    result = await get_client_bookings(session, seed_data["client"].id, include_past=True)
     assert len(result) == 1
     assert result[0].start_at == past_naive
 

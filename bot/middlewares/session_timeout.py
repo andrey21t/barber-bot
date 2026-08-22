@@ -53,8 +53,7 @@ class SessionTimeoutMiddleware(BaseMiddleware):
                     await state.clear()
                     if hasattr(event, "answer"):
                         await event.answer(
-                            "⏰ Сессия истекла (30 мин бездействия). "
-                            "Начните заново через /book"
+                            "⏰ Сессия истекла (30 мин бездействия). Начните заново через /book"
                         )
                     return None  # handler NOT called
 

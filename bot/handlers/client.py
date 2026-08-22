@@ -84,9 +84,7 @@ async def cmd_book(message: Message, state: FSMContext) -> None:
 # ============================================================
 # 2. date_cb — user picked a date → show available slots
 # ============================================================
-@router.callback_query(
-    BookDateCallbackData.filter(), StateFilter(BookingStates.selecting_date)
-)
+@router.callback_query(BookDateCallbackData.filter(), StateFilter(BookingStates.selecting_date))
 async def date_cb(
     callback: CallbackQuery,
     callback_data: BookDateCallbackData,
@@ -148,9 +146,7 @@ async def date_cb(
 # ============================================================
 # 3. slot_cb — user picked a slot → ask for name
 # ============================================================
-@router.callback_query(
-    BookSlotCallbackData.filter(), StateFilter(BookingStates.selecting_slot)
-)
+@router.callback_query(BookSlotCallbackData.filter(), StateFilter(BookingStates.selecting_slot))
 async def slot_cb(
     callback: CallbackQuery,
     callback_data: BookSlotCallbackData,
@@ -160,9 +156,7 @@ async def slot_cb(
     await state.update_data(slot_id=str(callback_data.slot_id))
     await state.set_state(BookingStates.entering_name)
     if callback.message is not None:
-        await callback.message.answer(
-            "На чьё имя записываем? (например: Паша, я сам, сын 5 лет)"
-        )
+        await callback.message.answer("На чьё имя записываем? (например: Паша, я сам, сын 5 лет)")
     await callback.answer()
 
 
@@ -243,9 +237,7 @@ async def service_msg(message: Message, state: FSMContext) -> None:
 # ============================================================
 # 6. confirm_cb — user tapped ✅ → create_booking
 # ============================================================
-@router.callback_query(
-    BookConfirmCallbackData.filter(), StateFilter(BookingStates.confirming)
-)
+@router.callback_query(BookConfirmCallbackData.filter(), StateFilter(BookingStates.confirming))
 async def confirm_cb(
     callback: CallbackQuery,
     callback_data: BookConfirmCallbackData,
@@ -276,9 +268,7 @@ async def confirm_cb(
         from bot.models import Business, Master
 
         # Single-master MVP: master from ADMIN_ID
-        stmt_m = (
-            select(Master).where(Master.telegram_id == settings.ADMIN_ID).limit(1)
-        )
+        stmt_m = select(Master).where(Master.telegram_id == settings.ADMIN_ID).limit(1)
         master = (await session.execute(stmt_m)).scalar_one_or_none()
         if master is None:
             await state.clear()
@@ -470,9 +460,7 @@ async def mybookings_msg(message: Message) -> None:
 # ============================================================
 # 9. mybookings_cancel_cb — inline [Отменить] button callback
 # ============================================================
-@router.callback_query(
-    MyBookingsCancelCallbackData.filter(), StateFilter(None)
-)
+@router.callback_query(MyBookingsCancelCallbackData.filter(), StateFilter(None))
 async def mybookings_cancel_cb(
     callback: CallbackQuery,
     callback_data: MyBookingsCancelCallbackData,
@@ -526,9 +514,7 @@ async def mybookings_cancel_cb(
             return
         except CancelTooLateError:
             if callback.message is not None:
-                await callback.message.answer(
-                    "❌ Отмена возможна только за 24+ часов до записи"
-                )
+                await callback.message.answer("❌ Отмена возможна только за 24+ часов до записи")
             await callback.answer()
             return
 
@@ -558,9 +544,7 @@ async def no_state_fallback(message: Message) -> None:
 # ============================================================
 # 11. mybookings_transfer_cb — [🔄 Перенести] entry (StateFilter(None))
 # ============================================================
-@router.callback_query(
-    MyBookingsTransferCallbackData.filter(), StateFilter(None)
-)
+@router.callback_query(MyBookingsTransferCallbackData.filter(), StateFilter(None))
 async def mybookings_transfer_cb(
     callback: CallbackQuery,
     callback_data: MyBookingsTransferCallbackData,
@@ -620,9 +604,7 @@ async def mybookings_transfer_cb(
         deadline = booking.start_at - timedelta(hours=settings.CANCEL_MIN_HOURS)
         if now_utc >= deadline:
             if callback.message is not None:
-                await callback.message.answer(
-                    "❌ Перенос возможен только за 24+ часов до записи"
-                )
+                await callback.message.answer("❌ Перенос возможен только за 24+ часов до записи")
             await callback.answer()
             return
 
@@ -644,9 +626,7 @@ async def mybookings_transfer_cb(
 # Re-uses BookDateCallbackData picker (same prefix="book_date") but branches on
 # TransferStates.selecting_date (distinct from BookingStates.selecting_date → date_cb).
 # aiogram dispatches by state filter, so the two handlers coexist without conflict.
-@router.callback_query(
-    BookDateCallbackData.filter(), StateFilter(TransferStates.selecting_date)
-)
+@router.callback_query(BookDateCallbackData.filter(), StateFilter(TransferStates.selecting_date))
 async def transfer_date_cb(
     callback: CallbackQuery,
     callback_data: BookDateCallbackData,
@@ -705,9 +685,7 @@ async def transfer_date_cb(
 # ============================================================
 # 13. transfer_slot_cb — user picked a slot → call transfer_booking
 # ============================================================
-@router.callback_query(
-    BookSlotCallbackData.filter(), StateFilter(TransferStates.selecting_slot)
-)
+@router.callback_query(BookSlotCallbackData.filter(), StateFilter(TransferStates.selecting_slot))
 async def transfer_slot_cb(
     callback: CallbackQuery,
     callback_data: BookSlotCallbackData,
@@ -781,9 +759,7 @@ async def transfer_slot_cb(
             return
         except CancelTooLateError:
             if callback.message is not None:
-                await callback.message.answer(
-                    "❌ Перенос возможен только за 24+ часов до записи"
-                )
+                await callback.message.answer("❌ Перенос возможен только за 24+ часов до записи")
             await callback.answer()
             return
         except BookingAlreadyTransferredError:

@@ -79,8 +79,19 @@ def date_picker_keyboard(days_ahead: int = 7) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     today = datetime.now(UTC).date()
     month_names = [
-        "", "января", "февраля", "марта", "апреля", "мая", "июня",
-        "июля", "августа", "сентября", "октября", "ноября", "декабря",
+        "",
+        "января",
+        "февраля",
+        "марта",
+        "апреля",
+        "мая",
+        "июня",
+        "июля",
+        "августа",
+        "сентября",
+        "октября",
+        "ноября",
+        "декабря",
     ]
     for i in range(days_ahead):
         d = today + timedelta(days=i)
@@ -173,8 +184,4 @@ def _format_booking_summary(
         slot.slot_date, dtime(hour=slot.slot_hour), tzinfo=ZoneInfo(business_timezone)
     )
     formatted = local_dt.strftime("%d %B %Y, %H:%M")
-    return (
-        f"📅 {formatted}\n"
-        f"💇 {service_title}\n"
-        f"👤 {client_name}\n"
-    )
+    return f"📅 {formatted}\n💇 {service_title}\n👤 {client_name}\n"

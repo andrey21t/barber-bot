@@ -28,7 +28,4 @@ async def cmd_start(message: Message) -> None:
             reply_markup=admin_keyboard(),
         )
     else:
-        await message.answer(
-            "Привет! Я бот для записи к парикмахеру.\n"
-            "Запишитесь командой /book"
-        )
+        await message.answer("Привет! Я бот для записи к парикмахеру.\nЗапишитесь командой /book")

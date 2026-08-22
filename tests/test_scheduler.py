@@ -50,9 +50,7 @@ async def _seed_booking(session: AsyncSession, start_at: datetime) -> Booking:
     session.add_all([master, client])
     await session.flush()
 
-    slot = Slot(
-        master_id=master.id, slot_date=start_at.date(), slot_hour=14, status="booked"
-    )
+    slot = Slot(master_id=master.id, slot_date=start_at.date(), slot_hour=14, status="booked")
     session.add(slot)
     await session.flush()
 
