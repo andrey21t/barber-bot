@@ -1178,9 +1178,9 @@ def test_render_bookings_strips_newlines_in_snapshots() -> None:
 #   66  — _resolve_master_and_business business is None (broken FK)
 #   136-137 — cmd_addslots resolved is None (master not in DB for admin_id)
 #   242 — cmd_closeslot slot already closed (idempotent re-close)
-# Dead code (NOT covered, unreachable):
-#   128-129 — `if not hours` (args[1:] never empty after len(args) >= 2 check)
-#   133, 210, 345 — `if admin_id is None` (admin_id never None after _is_admin True)
+# Dead code removed 2026-08-22 (was: 128-129 if not hours, 133/210/345 if admin_id is None):
+#   unreachable after early `if not _is_admin: return` — replaced with `assert admin_id is not None`
+#   for type narrowing (mypy) — pattern matches client.py:302-304.
 # ============================================================
 
 

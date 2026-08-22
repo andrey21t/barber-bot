@@ -124,13 +124,9 @@ async def cmd_addslots(message: Message, command: CommandObject) -> None:
         return
 
     hours = sorted(set(hours_raw))  # dedup
-    if not hours:
-        await message.answer("❌ Укажите хотя бы один час")
-        return
 
     admin_id = _require_admin_or_silent(message)
-    if admin_id is None:
-        return
+    assert admin_id is not None
     resolved = await _resolve_master_and_business(admin_id)
     if resolved is None:
         await message.answer("❌ Мастер не найден. Обратитесь к администратору.")
@@ -206,8 +202,7 @@ async def cmd_closeslot(message: Message, command: CommandObject) -> None:
         return
 
     admin_id = _require_admin_or_silent(message)
-    if admin_id is None:
-        return
+    assert admin_id is not None
     resolved = await _resolve_master_and_business(admin_id)
     if resolved is None:
         await message.answer("❌ Мастер не найден")
@@ -341,8 +336,7 @@ async def cmd_services(message: Message, command: CommandObject) -> None:
         return
 
     admin_id = _require_admin_or_silent(message)
-    if admin_id is None:
-        return
+    assert admin_id is not None
     resolved = await _resolve_master_and_business(admin_id)
     if resolved is None:
         await message.answer("❌ Мастер не найден")
