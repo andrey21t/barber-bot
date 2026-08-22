@@ -43,6 +43,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, User
 from aiogram_calendar import SimpleCalendarCallback
 from aiogram_calendar.schemas import SimpleCalAct
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from bot.config import get_settings
 from bot.handlers import client as client_handlers
 from bot.keyboards.client import (
     MyBookingsCancelCallbackData,
@@ -1426,6 +1427,53 @@ async def test_cmd_book_sets_state_and_shows_date_picker(
     reply_markup = _answer_reply_markup(msg)
     assert isinstance(reply_markup, InlineKeyboardMarkup), (
         "cmd_book must show date picker inline keyboard"
+    )
+
+
+# ============================================================
+# _calendar_range — regression test for F1 (today must be bookable)
+# ============================================================
+
+
+def test_calendar_range_returns_midnight_naive_local() -> None:
+    """_calendar_range must return (min_date, max_date) at MIDNIGHT in business TZ.
+
+    Regression test for F1 (code-reviewer LBTM): if min_date has a time component
+    (e.g. 13:45), aiogram_calendar's process_day_select (common.py:57) compares
+    `min_date > datetime(year, month, day) @ midnight` → today is out-of-range →
+    "Сегодня" button alerts "date have to be later <today>". User cannot book today.
+
+    aiogram_calendar builds `datetime(year, month, day)` naive AT MIDNIGHT — so
+    min_date must also be at midnight (just tzinfo-stripped is not enough).
+    """
+    settings = get_settings()
+    min_date, max_date = client_handlers._calendar_range(settings)
+
+    # Both naive (no tzinfo) — lib compares with naive datetime
+    assert min_date.tzinfo is None, "min_date must be naive (lib compares naive)"
+    assert max_date.tzinfo is None, "max_date must be naive (lib compares naive)"
+
+    # Both at midnight — F1 regression: time component breaks today-booking
+    assert min_date.hour == 0 and min_date.minute == 0 and min_date.second == 0, (
+        f"min_date must be midnight, got {min_date.time()}"
+    )
+    assert max_date.hour == 0 and max_date.minute == 0 and max_date.second == 0, (
+        f"max_date must be midnight, got {max_date.time()}"
+    )
+
+    # max_date - min_date == MAX_BOOKING_DAYS_AHEAD days
+    delta = (max_date - min_date).days
+    assert delta == settings.MAX_BOOKING_DAYS_AHEAD, (
+        f"range span = {delta} days, expected {settings.MAX_BOOKING_DAYS_AHEAD}"
+    )
+
+    # min_date is today (in business TZ) — F1 fix ensures today is bookable
+    tz = ZoneInfo(settings.TIMEZONE)
+    today_local_midnight = datetime.now(tz).replace(
+        tzinfo=None, hour=0, minute=0, second=0, microsecond=0
+    )
+    assert min_date.date() == today_local_midnight.date(), (
+        f"min_date={min_date.date()} != today={today_local_midnight.date()}"
     )
 
 
