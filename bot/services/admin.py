@@ -26,7 +26,7 @@ async def get_today_bookings(
     master_id: UUID,
     business_timezone: str,
     *,
-    now_utc: datetime | None = None,
+    now_utc: datetime | None = None,  # must be tz-aware UTC (datetime.now(UTC))
 ) -> list[Booking]:
     """Confirmed/transferred bookings for today (LOCAL date in business.timezone).
 
@@ -58,7 +58,7 @@ async def get_week_bookings(
     business_timezone: str,
     *,
     days_ahead: int = 7,
-    now_utc: datetime | None = None,
+    now_utc: datetime | None = None,  # must be tz-aware UTC (datetime.now(UTC))
 ) -> list[Booking]:
     """Confirmed/transferred bookings for next N days (today inclusive → today+N).
 
@@ -126,7 +126,7 @@ async def get_client_bookings(
     client_id: UUID,
     *,
     include_past: bool = False,
-    now_utc: datetime | None = None,
+    now_utc: datetime | None = None,  # must be tz-aware UTC (datetime.now(UTC))
 ) -> list[Booking]:
     """Confirmed/transferred bookings for a client.
 
@@ -149,16 +149,11 @@ async def get_client_bookings(
         )
     )
     if not include_past:
-        # ref must be UTC (not system-local). On dev Mac (TZ=Europe/Moscow)
-        # datetime.now(tz=None) returns naive MSK time, but Booking.start_at is
-        # stored as naive UTC (SQLite) — naive comparison would be off by 3 hours,
-        # excluding upcoming bookings from /mybookings. Fix mirrors W1 (commit bfab1fb):
-        # explicitly use datetime.now(UTC), then strip tzinfo for SQLite comparison.
+        # ref is aware UTC (caller passes datetime.now(UTC) or test-aware). SQLAlchemy
+        # variant strips tzinfo on SQLite bind (verified empirically 2026-08-23), so
+        # aware UTC bind → naive UTC string compared lexicographically with stored
+        # naive UTC string — correct. On Postgres, TIMESTAMPTZ vs aware UTC — correct.
         ref = now_utc or datetime.now(UTC)
-        # Filter on Booking.start_at (UTC). SQLite stores datetime naive (verified
-        # test_admin.py 2026-08-21), so compare with naive UTC.
-        if ref.tzinfo is not None:
-            ref = ref.replace(tzinfo=None)
         stmt = stmt.where(Booking.start_at > ref)
     stmt = stmt.order_by(Booking.start_at)
     result = await session.execute(stmt)

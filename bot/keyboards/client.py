@@ -18,7 +18,7 @@ Note: prefix uses '_' not ':' — aiogram 3.x forbids separator ':' inside prefi
 (ValueError: "Separator symbol ':' can not be used inside prefix").
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import cast
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -140,7 +140,10 @@ def mybookings_keyboard(
     tz = ZoneInfo(business_timezone)
     builder = InlineKeyboardBuilder()
     for b in bookings:
-        local_time = b.start_at.astimezone(tz)
+        # b.start_at: naive on SQLite, aware UTC on Postgres. Inject tzinfo=UTC
+        # (no-op on Postgres) before .astimezone — Python interprets naive as
+        # system-local TZ otherwise.
+        local_time = b.start_at.replace(tzinfo=UTC).astimezone(tz)
         when = local_time.strftime("%d %b %H:%M")
         builder.button(
             text=f"❌ Отменить {when}",

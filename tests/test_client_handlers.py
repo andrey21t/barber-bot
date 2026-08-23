@@ -235,7 +235,9 @@ async def test_mybookings_msg_with_cancelable_booking(
     This test would have caught the naive-datetime bug fixed in commit da66f01
     (handler compared `now_utc` aware vs `booking.start_at` naive from SQLite
     → partition was wrong: cancelable bookings flagged as too-late or vice-versa).
-    The fix stripped tzinfo from now_utc (line 431); this test locks that contract.
+    Original fix stripped tzinfo from now_utc. Updated 2026-08-23 (Урок 2.6):
+    handler now uses aware-aware comparison — `booking.start_at.replace(tzinfo=UTC)`
+    injects tzinfo on DB-read side (no-op on Postgres where already aware).
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
@@ -298,10 +300,11 @@ async def test_mybookings_msg_with_too_late_booking(
 
     start_at = +12h (LOCAL) — chosen to be robust on both Render (UTC system TZ)
     AND dev (Europe/Moscow TZ): `get_client_bookings` filters via
-    `datetime.now(tz=None)` (admin.py:152) which returns NAIVE LOCAL TIME (not UTC),
-    a pre-existing warning documented in NEXT_SESSION_PROMPT.md:137. The handler
-    partition (mybookings_msg:430-431) is correct — uses `datetime.now(UTC)` then
-    strips tzinfo to naive UTC, fixed in commit da66f01.
+    `datetime.now(UTC)` (admin.py:156) — aware UTC. SQLAlchemy variant strips
+    aware→naive on SQLite bind (verified 2026-08-23), so aware UTC vs stored
+    naive UTC compares correctly on SQLite; native TIMESTAMPTZ vs aware UTC on
+    Postgres. The handler partition (mybookings_msg:508) uses aware-aware
+    comparison — `b.start_at.replace(tzinfo=UTC) - timedelta(...)`.
 
     With start_at = +12h:
       - Render (system TZ=UTC): now_local == now_utc, filter passes (12h>0).

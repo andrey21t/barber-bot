@@ -502,18 +502,18 @@ async def mybookings_msg(message: Message) -> None:
         tz = ZoneInfo(tz_name)
 
     # Partition bookings: cancelable (start_at - CANCEL_MIN_HOURS > now) vs too-late.
-    # Computed in handler (I/O layer) — pure display logic, must MATCH service logic
-    # (cancel_booking:332-334): SQLite stores start_at naive (DateTime(timezone=True)
-    # ignored on SQLite), so compare with naive UTC (strip tzinfo from now_utc).
-    now_utc_aware = datetime.now(UTC)
-    now_utc = now_utc_aware.replace(tzinfo=None)
+    # Cross-DB aware-aware comparison: b.start_at naive on SQLite / aware UTC on
+    # Postgres (TIMESTAMPTZ + asyncpg). Inject tzinfo=UTC on DB-read so naive becomes
+    # aware (no-op on Postgres). now_utc is aware UTC.
+    now_utc = datetime.now(UTC)
     cancelable: list[Booking] = []
     lines = ["📋 Ваши записи:", ""]
     for b in bookings:
-        # b.start_at is naive (SQLite) → astimezone interprets as system-local TZ.
-        # On Render (UTC) this is correct; fix deferred to Postgres migration Урок 2.6
-        # (same pattern as booking.py:217 create_booking, booking.py:380 cancel_booking).
-        local_time = b.start_at.astimezone(tz)
+        # b.start_at: naive on SQLite, aware UTC on Postgres. Inject tzinfo=UTC
+        # (no-op on Postgres) before .astimezone — otherwise Python interprets naive
+        # as system-local TZ (Mac default Europe/Moscow → wrong render; Render UTC
+        # correct by accident). Same pattern as booking.py:380 cancel_booking.
+        local_time = b.start_at.replace(tzinfo=UTC).astimezone(tz)
         when = local_time.strftime("%d %b %Y, %H:%M")
         # Snapshots already escaped, strip newlines for list safety (consistent with
         # admin._render_bookings — html.escape(quote=False) skips \n).
@@ -521,8 +521,10 @@ async def mybookings_msg(message: Message) -> None:
         service = b.service_title_snapshot.replace("\n", " ")
         lines.append(f"• {when}\n  💇 {service}\n  👤 {name}")
 
-        # Naive comparison (start_at from DB is naive on SQLite; deadline also naive).
-        deadline = b.start_at - timedelta(hours=settings.CANCEL_MIN_HOURS)
+        # Aware-aware comparison: b.start_at.replace(tzinfo=UTC) - timedelta(...)
+        # yields aware UTC deadline; now_utc is aware UTC. Both SQLite (after strip
+        # injection) and Postgres compare correctly.
+        deadline = b.start_at.replace(tzinfo=UTC) - timedelta(hours=settings.CANCEL_MIN_HOURS)
         if now_utc < deadline:
             cancelable.append(b)
         else:
@@ -679,12 +681,12 @@ async def mybookings_transfer_cb(
             await callback.answer("Запись уже отменена")
             return
 
-        # 24h rule — same partition as mybookings_msg:430-448 (naive UTC comparison).
+        # 24h rule — same partition as mybookings_msg (aware-aware comparison).
         # We re-check here (NOT in service) to give a clear error before entering FSM
         # (transfer_booking also raises CancelTooLateError, but we want a popup now,
         # not after the user has picked a date+slot).
-        now_utc = datetime.now(UTC).replace(tzinfo=None)
-        deadline = booking.start_at - timedelta(hours=settings.CANCEL_MIN_HOURS)
+        now_utc = datetime.now(UTC)
+        deadline = booking.start_at.replace(tzinfo=UTC) - timedelta(hours=settings.CANCEL_MIN_HOURS)
         if now_utc >= deadline:
             if callback.message is not None:
                 await callback.message.answer("❌ Перенос возможен только за 24+ часов до записи")

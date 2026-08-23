@@ -580,16 +580,17 @@ async def test_get_today_extreme_timezone_utc_plus_12(
 
 
 # ============================================================
-# get_client_bookings — W2 fix: naive datetime must be UTC (T3)
+# get_client_bookings — cross-DB aware-aware SQL WHERE (T3, updated 2026-08-23 Урок 2.6)
 # ============================================================
 # Coverage (AUTONOMOUS_COVERAGE_PROMPT.md T3):
-#   ref = now_utc or datetime.now(tz=None) — naive LOCAL on non-UTC system.
-#   Booking.start_at is naive UTC → comparison off by TZ offset on dev Mac (MSK).
-#   Fix: datetime.now(UTC) → strip tzinfo (mirror of W1 fix, commit bfab1fb).
-#   Tests inject now_utc (aware UTC) for deterministic verification of the contract.
-#   Regression test on the original bug requires non-UTC system TZ (freezegun's
-#   datetime.now(tz=None) returns frozen time, not system-local) — not reproducible
-#   in CI without TZ env manipulation, so we test the post-fix contract directly.
+#   ref = now_utc or datetime.now(UTC) — aware UTC (was: datetime.now(tz=None) naive local).
+#   Booking.start_at: naive UTC on SQLite, aware UTC on Postgres (TIMESTAMPTZ + asyncpg).
+#   SQLAlchemy variant strips aware→naive on SQLite bind (verified empirically 2026-08-23),
+#   so aware UTC vs stored naive UTC compares correctly. On Postgres: TIMESTAMPTZ vs
+#   aware UTC — native comparison. Tests inject now_utc (aware UTC) for deterministic verify.
+#   Regression test on the original bug (naive datetime.now(tz=None)) requires non-UTC
+#   system TZ (freezegun returns frozen time, not system-local) — not reproducible in CI
+#   without TZ env manipulation, so we test the post-fix contract directly.
 
 
 @pytest.mark.asyncio

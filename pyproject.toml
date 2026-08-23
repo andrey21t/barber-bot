@@ -24,6 +24,16 @@ dev = [
     "mypy>=1.10",
     "freezegun>=1.5",
 ]
+# Prod-only deps (installed via `pip install -e .[prod]` on Render).
+# asyncpg: async Postgres driver for ORM (SQLAlchemy async engine).
+# psycopg2-binary: sync Postgres driver for SQLAlchemyJobStore (APScheduler) +
+#   alembic migrations (alembic is sync).
+# alembic: DB migrations (`alembic upgrade head` in preDeployCommand).
+prod = [
+    "asyncpg>=0.29",
+    "psycopg2-binary>=2.9",
+    "alembic>=1.13",
+]
 
 [tool.setuptools.packages.find]
 include = ["bot*"]

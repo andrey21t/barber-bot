@@ -14,14 +14,21 @@ from sqlalchemy import (
     Uuid,
     text,
 )
+from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
 from bot.db import Base
 
-# SQLAlchemy 2.0 + cross-DB types (Uuid + DateTime(timezone=True) работают на SQLite и Postgres)
-# TODO (Урок 2.6): на Postgres использовать sqlalchemy.dialects.postgresql.TIMESTAMP(timezone=True)
-# для TIMESTAMPTZ — DateTime(timezone=True) на Postgres = TIMESTAMP WITHOUT TZ.
+# SQLAlchemy 2.0 + cross-DB types (Uuid + DateTime(timezone=True) работают на SQLite и Postgres).
+# Postgres: with_variant(TIMESTAMP(timezone=True), "postgresql") → TIMESTAMPTZ column,
+# asyncpg returns aware UTC by default (regardless of session TZ — asyncpg normalizes
+# to UTC on the client side). `.replace(tzinfo=UTC)` in service code is no-op on Postgres
+# (already aware UTC), makes naive aware on SQLite. If connection timezone is changed
+# to non-UTC and a non-asyncpg driver returns non-UTC aware, use `.astimezone(UTC)` instead
+# (but that breaks SQLite naive path — would need DB-dialect branching).
+# SQLite: DateTime(timezone=True) base → naive datetime
+# (verified empirically: scratch stub 2026-08-23 — same as without variant).
 
 
 class Business(Base):
@@ -31,7 +38,10 @@ class Business(Base):
     name: Mapped[str] = mapped_column(String(255))
     telegram_owner_id: Mapped[int] = mapped_column(BigInteger)
     timezone: Mapped[str] = mapped_column(String(50), default="Europe/Moscow")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True).with_variant(TIMESTAMP(timezone=True), "postgresql"),
+        server_default=func.now(),
+    )
 
 
 class Master(Base):
@@ -45,7 +55,10 @@ class Master(Base):
     telegram_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     role: Mapped[str] = mapped_column(String(50), default="barber")
     is_active: Mapped[bool] = mapped_column(default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True).with_variant(TIMESTAMP(timezone=True), "postgresql"),
+        server_default=func.now(),
+    )
 
     __table_args__ = (
         Index("idx_masters_business", "business_id", postgresql_where=text("is_active = TRUE")),
@@ -63,7 +76,10 @@ class Service(Base):
     duration_minutes: Mapped[int] = mapped_column()
     price: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     is_active: Mapped[bool] = mapped_column(default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True).with_variant(TIMESTAMP(timezone=True), "postgresql"),
+        server_default=func.now(),
+    )
 
     __table_args__ = (
         CheckConstraint("duration_minutes > 0", name="ck_service_duration_positive"),
@@ -78,7 +94,10 @@ class Client(Base):
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True)
     name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True).with_variant(TIMESTAMP(timezone=True), "postgresql"),
+        server_default=func.now(),
+    )
 
 
 class Slot(Base):
@@ -91,7 +110,10 @@ class Slot(Base):
     slot_date: Mapped[date] = mapped_column()
     slot_hour: Mapped[int] = mapped_column()  # LOCAL hour in business.timezone
     status: Mapped[str] = mapped_column(String(20), default="open")  # open | booked | closed
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True).with_variant(TIMESTAMP(timezone=True), "postgresql"),
+        server_default=func.now(),
+    )
 
     __table_args__ = (
         CheckConstraint("slot_hour BETWEEN 0 AND 23", name="ck_slot_hour_range"),
@@ -122,10 +144,17 @@ class Booking(Base):
     service_title_snapshot: Mapped[str] = mapped_column(String(255))  # html.escape()'d
     service_price_snapshot: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
     client_name_snapshot: Mapped[str] = mapped_column(String(255))  # html.escape()'d
-    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))  # UTC
-    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))  # UTC
+    start_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True).with_variant(TIMESTAMP(timezone=True), "postgresql")
+    )  # UTC
+    end_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True).with_variant(TIMESTAMP(timezone=True), "postgresql")
+    )  # UTC
     status: Mapped[str] = mapped_column(String(20), default="confirmed")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True).with_variant(TIMESTAMP(timezone=True), "postgresql"),
+        server_default=func.now(),
+    )
 
     __table_args__ = (
         CheckConstraint("end_at > start_at", name="ck_booking_duration_positive"),
@@ -153,7 +182,10 @@ class NotificationLog(Base):
     )
     kind: Mapped[str] = mapped_column(String(30))
     # remind_24h | remind_1h | master_new | master_cancel | master_transfer
-    sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    sent_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True).with_variant(TIMESTAMP(timezone=True), "postgresql"),
+        server_default=func.now(),
+    )
 
     __table_args__ = (
         CheckConstraint(

@@ -15,7 +15,7 @@ Contract (spec.md 200-213, 307-309):
 
 import html
 import logging
-from datetime import date
+from datetime import UTC, date
 from decimal import Decimal, InvalidOperation
 from uuid import UUID
 
@@ -374,7 +374,10 @@ def _render_bookings(title: str, bookings: list[Booking], business_timezone: str
     tz = ZoneInfo(business_timezone)
     lines = [title, ""]
     for b in bookings:
-        local_time = b.start_at.astimezone(tz)
+        # b.start_at: naive on SQLite, aware UTC on Postgres. Inject tzinfo=UTC
+        # (no-op on Postgres) before .astimezone — Python interprets naive as
+        # system-local TZ otherwise.
+        local_time = b.start_at.replace(tzinfo=UTC).astimezone(tz)
         when = local_time.strftime("%d %b, %H:%M")
         # Strip newlines from already-escaped snapshots to preserve list layout
         name = b.client_name_snapshot.replace("\n", " ")

@@ -279,7 +279,7 @@ async def cancel_booking(
     client_id: UUID,
     scheduler: AsyncIOScheduler,
     *,
-    now_utc: datetime | None = None,
+    now_utc: datetime | None = None,  # must be tz-aware UTC (datetime.now(UTC))
 ) -> CancelResult:
     """Cancel booking (spec.md 41, 298, 317, 405-407).
 
@@ -319,14 +319,17 @@ async def cancel_booking(
         raise BookingAlreadyCancelledError(f"Booking {booking_id} already cancelled")
 
     # Step 4: 24h rule (spec.md 406). start_at - 24h is the deadline; past → refuse.
-    # SQLite stores DateTime naive (DateTime(timezone=True) is ignored on SQLite),
-    # so we compare with naive UTC here (pattern from admin.py:155-156, verified
-    # test_admin.py 2026-08-21). start_at from DB is naive; strip ref tzinfo if aware.
-    ref_naive = ref.replace(tzinfo=None) if ref.tzinfo is not None else ref
-    cancel_deadline = booking.start_at - timedelta(hours=settings.CANCEL_MIN_HOURS)
-    if ref_naive >= cancel_deadline:
+    # Cross-DB aware-aware comparison: on SQLite booking.start_at is naive (DateTime
+    # variant strips tzinfo on bind/result — verified empirically 2026-08-23), on
+    # Postgres it's aware UTC (TIMESTAMPTZ + asyncpg). Inject tzinfo=UTC on DB-read
+    # side so naive (SQLite) becomes aware UTC — no-op on Postgres where already aware.
+    # ref is aware UTC (caller injects datetime.now(UTC) or test passes aware).
+    cancel_deadline = booking.start_at.replace(tzinfo=UTC) - timedelta(
+        hours=settings.CANCEL_MIN_HOURS
+    )
+    if ref >= cancel_deadline:
         raise CancelTooLateError(
-            f"now={ref_naive} >= cancel_deadline={cancel_deadline} for booking {booking_id}"
+            f"now={ref} >= cancel_deadline={cancel_deadline} for booking {booking_id}"
         )
 
     # Step 5: UPDATE booking SET status='cancelled' + rowcount check (race protection).
@@ -516,18 +519,19 @@ async def transfer_booking(
     if booking.status == "cancelled":
         raise BookingAlreadyCancelledError(f"Booking {booking_id} is cancelled, cannot transfer")
 
-    # Step 4: 24h rule (same as cancel_booking). Naive UTC comparison (SQLite stores naive).
-    ref_naive = ref.replace(tzinfo=None) if ref.tzinfo is not None else ref
+    # Step 4: 24h rule (same as cancel_booking). Cross-DB aware-aware comparison:
+    # old_start_at is naive on SQLite / aware UTC on Postgres. Inject tzinfo=UTC
+    # so naive becomes aware (no-op on Postgres). ref is aware UTC (caller injects).
     # Capture OLD slot_id and start_at BEFORE step 8 UPDATE booking — SQLAlchemy
     # auto-mutates booking.slot_id and booking.start_at after UPDATE (synchronize_session
     # default). Without this capture, step 9 would release the NEW slot (already 'booked'
     # from step 10) and TransferResult.old_slot_id would carry the new_slot_id.
     old_slot_id = booking.slot_id
     old_start_at = booking.start_at  # naive UTC (captured for race-protected UPDATE)
-    cancel_deadline = old_start_at - timedelta(hours=settings.CANCEL_MIN_HOURS)
-    if ref_naive >= cancel_deadline:
+    cancel_deadline = old_start_at.replace(tzinfo=UTC) - timedelta(hours=settings.CANCEL_MIN_HOURS)
+    if ref >= cancel_deadline:
         raise CancelTooLateError(
-            f"now={ref_naive} >= transfer_deadline={cancel_deadline} for booking {booking_id}"
+            f"now={ref} >= transfer_deadline={cancel_deadline} for booking {booking_id}"
         )
 
     # Step 5: SELECT new slot — re-use create_booking's _select_open_slot helper.
@@ -566,8 +570,8 @@ async def transfer_booking(
         .values(
             status="transferred",
             slot_id=new_slot.id,
-            start_at=new_start_at.replace(tzinfo=None),  # store naive UTC for SQLite consistency
-            end_at=new_end_at.replace(tzinfo=None),
+            start_at=new_start_at,  # aware UTC; SQLAlchemy variant strips tzinfo on SQLite bind
+            end_at=new_end_at,
         )
     )
     res_b = await session.execute(upd_b)

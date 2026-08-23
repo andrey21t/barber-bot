@@ -574,8 +574,9 @@ async def test_cancel_booking_now_utc_default_production_path(
     a slot 48h ahead (seed_data slot is only ~24h ahead — too borderline).
 
     This test exercises the default-arg branch (line booking.py:314 `now_utc or datetime.now(UTC)`)
-    to ensure no TypeError when ref has tzinfo=UTC (must be stripped to naive
-    before comparison with booking.start_at naive-from-SQLite).
+    to ensure no TypeError with the cross-DB aware-aware comparison: ref is aware UTC
+    (datetime.now(UTC) default), booking.start_at.replace(tzinfo=UTC) injects tzinfo
+    on DB-read side (no-op on Postgres where already aware, makes naive aware on SQLite).
     """
     # Build a slot 48h ahead so deadline = start_at - 24h > now (any time of day).
     future_date = (datetime.now(UTC) + timedelta(hours=48)).date()
