@@ -2,6 +2,8 @@
 
 Cross-DB support:
 - prod: DATABASE_URL=postgresql+asyncpg://... → postgresql+psycopg2://...
+- prod: DATABASE_URL=postgresql://... (Render fromDatabase) → postgresql+psycopg2://...
+- prod: DATABASE_URL=postgres://... (Render legacy) → postgresql+psycopg2://...
 - dev:  DATABASE_URL=sqlite+aiosqlite:///./barber.db → sqlite:///./barber.db
 - fallback: DATABASE_URL_SYNC env var (sync engine for SQLAlchemyJobStore, may differ)
 
@@ -33,10 +35,13 @@ config = context.config
 sync_url = os.getenv("DATABASE_URL_SYNC", "")
 if not sync_url:
     async_url = os.getenv("DATABASE_URL", "sqlite:///./barber.db")
-    # asyncpg → psycopg2 (prod Postgres migrations)
-    sync_url = async_url.replace("postgresql+asyncpg://", "postgresql+psycopg2://")
-    # aiosqlite → sqlite (dev SQLite migrations)
-    sync_url = sync_url.replace("sqlite+aiosqlite://", "sqlite://")
+    # Handle ALL Render formats: postgresql+asyncpg://, postgresql://, postgres://
+    for prefix in ("postgresql+asyncpg://", "postgresql://", "postgres://"):
+        if async_url.startswith(prefix):
+            sync_url = async_url.replace(prefix, "postgresql+psycopg2://", 1)
+            break
+    else:
+        sync_url = async_url.replace("sqlite+aiosqlite://", "sqlite://", 1)
 config.set_main_option("sqlalchemy.url", sync_url)
 
 # Logging from alembic.ini.

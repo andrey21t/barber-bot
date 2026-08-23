@@ -25,6 +25,34 @@ class Settings(BaseSettings):
     SERVICE_DEFAULT_DURATION_MIN: int = 60
     MAX_BOOKING_DAYS_AHEAD: int = 60  # aiogram_calendar range (today..today+N days)
 
+    @property
+    def async_database_url(self) -> str:
+        """Convert Render's plain `postgresql://` / `postgres://` → asyncpg format.
+
+        Render Postgres `fromDatabase` env var provides `postgresql://user:pass@host:port/db`
+        (НЕ asyncpg). asyncpg driver требует `postgresql+asyncpg://`.
+        """
+        if self.DATABASE_URL.startswith(("postgresql://", "postgres://")):
+            return self.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1).replace(
+                "postgres://", "postgresql+asyncpg://", 1
+            )
+        return self.DATABASE_URL
+
+    @property
+    def sync_database_url(self) -> str:
+        """Derive sync URL for SQLAlchemyJobStore (psycopg2).
+
+        Render НЕ поддерживает env var interpolation в render.yaml — поэтому
+        DATABASE_URL_SYNC задаём через property, не через render.yaml envVars.
+        """
+        if self.DATABASE_URL_SYNC:
+            return self.DATABASE_URL_SYNC
+        for prefix in ("postgresql+asyncpg://", "postgresql://", "postgres://"):
+            if self.DATABASE_URL.startswith(prefix):
+                return self.DATABASE_URL.replace(prefix, "postgresql+psycopg2://", 1)
+        # SQLite fallback (dev)
+        return self.DATABASE_URL.replace("sqlite+aiosqlite://", "sqlite://", 1)
+
 
 def get_settings() -> Settings:
     return Settings()  # type: ignore[call-arg]  # values come from .env

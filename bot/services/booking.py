@@ -574,7 +574,18 @@ async def transfer_booking(
             end_at=new_end_at,
         )
     )
-    res_b = await session.execute(upd_b)
+    try:
+        res_b = await session.execute(upd_b)
+    except IntegrityError as exc:
+        # EXCLUDE constraint (Postgres): new tstzrange(start_at, end_at) overlaps
+        # another active booking (confirmed/transferred) for same master.
+        # SQLite не имеет EXCLUDE — UNIQUE(slot_id) handles only same-slot case,
+        # но это безопасно (SQLite dev, надёжность через UNIQUE + service-layer checks).
+        # Map to existing SlotAlreadyBookedError — пользователь видит "слот занят".
+        await session.rollback()
+        raise SlotAlreadyBookedError(
+            f"Transfer to slot {new_slot.id} overlaps existing booking (EXCLUDE constraint)"
+        ) from exc
     if cast("CursorResult[Any]", res_b).rowcount == 0:
         # rowcount=0 means WHERE clause didn't match — three possible causes:
         #   1. Concurrent transfer (winner changed start_at) → BookingAlreadyTransferredError

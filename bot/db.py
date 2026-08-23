@@ -13,7 +13,12 @@ class Base(DeclarativeBase):
 
 settings = get_settings()
 
-engine = create_async_engine(settings.DATABASE_URL, future=True)
+engine = create_async_engine(
+    settings.async_database_url,
+    future=True,
+    pool_pre_ping=True,  # detect dead conn после Render sleep 15 мин
+    pool_recycle=1800,  # 30 мин recycle (Render sleep 15 мин → stale)
+)
 async_session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 

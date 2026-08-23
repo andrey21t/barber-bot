@@ -1,12 +1,19 @@
-"""Scheduler — APScheduler AsyncIOScheduler + MemoryJobStore (dev).
+"""Scheduler — APScheduler AsyncIOScheduler with cross-DB jobstore.
 
 Spec.md 322-393, 354:
-- MemoryJobStore in dev SQLite (no pickle)
-- on_startup_scan пересоздаёт jobs при restart
+- Dev (SQLite): MemoryJobStore (no pickle, no sync engine)
+- Prod (Postgres): SQLAlchemyJobStore(engine=sync_engine) — sync psycopg2 engine
+  (pickle-сериализация не работает с asyncpg; separate sync engine required).
+- on_startup_scan пересоздаёт jobs при restart (BB-012)
 - schedule_for_booking: add_job remind_24h + remind_1h (replace_existing=True)
 - job_id format: f"remind_24h_{booking_id}", f"remind_1h_{booking_id}" (deterministic for replace)
 - misfire_grace_time=3600 (1h — Render sleep 15min = 900s → 3600s запас)
 - coalesce=True, max_instances=1
+
+SQLAlchemyJobStore.__init__ lazy (verified apscheduler/jobstores/sqlalchemy.py:65-85):
+engine stored as reference, NO connection на construct. Table `apscheduler_jobs`
+created at `scheduler.start()` via `jobs_t.create(engine, True)` (CREATE IF NOT EXISTS).
+Module-level `scheduler = build_scheduler()` безопасен.
 """
 
 from contextlib import suppress
@@ -16,20 +23,39 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from apscheduler.jobstores.memory import MemoryJobStore
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bot.config import get_settings
+from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
 def build_scheduler() -> AsyncIOScheduler:
-    """Build AsyncIOScheduler with dev config (MemoryJobStore).
+    """Build AsyncIOScheduler with cross-DB jobstore branching.
 
-    In prod (Урок 2.6): swap MemoryJobStore → SQLAlchemyJobStore(engine=sync_engine).
+    Dev (DATABASE_URL=sqlite, DATABASE_URL_SYNC empty) → MemoryJobStore.
+    Prod (DATABASE_URL=postgresql, DATABASE_URL_SYNC empty → derived) → SQLAlchemyJobStore.
     """
     settings = get_settings()
+    sync_url = settings.sync_database_url
+    # SQLAlchemyJobStore.__init__ lazy — engine не подключается на construct
+    # (verified apscheduler/jobstores/sqlalchemy.py:65-85). Module-level
+    # build_scheduler() безопасен — actual table CREATE в scheduler.start().
+    if sync_url.startswith("postgresql"):
+        sync_engine = create_engine(
+            sync_url,
+            pool_pre_ping=True,  # detect dead conn после Render sleep 15 мин
+            pool_recycle=1800,
+            pool_size=5,
+            max_overflow=10,
+        )
+        jobstore = SQLAlchemyJobStore(engine=sync_engine)
+    else:
+        # Dev SQLite — MemoryJobStore (no pickle, no sync engine)
+        jobstore = MemoryJobStore()
     return AsyncIOScheduler(
         timezone=ZoneInfo(settings.TIMEZONE),
-        jobstores={"default": MemoryJobStore()},
+        jobstores={"default": jobstore},
         job_defaults={
             "coalesce": True,
             "misfire_grace_time": settings.MISFIRE_GRACE_TIME,
@@ -40,6 +66,13 @@ def build_scheduler() -> AsyncIOScheduler:
 
 async def send_reminder(booking_id: UUID, kind: str, bot: Any = None) -> None:
     """Job target — sends reminder to client.
+
+    ⚠️ PICKLE-STABLE SIGNATURE — DO NOT rename/remove args without
+    drop+reschedule strategy. SQLAlchemyJobStore pickles (booking_id, kind, bot)
+    into apscheduler_jobs.job_state column. Adding args with defaults is safe;
+    renaming/removing is a ONE-WAY DOOR (existing jobs fail to unpickle → TypeError
+    on next scheduler.start). Migration strategy: scheduler.remove_all_jobs()
+    then on_startup_scan reschedules from DB.
 
     Stub for Шаг 3: real implementation in Урок 2.4 (master handlers).
     Real flow:
