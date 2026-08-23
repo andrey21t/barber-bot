@@ -281,7 +281,7 @@ barber-bot/
 ├── roadmap.md               # что отложено (Deferred features)
 ├── .env.example             # BOT_TOKEN=, DATABASE_URL=sqlite+aiosqlite:///./barber.db, ADMIN_ID=, TIMEZONE=Europe/Moscow
 ├── .gitignore               # .env, __pycache__, *.db, .pytest_cache, .venv, alembic/versions/__pycache__/
-├── requirements.txt        # aiogram>=3.x, sqlalchemy>=2.0, aiosqlite, asyncpg, apscheduler, alembic, pydantic-settings, psycopg2-binary (для SQLAlchemyJobStore в проде)
+├── pyproject.toml          # aiogram>=3.x, sqlalchemy>=2.0, aiosqlite, asyncpg, apscheduler, alembic, pydantic-settings, psycopg2-binary (для SQLAlchemyJobStore в проде). [project.optional-dependencies].prod = [asyncpg, psycopg2-binary, alembic]
 ├── render.yaml              # (создаётся при деплое) web service + Postgres + pre-deploy alembic upgrade
 ├── README.md                # инструкция запуска (для разработчика)
 └── USER_GUIDE.md            # инструкция для Екатерины (для пользователя, НЕ для разработчика)
@@ -425,7 +425,7 @@ async def on_startup(bot: Bot):
     - type: web
       name: barber-bot
       env: python
-      buildCommand: pip install -r requirements.txt
+      buildCommand: pip install -e .[prod]  # requirements.txt НЕ существует; pyproject.toml [project.optional-dependencies].prod
       startCommand: python -m bot.main
       envVars:
         - key: DATABASE_URL

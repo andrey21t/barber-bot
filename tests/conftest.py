@@ -22,12 +22,13 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-# Ensure env is set before importing bot.config (Settings reads .env on import)
-# DATABASE_URL setdefault гарантирует dev path (MemoryJobStore) в тестах
-# независимо от того, что лежит в .env (например, postgres URL для локального smoke).
-os.environ.setdefault("BOT_TOKEN", "test:TOKEN")
-os.environ.setdefault("ADMIN_ID", "461355056")
-os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./barber.db")
+# Ensure env is set before importing bot.config (Settings reads .env on import).
+# FORCE override (не setdefault) — setdefault не срабатывает если shell env уже выставлен,
+# например `export DATABASE_URL=postgresql://...` для smoke-test против Postgres →
+# тесты падали бы на SQLAlchemyJobStore. Smoke против Postgres делается ВНЕ pytest.
+os.environ["BOT_TOKEN"] = "test:TOKEN"
+os.environ["ADMIN_ID"] = "461355056"
+os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./barber.db"
 
 from bot.db import Base  # noqa: E402
 from bot.models import Business, Client, Master, Slot  # noqa: E402
