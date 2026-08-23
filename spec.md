@@ -80,7 +80,7 @@ Telegram-бот для записи к парикмахеру-одиночке: 
 > **Реализация UUID (2026-08-23, Урок 2.6):** spec описывает `DEFAULT gen_random_uuid()`
 > (server-side). Реализация использует **Python-side `default=uuid.uuid4`** (bot/models.py)
 > — простота, работает на обеих БД (SQLite не имеет `gen_random_uuid`). На Postgres UUID
-> генерируется в app перед INSERT, не в DB. Sm.oko: pet-project simplicity > strict spec.
+> генерируется в app перед INSERT, не в DB. Итог: pet-project simplicity > strict spec.
 > alembic/versions/001_initial.py не задаёт server_default для UUID PK — Python-side.
 
 ```sql
