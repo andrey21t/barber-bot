@@ -8,6 +8,13 @@ Cross-DB support:
 - fallback: DATABASE_URL_SYNC env var (sync engine for SQLAlchemyJobStore, may differ)
 
 target_metadata = Base.metadata (auto-detects models via bot.models import).
+
+Lazy imports (Session 3 fix): `from bot import models` and `from bot.db import Base`
+are deferred INSIDE _get_target_metadata(). Reason: bot.models → bot.db →
+bot.config → Settings(BOT_TOKEN, ADMIN_ID). Alembic runs in CI/pre-deploy with
+ONLY DATABASE_URL env (no BOT_TOKEN/ADMIN_ID) → Settings() raises ValidationError
+if imported at module level. Lazy import inside function defers Settings load
+until after env validation, when alembic only needs DATABASE_URL.
 """
 
 from __future__ import annotations
@@ -16,6 +23,7 @@ import os
 import sys
 from logging.config import fileConfig
 from pathlib import Path
+from typing import Any
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
@@ -24,9 +32,6 @@ from sqlalchemy import engine_from_config, pool
 # the project root, but be explicit for robustness).
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
-
-from bot import models  # noqa: E402, F401 — register models with Base.metadata
-from bot.db import Base  # noqa: E402
 
 # Alembic config object.
 config = context.config
@@ -48,7 +53,18 @@ config.set_main_option("sqlalchemy.url", sync_url)
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-target_metadata = Base.metadata
+
+def _get_target_metadata() -> Any:
+    """Lazy import bot.models + bot.db.Base → return Base.metadata.
+
+    Deferred until called (run_migrations_online/offline) so Settings() is
+    NOT triggered at alembic module import time. Without this, CI/pre-deploy
+    fails: Settings requires BOT_TOKEN + ADMIN_ID, alembic only has DATABASE_URL.
+    """
+    from bot import models  # noqa: F401 — register models with Base.metadata
+    from bot.db import Base
+
+    return Base.metadata
 
 
 def run_migrations_offline() -> None:
@@ -56,7 +72,7 @@ def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
     context.configure(
         url=url,
-        target_metadata=target_metadata,
+        target_metadata=_get_target_metadata(),
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
     )
@@ -72,7 +88,7 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
+        context.configure(connection=connection, target_metadata=_get_target_metadata())
         with context.begin_transaction():
             context.run_migrations()
 

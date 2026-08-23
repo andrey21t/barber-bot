@@ -19,7 +19,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from scheduler import build_scheduler, on_startup_scan
+from scheduler import _set_bot_ref, build_scheduler, on_startup_scan
 
 from bot.config import get_settings
 from bot.db import async_session_factory
@@ -44,12 +44,18 @@ def setup_logging() -> None:
 
 
 async def _on_startup(bot: Bot, scheduler: AsyncIOScheduler) -> None:
-    """on_startup — start scheduler (sync) then rescan bookings.
+    """on_startup — set bot ref, start scheduler (sync) then rescan bookings.
 
-    Order matters: on_startup_scan calls schedule_for_booking which calls
-    scheduler.add_job. add_job works on unstarted scheduler (job stored but
-    not scheduled), but for jobs to fire scheduler must be started first.
+    Order matters:
+      1. _set_bot_ref(bot) — BEFORE scheduler.start() so scheduled jobs (which
+         fire after start) can use the global ref. Scheduled jobs call
+         send_reminder(booking_id, kind) with bot=None → falls back to _bot_ref.
+      2. scheduler.start() — sync, schedules due jobs (misfire_grace_time window).
+      3. on_startup_scan — async, fires overdue (Phase 1) + reschedules upcoming
+         (Phase 2). Requires started scheduler for jobs to be scheduled immediately.
     """
+    # Set global bot ref FIRST — scheduled jobs use it as fallback.
+    _set_bot_ref(bot)
     # AsyncIOScheduler.start() is sync (APScheduler 3.x — not a coroutine)
     scheduler.start()
     # on_startup_scan — async, requires started scheduler for jobs to be

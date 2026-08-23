@@ -375,7 +375,7 @@ async def on_startup(bot: Bot):
         "AND NOT EXISTS (SELECT 1 FROM notifications_log WHERE booking_id=bookings.id AND kind='remind_24h')"
     )
     for b in overdue:
-        await send_reminder(bot, b.id, "remind_24h")  # UNIQUE guard защитит от дублей
+        await send_reminder(b.id, "remind_24h", bot=bot)  # bot последним для pickle-stability; UNIQUE guard inside send_reminder
 
     # 2. schedule_for_booking для upcoming
     upcoming = await db.fetch(

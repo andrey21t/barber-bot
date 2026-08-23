@@ -16,6 +16,8 @@ created at `scheduler.start()` via `jobs_t.create(engine, True)` (CREATE IF NOT 
 Module-level `scheduler = build_scheduler()` безопасен.
 """
 
+import asyncio
+import logging
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -28,6 +30,24 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bot.config import get_settings
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+logger = logging.getLogger(__name__)
+
+# Global bot ref — set by main.py:_on_startup BEFORE scheduler.start().
+# Anti-pattern (global mutable state), but aiogram Bot is not picklable (aiohttp
+# session) → cannot be passed via APScheduler args (pickle). Scheduled jobs call
+# send_reminder(booking_id, kind) — bot defaults to None → falls back to _bot_ref.
+# Direct callers (on_startup_scan) pass bot explicitly. Session 4: refactor via
+# context var / DI.
+_bot_ref: Any = None
+
+
+def _set_bot_ref(bot: Any) -> None:
+    """Set global bot ref. Must be called from main.py:_on_startup BEFORE
+    scheduler.start() so scheduled jobs can send messages.
+    """
+    global _bot_ref
+    _bot_ref = bot
 
 
 def build_scheduler() -> AsyncIOScheduler:
@@ -68,20 +88,117 @@ async def send_reminder(booking_id: UUID, kind: str, bot: Any = None) -> None:
     """Job target — sends reminder to client.
 
     ⚠️ PICKLE-STABLE SIGNATURE — DO NOT rename/remove args without
-    drop+reschedule strategy. SQLAlchemyJobStore pickles (booking_id, kind, bot)
-    into apscheduler_jobs.job_state column. Adding args with defaults is safe;
-    renaming/removing is a ONE-WAY DOOR (existing jobs fail to unpickle → TypeError
-    on next scheduler.start). Migration strategy: scheduler.remove_all_jobs()
+    drop+reschedule strategy. SQLAlchemyJobStore pickles (booking_id, kind)
+    into apscheduler_jobs.job_state column. `bot` is NOT in scheduled job args
+    (see schedule_for_booking: `args=[booking_id, kind]`) — bot is not picklable
+    (aiohttp session). Scheduled jobs use global `_bot_ref` fallback; direct
+    callers (on_startup_scan) pass bot explicitly. Adding args with defaults is
+    safe; renaming/removing is a ONE-WAY DOOR. Migration: scheduler.remove_all_jobs()
     then on_startup_scan reschedules from DB.
 
-    Stub for Шаг 3: real implementation in Урок 2.4 (master handlers).
-    Real flow:
-      1. SELECT booking
-      2. INSERT notifications_log(booking_id, kind) — UNIQUE guard
-      3. bot.send_message(client_id, "Напоминание: ...")
+    Flow (spec.md 322-326, 358-396):
+      1. Resolve bot (param > _bot_ref). None → return (startup not complete).
+      2. SELECT booking + client + business (selectinload, single query).
+      3. log_notification UNIQUE guard — False = already sent, return.
+      4. Build text per kind:
+         - remind_24h: "Напоминаю: завтра в 14:00" (local time in business.timezone)
+         - remind_1h: "Через час: 14:00"
+      5. bot.send_message with try/except:
+         - TelegramRetryAfter → asyncio.sleep(retry_after) + retry once
+         - TelegramForbiddenError / TelegramBadRequest → log warning, return
+         - Other TelegramAPIError → log error, return
+
+    MVP-допущение (spec.md 396): bot crash after INSERT notifications_log but
+    before send_message → message lost. Known limitation, prod = two-phase
+    (INSERT with sent_at=NULL, UPDATE after send + reaper).
     """
-    # TODO Урок 2.4: real send_reminder with DB lookup + bot.send_message
-    return None
+    from aiogram.exceptions import (
+        TelegramAPIError,
+        TelegramBadRequest,
+        TelegramForbiddenError,
+        TelegramRetryAfter,
+    )
+    from bot.db import async_session_factory
+    from bot.models import Booking
+    from bot.services.notifications import log_notification
+    from sqlalchemy import select
+
+    active_bot = bot if bot is not None else _bot_ref
+    if active_bot is None:
+        logger.warning(
+            "send_reminder: bot unavailable (startup not complete?), skip booking=%s kind=%s",
+            booking_id,
+            kind,
+        )
+        return
+
+    async with async_session_factory() as session:
+        # Booking has no ORM relationships (models.py uses plain FKs without
+        # relationship()). Explicit JOIN to fetch Client + Business in one query.
+        from bot.models import Booking, Business, Client
+
+        stmt = (
+            select(Booking, Client, Business)
+            .join(Client, Booking.client_id == Client.id)
+            .join(Business, Booking.business_id == Business.id)
+            .where(Booking.id == booking_id)
+        )
+        result = await session.execute(stmt)
+        row = result.first()
+        if row is None:
+            logger.warning("send_reminder: booking %s not found", booking_id)
+            return
+        booking, client, business = row
+
+        if not await log_notification(session, booking_id, kind):
+            return
+
+        tz = ZoneInfo(business.timezone)
+        time_str = booking.start_at.astimezone(tz).strftime("%H:%M")
+        if kind == "remind_24h":
+            text = f"Напоминаю: завтра в {time_str}"
+        elif kind == "remind_1h":
+            text = f"Через час: {time_str}"
+        else:
+            logger.warning("send_reminder: unknown kind=%s for booking=%s, skip", kind, booking_id)
+            return
+
+        for attempt in range(2):
+            try:
+                await active_bot.send_message(client.telegram_id, text)
+                return
+            except TelegramRetryAfter as e:
+                if attempt == 0:
+                    logger.warning(
+                        "send_reminder: flood control, retry after %ss (booking=%s kind=%s)",
+                        e.retry_after,
+                        booking_id,
+                        kind,
+                    )
+                    await asyncio.sleep(e.retry_after)
+                    continue
+                logger.error(
+                    "send_reminder: flood retry failed (booking=%s kind=%s)",
+                    booking_id,
+                    kind,
+                )
+                return
+            except (TelegramForbiddenError, TelegramBadRequest) as e:
+                logger.warning(
+                    "send_reminder: chat issue (booking=%s kind=%s): %s",
+                    booking_id,
+                    kind,
+                    e,
+                )
+                return
+            except TelegramAPIError as e:
+                logger.error(
+                    "send_reminder: send_message failed (booking=%s kind=%s): %s",
+                    booking_id,
+                    kind,
+                    e,
+                )
+                return
 
 
 def schedule_for_booking(
@@ -135,25 +252,36 @@ async def on_startup_scan(
 ) -> None:
     """on_startup — 2 phases (spec.md 358-382):
 
-    Phase 1: fire_overdue_reminders — bookings без remind_24h где start_at в окне (now-24h, now)
-    Phase 2: schedule_for_booking для ВСЕХ upcoming (start_at > now, < now+25h)
+    Phase 1: fire_overdue_reminders — bookings без remind_24h где start_at в окне (now-24h, now).
+             Calls send_reminder(booking_id, kind, bot) — bot passed explicitly (UNIQUE guard
+             inside send_reminder protects against duplicate sends if scan runs multiple times).
+             send_reminder opens its OWN session (separate from this scan session) — booking
+             IDs extracted here before close, send happens outside `async with` to avoid
+             nesting sessions.
+    Phase 2: schedule_for_booking для ВСЕХ upcoming (start_at > now, < now+25h).
+             Booking.id + start_at extracted into tuples before close — schedule_for_booking
+             is sync, but accesses booking attrs lazily → would DetachedInstanceError after
+             session close.
     """
     from bot.services.notifications import (
         get_overdue_bookings_without_remind_24h,
         get_upcoming_bookings_for_reschedule,
-        log_notification,
     )
 
     now = datetime.now(UTC)
 
     async with session_factory() as session:
-        # Phase 1: fire overdue (stub — real send in Урок 2.4)
         overdue = await get_overdue_bookings_without_remind_24h(session, now)
-        for b in overdue:
-            # TODO Урок 2.4: actually send message via bot
-            await log_notification(session, b.id, "remind_24h")
-
-        # Phase 2: reschedule upcoming
         upcoming = await get_upcoming_bookings_for_reschedule(session, now, look_ahead_hours=25)
-        for b in upcoming:
-            schedule_for_booking(scheduler, b.id, b.start_at)
+        # Extract scalars before session close — schedule_for_booking accesses
+        # booking.id + booking.start_at lazily → DetachedInstanceError otherwise.
+        overdue_ids = [b.id for b in overdue]
+        upcoming_pairs = [(b.id, b.start_at) for b in upcoming]
+
+    # Phase 1: fire overdue outside session — send_reminder opens its own.
+    for booking_id in overdue_ids:
+        await send_reminder(booking_id, "remind_24h", bot=bot)
+
+    # Phase 2: reschedule upcoming — schedule_for_booking is sync (add_job).
+    for booking_id, start_at in upcoming_pairs:
+        schedule_for_booking(scheduler, booking_id, start_at)

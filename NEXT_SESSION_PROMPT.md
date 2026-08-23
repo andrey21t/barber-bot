@@ -551,9 +551,71 @@ NEXT: Session 3 — FSM PostgresStorage + real send_reminder (Урок 2.4) + Re
 - https://render.com/docs/postgresql-extensions — btree_gist availability VERIFIED (PG 13+)
 - Spec: Урок 2.6 Postgres migration (spec.md:320-447 Session 2 design, 538-547 FSM storage)
 
-## NEXT: Session 3
+## NEXT: Session 4
 
-- FSM PostgresStorage (spec.md:538-547) — in-progress FSM state в Postgres вместо MemoryStorage (Render free restarts каждые 15 мин теряют FSM)
-- Real `send_reminder` implementation (Урок 2.4) — DB lookup + bot.send_message
-- Render deploy smoke test — записать бронь через bot, проверить /today + EXCLUDE constraint работает (2 брони на overlap → отбивается)
-- Master handlers (Урок 2.4) — /today для мастеров с реальным render
+> Session 3 закрыт: real `send_reminder` реализован, deferred Session 2 fixes применены. Critic iter 1 → SURFACE_LEVEL (4 findings без grounding) → все applied к плану → iter 2 не запускался (risk-class LOGIC confirmed, fixes приняли вид proper grounding).
+
+### Session 3 итоги (commits pending)
+
+1. **`scheduler.py:67-160` `send_reminder`** — заглушка → реальная реализация:
+   - DB lookup Booking+Client+Business через explicit JOIN (нет ORM relationships в models.py)
+   - log_notification UNIQUE guard — False = already sent, return
+   - bot resolution: param > global `_bot_ref` (None → return с warning)
+   - text: "Напоминаю: завтра в HH:MM" / "Через час: HH:MM" (start_at в business.timezone)
+   - try/except с retry:
+     - `TelegramRetryAfter` → `asyncio.sleep(retry_after)` + retry once (flood control)
+     - `TelegramForbiddenError` / `TelegramBadRequest` → log warning, return (chat blocked/invalid)
+     - Прочее `TelegramAPIError` → log error, return
+
+2. **`scheduler.py` global `_bot_ref` + `_set_bot_ref()`** — anti-pattern (global mutable state), но aiogram Bot не picklable (aiohttp session) → нельзя через APScheduler args. Scheduled jobs используют `_bot_ref` fallback (args=[booking_id, kind] без bot). Direct callers (on_startup_scan) передают bot явно. Session 4: refactor через context var / DI.
+
+3. **`bot/main.py:_on_startup`** — `_set_bot_ref(bot)` вызывается ПЕРЕД `scheduler.start()` (избежать race: scheduled jobs после start должны видеть ref).
+
+4. **`alembic/env.py`** — lazy import ОБА `bot.models` и `bot.db.Base` внутрь `_get_target_metadata()` (вызывается из `run_migrations_online` / `run_migrations_offline`). Причина: `bot.models → bot.db → bot.config → Settings(BOT_TOKEN, ADMIN_ID)`. Module-level импорт триггерит Settings при `alembic upgrade` в CI/pre-deploy, где есть только `DATABASE_URL`, нет `BOT_TOKEN` → `ValidationError`. Lazy import откладывает Settings load до момента, когда alembic уже знает DATABASE_URL.
+
+5. **`scheduler.py:on_startup_scan`** — Phase 1 теперь вызывает `send_reminder(booking_id, "remind_24h", bot=bot)` (вместо заглушки `log_notification`). Booking IDs извлекаются из session до её закрытия, send_reminder открывает свою session (не nested). Phase 2: upcoming pairs `(id, start_at)` извлекаются до закрытия session (избежать DetachedInstanceError).
+
+6. **`spec.md:378`** — сигнатура синхронизирована с кодом: `await send_reminder(b.id, "remind_24h", bot=bot)` (bot последним для pickle-stability, default None для scheduled jobs).
+
+7. **`tests/test_scheduler.py`** — 7 новых/обновлённых тестов (всего 14):
+   - `test_on_startup_scan_phase_1_sends_overdue` (mock bot, патч `bot.db.async_session_factory` на test session_factory)
+   - `test_send_reminder_booking_not_found` (random UUID, no send)
+   - `test_send_reminder_unique_guard_skips_duplicate` (pre-insert NotificationLog → no send)
+   - `test_send_reminder_bot_none_returns` (both bot=None + _bot_ref=None → early return)
+   - `test_send_reminder_retry_after` (TelegramRetryAfter → asyncio.sleep + retry, mock sleep)
+   - `test_send_reminder_forbidden_logs_warning` (TelegramForbiddenError → log warning, no retry)
+   - `test_send_reminder_happy_path` (correct text prefix)
+
+### Verify gate
+
+- pytest: **232 passed** (was 226, +6 new tests for send_reminder + 1 updated on_startup_scan_phase_1)
+- ruff: clean (3 auto-fixed — unused import selectinload, organize imports)
+- mypy: clean
+
+### Known limitations (NOT blockers, deferred to Session 4+)
+
+| # | Limitation | Severity | Source | Where |
+|---|---|---|---|---|
+| L1 | `callback_query` в mid-FSM после restart НЕ покрывается `no_state_fallback` (только `message` — `client.py:624` `StateFilter(None), F.text`). UX edge: inline button tap (SimpleCalendar, [🚠 подтвердить]) в mid-FSM после bot restart → callback не сматчится → "callback query not answered" в логах, кнопка молчит. | Minor (UX) | Critic iter 1 Pass 3 | Session 4 — добавить callback_query fallback в client_router |
+| L2 | `log_notification → send_message` atomicity: bot crash между INSERT `notifications_log` и `bot.send_message` → сообщение потеряно (UNIQUE блокирует retry навсегда). MVP-допущение из `spec.md:396`. | Minor (data) | spec.md:396 | Прод: двухфазная схема (INSERT с `sent_at=NULL`, UPDATE `sent_at=now()` после send + reaper для зависших) |
+| L3 | N+1 в `get_overdue_bookings_without_remind_24h` (`notifications.py:54-60`): для каждого booking отдельный SELECT NotificationLog. 100 bookings = 101 queries. На Render free tier с Postgres — latency, но не блокер для MVP (overdue scan только при restart, обычно <10 bookings). | Minor (perf) | Critic iter 1 Pass 2 | Session 4 — batched query через `NOT EXISTS` subquery в основном SELECT |
+| L4 | `_bot_ref` global mutable state — anti-pattern. Тесты патчат через `with patch("scheduler._bot_ref", ...)` (см. `tests/test_scheduler.py`). Рефактор через context var / DI в Session 4. | Code smell | Self-identified | Session 4 |
+| L5 | FSM storage `MemoryStorage` (default aiogram) — теряется при Render free restart каждые 15 мин. spec.md:538-547 recommends PostgresStorage, aiogram 3.30 НЕ имеет PostgresStorage/SQLAlchemyStorage (only MemoryStorage в коробке; RedisStorage2 требует Redis пакет; `aiogram-fsm-sqlalchemy` отсутствует на PyPI) → custom ~200+ строк. | Major (UX, deferred from Session 2) | spec.md:538-547, aiogram 3.30 API | Session 4 — custom PostgresStorage (или `aiogram-fsm-sqlalchemy` если появится) |
+
+### Cross-refs
+
+- `~/.config/opencode/skills/deep-analysis-protocol/SKILL.md` — гейт протокол (Pass 1-4 + critic)
+- `~/.config/opencode/AGENTS.md` § git-repo-categories — barber-bot = personal free (коммиты без переспроса)
+- `~/.config/opencode/references/donor-research/topics/booking-bot-architecture.md` — BB-008 (EXCLUDE), BB-011 (SQLAlchemyJobStore), BB-012 (on_startup_scan), BB-013 (idempotency UNIQUE), BB-014 (anti-pattern MemoryJobStore)
+- https://render.com/docs/postgresql-extensions — btree_gist availability VERIFIED (PG 13+)
+- Spec: Урок 2.4 master handlers (spec.md:280-340 trigger'ы, 358-396 on_startup flow), Урок 2.6 Postgres migration (spec.md:320-447), 538-547 FSM storage
+
+### NEXT: Session 4 — план
+
+1. **Custom PostgresStorage для FSM** (L5) — реализовать `bot/fsm_storage.py`, ~200 строк. Альтернатива: ждать `aiogram-fsm-sqlalchemy` на PyPI. Spec.md:538-547 рекомендует вариант C (PostgresStorage).
+2. **`callback_query` fallback в mid-FSM** (L1) — добавить в `client_router` хендлер `StateFilter("*"), F.callback_query` который отлавливает callback после restart и просит "Начните через /book".
+3. **Batched query для overdue scan** (L3) — переписать `get_overdue_bookings_without_remind_24h` через `NOT EXISTS` subquery.
+4. **Render deploy smoke test** — записать бронь через bot, проверить /today + EXCLUDE constraint (2 брони на overlap → отбивается).
+5. **Master handlers (Урок 2.4)** — /today для мастеров с реальным render (УЖЕ работает `handlers/admin.py:243`, но проверить end-to-end на Render).
+6. **`_bot_ref` refactor** (L4) — context var или DI вместо global (после FSM storage, можно вместе).
+7. **Master notifications** (Урок 2.4 триггеры) — `master_new`, `master_cancel`, `master_transfer` (пока только `remind_24h`/`remind_1h` реализованы).
