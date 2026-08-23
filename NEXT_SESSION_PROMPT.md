@@ -1,261 +1,559 @@
-# NEXT_SESSION_PROMPT — Опц. A Postgres migration: готов к external review (4 пробела closed, 5 приняты)
+# NEXT_SESSION_PROMPT — Session 1 (Phase 5) закрыт. Session 2 (EXCLUDE + SQLAlchemyJobStore + Render) готов к реализации.
 
-> Дата: 2026-08-23 · Pass 1-4 + 3 critic итерации (iter 3 VERDICT: NEEDS_MORE_ANALYSIS, max 2 LBTM превышен с user consent).
-> Код НЕ правили. План augmented с fixes critic iter 3. **Готов к user external review** (last line per Cross-model limitation).
-> **После GO от пользователя → Phase 5 implementation.**
+> Дата: 2026-08-23 · Session 1 Phase 5 закоммичен и запушен (commit `6b30bc0` + `e63ca83`). Pass 1-4 + 2 critic итерации на Session 2 (iter 1 → NEEDS_MORE_ANALYSIS 7 findings → fixes applied → iter 2 → DEEP_ENOUGH, 1 minor gap fixed). **Готов к user GO → implementation.**
 
 ## Контекст проекта
 
 **Репозиторий:** `~/PycharmProjects/barber-bot/` (личный pet-проект, коммитить свободно по AGENTS.md § git-repo-categories)
-**Стек:** Python 3.12, aiogram 3.x, SQLAlchemy 2.0 async, SQLite (dev) → Postgres (prod), APScheduler
-**Spec (SSOT):** `~/PycharmProjects/barber-bot/spec.md` (Урок 2.6 Postgres migration — строки 66-176, 322-393, 413-436)
+**GitHub:** https://github.com/andrey21t/barber-bot (private, remote `origin` настроен)
+**Стек:** Python 3.12, aiogram 3.x, SQLAlchemy 2.0 async (asyncpg/aiosqlite), APScheduler 3.11.3
+**Spec (SSOT):** `~/PycharmProjects/barber-bot/spec.md` (Урок 2.6 — строки 320-447 Session 2 design, 538-547 FSM storage)
 **Формат работы:** `~/PycharmProjects/barber-bot/MY-VIBE-RULES.md` — dev-режим, гейты: deep-analysis → impl → verify → code-review
-**Состояние на старте след. сессии:** 226 тестов, 0 skipped, coverage 99% (2 miss: `bot/main.py __name__`), ruff+mypy чисто, последний коммит `f7aa0a8` (docs close Опц. E)
+**Состояние на старте Session 2:** 226 тестов, 0 skipped, coverage 97%, ruff+mypy чисто, последний коммит `e63ca83` (typo fix в spec.md), push в `origin/main` выполнен.
 
-## Что сделано в сессии 2026-08-23 (анализ, без правок)
+## Что сделано в Session 1 Phase 5 (коммиты 6b30bc0 + e63ca83, запушены)
 
-1. `deep-analysis-protocol` Pass 1-4 выполнен
-2. `deep-analysis-critic` iter 1 → `VERDICT: NEEDS_MORE_ANALYSIS` (10 gaps)
-3. 10 gaps применены к плану (overcount 14→11, классификация BREAKS/SAFE, 3 W1 bug locations, keyboards/client.py, test_scheduler.py, alembic.ini, 9 datetime columns, func.now strip, main.py:36 side effect, requirements conflict)
-4. `deep-analysis-critic` iter 2 → `VERDICT: NEEDS_MORE_ANALYSIS` (1 CRITICAL blocker)
-5. CRITICAL blocker применён к плану: inject `.replace(tzinfo=UTC)` в 4 местах Python comparison (вместо naive removal strip — это вызвало бы TypeError на SQLite)
-6. Max 2 LBTM итераций — **INCOMPLETE per protocol**
-7. Сессия 2 (продолжение 2026-08-23): user consent на 3-й critic pass
-8. **Phase 1 закрыта** — read notifications.py (SAFE), slots.py (SAFE), grep naive assertions в tests (14 найдено, классифицировано)
-9. **Phase 3 закрыта** — SQLite scratch stub verify: `with_variant(TIMESTAMP(timezone=True), "postgresql")` возвращает naive на SQLite (то же что без variant, control). Все 226 SQLite тестов продолжат проходить. Postgres asyncpg behavior — docs only (no testcontainers, honest limitation).
-10. **Phase 4 — 3-й critic pass** (task tool, subagent_type=deep-analysis-critic, full augmented plan):
-    - VERDICT: **NEEDS_MORE_ANALYSIS**
-    - **4 CRITICAL gaps**: Python comparisons регрессировали из NEXT_SESSION_PROMPT iter 1. План "aware vs aware" WRONG для 4 deadline computations (`booking.start_at` naive на SQLite → TypeError). Fix: `.replace(tzinfo=UTC)` injection на DB-read side (booking.py:326, 527, client.py:525, 687).
-    - **3 MINOR gaps**: alembic 001 missing `idx_bookings_master_start`, `Client.telegram_id unique`, FK `ondelete="CASCADE"` для 2 FK.
-11. **Augmented план с critic iter 3 fixes** — ниже. Код НЕ правили.
-12. **Статус**: ready for user external review (last line per Cross-model limitation). После GO → Phase 5 implementation.
+1. Cross-DB schema: 9 DateTime columns → `with_variant(TIMESTAMP(timezone=True), "postgresql")` (bot/models.py)
+2. 7 BREAKS: убраны `.replace(tzinfo=None)` workaround'ы + 11 инъекций `.replace(tzinfo=UTC)` на DB-read side (booking.py, admin.py, handlers/admin.py, client.py, keyboards/client.py)
+3. alembic/versions/001_initial.py — 7 tables, 4 CHECKs, 4 partial indexes, 3 UNIQUE + 1 implicit, 1 regular composite, 2 FK CASCADE, NO EXCLUDE
+4. alembic/env.py + alembic.ini — async URL → sync URL (asyncpg→psycopg2, aiosqlite→sqlite)
+5. pyproject.toml — `[project.optional-dependencies].prod = [asyncpg, psycopg2-binary, alembic]`
+6. .env.example — `DATABASE_URL_SYNC=` placeholder
+7. spec.md — note про UUID Python-side (опечатка "Sm.oko" исправлена на "Итог")
+8. Code-review: LGTM, 3 warnings (W1 contract comments, W2 stale test docstrings, W3 assumption comment) — all fixed
 
-## Готовый план Session 1 (применять ПОСЛЕ закрытия 9 пробелов)
+## Что сделано в Session 2 analysis (БЕЗ правок кода, только план)
 
-### Schema (9 columns, `bot/models.py`)
+1. `deep-analysis-protocol` Pass 1-4 на Session 2 scope (миграция 002 + SQLAlchemyJobStore + Render deploy)
+2. Risk-класс: **high-stakes** (миграция БД + persistence layer change + deploy secrets)
+3. `deep-analysis-critic` iter 1 → `VERDICT: NEEDS_MORE_ANALYSIS` (7 findings: 2 Critical + 4 Important + 1 Boundary + 1 inconsistency)
+4. 7 findings применены к плану:
+   - (Critical) transfer_booking IntegrityError location — booking.py:577 (`session.execute(upd_b)`), НЕ flush/commit
+   - (Critical) create_booking уже имеет catch — booking.py:188-190, НЕ ТРОГАТЬ
+   - (Important) MAIN DECISION POINT non-issue — SQLAlchemyJobStore.__init__ lazy, module-level `build_scheduler()` остаётся
+   - (Important) DATABASE_URL conversion — `@property async_database_url` в Settings
+   - (Important) DATABASE_URL_SYNC derivation — `@property sync_database_url` в Settings
+   - (Verified) btree_gist на Render — confirmed via webfetch render.com/docs/postgresql-extensions
+   - (Boundary) FSM state storage (spec.md:538-547) — добавлено в Honest limitations, deferred to Session 3
+   - (Inconsistency) render.yaml buildCommand — `pip install -e .[prod]` (requirements.txt НЕ существует)
+5. `deep-analysis-critic` iter 2 → `VERDICT: DEEP_ENOUGH` — все 7 findings применены корректно
+6. 1 NEW minor gap из iter 2: async engine `pool_pre_ping` (bot/db.py) — applied as minor amendment
+7. **Статус**: READY FOR IMPLEMENTATION. После GO → Phase A → B → C → verify → code-review → push.
+
+## Augmented Plan Session 2 — 3 фазы (post critic iter 2 DEEP_ENOUGH)
+
+### Фаза A — EXCLUDE constraint migration 002
+
+**Файл:** `alembic/versions/002_postgres_exclude.py`
+
 ```python
-# было: DateTime(timezone=True)
-# стало: DateTime(timezone=True).with_variant(TIMESTAMP(timezone=True), "postgresql")
+"""Postgres-only EXCLUDE constraint for no-double-booking (tstzrange overlap).
+
+revision: 002_postgres_exclude
+down_revision: 001_initial
+created: 2026-08-23
+
+Cross-DB:
+- Postgres: CREATE EXTENSION btree_gist + EXCLUDE USING gist (tstzrange)
+  (VERIFIED btree_gist available on Render Postgres 13+ —
+   https://render.com/docs/postgresql-extensions)
+- SQLite: no-op (UNIQUE(slot_id) from 001_initial handles same-slot double-booking;
+  SQLite не имеет EXCLUDE USING gist)
+
+WHERE clause: status IN ('confirmed', 'transferred') — адаптировано под codebase:
+- booking INSERT goes 'confirmed' (booking.py:183)
+- UPDATE to 'transferred' (booking.py:571)
+- UPDATE to 'cancelled' (booking.py:345) — 'cancelled' excluded из WHERE
+  (отмена освобождает слот для новых overlap'ов)
+"""
+
+from __future__ import annotations
+
+import sqlalchemy as sa
+from alembic import op
+
+revision = "002_postgres_exclude"
+down_revision = "001_initial"
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    dialect = op.get_bind().dialect.name
+    if dialect == "postgresql":
+        # VERIFIED btree_gist available on Render Postgres 13+
+        # https://render.com/docs/postgresql-extensions
+        op.execute("CREATE EXTENSION IF NOT EXISTS btree_gist")
+        op.execute(
+            sa.text("""
+                ALTER TABLE bookings ADD CONSTRAINT no_overlap
+                EXCLUDE USING gist (
+                    master_id WITH =,
+                    tstzrange(start_at, end_at) WITH &&
+                ) WHERE (status IN ('confirmed', 'transferred'))
+            """)
+        )
+    # SQLite — no-op (UNIQUE(slot_id) из 001 handles same-slot)
+
+
+def downgrade() -> None:
+    dialect = op.get_bind().dialect.name
+    if dialect == "postgresql":
+        op.execute("ALTER TABLE bookings DROP CONSTRAINT IF EXISTS no_overlap")
 ```
-9 columns: Business.created_at (34), Master.created_at (48), Service.created_at (66), Client.created_at (81), Slot.created_at (94), Booking.start_at (125), Booking.end_at (126), Booking.created_at (128), NotificationLog.sent_at (156). Убрать TODO comment (23).
 
-### 7 BREAKS — убрать `.replace(tzinfo=None)` workaround'ы + inject `.replace(tzinfo=UTC)` на DB-read side
+### Фаза B — Scheduler SQLAlchemyJobStore (sync psycopg2 engine)
 
-**CRITICAL (critic iter 3):** в deadline computations `ref` становится aware (после удаления strip), но `booking.start_at` остаётся naive на SQLite → TypeError. Fix: inject `.replace(tzinfo=UTC)` на DB-read side (no-op на Postgres где уже aware, makes naive aware на SQLite).
+#### B.1 — `bot/config.py` — добавить 2 properties для URL conversion
 
-| File:line | Тип | Fix (final, после critic iter 3) |
-|---|---|---|
-| `bot/services/booking.py:569` | INSERT start_at (transfer_booking) | убрать strip: `start_at=new_start_at` (SQLAlchemy coerces aware → TIMESTAMPTZ; SQLite strips на bind) |
-| `bot/services/booking.py:570` | INSERT end_at (transfer_booking) | убрать strip: `end_at=new_end_at` |
-| `bot/services/admin.py:161` | SQL WHERE (get_today_bookings) | убрать strip (SQLAlchemy handles aware vs aware на Postgres; SQLite lexicographic) |
-| `bot/services/booking.py:325-326` (cancel_booking) | Python comparison (24h rule) | убрать `ref_naive = ref.replace(tzinfo=None)` → использовать `ref` (aware). **CRITICAL:** `cancel_deadline = booking.start_at.replace(tzinfo=UTC) - timedelta(...)` (was: `booking.start_at - timedelta(...)`) |
-| `bot/services/booking.py:520-527` (transfer_booking) | Python comparison (24h rule) | то же: `ref` без strip. **CRITICAL:** `cancel_deadline = old_start_at.replace(tzinfo=UTC) - timedelta(...)` (was: `old_start_at - timedelta(...)`) |
-| `bot/handlers/client.py:509` (mybookings) | Python comparison + .astimezone | убрать `now_utc = now_utc_aware.replace(tzinfo=None)` → использовать `now_utc_aware`. **CRITICAL:** `deadline = b.start_at.replace(tzinfo=UTC) - timedelta(...)` (was: `b.start_at - timedelta(...)`) на line 525. W1 fix на line 516: `b.start_at.replace(tzinfo=UTC).astimezone(tz)`. |
-| `bot/handlers/client.py:686-687` (transfer pre-check) | Python comparison | убрать `now_utc = datetime.now(UTC).replace(tzinfo=None)` → использовать `datetime.now(UTC)`. **CRITICAL:** `deadline = booking.start_at.replace(tzinfo=UTC) - timedelta(...)` (was: `booking.start_at - timedelta(...)`) |
-
-### 3 W1 explicit fix (inject `.replace(tzinfo=UTC)`)
-- `bot/handlers/admin.py:377` — `b.start_at.replace(tzinfo=UTC).astimezone(tz)`
-- `bot/handlers/client.py:516` — то же
-- `bot/keyboards/client.py:143` — то же
-
-### KEEP (не трогать)
-- `bot/handlers/client.py:92, 149` — SAFE (aiogram_calendar/date calc, не DB)
-- 8 `.replace(tzinfo=None)` в `tests/*` (test_admin.py:108,693,702; test_admin_handlers.py:197; test_client_handlers.py:193,1499,1740,1754; test_booking.py:515) — SQLite tests, naive OK
-- `bot/services/booking.py:377, 635, 655` — уже имеют `.replace(tzinfo=UTC)`
-
-### alembic/versions/001_initial.py (hand-written, cross-DB) — augmented с critic iter 3 fixes
-
-7 tables БЕЗ EXCLUDE (Postgres-only, separate migration 002). Cross-DB compatible:
-- `BigInteger().with_variant(Integer, "sqlite")` для NotificationLog.id (models.py:147)
-- 4 CHECK constraints: `slot_hour BETWEEN 0 AND 23`, `duration_minutes > 0`, `end_at > start_at`, `kind IN (...)`
-- 4 partial indexes с `postgresql_where` (на Postgres, ignored на SQLite)
-- 3 UNIQUE indexes: `ux_slots_master_date_hour`, `ux_bookings_slot`, `ux_notifications_booking_kind`
-- **(critic iter 3 add)** `idx_bookings_master_start` regular composite index (master_id, start_at) — models.py:138
-- **(critic iter 3 add)** `Client.telegram_id` unique=True implicit index — models.py:78
-- **(critic iter 3 add)** FK `ondelete="CASCADE"` для `Slot.master_id` (models.py:89) и `NotificationLog.booking_id` (models.py:152) — Alembic должен явно renderить ON DELETE CASCADE на Postgres
-- UUID: Python-side `default=uuid.uuid4` (пробел 4 — рекомендация A, pet-project simplicity). Update spec.md note: "механизм = Python-side, не server-side gen_random_uuid()"
-
-### Infra files
-- `pyproject.toml`: `[project.optional-dependencies].prod = ["asyncpg>=0.29", "psycopg2-binary>=2.9", "alembic>=1.13"]`
-- `alembic.ini` (root): config from `DATABASE_URL` env, `script_location = alembic`
-- `alembic/env.py`: reads DATABASE_URL from settings, `target_metadata = Base.metadata`, online mode
-- `.env.example`: добавить `DATABASE_URL_SYNC=` placeholder (config.py:18 уже имеет default "")
-
-## 9 пробелов — статус после сессии 2 (анализ продолжен)
-
-### Пробел 1 — `bot/services/notifications.py` — ЗАКРЫТ (SAFE)
-
-`read` выполнен полностью (79 строк). `get_overdue_bookings_without_remind_24h` (строки 35-61) и `get_upcoming_bookings_for_reschedule` (64-79) — все сравнения `Booking.start_at > window_start` (lines 45-47) и `Booking.start_at < now` (line 47) в **SQL WHERE**. Нет `.replace(tzinfo=None)`, нет Python comparison `booking.start_at - timedelta(...)`, нет `.astimezone()`. На Postgres TIMESTAMPTZ aware UTC сравнивается с `datetime.now(UTC)` aware — корректно. Никаких правок не нужно.
-
-### Пробел 2 — `bot/services/slots.py` — ЗАКРЫТ (SAFE)
-
-`read` выполнен полностью (102 строки). `add_slots` (15-55), `close_slot` (62-83), `get_available_slots` (86-102). Поля: `slot_date` (date), `slot_hour` (int), `status`, `created_at` (default=func.now()). Никаких datetime comparisons. Никаких правок не нужно.
-
-### Пробел 3 — `alembic/versions/001_initial.py` content — ЗАКРЫТ (Phase 2 design, augmented с critic iter 3)
-
-См. раздел "alembic/versions/001_initial.py" выше — hand-written, cross-DB, 7 tables + 4 CHECKs + 4 partial indexes + 3 UNIQUE + 1 regular composite + 1 implicit unique (telegram_id) + 2 FK CASCADE. Решение: hand-written для детерминизма (autogenerate может пропустить partial indexes с `postgresql_where`).
-
-### Пробел 4 — UUID default — ЗАКРЫТ (Phase 2 decision: A)
-
-**Решение: A (Python-side `default=uuid.uuid4`)** — простота, работает на обеих БД, pet-project. Spec.md update (механизм = Python-side, не server-side `gen_random_uuid()`). Альтернатива B (server-side) отклонена: на старом Postgres нужен pgcrypto, на SQLite нужен fallback — over-engineering для pet-project.
-
-### Пробел 5 — asyncpg aware UTC — ЗАКРЫТ (Phase 3 verification)
-
-SQLite scratch stub (выполнен в сессии 2):
 ```python
-# Test: with_variant vs без variant, both SQLite
-[with_variant] Inserted: aware UTC, Returned: tzinfo=None, value=2026-08-23 12:00:00
-[no variant]   Inserted: aware UTC, Returned: tzinfo=None, value=2026-08-23 12:00:00
-[with_variant] Inserted: naive,    Returned: tzinfo=None, value=2026-08-23 12:00:00
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Настройки проекта (spec.md 290-305).
+
+    DATABASE_URL_SYNC — пусто в dev (MemoryJobStore), заполняется в проде для SQLAlchemyJobStore.
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    BOT_TOKEN: str
+    DATABASE_URL: str = "sqlite+aiosqlite:///./barber.db"
+    DATABASE_URL_SYNC: str = ""  # sync engine для SQLAlchemyJobStore (psycopg2)
+    ADMIN_ID: int
+    TIMEZONE: str = "Europe/Moscow"
+    REMINDER_24H_BEFORE: int = 24
+    REMINDER_1H_BEFORE: int = 1
+    CANCEL_MIN_HOURS: int = 24
+    MISFIRE_GRACE_TIME: int = 3600  # Render free tier sleep 15 мин = 900 сек → 3600 сек запас
+    SERVICE_DEFAULT_DURATION_MIN: int = 60
+    MAX_BOOKING_DAYS_AHEAD: int = 60  # aiogram_calendar range (today..today+N days)
+
+    @property
+    def async_database_url(self) -> str:
+        """Convert Render's plain `postgresql://` / `postgres://` → asyncpg format.
+
+        Render Postgres `fromDatabase` env var provides `postgresql://user:pass@host:port/db`
+        (НЕ asyncpg). asyncpg driver требует `postgresql+asyncpg://`.
+        """
+        if self.DATABASE_URL.startswith(("postgresql://", "postgres://")):
+            return self.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1) \
+                .replace("postgres://", "postgresql+asyncpg://", 1)
+        return self.DATABASE_URL
+
+    @property
+    def sync_database_url(self) -> str:
+        """Derive sync URL for SQLAlchemyJobStore (psycopg2).
+
+        Render НЕ поддерживает env var interpolation в render.yaml — поэтому
+        DATABASE_URL_SYNC задаём через property, не через render.yaml envVars.
+        """
+        if self.DATABASE_URL_SYNC:
+            return self.DATABASE_URL_SYNC
+        for prefix in ("postgresql+asyncpg://", "postgresql://", "postgres://"):
+            if self.DATABASE_URL.startswith(prefix):
+                return self.DATABASE_URL.replace(prefix, "postgresql+psycopg2://", 1)
+        # SQLite fallback (dev)
+        return self.DATABASE_URL.replace("sqlite+aiosqlite://", "sqlite://", 1)
+
+
+def get_settings() -> Settings:
+    return Settings()  # type: ignore[call-arg]  # values come from .env
 ```
 
-**Вывод:** `DateTime(timezone=True).with_variant(TIMESTAMP(timezone=True), "postgresql")` на SQLite возвращает naive (то же что без variant). Все 226 SQLite тестов ПРОДОЛЖАТ проходить. На Postgres (по SQLAlchemy/asyncpg docs): `TIMESTAMP(timezone=True)` → TIMESTAMPTZ column → asyncpg возвращает aware UTC (стандартное поведение asyncpg). Empirical Postgres test нет (constraint: no testcontainers, overkill для pet-project).
+#### B.2 — `bot/db.py` — использовать `async_database_url` + pool_pre_ping
 
-**Verdict:** confirmed (SQLite empirical) + assumed (Postgres docs). Honest limitation.
+```python
+# было (line 16):
+# engine = create_async_engine(settings.DATABASE_URL, future=True)
 
-### Пробел 6 — 3-й critic pass — ЗАВЕРШЁН (NEEDS_MORE_ANALYSIS, max 2 LBTM превышен с user consent)
-
-3-я итерация critic выполнена (task tool, subagent_type=deep-analysis-critic). VERDICT: **NEEDS_MORE_ANALYSIS** — найдено 4 CRITICAL + 3 MINOR gaps. Все fixes применены к augmented плану выше (см. раздел "7 BREAKS" с `.replace(tzinfo=UTC)` injection + alembic section с 3 add'ами).
-
-Per protocol: max 2 LBTM — 3-я требует user consent (получено: "Запусти всё что нужно"). Дальше — **user external review** (last line per Cross-model limitation). Код НЕ правили. Ждём GO от пользователя для Phase 5.
-
-### Пробел 7 — Postgres tests НЕТ (no testcontainers)
-
-Все 226 тестов на SQLite. Postgres behavior (TIMESTAMPTZ, asyncpg aware, EXCLUDE constraint) — предположение. Узнаем только при deploy на Render.
-
-**Что принять:** Honest limitation. Pet-project, constraint 3 (no testcontainers — overkill). Альтернатива: manual smoke test после deploy (запись брони через bot, проверка что `/today` показывает корректное время).
-
-**Зафиксировать в PLANS:** "Postgres behavior не покрыт тестами. Smoke test после Session 2 deploy".
-
-### Пробел 8 — Cross-model correlation (одна модель LiteLLM)
-
-Main и critic на одной модели. Общие слепые пятна не ловятся. Это уменьшение sycophancy/confirmation bias, не панацея.
-
-**Что принять:** Honest limitation (per `deep-analysis-protocol` Cross-model limitation). Mitigation — пробел 6 (C): внешний review пользователя.
-
-### Пробел 9 — naive assertions в tests — ЗАКРЫТ (классификация)
-
-`grep -rn "tzinfo is None\|tzinfo is not None\|assert.*naive" tests/` найдено 14 мест, классифицировано:
-
-**9 BREAK-ON-POSTGRES** (НЕ править в Session 1, остаются для dev SQLite):
-- `tests/test_admin.py:178, 215, 409, 410, 411, 579, 651, 681` — `assert result[0].start_at == _utc_naive(...)`. Сравнивают SQLite naive с naive. На Postgres (aware vs naive) → TypeError.
-- `tests/test_client_handlers.py:254` — `assert b.start_at.tzinfo is None`. На Postgres будет `timezone.utc`.
-
-**3 SAFE** (продолжат работать на Postgres):
-- `tests/test_db.py:106` — `assert result.tzinfo is not None` (db.utcnow() aware — корректно на обеих БД)
-- `tests/test_client_handlers.py:1453, 1454` — `assert min_date.tzinfo is None / max_date.tzinfo is None` (calendar range, не DB roundtrip)
-- `tests/test_booking.py:239` — `assert result.start_at.tzinfo is not None` (service возвращает in-memory aware объект до roundtrip)
-
-**Honest limitation:** SQLite tests не верифицируют Postgres behavior для datetime comparisons. Smoke test после deploy (запись брони через bot, проверка /today корректного времени). Fix для Session 2+: либо cross-DB helper `_aware_utc()` (возвращает aware на Postgres, naive на SQLite), либо Postgres-only test suite с testcontainers (out of scope MVP).
-
-## План на следующую сессию (фазы)
-
-### Phase 1 — Read missed files (30 мин)
-1. `read bot/services/notifications.py` полностью — классифицировать `.replace(tzinfo=None)` и Python comparisons
-2. `read bot/services/slots.py` полностью — верифицировать safe
-3. `grep -rn "tzinfo is None\|tzinfo is not None\|assert.*naive" tests/` — найти naive assertions
-4. `grep -rn "astimezone.*b\.start_at\|booking\.start_at\.astimezone" tests/` — найти `.astimezone()` patterns
-
-**Выход:** обновлённая классификация BREAKS/SAFE + список tests assertions для проверки.
-
-## План на следующую сессию — Phase 5 (после user external review GO)
-
-Phases 1-4 закрыты в сессии 2026-08-23 (продолжение). Осталась только Phase 5.
-
-### Phase 5 — User external review → GO → Session 1 implementation (~2-3 часа)
-
-1. **External review (user)** — пользователь читает augmented план (этот файл, секции 1-5). Если OK → "go" / "правь" / "apply". Если найдёт gaps → корректирует, я дорабатываю план.
-2. **Implementation** — Session 1 (применять augmented план):
-   - Schema change (models.py: 9 columns with_variant + убрать TODO comment + import TIMESTAMP)
-   - 7 BREAKS: убрать `.replace(tzinfo=None)` + inject `.replace(tzinfo=UTC)` на DB-read side (4 deadline computations + 3 .astimezone)
-   - alembic/versions/001_initial.py + alembic/env.py + alembic.ini
-   - pyproject.toml: `[project.optional-dependencies].prod`
-   - .env.example: `DATABASE_URL_SYNC=`
-   - spec.md: note "механизм = Python-side, не server-side gen_random_uuid()"
-3. **`qa-verify-and-fix`**: pytest 226 + ruff + mypy + coverage (99% preserved — SQLite behavior не меняется)
-4. **`qa-code-review`**: code-reviewer subagent на logic-change (strip workaround removed, `.replace(tzinfo=UTC)` injection added)
-5. **Коммиты свободно** (pet-project, AGENTS.md § git-repo-categories)
-6. **Postgres smoke test** после deploy (Session 2): записать бронь через bot, проверить /today корректное время.
-
-**Выход:** Session 1 закрыта. Готово к Session 2 (Scheduler SQLAlchemyJobStore + Render + EXCLUDE constraint migration 002 — отдельная сессия).
-
-## Quick start prompt для opencode (обновлён после сессии 2)
-
-```
-Продолжаем barber-bot Опц. A (Postgres migration) — финальная проверка перед Phase 5 implementation.
-
-Прочитай ~/PycharmProjects/barber-bot/NEXT_SESSION_PROMPT.md — там полный контекст:
-- Сессия 2026-08-23 (продолжение): Phase 1-4 закрыты.
-- 3-й critic pass выполнен с user consent — VERDICT: NEEDS_MORE_ANALYSIS (4 CRITICAL + 3 MINOR gaps).
-- Все critic iter 3 fixes применены к augmented плану (см. секции "7 BREAKS" и "alembic/versions/001_initial.py" выше).
-- 4 из 9 пробелов ЗАКРЫТЫ: 1 (notifications.py SAFE), 2 (slots.py SAFE), 5 (asyncpg — SQLite stub + docs), 9 (naive assertions — 14 классифицировано).
-- 3 пробела решены в Phase 2: 3 (alembic 001 design), 4 (UUID = A Python-side), 6 (3-й critic done).
-- 2 пробела ПРИНЯТЫ как honest limitations: 7 (no Postgres tests, smoke after deploy), 8 (cross-model correlation, mitigation = user external review).
-
-Статус: READY FOR USER EXTERNAL REVIEW (last line per Cross-model limitation).
-После GO от пользователя ("go" / "правь" / "apply") → Phase 5 implementation.
-
-Phase 5 (после GO):
-1. Implementation: Schema (models.py 9 columns with_variant) + 7 BREAKS (strip + .replace(tzinfo=UTC) injections) + alembic 001 + pyproject + .env.example + spec.md note
-2. qa-verify-and-fix: pytest 226 + ruff + mypy
-3. qa-code-review: code-reviewer subagent на logic-change
-4. Коммиты свободно (pet-project)
-
-Гейты: deep-analysis Pass 1-4 + 3 critic итерации (выполнены). Pre-push НЕ нужен (личный репо).
+# стало:
+engine = create_async_engine(
+    settings.async_database_url,
+    future=True,
+    pool_pre_ping=True,   # detect dead conn после Render sleep 15 мин (асимметрия с sync engine B.3)
+    pool_recycle=1800,    # 30 мин recycle (Render free sleep 15 мин → conn stale)
+)
 ```
 
-## Файлы для быстрого ориентирования
+#### B.3 — `scheduler.py` — branching by `sync_database_url`
 
-| Файл | Что | Строк |
-|---|---|---|
-| `spec.md` | SSOT — Урок 2.6 Postgres migration (строки 66-176, 322-393, 413-436) | 541 |
-| `MY-VIBE-RULES.md` | Формат работы + гейты (dev-режим) | 79 |
-| `bot/models.py` | 7 SQLAlchemy 2.0 models, 9 DateTime(timezone=True), with_variant precedent (147) | 164 |
-| `bot/db.py` | Async engine, session_factory, create_all/drop_all | 43 |
-| `bot/services/booking.py` | create/cancel/transfer booking, 7 BREAKS workarounds (325, 520, 569, 570), W1 explicit fix (377, 635, 655) | 671 |
-| `bot/services/admin.py` | get_today/week_bookings, get_client_bookings (W2 at 157-161), W1 bug (377) | 165 |
-| `bot/services/notifications.py` | on_startup helpers — ЧИТАН, SAFE (все comparisons в SQL WHERE) | 79 |
-| `bot/services/slots.py` | add_slots, close_slot, get_available_slots — ЧИТАН, SAFE (нет datetime comparisons) | 102 |
-| `bot/handlers/admin.py` | /addslots, /closeslot, /today, /week, /services, W1 bug (377) | 383 |
-| `bot/handlers/client.py` | booking FSM + SimpleCalendar + /mybookings + /cancel + /transfer, 2 BREAKS (509, 686), W1 bug (516) | 856 |
-| `bot/keyboards/client.py` | inline keyboards, W1 bug (143), comments (6, 75) | 174 |
-| `bot/main.py` | entry point, scheduler = build_scheduler() at module level (36) | 112 |
-| `bot/config.py` | Settings, DATABASE_URL_SYNC="" placeholder (18) | 30 |
-| `scheduler.py` | AsyncIOScheduler + MemoryJobStore (dev), schedule_for_booking, on_startup_scan | 126 |
-| `tests/test_scheduler.py` | test_build_scheduler_memory_jobstore (75-80) — продолжит проходить с conditional build_scheduler | 240 |
-| `tests/test_booking.py` | booking service tests + 12 transfer + concurrent race | ~2053 |
-| `tests/test_admin.py` | services/admin tests, .replace(tzinfo=None) at 108, 693, 702 | 703 |
-| `tests/test_admin_handlers.py` | admin handlers tests, .replace(tzinfo=None) at 197 | 1282 |
-| `tests/test_client_handlers.py` | client handlers tests, naive assert at 254, .replace(tzinfo=None) at 193, 1499, 1740, 1754 | ~2720 |
-| `tests/test_main.py` | bot/main.py wiring + lifecycle + subprocess | 227 |
-| `tests/test_session.py` | CorpAiohttpSession ssl context | 124 |
-| `tests/test_db.py` | bot/db.py create_all/drop_all/dispose/utcnow | 109 |
-| `tests/test_slots.py` | slots service tests + concurrent race | 285 |
-| `tests/conftest.py` | in-memory SQLite fixtures, seed_data | 144 |
-| `alembic/` | каталог пустой (нет env.py, нет versions/*, нет alembic.ini в root) | — |
-| `pyproject.toml` | Python 3.12, deps без asyncpg/psycopg2/alembic | — |
-| `.env.example` | BOT_TOKEN, DATABASE_URL=sqlite, ADMIN_ID — нет DATABASE_URL_SYNC | — |
+```python
+"""Scheduler — APScheduler AsyncIOScheduler with cross-DB jobstore.
+
+Spec.md 322-393, 354:
+- Dev (SQLite): MemoryJobStore (no pickle, no sync engine)
+- Prod (Postgres): SQLAlchemyJobStore(engine=sync_engine) — sync psycopg2 engine
+  (pickle-сериализация не работает с asyncpg; separate sync engine required).
+- on_startup_scan пересоздаёт jobs при restart (BB-012)
+- schedule_for_booking: add_job remind_24h + remind_1h (replace_existing=True)
+- job_id format: f"remind_24h_{booking_id}", f"remind_1h_{booking_id}" (deterministic for replace)
+- misfire_grace_time=3600 (1h — Render sleep 15min = 900s → 3600s запас)
+- coalesce=True, max_instances=1
+
+SQLAlchemyJobStore.__init__ lazy (verified apscheduler/jobstores/sqlalchemy.py:65-85):
+engine stored as reference, NO connection на construct. Table `apscheduler_jobs`
+created at `scheduler.start()` via `jobs_t.create(engine, True)` (CREATE IF NOT EXISTS).
+Module-level `scheduler = build_scheduler()` безопасен.
+"""
+
+from contextlib import suppress
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from uuid import UUID
+from zoneinfo import ZoneInfo
+
+from apscheduler.jobstores.memory import MemoryJobStore
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from bot.config import get_settings
+from sqlalchemy import create_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+
+def build_scheduler() -> AsyncIOScheduler:
+    """Build AsyncIOScheduler with cross-DB jobstore branching.
+
+    Dev (DATABASE_URL=sqlite, DATABASE_URL_SYNC empty) → MemoryJobStore.
+    Prod (DATABASE_URL=postgresql, DATABASE_URL_SYNC empty → derived) → SQLAlchemyJobStore.
+    """
+    settings = get_settings()
+    sync_url = settings.sync_database_url
+    # SQLAlchemyJobStore.__init__ lazy — engine не подключается на construct
+    # (verified apscheduler/jobstores/sqlalchemy.py:65-85). Module-level
+    # build_scheduler() безопасен — actual table CREATE в scheduler.start().
+    if sync_url.startswith("postgresql"):
+        sync_engine = create_engine(
+            sync_url,
+            pool_pre_ping=True,    # detect dead conn после Render sleep 15 мин
+            pool_recycle=1800,
+            pool_size=5,
+            max_overflow=10,
+        )
+        jobstore = SQLAlchemyJobStore(engine=sync_engine)
+    else:
+        # Dev SQLite — MemoryJobStore (no pickle, no sync engine)
+        jobstore = MemoryJobStore()
+    return AsyncIOScheduler(
+        timezone=ZoneInfo(settings.TIMEZONE),
+        jobstores={"default": jobstore},
+        job_defaults={
+            "coalesce": True,
+            "misfire_grace_time": settings.MISFIRE_GRACE_TIME,
+            "max_instances": 1,
+        },
+    )
+
+
+async def send_reminder(booking_id: UUID, kind: str, bot: Any = None) -> None:
+    """Job target — sends reminder to client.
+
+    ⚠️ PICKLE-STABLE SIGNATURE — DO NOT rename/remove args without
+    drop+reschedule strategy. SQLAlchemyJobStore pickles (booking_id, kind, bot)
+    into apscheduler_jobs.job_state column. Adding args with defaults is safe;
+    renaming/removing is a ONE-WAY DOOR (existing jobs fail to unpickle → TypeError
+    on next scheduler.start). Migration strategy: scheduler.remove_all_jobs()
+    then on_startup_scan reschedules from DB.
+
+    Stub for Шаг 3: real implementation in Урок 2.4 (master handlers).
+    Real flow:
+      1. SELECT booking
+      2. INSERT notifications_log(booking_id, kind) — UNIQUE guard
+      3. bot.send_message(client_id, "Напоминание: ...")
+    """
+    # TODO Урок 2.4: real send_reminder with DB lookup + bot.send_message
+    return None
+
+
+def schedule_for_booking(
+    scheduler: AsyncIOScheduler,
+    booking_id: UUID,
+    start_at: datetime,
+) -> None:
+    """Schedule remind_24h + remind_1h for a booking.
+
+    replace_existing=True — idempotent, safe to call multiple times.
+    If start_at - 24h is in the past, APScheduler's misfire_grace_time handles it
+    (job fires immediately if within grace window, otherwise dropped — on_startup_scan catches).
+    """
+    settings = get_settings()
+    remind_24h_at = start_at - timedelta(hours=settings.REMINDER_24H_BEFORE)
+    remind_1h_at = start_at - timedelta(hours=settings.REMINDER_1H_BEFORE)
+
+    job_id_24h = f"remind_24h_{booking_id}"
+    job_id_1h = f"remind_1h_{booking_id}"
+
+    scheduler.add_job(
+        send_reminder,
+        trigger="date",
+        run_date=remind_24h_at,
+        args=[booking_id, "remind_24h"],
+        id=job_id_24h,
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        send_reminder,
+        trigger="date",
+        run_date=remind_1h_at,
+        args=[booking_id, "remind_1h"],
+        id=job_id_1h,
+        replace_existing=True,
+    )
+
+
+def remove_jobs_for_booking(scheduler: AsyncIOScheduler, booking_id: UUID) -> None:
+    """Remove remind_24h + remind_1h for a booking (on cancel)."""
+    for kind in ("remind_24h", "remind_1h"):
+        job_id = f"{kind}_{booking_id}"
+        with suppress(Exception):
+            scheduler.remove_job(job_id)
+
+
+async def on_startup_scan(
+    scheduler: AsyncIOScheduler,
+    session_factory: async_sessionmaker[AsyncSession],
+    bot: Any = None,
+) -> None:
+    """on_startup — 2 phases (spec.md 358-382):
+
+    Phase 1: fire_overdue_reminders — bookings без remind_24h где start_at в окне (now-24h, now)
+    Phase 2: schedule_for_booking для ВСЕХ upcoming (start_at > now, < now+25h)
+    """
+    from bot.services.notifications import (
+        get_overdue_bookings_without_remind_24h,
+        get_upcoming_bookings_for_reschedule,
+        log_notification,
+    )
+
+    now = datetime.now(UTC)
+
+    async with session_factory() as session:
+        # Phase 1: fire overdue (stub — real send in Урок 2.4)
+        overdue = await get_overdue_bookings_without_remind_24h(session, now)
+        for b in overdue:
+            # TODO Урок 2.4: actually send message via bot
+            await log_notification(session, b.id, "remind_24h")
+
+        # Phase 2: reschedule upcoming
+        upcoming = await get_upcoming_bookings_for_reschedule(session, now, look_ahead_hours=25)
+        for b in upcoming:
+            schedule_for_booking(scheduler, b.id, b.start_at)
+```
+
+#### B.4 — `bot/services/booking.py:562-577` — transfer_booking IntegrityError catch
+
+**Точный line (post critic iter 1 fix):** оборачиваем `await session.execute(upd_b)` на line 577.
+
+```python
+    upd_b = (
+        update(Booking)
+        .where(
+            Booking.id == booking_id,
+            Booking.client_id == client_id,
+            Booking.status.in_(("confirmed", "transferred")),
+            Booking.start_at == old_start_at,  # race-protection pin (Pass 3 [blocker] finding)
+        )
+        .values(
+            status="transferred",
+            slot_id=new_slot.id,
+            start_at=new_start_at,
+            end_at=new_end_at,
+        )
+    )
+    try:
+        res_b = await session.execute(upd_b)
+    except IntegrityError as exc:
+        # EXCLUDE constraint (Postgres): new tstzrange(start_at, end_at) overlaps
+        # another active booking (confirmed/transferred) for same master.
+        # SQLite не имеет EXCLUDE — UNIQUE(slot_id) handles only same-slot case,
+        # но это безопасно (SQLite dev, надёжность через UNIQUE + service-layer checks).
+        # Map to existing SlotAlreadyBookedError — пользователь видит "слот занят".
+        await session.rollback()
+        raise SlotAlreadyBookedError(
+            f"Transfer to slot {new_slot.id} overlaps existing booking (EXCLUDE constraint)"
+        ) from exc
+    if cast("CursorResult[Any]", res_b).rowcount == 0:
+        # existing race-protection logic (unchanged)
+        # ...
+```
+
+**create_booking (booking.py:188-190) — НЕ ТРОГАТЬ.** Existing `except IntegrityError → SlotAlreadyBookedError` handles EXCLUDE на Postgres (EXCLUDE fires на flush).
+
+**Импорт `IntegrityError`** — проверить что уже импортирован в `bot/services/booking.py` (если нет — добавить `from sqlalchemy.exc import IntegrityError`).
+
+### Фаза C — Render deploy
+
+#### C.1 — `alembic/env.py` — handle ALL Render URL formats
+
+```python
+# заменить строки 33-40 на:
+sync_url = os.getenv("DATABASE_URL_SYNC", "")
+if not sync_url:
+    async_url = os.getenv("DATABASE_URL", "sqlite:///./barber.db")
+    # Handle ALL Render formats: postgresql+asyncpg://, postgresql://, postgres://
+    for prefix in ("postgresql+asyncpg://", "postgresql://", "postgres://"):
+        if async_url.startswith(prefix):
+            sync_url = async_url.replace(prefix, "postgresql+psycopg2://", 1)
+            break
+    else:
+        sync_url = async_url.replace("sqlite+aiosqlite://", "sqlite://", 1)
+config.set_main_option("sqlalchemy.url", sync_url)
+```
+
+#### C.2 — `render.yaml` (новый файл, root)
+
+```yaml
+# Render deployment config — barber-bot pet-project (Урок 2.6).
+# Render free tier: web service sleeps 15 min without inbound HTTP.
+# Polling bot → sleeps → missed jobs → on_startup_scan on wake (BB-012).
+# FSM state storage (spec.md:538-547) deferred to Session 3 (PostgresStorage).
+
+services:
+  - type: web
+    name: barber-bot
+    env: python
+    buildCommand: pip install -e .[prod]  # NOT pip install -r requirements.txt (requirements.txt doesn't exist; pyproject.toml [project.optional-dependencies].prod has asyncpg + psycopg2-binary + alembic)
+    startCommand: python -m bot.main
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase: { name: barber-db, property: connectionString }
+      # DATABASE_URL_SYNC НЕ задаём — Settings.sync_database_url derives от DATABASE_URL
+      # (Render НЕ поддерживает env var interpolation в render.yaml)
+      - key: BOT_TOKEN
+        sync: false  # manual entry на Render dashboard
+      - key: ADMIN_ID
+        sync: false
+    preDeployCommand: alembic upgrade head  # runs 001_initial + 002_postgres_exclude sequentially (empty Postgres)
+databases:
+  - name: barber-db
+    plan: free
+    ipAllowList: []  # internal only (Render services → Render DB)
+```
+
+## Honest limitations (not blockers, зафиксированы для Session 3)
+
+- **No Postgres tests** (no testcontainers, overkill для pet-project) — smoke test после deploy.
+- **Render free web service sleep** 15 мин → polling bot спит → missed jobs (on_startup_scan на wake подхватывает).
+- **Cross-model correlation** — main и critic на одной модели LiteLLM (общие слепые пятна).
+- **FSM state storage** (spec.md:538-547) — Render free restarts каждые 15 мин → in-progress FSM теряется. Spec recommends PostgresStorage (option C). **Deferred to Session 3** (out of scope Session 2).
+- **EXCLUDE violation semantically off** — `SlotAlreadyBookedError` от EXCLUDE показывает "слот только что заняли" (acceptable для MVP, semantically off для overlap, но user-facing текст релевантный).
+- **btree_gist availability** — VERIFIED via webfetch render.com/docs/postgresql-extensions (PG 13+).
+
+## Verification plan (после implementation, перед коммитом)
+
+1. `pytest` — 226 тестов должны остаться зелёными (dev path не меняется: MemoryJobStore по умолчанию, sync_database_url → sqlite://)
+2. `ruff check .` + `ruff format --check .` — чисто
+3. `mypy bot` — Success
+4. `alembic upgrade head --sql` (SQLite dialect) — 002 должен быть no-op (UNIQUE(slot_id) handles)
+5. `pip install -e .[prod]` на clean venv — verify prod deps coexist (asyncpg + psycopg2-binary + alembic)
+6. `alembic upgrade head` на SQLite in-memory DB — 002 должен пройти (no-op)
+7. Post-deploy smoke test на Render (после push и deploy):
+   - Записать бронь через bot, проверить /today корректное время
+   - Записать 2 брони на overlap (same master, overlapping tstzrange) → должно отбиться EXCLUDE constraint
+   - Проверить что `apscheduler_jobs` table создалась в Postgres
 
 ## Гейты (напоминание)
 
-- **deep-analysis-protocol** Pass 1-4 на нетривиальное
-- **deep-analysis-critic** ОБЯЗАТЕЛЕН для high-stakes (миграции) — max 2 LBTM, 3-я требует user consent
-- **qa-verify-and-fix** после правок: pytest + ruff + mypy + coverage (все зелёные)
-- **qa-code-review** на logic-change (через `code-reviewer` subagent)
+- **deep-analysis-protocol** Pass 1-4 на Session 2 — выполнен
+- **deep-analysis-critic** iter 1 → NEEDS_MORE_ANALYSIS (7 findings), iter 2 → DEEP_ENOUGH (1 minor fixed) — выполнен (max 2 LBTM, в рамках протокола)
+- **qa-verify-and-fix** после implementation: pytest + ruff + mypy — все зелёные
+- **qa-code-review** через `code-reviewer` subagent на logic-change (SQLAlchemyJobStore branching, IntegrityError catch)
 - **Pre-push**: НЕ нужен — barber-bot личный репо (AGENTS.md § git-repo-categories)
-- **Коммитить свободно** — pet-проект, без переспроса
+- **Коммитить свободно** — pet-проект, без переспроса, после verify + code-review
 
-## Pre-existing Warnings (carry-over, не блокирующие на dev)
+## Файлы для быстрого ориентирования
 
-- **W1** — `booking.start_at.astimezone` на naive (SQLite workaround в booking.py:377, 635, 655). 3 bug locations вне booking.py (admin.py:377, client.py:516, keyboards/client.py:143) — будут explicit fix в Session 1.
-- **W2** — `datetime.now(tz=None)` naive local (admin.py:152 comment, fix в admin.py:157-161). Полный fix — Session 1 (убрать workaround).
-- **W3** — `assert` в production при `python -O` (admin.py:129, 205, 339). Acceptable для pet-project без `-O` в deploy.
-- **F1** (code-reviewer) — ЗАКРЫТО (commit 3f55355 + 17b2a19 regression test).
-- **RUFF FORMAT DRIFT** — ЗАКРЫТО (commit 68df6ab).
-- **FLAKY test_add_slots_concurrent_race** — ЗАКРЫТО (commit 0fac563).
+| Файл | Что | Изменения Session 2 |
+|---|---|---|
+| `spec.md` | SSOT — Урок 2.6 (строки 320-447 Session 2 design, 538-547 FSM storage) | Не трогать |
+| `MY-VIBE-RULES.md` | Формат работы + гейты (dev-режим) | Не трогать |
+| `alembic/versions/002_postgres_exclude.py` | НОВЫЙ — Postgres EXCLUDE constraint + btree_gist, SQLite no-op | СОЗДАТЬ (Фаза A) |
+| `alembic/versions/001_initial.py` | 7 tables, NO EXCLUDE (из Session 1) | Не трогать (down_revision ref) |
+| `alembic/env.py` | async URL → sync URL | ПРАВИТЬ (C.1 — handle 3 Render prefixes) |
+| `bot/config.py` | Settings — добавить 2 properties | ПРАВИТЬ (B.1 — async_database_url, sync_database_url) |
+| `bot/db.py` | Async engine, session_factory | ПРАВИТЬ (B.2 — async_database_url + pool_pre_ping + pool_recycle) |
+| `bot/models.py` | 7 SQLAlchemy 2.0 models (из Session 1) | Не трогать |
+| `bot/services/booking.py` | create/cancel/transfer booking | ПРАВИТЬ (B.5 — transfer_booking IntegrityError catch на line 577; create_booking НЕ ТРОГАТЬ line 188-190) |
+| `bot/services/admin.py` | get_today/week_bookings | Не трогать |
+| `bot/services/notifications.py` | on_startup helpers | Не трогать |
+| `bot/services/slots.py` | add_slots, close_slot, get_available_slots | Не трогать |
+| `bot/handlers/admin.py` | /today, /week, /services | Не трогать |
+| `bot/handlers/client.py` | booking FSM + /mybookings + /cancel + /transfer | Не трогать |
+| `bot/keyboards/client.py` | inline keyboards | Не трогать |
+| `bot/main.py` | entry point, scheduler = build_scheduler() (line 36) | Не трогать (module-level safe per critic iter 1) |
+| `scheduler.py` | AsyncIOScheduler + MemoryJobStore | ПРАВИТЬ (B.3 — SQLAlchemyJobStore branching + B.4 — pickle-stable docstring) |
+| `tests/test_scheduler.py` | test_build_scheduler_memory_jobstore (75-80) — продолжит проходить (dev path MemoryJobStore) | Не трогать |
+| `tests/test_booking.py` | booking service tests (~2053 строк) | Не трогать (опц.: добавить test для transfer_booking IntegrityError — ручной smoke на Postgres) |
+| `tests/test_admin.py` | services/admin tests | Не трогать |
+| `tests/test_admin_handlers.py` | admin handlers tests | Не трогать |
+| `tests/test_client_handlers.py` | client handlers tests (~2720 строк) | Не трогать |
+| `tests/test_main.py` | bot/main.py wiring + lifecycle | Не трогать |
+| `tests/test_session.py` | CorpAiohttpSession ssl context | Не трогать |
+| `tests/test_db.py` | bot/db.py create_all/drop_all/dispose/utcnow | Не трогать |
+| `tests/test_slots.py` | slots service tests | Не трогать |
+| `tests/conftest.py` | in-memory SQLite fixtures, seed_data | Не трогать |
+| `pyproject.toml` | Python 3.12, deps + `[project.optional-dependencies].prod` (из Session 1) | Не трогать (buildCommand ref) |
+| `.env.example` | BOT_TOKEN, DATABASE_URL=sqlite, ADMIN_ID, DATABASE_URL_SYNC= (из Session 1) | Не трогать |
+| `render.yaml` | НОВЫЙ — Render deploy config | СОЗДАТЬ (C.2) |
+
+## Quick start prompt для opencode (вставить в новую сессию)
+
+```
+Продолжаем barber-bot Session 2 (Postgres migration продолжение — EXCLUDE constraint + SQLAlchemyJobStore + Render deploy).
+
+Прочитай ~/PycharmProjects/barber-bot/NEXT_SESSION_PROMPT.md — там полный контекст:
+- Session 1 Phase 5 закоммичен и запушен (commit 6b30bc0 + e63ca83, origin/main).
+- Session 2: deep-analysis Pass 1-4 + 2 critic итерации (iter 1 NEEDS_MORE_ANALYSIS 7 findings, iter 2 DEEP_ENOUGH 1 minor fixed).
+- Augmented план готов: 3 фазы (A — EXCLUDE 002, B — SQLAlchemyJobStore, C — Render deploy).
+
+Статус: READY FOR IMPLEMENTATION. После GO ("go" / "правь" / "apply") → implementation.
+
+Implementation order:
+1. Фаза A: alembic/versions/002_postgres_exclude.py (новый файл)
+2. Фаза B.1: bot/config.py — добавить 2 properties (async_database_url, sync_database_url)
+3. Фаза B.2: bot/db.py — async_database_url + pool_pre_ping + pool_recycle
+4. Фаза B.3: scheduler.py — SQLAlchemyJobStore branching + pickle-stable docstring
+5. Фаза B.4: scheduler.py:41-51 — send_reminder pickle-stable docstring
+6. Фаза B.5: bot/services/booking.py:562-577 — transfer_booking IntegrityError catch (проверить импорт IntegrityError)
+7. Фаза C.1: alembic/env.py — handle 3 Render URL prefixes
+8. Фаза C.2: render.yaml (новый файл)
+
+Verification:
+- pytest (226 → green, dev path MemoryJobStore не меняется)
+- ruff + mypy — clean
+- alembic upgrade head --sql (SQLite dialect) — 002 должен быть no-op
+- pip install -e .[prod] на clean venv — verify prod deps coexist
+
+Gates:
+- qa-verify-and-fix после implementation
+- qa-code-review через code-reviewer subagent на logic-change (SQLAlchemyJobStore branching, IntegrityError catch)
+- Коммиты свободно (pet-project, AGENTS.md § git-repo-categories)
+- Push в origin/main после verify + code-review
+
+Honest limitations (not blockers):
+- No Postgres tests (smoke after deploy)
+- Render free web service sleep 15 мин (on_startup_scan catches)
+- FSM state storage deferred to Session 3 (spec.md:538-547)
+
+NEXT: Session 3 — FSM PostgresStorage + real send_reminder (Урок 2.4) + Render deploy smoke.
+```
 
 ## Cross-refs
 
-- `~/.config/opencode/skills/deep-analysis-protocol/SKILL.md` — гейт протокол
-- `~/.config/opencode/AGENTS.md` § git-repo-categories — barber-bot = personal free
-- `~/.config/opencode/references/donor-research/topics/booking-bot-architecture.md` — BB-011 (SQLAlchemyJobStore + psycopg2), BB-012 (on_startup_scan) — подтверждает two-engine подход
+- `~/.config/opencode/skills/deep-analysis-protocol/SKILL.md` — гейт протокол (Pass 1-4 + critic)
+- `~/.config/opencode/AGENTS.md` § git-repo-categories — barber-bot = personal free (коммиты без переспроса)
+- `~/.config/opencode/references/donor-research/topics/booking-bot-architecture.md` — BB-008 (EXCLUDE constraint), BB-011 (SQLAlchemyJobStore), BB-012 (on_startup_scan), BB-014 (anti-pattern MemoryJobStore на Render)
+- https://render.com/docs/postgresql-extensions — btree_gist availability VERIFIED (PG 13+)
+- Spec: Урок 2.6 Postgres migration (spec.md:320-447 Session 2 design, 538-547 FSM storage)
+
+## NEXT: Session 3
+
+- FSM PostgresStorage (spec.md:538-547) — in-progress FSM state в Postgres вместо MemoryStorage (Render free restarts каждые 15 мин теряют FSM)
+- Real `send_reminder` implementation (Урок 2.4) — DB lookup + bot.send_message
+- Render deploy smoke test — записать бронь через bot, проверить /today + EXCLUDE constraint работает (2 брони на overlap → отбивается)
+- Master handlers (Урок 2.4) — /today для мастеров с реальным render
