@@ -1,8 +1,10 @@
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     CheckConstraint,
     DateTime,
@@ -14,7 +16,7 @@ from sqlalchemy import (
     Uuid,
     text,
 )
-from sqlalchemy.dialects.postgresql import TIMESTAMP
+from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -194,3 +196,44 @@ class NotificationLog(Base):
         ),
         Index("ux_notifications_booking_kind", "booking_id", "kind", unique=True),
     )
+
+
+class FsmState(Base):
+    """FSM state persistence (spec.md:538-547 — PostgresStorage prod).
+
+    Cross-DB design (deep-analysis Session 4):
+    - Postgres: JSONB column → atomic `data || $new::jsonb` merge in update_data
+      (no race condition, no SimpleEventIsolation needed).
+    - SQLite (dev/test): JSON column → update_data uses read-modify-write
+      (base.py default impl). Single-process test → race not triggered.
+
+    PK = composite (bot_id, chat_id, user_id, destiny) — covers all
+    StorageKey fields except thread_id/business_connection_id (NULL for simple
+    chats). See aiogram StorageKey (fsm/storage/base.py:14-21).
+
+    Values stored as JSON-serializable (verified existing handlers use
+    str(uuid) and ISO datetime strings — no custom encoder needed):
+    - client.py:239 `state.update_data(slot_id=str(callback_data.slot_id))`
+    - client.py:698 `state.update_data(transfer_booking_id=str(...))`
+    - session_timeout.py:61 `update_data(last_message_at=...isoformat())`
+    """
+
+    __tablename__ = "fsm_states"
+
+    bot_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    destiny: Mapped[str] = mapped_column(String(50), primary_key=True, default="default")
+    state: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    data: Mapped[dict[str, Any]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"),
+        nullable=False,
+        server_default="{}",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True).with_variant(TIMESTAMP(timezone=True), "postgresql"),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (Index("idx_fsm_states_chat_user", "chat_id", "user_id"),)

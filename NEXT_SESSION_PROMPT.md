@@ -1,6 +1,6 @@
-# NEXT_SESSION_PROMPT — Session 1 (Phase 5) закрыт. Session 2 (EXCLUDE + SQLAlchemyJobStore + Render) готов к реализации.
+# NEXT_SESSION_PROMPT — Session 3 закрыт. Session 4 (FSM PostgresStorage + deferred limitations) готова к анализу.
 
-> Дата: 2026-08-23 · Session 1 Phase 5 закоммичен и запушен (commit `6b30bc0` + `e63ca83`). Pass 1-4 + 2 critic итерации на Session 2 (iter 1 → NEEDS_MORE_ANALYSIS 7 findings → fixes applied → iter 2 → DEEP_ENOUGH, 1 minor gap fixed). **Готов к user GO → implementation.**
+> Дата: 2026-08-23 · Session 3 закоммичен и запушен (commits `49e995c` + `be6fb14`). Real `send_reminder` реализован, deferred Session 2 fixes применены. Critic iter 1 → SURFACE_LEVEL (4 findings без grounding) → все applied к плану. Code-review iter 1 → LBTM (1 Critical F1 timezone bug + 2 Warnings + 1 Suggestion) → fixed → iter 2 → LGTM. **Готов к user GO → Session 4 analysis.**
 
 ## Контекст проекта
 

@@ -18,11 +18,14 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.fsm.storage.base import BaseStorage
+from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from scheduler import _set_bot_ref, build_scheduler, on_startup_scan
 
-from bot.config import get_settings
+from bot.config import Settings, get_settings
 from bot.db import async_session_factory
+from bot.fsm_storage import PostgresStorage
 from bot.handlers.admin import router as admin_router
 from bot.handlers.client import router as client_router
 from bot.handlers.start import router as start_router
@@ -34,6 +37,19 @@ logger = logging.getLogger(__name__)
 # Global scheduler — single instance per process (spec.md 341-349).
 # Module-level so handlers can inject it via dp["scheduler"] workflow_data.
 scheduler = build_scheduler()
+
+
+def _build_fsm_storage(settings: Settings) -> BaseStorage:
+    """Env-based switch (spec.md:546 — PostgresStorage prod + MemoryStorage dev).
+
+    - DATABASE_URL starts with "sqlite" → MemoryStorage (dev/test, no DB writes)
+    - DATABASE_URL starts with "postgresql" → PostgresStorage (prod, durable)
+    """
+    if settings.async_database_url.startswith("sqlite"):
+        logger.info("FSM storage: MemoryStorage (dev/sqlite)")
+        return MemoryStorage()
+    logger.info("FSM storage: PostgresStorage (prod/postgresql)")
+    return PostgresStorage(async_session_factory)
 
 
 def setup_logging() -> None:
@@ -80,7 +96,14 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         session=CorpAiohttpSession(),
     )
-    dp = Dispatcher()
+    dp = Dispatcher(
+        storage=_build_fsm_storage(settings),
+        # Explicit SimpleEventIsolation (code-review W4 fix) — aiogram default
+        # is DisabledEventIsolation (verified via Dispatcher.__init__ source).
+        # Per-StorageKey asyncio.Lock serializes update_data calls per chat,
+        # defensive against any remaining race in PostgresStorage INSERT path.
+        events_isolation=SimpleEventIsolation(),
+    )
 
     # Inject scheduler into workflow_data — handlers receive it as kwarg
     # `scheduler: AsyncIOScheduler` via aiogram's _prepare_kwargs filter.

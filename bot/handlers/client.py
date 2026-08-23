@@ -856,3 +856,28 @@ async def transfer_slot_cb(
         when = new_local.strftime("%d %b %Y, %H:%M")
         await callback.message.answer(f"✅ Запись перенесена на {when}. Мастер уведомлён.")
     await callback.answer()
+
+
+# ============================================================
+# 14. no_state_callback_fallback — inline button tap with no FSM state (L1)
+# ============================================================
+# MUST be registered LAST in client_router — catches only callbacks not
+# matched by more specific handlers above (mybookings_cancel_cb at line 548,
+# mybookings_transfer_cb at line 649). Both have StateFilter(None) + specific
+# callback_data filter and win by specificity (registered earlier = matched
+# first by aiogram router dispatch).
+@router.callback_query(StateFilter(None))
+async def no_state_callback_fallback(callback: CallbackQuery) -> None:
+    """Catch inline button tap when no FSM state active (L1, spec.md Session 4).
+
+    Scenario: user tapped an inline button (e.g. calendar, slot picker from
+    old message) after bot restart or session timeout cleared FSM state.
+    Without this handler aiogram logs "callback query not answered" and the
+    button silently fails. Reply with popup telling user to start fresh.
+
+    Note: mybookings_cancel_cb and mybookings_transfer_cb are registered
+    EARLIER (lines 548, 649) with StateFilter(None) + specific callback_data
+    filter — they win by specificity. This fallback only catches unmatched
+    callbacks (e.g. stale slot picker from a previous bot run).
+    """
+    await callback.answer("Сессия истекла — начните через /book", show_alert=True)

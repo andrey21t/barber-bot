@@ -93,7 +93,21 @@ async def test_main_wires_routers_middleware_hooks_and_polls(
     assert "token" in bot_kwargs
     assert bot_kwargs["session"] is mock_session_class.return_value
 
-    mock_dp_class.assert_called_once_with()
+    mock_dp_class.assert_called_once()
+    dp_kwargs = mock_dp_class.call_args.kwargs
+    # storage= depends on DATABASE_URL — MemoryStorage for sqlite (conftest
+    # sets sqlite+aiosqlite), PostgresStorage for postgresql. Test env uses
+    # sqlite → MemoryStorage.
+    assert "storage" in dp_kwargs
+    from aiogram.fsm.storage.memory import MemoryStorage
+
+    assert isinstance(dp_kwargs["storage"], MemoryStorage)
+    # events_isolation= explicitly passed (code-review W4 fix — aiogram default
+    # is DisabledEventIsolation, we want SimpleEventIsolation for per-chat lock).
+    assert "events_isolation" in dp_kwargs
+    from aiogram.fsm.storage.memory import SimpleEventIsolation
+
+    assert isinstance(dp_kwargs["events_isolation"], SimpleEventIsolation)
     mock_dp_instance.__setitem__.assert_called_once_with("scheduler", mock_scheduler)
 
     assert mock_dp_instance.include_router.call_count == 3
