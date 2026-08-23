@@ -588,9 +588,26 @@ NEXT: Session 3 — FSM PostgresStorage + real send_reminder (Урок 2.4) + Re
 
 ### Verify gate
 
-- pytest: **232 passed** (was 226, +6 new tests for send_reminder + 1 updated on_startup_scan_phase_1)
-- ruff: clean (3 auto-fixed — unused import selectinload, organize imports)
+- pytest: **234 passed** (was 232 → +2 regression: timezone_utc_to_moscow + invalid_timezone_logs_error)
+- ruff: clean
 - mypy: clean
+
+### Code-review (qa-code-review gate, AGENTS.md § write-actions-subagents rule 7)
+
+**Iter 1: LBTM** — 1 Critical + 2 Warnings + 1 Suggestion (BP-10 A2 verified):
+- **F1 Critical** (scheduler.py:157): `booking.start_at.astimezone(tz)` без `.replace(tzinfo=UTC)` — нарушает паттерн `booking.py:380, :531, :650`. На SQLite naive → system-local TZ → wrong time на TZ≠UTC системах (macOS Europe/Moscow +3h shift, Render TZ=UTC correct by accident). Tests не ловили (только prefix+length checks).
+- **W1 Warning** (scheduler.py:156): `ZoneInfo(business.timezone)` без try/except — invalid timezone → ZoneInfoNotFoundError bubbles, log_notification уже закоммичен → UNIQUE блокирует retry навсегда.
+- **W2 Warning** (alembic/env.py:12-17): misleading comment «CI fix» — реального фикса нет, lazy import лишь откладывает crash до `_get_target_metadata()` call.
+- **S1 Suggestion** (scheduler.py:122): redundant `from bot.models import Booking` (повторно в line 138).
+
+**Fixes applied + re-verify + re-review (усиление N):**
+
+- **F1 fix** (scheduler.py): добавлен `.replace(tzinfo=UTC)` перед `.astimezone(tz)` + comment (mirror of booking.py:380). Regression test `test_send_reminder_timezone_utc_to_moscow` с `monkeypatch.setenv("TZ", "Europe/Moscow") + time.tzset()` — TZ-independent, ловит regression на CI (TZ=UTC) и dev (TZ≠UTC). Verified: без fix → "11:00" (fail), с fix → "14:00" (pass).
+- **W1 fix** (scheduler.py): try/except `KeyError` (ZoneInfoNotFoundError subclass, PEP 615) вокруг `ZoneInfo(...)`. **ZoneInfo проверка ПЕРЕД log_notification** — если timezone invalid, return BEFORE INSERT → retry possible когда DBA починит timezone. `except KeyError` (не `Exception`) — не ловит MemoryError/AttributeError. Regression test `test_send_reminder_invalid_timezone_logs_error`.
+- **W2 fix** (alembic/env.py): comment переписан — явно указано что lazy import лишь откладывает crash, не решает; BOT_TOKEN/ADMIN_ID всё ещё нужны; предложен Optional fields или separate config как реальный фикс.
+- **S1 fix** (scheduler.py): удалён redundant import.
+
+**Iter 2 (re-review): LGTM** — все 3 кодовых фикса корректны. 2 warnings (W1-PARTIAL — устранён переупорядочиванием, W2-TEST-TZ — устранён monkeypatch), 2 suggestions (S1-EXCEPT — упрощено до KeyError, S2-FREEZE — удалён dead freeze_time). Все применены в этом commit.
 
 ### Known limitations (NOT blockers, deferred to Session 4+)
 

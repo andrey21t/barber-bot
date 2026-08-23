@@ -119,7 +119,6 @@ async def send_reminder(booking_id: UUID, kind: str, bot: Any = None) -> None:
         TelegramRetryAfter,
     )
     from bot.db import async_session_factory
-    from bot.models import Booking
     from bot.services.notifications import log_notification
     from sqlalchemy import select
 
@@ -150,17 +149,40 @@ async def send_reminder(booking_id: UUID, kind: str, bot: Any = None) -> None:
             return
         booking, client, business = row
 
-        if not await log_notification(session, booking_id, kind):
+        # booking.start_at is naive UTC on SQLite (per models.py:30 comment),
+        # aware UTC on Postgres. .replace(tzinfo=UTC) is no-op on aware, makes
+        # naive → aware UTC before astimezone. Without this, Python interprets
+        # naive as system-local TZ (Mac default Europe/Moscow → wrong time;
+        # Render TZ=UTC correct by accident). Mirror of booking.py:380, :531, :650.
+        #
+        # ZoneInfo validation BEFORE log_notification: if timezone is invalid,
+        # return BEFORE inserting into notifications_log → retry possible when
+        # DBA fixes the timezone value. If we logged first then failed on
+        # ZoneInfo, UNIQUE(booking_id, kind) would block retry forever (message
+        # permanently lost for this booking+kind).
+        try:
+            tz = ZoneInfo(business.timezone)
+        except KeyError as e:
+            # ZoneInfoNotFoundError is subclass of KeyError (PEP 615).
+            logger.error(
+                "send_reminder: invalid business.timezone=%r (booking=%s): %s",
+                business.timezone,
+                booking_id,
+                e,
+            )
             return
-
-        tz = ZoneInfo(business.timezone)
-        time_str = booking.start_at.astimezone(tz).strftime("%H:%M")
+        time_str = booking.start_at.replace(tzinfo=UTC).astimezone(tz).strftime("%H:%M")
         if kind == "remind_24h":
             text = f"Напоминаю: завтра в {time_str}"
         elif kind == "remind_1h":
             text = f"Через час: {time_str}"
         else:
             logger.warning("send_reminder: unknown kind=%s for booking=%s, skip", kind, booking_id)
+            return
+
+        # log_notification UNIQUE guard AFTER timezone validation — ensures
+        # invalid timezone doesn't permanently block retry.
+        if not await log_notification(session, booking_id, kind):
             return
 
         for attempt in range(2):

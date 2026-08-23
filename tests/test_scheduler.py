@@ -382,6 +382,95 @@ async def test_send_reminder_happy_path(
 
 
 @pytest.mark.asyncio
+async def test_send_reminder_timezone_utc_to_moscow(
+    session_factory: Any,
+    session: AsyncSession,
+    scheduler: AsyncIOScheduler,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for F1 (code-review Session 3): booking.start_at naive UTC
+    on SQLite must be explicitly marked UTC before astimezone. Without
+    `.replace(tzinfo=UTC)`, Python interprets naive as system-local TZ → wrong
+    time on TZ≠UTC systems.
+
+    Setup: booking.start_at = 2026-01-15 11:00 UTC. Business.timezone =
+    Europe/Moscow. Expected: text contains "14:00" (11:00 UTC + 3h = 14:00 MSK).
+
+    TZ-independence: monkeypatch system TZ to Europe/Moscow + time.tzset() so
+    naive datetime is interpreted as MSK. Without fix: 11:00 MSK → astimezone(MSK)
+    = 11:00 → "11:00" (test fails, regression caught). With fix: 11:00 UTC →
+    14:00 MSK (test passes). On TZ=UTC systems without monkeypatch — false
+    negative (test passes even without fix, since naive 11:00 == 11:00 UTC).
+    """
+    import sys
+    import time
+
+    if sys.platform == "win32":
+        pytest.skip("time.tzset() is Unix-only (test for F1 regression)")
+
+    # Force system TZ to Europe/Moscow — without fix, naive 11:00 → MSK → wrong.
+    # With fix: replace(tzinfo=UTC) → 11:00 UTC → 14:00 MSK → correct.
+    monkeypatch.setenv("TZ", "Europe/Moscow")
+    time.tzset()
+
+    _start_scheduler(scheduler)
+
+    # booking.start_at = 2026-01-15 11:00 UTC, stored as naive on SQLite
+    naive_start = datetime(2026, 1, 15, 11, 0)
+    booking = await _seed_booking(session, naive_start)
+
+    mock_bot = AsyncMock()
+    with (
+        patch("scheduler._bot_ref", mock_bot),
+        patch("bot.db.async_session_factory", session_factory),
+    ):
+        await send_reminder(booking.id, "remind_24h", bot=mock_bot)
+
+    assert mock_bot.send_message.await_count == 1
+    _, text = mock_bot.send_message.await_args.args
+    # 11:00 UTC → 14:00 Europe/Moscow (UTC+3, no DST in January)
+    assert text == "Напоминаю: завтра в 14:00", (
+        f"Expected 'Напоминаю: завтра в 14:00' (11:00 UTC → 14:00 MSK), got {text!r}. "
+        "If you see '11:00' — F1 regression: booking.start_at treated as system-local TZ."
+    )
+    scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_send_reminder_invalid_timezone_logs_error(
+    session_factory: Any, session: AsyncSession, scheduler: AsyncIOScheduler
+) -> None:
+    """Regression test for W1 (code-review Session 3): invalid business.timezone
+    raises ZoneInfoNotFoundError → caught, log error, return (no send).
+    Without try/except, exception bubbles up + log_notification already committed
+    → UNIQUE blocks retry forever.
+    """
+    _start_scheduler(scheduler)
+    booking_start = datetime.now(UTC) - timedelta(hours=12)
+    booking = await _seed_booking(session, booking_start)
+    # Corrupt business timezone AFTER seed (direct UPDATE)
+    from bot.models import Business
+    from sqlalchemy import update
+
+    await session.execute(
+        update(Business).where(Business.id == booking.business_id).values(timezone="Europe/Moscowg")
+    )
+    await session.commit()
+
+    mock_bot = AsyncMock()
+    with (
+        patch("scheduler._bot_ref", mock_bot),
+        patch("bot.db.async_session_factory", session_factory),
+    ):
+        # Should not raise — ZoneInfoNotFoundError caught internally
+        await send_reminder(booking.id, "remind_24h", bot=mock_bot)
+
+    # No send_message (invalid timezone caught before send)
+    assert mock_bot.send_message.await_count == 0
+    scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
 async def test_on_startup_scan_phase_2_reschedules_upcoming(
     session_factory: Any, session: AsyncSession, scheduler: AsyncIOScheduler
 ) -> None:

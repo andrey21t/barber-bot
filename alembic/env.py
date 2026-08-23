@@ -9,12 +9,20 @@ Cross-DB support:
 
 target_metadata = Base.metadata (auto-detects models via bot.models import).
 
-Lazy imports (Session 3 fix): `from bot import models` and `from bot.db import Base`
-are deferred INSIDE _get_target_metadata(). Reason: bot.models → bot.db →
-bot.config → Settings(BOT_TOKEN, ADMIN_ID). Alembic runs in CI/pre-deploy with
-ONLY DATABASE_URL env (no BOT_TOKEN/ADMIN_ID) → Settings() raises ValidationError
-if imported at module level. Lazy import inside function defers Settings load
-until after env validation, when alembic only needs DATABASE_URL.
+Lazy imports (Session 3 change): `from bot import models` and `from bot.db import Base`
+are deferred INSIDE _get_target_metadata() (called from run_migrations_online/offline).
+Reason: at module-level import time, bot.models → bot.db → bot.config →
+Settings(BOT_TOKEN, ADMIN_ID) would raise ValidationError if env not loaded.
+Lazy import defers this to function-call time so the alembic config block (env.py
+lines 32-49: sync_url resolution from DATABASE_URL) runs first.
+
+NOTE: This does NOT make alembic work with ONLY DATABASE_URL — Settings() is still
+triggered when _get_target_metadata() runs (in run_migrations_online/offline).
+If BOT_TOKEN/ADMIN_ID are not set, alembic WILL fail at that point. This is
+acceptable for the render.yaml preDeployCommand workflow (envVars including
+BOT_TOKEN/ADMIN_ID are available at preDeploy time on Render). If you need to run
+alembic in an environment without BOT_TOKEN/ADMIN_ID, consider making those
+fields Optional in Settings or using a separate alembic-only config.
 """
 
 from __future__ import annotations
