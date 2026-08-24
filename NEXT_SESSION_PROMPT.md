@@ -1,6 +1,6 @@
-# NEXT_SESSION_PROMPT — Session 4 закрыт. Session 5 (Render smoke test + L2 atomicity + new features) готова к анализу.
+# NEXT_SESSION_PROMPT — Session 4 + 4.5 закрыты. Session 5 (Render smoke test + L2 atomicity) готова к старту.
 
-> Дата: 2026-08-24 · Session 4 закоммичен и запушен (commits `66e11e4` + `e3cf1dc`). FSM PostgresStorage реализован (L5 + L1 callback fallback), L4 dropped (ContextVar не работает с AsyncIOScheduler). L3 — batched NOT EXISTS subquery. Deep-analysis: 3 critic итерации (SURFACE_LEVEL → упрощённый scope). Code-review iter 1 LGTM + 4 warnings applied (W1 race / W2 contract / W3 onupdate / W4 events_isolation). **Готов к user GO → Session 5.**
+> Дата: 2026-08-24 · Session 4 + 4.5 закоммичены и запушены (commits `66e11e4` + `e3cf1dc` + `8d70a76` + `38f5dc2` + `559ccbe` + `357b616`). FSM PostgresStorage реализован (L5 + L1 callback fallback), L4 dropped (ContextVar не работает с AsyncIOScheduler). L3 — batched NOT EXISTS subquery. Session 4.5: Findings 4-7 (refactor) + Postgres SQL construction tests 100% coverage + LBTM re-review (tautological assertions fixed). Deep-analysis: 3 critic итерации. Code-review iter 1 LGTM + 4 warnings applied (W1 race / W2 contract / W3 onupdate / W4 events_isolation). Session 4.5 code-review iter 1 LBTM (2 critical) + iter 2 LGTM (mutation tests verified). **Готов к user GO → Session 5.**
 
 ## Контекст проекта
 
@@ -504,43 +504,62 @@ databases:
 ## Quick start prompt для opencode (вставить в новую сессию)
 
 ```
-Продолжаем barber-bot Session 2 (Postgres migration продолжение — EXCLUDE constraint + SQLAlchemyJobStore + Render deploy).
+Продолжаем barber-bot Session 5 (Render smoke test + L2 atomicity + new features).
 
 Прочитай ~/PycharmProjects/barber-bot/NEXT_SESSION_PROMPT.md — там полный контекст:
-- Session 1 Phase 5 закоммичен и запушен (commit 6b30bc0 + e63ca83, origin/main).
-- Session 2: deep-analysis Pass 1-4 + 2 critic итерации (iter 1 NEEDS_MORE_ANALYSIS 7 findings, iter 2 DEEP_ENOUGH 1 minor fixed).
-- Augmented план готов: 3 фазы (A — EXCLUDE 002, B — SQLAlchemyJobStore, C — Render deploy).
+- Sessions 1-4 закоммичены и запушены (origin/main, последний commit 357b616).
+- Session 4 (commit 66e11e4 + e3cf1dc + 8d70a76): PostgresStorage (L5 + L1 callback fallback),
+  L3 batched NOT EXISTS, L4 dropped (ContextVar incompatible с AsyncIOScheduler).
+- Session 4.5 (commit 38f5dc2 + 559ccbe + 357b616): Findings 4-7 (refactor:
+  alembic 003 SQLite TIMESTAMP timezone, dialect_name cache, removed redundant
+  SELECT in _upsert_state, single atomic pg_insert.on_conflict_do_update с JSONB
+  || excluded.data merge) + Postgres SQL construction tests (15 тестов, 100%
+  coverage на fsm_storage.py) + LBTM re-review (2 critical tautological assertions
+  fixed, mutation-tested).
 
-Статус: READY FOR IMPLEMENTATION. После GO ("go" / "правь" / "apply") → implementation.
+Статус: READY FOR SESSION 5. Sessions 1-4.5 closed, всё запушено в origin/main.
 
-Implementation order:
-1. Фаза A: alembic/versions/002_postgres_exclude.py (новый файл)
-2. Фаза B.1: bot/config.py — добавить 2 properties (async_database_url, sync_database_url)
-3. Фаза B.2: bot/db.py — async_database_url + pool_pre_ping + pool_recycle
-4. Фаза B.3: scheduler.py — SQLAlchemyJobStore branching + pickle-stable docstring
-5. Фаза B.4: scheduler.py:41-51 — send_reminder pickle-stable docstring
-6. Фаза B.5: bot/services/booking.py:562-577 — transfer_booking IntegrityError catch (проверить импорт IntegrityError)
-7. Фаза C.1: alembic/env.py — handle 3 Render URL prefixes
-8. Фаза C.2: render.yaml (новый файл)
+Что осталось (Session 5 scope):
+1. Render smoke test (ВРУЧНУЮ — нужен деплой + реальный Telegram):
+   - /start → бот отвечает
+   - /book → выбор даты/слота/имени/услуги → бронь создаётся
+   - Master notification приходит на settings.ADMIN_ID
+   - FSM state survives restart: /book mid-flow → Render restart (15 min) →
+     продолжить → state preserved (новый PostgresStorage, миграция 003 выполнена)
+   - /mybookings → [🚠 Отменить] → отменяется → EXCLUDE не срабатывает на той
+     же дате/времени (UNIQUE slot_id fallback на SQLite, EXCLUDE USING gist на Postgres)
+   - [🔄 Перенести] → выбор нового слота → перенос выполняется, старый slot освобождается
+   - Bot restart mid-FSM → tap stale inline button → no_state_callback_fallback
+     показывает popup "Сессия истекла — начните через /book"
+2. L2 atomicity (production-level, materially changes):
+   - Двухфазная схема log_notification: INSERT с sent_at=NULL → UPDATE sent_at=now()
+     после успешного send_message → reaper для зависших (sent_at=NULL старше N минут)
+   - Меняет contract notifications_log (sent_at становится nullable, добавляется
+     reaper job в scheduler). Нужен deep-analysis (logic change + state machine).
+3. Postgres JSONB runtime coverage (Honest limitation):
+   - SQL construction покрыт (test_fsm_storage_postgres.py, 15 тестов, 100% line)
+   - Runtime: JSONB || merge semantics, ON CONFLICT target matching, RETURNING
+     population — НЕ exercised (needs testcontainers Postgres ИЛИ Render smoke).
+   - Pragmatic для pet: оставить как Honest limitation, Render smoke покроет.
 
-Verification:
-- pytest (226 → green, dev path MemoryJobStore не меняется)
-- ruff + mypy — clean
-- alembic upgrade head --sql (SQLite dialect) — 002 должен быть no-op
-- pip install -e .[prod] на clean venv — verify prod deps coexist
+Master handlers end-to-end на Render (Урок 2.5+):
+- /today уже работает локально (admin.py:243), проверить на prod
+- master_new/cancel/transfer УЖЕ реализованы в handlers (client.py:423-427,
+  609-613, 843-847), покрыты тестами — закрыто без новой работы
 
-Gates:
-- qa-verify-and-fix после implementation
-- qa-code-review через code-reviewer subagent на logic-change (SQLAlchemyJobStore branching, IntegrityError catch)
+Гейты (напоминание):
+- qa-verify-and-fix после правок кода (pytest + ruff + mypy)
+- qa-code-review через code-reviewer subagent на logic-change
 - Коммиты свободно (pet-project, AGENTS.md § git-repo-categories)
 - Push в origin/main после verify + code-review
 
 Honest limitations (not blockers):
-- No Postgres tests (smoke after deploy)
+- No Postgres runtime tests (SQL construction covered, runtime — Render smoke)
 - Render free web service sleep 15 мин (on_startup_scan catches)
-- FSM state storage deferred to Session 3 (spec.md:538-547)
+- L2 atomicity deferred to backlog (production-level, materially changes)
 
-NEXT: Session 3 — FSM PostgresStorage + real send_reminder (Урок 2.4) + Render deploy smoke.
+NEXT: Session 5 — Render smoke test (manual) + L2 atomicity (if user GO) +
+Урок 2.5+ new features.
 ```
 
 ## Cross-refs
@@ -627,10 +646,69 @@ NEXT: Session 3 — FSM PostgresStorage + real send_reminder (Урок 2.4) + Re
 - https://render.com/docs/postgresql-extensions — btree_gist availability VERIFIED (PG 13+)
 - Spec: Урок 2.4 master handlers (spec.md:280-340 trigger'ы, 358-396 on_startup flow), Урок 2.6 Postgres migration (spec.md:320-447), 538-547 FSM storage
 
-### NEXT: Session 5 — план
+## NEXT: Session 4.5 — итоги (commits `38f5dc2` + `559ccbe` + `357b616`, запушены)
 
-**Готово к ручному smoke test на Render (HIGH PRIORITY):**
-1. **Render deploy smoke test** — после push `66e11e4`+`e3cf1dc` Render задеплоит автоматически. Проверить:
+> Session 4.5: forensic review [REDACTED-SESSION-ID] → Findings 4-7 (refactor) + Postgres SQL construction tests + LBTM re-review.
+
+### Что сделано в Session 4.5
+
+**Commit `38f5dc2` — refactor(fsm): Findings 4-7 from session fd072656 review**
+- **F4**: `alembic/versions/003_fsm_storage.py:60` — SQLite path `sa.TIMESTAMP` → `sa.DateTime(timezone=True)` (cross-DB consistency с models.py:234, Postgres path уже имел timezone=True)
+- **F5**: `bot/fsm_storage.py` — кеш `dialect_name` в `__init__` через `session_factory.kw["bind"].dialect.name` (verified: `async_sessionmaker` хранит bind в `self.kw` dict, НЕ в `.bind` property). Заменены ВСЕ deprecated `session.get_bind()` calls (SQLAlchemy 2.0 deprecation).
+- **F6**: `bot/fsm_storage.py` `_upsert_state` — убран лишний `SELECT data` перед `pg_insert.on_conflict_do_update`. PostgreSQL сохраняет columns NOT in SET — data column не трогается на UPDATE, INSERT нового row использует `data={}` (server_default). 1 query saved.
+- **F7**: `bot/fsm_storage.py` `update_data` Postgres — заменён 2-step race-prone flow (UPDATE→None→INSERT ON CONFLICT DO NOTHING → return data_dict.copy()) на SINGLE atomic `pg_insert.on_conflict_do_update` с JSONB `data || excluded.data` merge через `insert_stmt.excluded`. Race-free single statement, returns merged JSONB from RETURNING.
+- Удалён dead code `_insert_if_absent` (стал unused после F7) + unused import `update` из sqlalchemy.
+
+**Commit `559ccbe` — test(fsm): Postgres path SQL construction tests — 100% coverage**
+- Новый файл `tests/test_fsm_storage_postgres.py` (15 тестов) — покрывает все Postgres branches в `PostgresStorage` (было 0%, стало 100% line coverage на `bot/fsm_storage.py`).
+- Подход: SQL construction unit-testing без testcontainers — `PostgresStorage(dialect_name="postgresql")` с mock AsyncSession, перехват SQLAlchemy statement из `session.execute`, компиляция с postgresql dialect, assertions на SQL keywords (ON CONFLICT, DO UPDATE, EXCLUDED, JSONB `||`, RETURNING).
+- Honest limitation: runtime JSONB `||` merge semantics, ON CONFLICT target matching, RETURNING population — НЕ exercised (needs testcontainers Postgres ИЛИ Render smoke).
+
+**Commit `357b616` — fix(tests): LBTM re-review — tautological assertions replaced**
+- Code-reviewer subagent (review commit `559ccbe`) → **VERDICT: LBTM** с 2 Critical + 3 Warnings — все assertions были no-op (false confidence):
+  - **F1 Critical** `test_update_data_postgres_returns_merged_dict:220` — `assert "extra" not in (...) or True` → assertion тавтологически True, defensive copy НИКОГДА не проверялся.
+  - **F2 Critical** `test_set_state_postgres_sql_updates_only_state_and_updated_at:281-282` — `"set data"` (с пробелом) searched in `set_clause_lower.replace(" ", "")` (пробелы удалены) → тавтологически absent. `'set"data"'` (с кавычками) для unquoted non-reserved column `data` → тавтологически absent.
+  - **W1+W3 Warnings** — merge direction `data || excluded.data` НЕ верифицирован (assertions `excluded` + `||` + `data` независимы, проходят при wrong order).
+  - **W2 Warning** — `"setstate"` partial check (ловил state только как FIRST column).
+- Fixes: убран `or True` (F1), новый helper `_set_columns()` regex parser для SET clause (F2+W2), substring assertion на exact merge expression `fsm_states.data || excluded.data` (W1+W3).
+- **Mutation tests** (verify assertions реальные, не симуляция):
+  - F1: `return dict(merged)` → `return merged` → F1 assertion fails ✓
+  - F2: add `"data": {}` to SET `_upsert_state` → F2 assertion fails ✓
+  - W3: swap merge direction `excluded.data.op("||")(FsmState.data)` → W3 assertion fails ✓
+- **Re-review (усиление N)**: code-reviewer subagent → **VERDICT: LGTM**, no new findings. 1 Suggestion (S1 — assertion зависит от whitespace rendering `op(||)`, low risk, не блокирующее).
+
+### Verify gate (Session 4.5)
+
+- pytest: **266 passed** (was 251, +15 Postgres tests)
+- ruff: clean
+- mypy: clean
+- coverage: **100% на bot/fsm_storage.py** (87 stmts, 0 miss)
+- Mutation tests: 3/3 pass (assertions реальные)
+
+### Known limitations (Session 4.5 status — обновление таблицы Session 4)
+
+| # | Limitation | Severity | Source | Status (was) | Status (now) |
+|---|---|---|---|---|---|
+| L1 | callback_query fallback | Minor (UX) | Critic iter 1 | ✅ Closed Session 4 | unchanged |
+| L2 | log_notification atomicity | Minor (data) | spec.md:396 | ⏳ Open | ⏳ Open (Session 5 candidate) |
+| L3 | N+1 in overdue query | Minor (perf) | Critic iter 1 | ✅ Closed Session 4 | unchanged |
+| L4 | _bot_ref global | Code smell | Self-identified | ❌ Dropped Session 4 | unchanged |
+| L5 | FSM MemoryStorage | Major (UX) | spec.md:538-547 | ✅ Closed Session 4 | unchanged |
+| **L6** | **Postgres JSONB runtime coverage** | **Honest limitation** | **Code-review S1** | **(new)** | **⏳ Open — SQL construction covered (100% line), runtime needs testcontainers/Render smoke** |
+| **L7** | **Tautological assertions (false confidence)** | **Critical (test quality)** | **Code-review F1+F2** | **(new)** | **✅ Closed Session 4.5 — _set_columns regex parser + substring assertion + mutation tests** |
+
+### Cross-refs (Session 4.5)
+
+- `~/.config/opencode/AGENTS.md` § write-actions-subagents rule 7 — code-review gate, усиление N (re-review after LBTM)
+- `~/.config/opencode/AGENTS.md` § git-repo-categories — barber-bot = personal free (коммиты без переспроса)
+- `~/.config/opencode/skills/qa-code-review/SKILL.md` — POST-код semantic гейт, BP-10 A2 verification
+- `tests/test_fsm_storage_postgres.py` — 15 Postgres SQL construction tests (commit 559ccbe + fixes 357b616)
+- `tests/test_fsm_storage.py` — 17 SQLite path tests (не менялся в Session 4.5)
+
+### NEXT: Session 5 — план (обновлён после Session 4.5)
+
+**Готово к ручному smoke test на Render (HIGH PRIORITY — не менялся):**
+1. **Render deploy smoke test** — после push `357b616` (последний) Render задеплоит автоматически. Проверить:
    - `/start` в Telegram → бот отвечает
    - `/book` → выбор даты/слота/имени/услуги → подтверждение → бронь создаётся
    - Master notification приходит на `settings.ADMIN_ID`
@@ -638,13 +716,12 @@ NEXT: Session 3 — FSM PostgresStorage + real send_reminder (Урок 2.4) + Re
    - `/mybookings` → список → `[🚠 Отменить]` → отменяется → EXCLUDE constraint не срабатывает на той же дате/времени (UNIQUE slot_id fallback на SQLite, EXCLUDE USING gist на Postgres)
    - `[🔄 Перенести]` → выбор нового слота → перенос выполняется, старый slot освобождается
    - Bot restart mid-FSM → tap stale inline button → `no_state_callback_fallback` показывает popup "Сессия истекла — начните через /book"
+   - PostgresStorage JSONB merge runtime: `/book` → write FSM state → Render restart → state read (verify JSONB `||` atomic merge работает на реальном Postgres, не только SQL construction)
 
-**Code review S3 (Unit-тест Postgres JSONB path):**
-2. **Smoke test PostgresStorage на Postgres** — unit-тесты в `test_fsm_storage.py` покрывают только SQLite path (read-modify-write). Postgres JSONB `||` atomic merge + ON CONFLICT DO NOTHING не exercised. Решение: либо testcontainers + pytest mark `@pytest.mark.postgres`, либо manual smoke на Render.
+**Остальные limitations (Session 5 candidates):**
+2. **L2 atomicity** (production-level, materially changes) — двухфазная схема log_notification: INSERT с `sent_at=NULL` → UPDATE `sent_at=now()` после успешного `send_message` → reaper для зависших (sent_at=NULL старше N минут). Меняет contract `notifications_log` (sent_at становится nullable, добавляется reaper job в scheduler). Нужен deep-analysis (logic change + state machine).
+3. **L6 Postgres JSONB runtime** (Honest limitation) — SQL construction покрыт (15 тестов, 100% line coverage), runtime JSONB `||` merge / ON CONFLICT target / RETURNING population НЕ exercised. Опции: (a) testcontainers + `@pytest.mark.postgres`, (b) Render smoke (покроет п.1), (c) оставить как Honest limitation (pragmatic для pet). Рекомендация: Render smoke (п.1) закроет runtime coverage без new deps.
 
-**Остальные limitations:**
-3. **L2 atomicity** — двухфазная схема log_notification (INSERT с sent_at=NULL → UPDATE после send → reaper для зависших). Production-level, отложено в backlog.
-
-**Урок 2.5+ — новые features:**
+**Урок 2.5+ — новые features (не менялся):**
 4. **Master handlers end-to-end на Render** — `/today` уже работает локально (admin.py:243), проверить на prod.
 5. **Master notifications** — master_new/cancel/transfer УЖЕ реализованы в handlers (client.py:423-427, 609-613, 843-847), покрыты тестами (test_client_handlers.py — `bot.send_message.assert_called_once()` для всех 3 сценариев). Закрыто без новой работы.
