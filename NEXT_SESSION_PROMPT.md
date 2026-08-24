@@ -1,6 +1,6 @@
-# NEXT_SESSION_PROMPT — Session 3 закрыт. Session 4 (FSM PostgresStorage + deferred limitations) готова к анализу.
+# NEXT_SESSION_PROMPT — Session 4 закрыт. Session 5 (Render smoke test + L2 atomicity + new features) готова к анализу.
 
-> Дата: 2026-08-23 · Session 3 закоммичен и запушен (commits `49e995c` + `be6fb14`). Real `send_reminder` реализован, deferred Session 2 fixes применены. Critic iter 1 → SURFACE_LEVEL (4 findings без grounding) → все applied к плану. Code-review iter 1 → LBTM (1 Critical F1 timezone bug + 2 Warnings + 1 Suggestion) → fixed → iter 2 → LGTM. **Готов к user GO → Session 4 analysis.**
+> Дата: 2026-08-24 · Session 4 закоммичен и запушен (commits `66e11e4` + `e3cf1dc`). FSM PostgresStorage реализован (L5 + L1 callback fallback), L4 dropped (ContextVar не работает с AsyncIOScheduler). L3 — batched NOT EXISTS subquery. Deep-analysis: 3 critic итерации (SURFACE_LEVEL → упрощённый scope). Code-review iter 1 LGTM + 4 warnings applied (W1 race / W2 contract / W3 onupdate / W4 events_isolation). **Готов к user GO → Session 5.**
 
 ## Контекст проекта
 
@@ -609,15 +609,15 @@ NEXT: Session 3 — FSM PostgresStorage + real send_reminder (Урок 2.4) + Re
 
 **Iter 2 (re-review): LGTM** — все 3 кодовых фикса корректны. 2 warnings (W1-PARTIAL — устранён переупорядочиванием, W2-TEST-TZ — устранён monkeypatch), 2 suggestions (S1-EXCEPT — упрощено до KeyError, S2-FREEZE — удалён dead freeze_time). Все применены в этом commit.
 
-### Known limitations (NOT blockers, deferred to Session 4+)
+### Known limitations (Session 4 status)
 
-| # | Limitation | Severity | Source | Where |
+| # | Limitation | Severity | Source | Status |
 |---|---|---|---|---|
-| L1 | `callback_query` в mid-FSM после restart НЕ покрывается `no_state_fallback` (только `message` — `client.py:624` `StateFilter(None), F.text`). UX edge: inline button tap (SimpleCalendar, [🚠 подтвердить]) в mid-FSM после bot restart → callback не сматчится → "callback query not answered" в логах, кнопка молчит. | Minor (UX) | Critic iter 1 Pass 3 | Session 4 — добавить callback_query fallback в client_router |
-| L2 | `log_notification → send_message` atomicity: bot crash между INSERT `notifications_log` и `bot.send_message` → сообщение потеряно (UNIQUE блокирует retry навсегда). MVP-допущение из `spec.md:396`. | Minor (data) | spec.md:396 | Прод: двухфазная схема (INSERT с `sent_at=NULL`, UPDATE `sent_at=now()` после send + reaper для зависших) |
-| L3 | N+1 в `get_overdue_bookings_without_remind_24h` (`notifications.py:54-60`): для каждого booking отдельный SELECT NotificationLog. 100 bookings = 101 queries. На Render free tier с Postgres — latency, но не блокер для MVP (overdue scan только при restart, обычно <10 bookings). | Minor (perf) | Critic iter 1 Pass 2 | Session 4 — batched query через `NOT EXISTS` subquery в основном SELECT |
-| L4 | `_bot_ref` global mutable state — anti-pattern. Тесты патчат через `with patch("scheduler._bot_ref", ...)` (см. `tests/test_scheduler.py`). Рефактор через context var / DI в Session 4. | Code smell | Self-identified | Session 4 |
-| L5 | FSM storage `MemoryStorage` (default aiogram) — теряется при Render free restart каждые 15 мин. spec.md:538-547 recommends PostgresStorage, aiogram 3.30 НЕ имеет PostgresStorage/SQLAlchemyStorage (only MemoryStorage в коробке; RedisStorage2 требует Redis пакет; `aiogram-fsm-sqlalchemy` отсутствует на PyPI) → custom ~200+ строк. | Major (UX, deferred from Session 2) | spec.md:538-547, aiogram 3.30 API | Session 4 — custom PostgresStorage (или `aiogram-fsm-sqlalchemy` если появится) |
+| L1 | `callback_query` fallback в mid-FSM после restart | Minor (UX) | Critic iter 1 Pass 3 | ✅ **Closed in Session 4** — `no_state_callback_fallback` (client.py:869), registered LAST in client_router |
+| L2 | `log_notification → send_message` atomicity: bot crash между INSERT `notifications_log` и `bot.send_message` → сообщение потеряно (UNIQUE блокирует retry навсегда). MVP-допущение из `spec.md:396`. | Minor (data) | spec.md:396 | ⏳ **Open** — прод: двухфазная схема (INSERT с `sent_at=NULL`, UPDATE `sent_at=now()` после send + reaper для зависших) |
+| L3 | N+1 в `get_overdue_bookings_without_remind_24h` | Minor (perf) | Critic iter 1 Pass 2 | ✅ **Closed in Session 4** — batched NOT EXISTS subquery, single query (notifications.py:46-64) |
+| L4 | `_bot_ref` global mutable state | Code smell | Self-identified | ❌ **Dropped in Session 4** — ContextVar не работает с AsyncIOScheduler (jobs запускаются без caller context, verified). Глобал остаётся |
+| L5 | FSM storage `MemoryStorage` теряется при Render restart | Major (UX, deferred from Session 2) | spec.md:538-547 | ✅ **Closed in Session 4** — custom PostgresStorage (bot/fsm_storage.py), env-based switch, JSONB atomic merge + 4 code-review fixes (W1+W2+W3+W4) |
 
 ### Cross-refs
 
@@ -627,12 +627,24 @@ NEXT: Session 3 — FSM PostgresStorage + real send_reminder (Урок 2.4) + Re
 - https://render.com/docs/postgresql-extensions — btree_gist availability VERIFIED (PG 13+)
 - Spec: Урок 2.4 master handlers (spec.md:280-340 trigger'ы, 358-396 on_startup flow), Урок 2.6 Postgres migration (spec.md:320-447), 538-547 FSM storage
 
-### NEXT: Session 4 — план
+### NEXT: Session 5 — план
 
-1. **Custom PostgresStorage для FSM** (L5) — реализовать `bot/fsm_storage.py`, ~200 строк. Альтернатива: ждать `aiogram-fsm-sqlalchemy` на PyPI. Spec.md:538-547 рекомендует вариант C (PostgresStorage).
-2. **`callback_query` fallback в mid-FSM** (L1) — добавить в `client_router` хендлер `StateFilter("*"), F.callback_query` который отлавливает callback после restart и просит "Начните через /book".
-3. **Batched query для overdue scan** (L3) — переписать `get_overdue_bookings_without_remind_24h` через `NOT EXISTS` subquery.
-4. **Render deploy smoke test** — записать бронь через bot, проверить /today + EXCLUDE constraint (2 брони на overlap → отбивается).
-5. **Master handlers (Урок 2.4)** — /today для мастеров с реальным render (УЖЕ работает `handlers/admin.py:243`, но проверить end-to-end на Render).
-6. **`_bot_ref` refactor** (L4) — context var или DI вместо global (после FSM storage, можно вместе).
-7. **Master notifications** (Урок 2.4 триггеры) — `master_new`, `master_cancel`, `master_transfer` (пока только `remind_24h`/`remind_1h` реализованы).
+**Готово к ручному smoke test на Render (HIGH PRIORITY):**
+1. **Render deploy smoke test** — после push `66e11e4`+`e3cf1dc` Render задеплоит автоматически. Проверить:
+   - `/start` в Telegram → бот отвечает
+   - `/book` → выбор даты/слота/имени/услуги → подтверждение → бронь создаётся
+   - Master notification приходит на `settings.ADMIN_ID`
+   - FSM state проверяет переживание restart: `/book` mid-flow → Render restart (15 min) → продолжить → state preserved (новый PostgresStorage, миграция 003 выполнена)
+   - `/mybookings` → список → `[🚠 Отменить]` → отменяется → EXCLUDE constraint не срабатывает на той же дате/времени (UNIQUE slot_id fallback на SQLite, EXCLUDE USING gist на Postgres)
+   - `[🔄 Перенести]` → выбор нового слота → перенос выполняется, старый slot освобождается
+   - Bot restart mid-FSM → tap stale inline button → `no_state_callback_fallback` показывает popup "Сессия истекла — начните через /book"
+
+**Code review S3 (Unit-тест Postgres JSONB path):**
+2. **Smoke test PostgresStorage на Postgres** — unit-тесты в `test_fsm_storage.py` покрывают только SQLite path (read-modify-write). Postgres JSONB `||` atomic merge + ON CONFLICT DO NOTHING не exercised. Решение: либо testcontainers + pytest mark `@pytest.mark.postgres`, либо manual smoke на Render.
+
+**Остальные limitations:**
+3. **L2 atomicity** — двухфазная схема log_notification (INSERT с sent_at=NULL → UPDATE после send → reaper для зависших). Production-level, отложено в backlog.
+
+**Урок 2.5+ — новые features:**
+4. **Master handlers end-to-end на Render** — `/today` уже работает локально (admin.py:243), проверить на prod.
+5. **Master notifications** — master_new/cancel/transfer УЖЕ реализованы в handlers (client.py:423-427, 609-613, 843-847), покрыты тестами (test_client_handlers.py — `bot.send_message.assert_called_once()` для всех 3 сценариев). Закрыто без новой работы.
