@@ -97,6 +97,18 @@ async def test_get_overdue_filters_by_window_and_log(session: AsyncSession) -> N
     # Future booking — should NOT be returned (start_at > now)
     future = await _seed_booking(session, datetime.now(UTC) + timedelta(days=2))
 
+    # W1 fix (code-review): booking 12h ago with NON-remind_24h log (master_new)
+    # → SHOULD be returned. Distinguishes "filter by remind_24h" from "filter by
+    # any kind" — guards against future regression that inverts kind logic.
+    with_other_log = await _seed_booking(session, datetime.now(UTC) - timedelta(hours=12))
+    await log_notification(session, with_other_log.id, "master_new")
+
+    # W2 fix (code-review): booking 12h ago with status='cancelled'
+    # → should NOT be returned (only 'confirmed' bookings need overdue reminders).
+    cancelled_in_window = await _seed_booking(session, datetime.now(UTC) - timedelta(hours=12))
+    cancelled_in_window.status = "cancelled"
+    await session.commit()
+
     overdue_list = await get_overdue_bookings_without_remind_24h(session, datetime.now(UTC))
 
     overdue_ids = {b.id for b in overdue_list}
@@ -104,6 +116,10 @@ async def test_get_overdue_filters_by_window_and_log(session: AsyncSession) -> N
     assert too_old.id not in overdue_ids
     assert with_log.id not in overdue_ids
     assert future.id not in overdue_ids
+    # W1: booking with master_new log (no remind_24h) should be returned
+    assert with_other_log.id in overdue_ids
+    # W2: cancelled booking in window should NOT be returned
+    assert cancelled_in_window.id not in overdue_ids
 
 
 @pytest.mark.asyncio

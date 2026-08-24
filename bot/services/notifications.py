@@ -38,27 +38,30 @@ async def get_overdue_bookings_without_remind_24h(
     """Phase 1 of on_startup_scan: bookings that missed remind_24h while bot was down.
 
     Spec.md 363-372: status='confirmed' AND start_at in (now-24h, now) AND
-    NOT EXISTS notifications_log(booking_id, kind='remind_24h')
+    NOT EXISTS notifications_log(booking_id, kind='remind_24h').
+
+    L3 fix (Session 4, code-review S suggestion): single query with NOT EXISTS
+    subquery instead of N+1 (was 1 SELECT for bookings + 1 SELECT per booking
+    for NotificationLog = N+1 queries; now 1 query).
     """
     window_start = now - timedelta(hours=24)
+    # Single query with correlated NOT EXISTS subquery — DB does the filtering
+    remind_24h_exists = (
+        select(NotificationLog.id)
+        .where(
+            NotificationLog.booking_id == Booking.id,
+            NotificationLog.kind == "remind_24h",
+        )
+        .exists()
+    )
     stmt = select(Booking).where(
         Booking.status == "confirmed",
         Booking.start_at > window_start,
         Booking.start_at < now,
+        ~remind_24h_exists,
     )
     result = await session.execute(stmt)
-    bookings = list(result.scalars().all())
-
-    # Filter out bookings that already have remind_24h log
-    overdue: list[Booking] = []
-    for b in bookings:
-        log_stmt = select(NotificationLog).where(
-            NotificationLog.booking_id == b.id, NotificationLog.kind == "remind_24h"
-        )
-        log_result = await session.execute(log_stmt)
-        if log_result.scalar_one_or_none() is None:
-            overdue.append(b)
-    return overdue
+    return list(result.scalars().all())
 
 
 async def get_upcoming_bookings_for_reschedule(
