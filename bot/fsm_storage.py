@@ -161,17 +161,13 @@ class PostgresStorage(BaseStorage):
                     state=None,
                     data=data_dict,
                 )
-                stmt = (
-                    insert_stmt
-                    .on_conflict_do_update(
-                        index_elements=["bot_id", "chat_id", "user_id", "destiny"],
-                        set_={
-                            "data": FsmState.data.op("||")(insert_stmt.excluded.data),
-                            "updated_at": func.now(),
-                        },
-                    )
-                    .returning(FsmState.data)
-                )
+                stmt = insert_stmt.on_conflict_do_update(
+                    index_elements=["bot_id", "chat_id", "user_id", "destiny"],
+                    set_={
+                        "data": FsmState.data.op("||")(insert_stmt.excluded.data),
+                        "updated_at": func.now(),
+                    },
+                ).returning(FsmState.data)
                 result = await session.execute(stmt)
                 merged = result.scalar_one()
                 await session.commit()
