@@ -57,7 +57,9 @@ def upgrade() -> None:
             sa.Column("destiny", sa.String(50), primary_key=True, server_default="default"),
             sa.Column("state", sa.String(255), nullable=True),
             sa.Column("data", sa.JSON, nullable=False, server_default=sa.text("'{}'")),
-            sa.Column("updated_at", sa.TIMESTAMP, server_default=sa.func.now()),
+            # DateTime(timezone=True) для cross-DB консистентности с models.py:234
+            # (Postgres path использует sa.TIMESTAMP(timezone=True) на line 45)
+            sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
             sa.Index("idx_fsm_states_chat_user", "chat_id", "user_id"),
         )
 
