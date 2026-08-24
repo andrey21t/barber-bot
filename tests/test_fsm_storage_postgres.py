@@ -29,6 +29,7 @@ What we DON'T catch (Honest limitation, needs testcontainers or Render smoke):
 
 from __future__ import annotations
 
+import re
 from contextlib import AbstractAsyncContextManager
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -47,6 +48,55 @@ def _compile_sql(stmt: Any) -> str:
     Placeholders (%s) are fine — we assert on SQL keywords, not bind values.
     """
     return str(stmt.compile(dialect=postgresql.dialect()))  # type: ignore[no-untyped-call]
+
+
+def _set_columns(sql: str) -> set[str]:
+    """Extract column names from `DO UPDATE SET col1 = ..., col2 = ...` clause.
+
+    Returns set of column names that are explicitly assigned in SET.
+    Used to verify which columns a statement modifies — robust against column
+    ordering and whitespace variations (F2 fix: replaces substring checks that
+    were tautologically True because of `.replace(" ", "")` removing the space
+    in `"set data"` search string, and because `data` is unquoted non-reserved
+    word so `"set\\"data\\""` never matches).
+
+    Example:
+        `INSERT INTO t ... DO UPDATE SET state = %s, updated_at = now() RETURNING data`
+        → {"state", "updated_at"}
+    """
+    set_match = re.search(
+        r"DO UPDATE SET\s+(.+?)(?:\s+RETURNING\s+.+|$)",
+        sql,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if set_match is None:
+        return set()
+    set_clause = set_match.group(1)
+    # Split on commas at top level (paren-aware to avoid splitting inside `(a || b)`)
+    columns: set[str] = set()
+    depth = 0
+    current = ""
+    for char in set_clause:
+        if char == "(":
+            depth += 1
+            current += char
+        elif char == ")":
+            depth -= 1
+            current += char
+        elif char == "," and depth == 0:
+            columns.add(_first_token(current))
+            current = ""
+        else:
+            current += char
+    if current.strip():
+        columns.add(_first_token(current))
+    return columns
+
+
+def _first_token(assignment: str) -> str:
+    """Extract column name from `col = expr` (or `table.col = expr`) assignment."""
+    m = re.match(r"\s*(?:[\w]+\.)?(\w+)\s*=", assignment)
+    return m.group(1) if m else ""
 
 
 class _FakeSessionFactory:
@@ -172,21 +222,26 @@ async def test_update_data_postgres_sql_uses_jsonb_merge_via_excluded(
 ) -> None:
     """update_data Postgres SQL merges existing JSONB with new via `|| excluded.data`.
 
-    Critical check (Finding 7): SQL must contain `data || excluded.data` (or
-    equivalent string form) — atomic JSONB merge in single statement. Verifies
-    that insert_stmt.excluded API was used correctly (not pg_insert.excluded
-    class attribute which would AttributeError).
+    Critical check (Finding 7): SQL must contain `fsm_states.data || excluded.data`
+    (or equivalent string form) — atomic JSONB merge in single statement with
+    correct ORDER of operands:
+    - existing.data first → new keys overwrite existing on conflict (correct)
+    - excluded.data first → existing overwrites new (BUG — user's new data lost)
+
+    W3 fix: assertions verify the full merge expression as a substring, not
+    independent `excluded` + `||` + `data` substrings that pass even when the
+    operand order is wrong (e.g. `excluded.data || fsm_states.data`).
     """
     await pg_storage.update_data(key, {"new": "data"})
 
     stmt = mock_session.execute.call_args[0][0]
     sql = _compile_sql(stmt)
-    # JSONB `||` operator + EXCLUDED pseudo-table reference for new data
-    assert "excluded" in sql.lower()
-    assert "||" in sql
-    # The merge direction: existing || new (excluded), not new || existing
-    # PostgreSQL: data || excluded.data — existing first, excluded second
-    assert "data" in sql  # data column referenced in SET
+    sql_compact = " ".join(sql.split())  # normalize whitespace
+    # Verify exact merge expression: existing.data || excluded.data (correct order)
+    assert "fsm_states.data || excluded.data" in sql_compact, (
+        f"Expected JSONB merge `fsm_states.data || excluded.data` "
+        f"(existing first, new overwrites), got: {sql_compact}"
+    )
 
 
 @pytest.mark.asyncio
@@ -209,15 +264,21 @@ async def test_update_data_postgres_returns_merged_dict(
     mock_session: AsyncMock,
     key: StorageKey,
 ) -> None:
-    """update_data returns dict copy of merged result (not reference to storage)."""
+    """update_data returns dict copy of merged result (not reference to storage).
+
+    F1 fix: removed `or True` that made assertion tautologically True (no-op).
+    Real assertion: mutate result, second update_data call should NOT contain
+    the mutation — proves dict() defensive copy in fsm_storage.py:174.
+    """
     result = await pg_storage.update_data(key, {"new": "data"})
 
     assert isinstance(result, dict)
     # mock_session.execute.return_value.scalar_one returns {"mock": "merged"}
     assert result == {"mock": "merged"}
-    # Mutating result should not affect storage (defensive copy)
+    # Mutating result must not affect next call (defensive copy via dict())
     result["extra"] = "value"
-    assert "extra" not in (await pg_storage.update_data(key, {"x": 1})) or True
+    second_result = await pg_storage.update_data(key, {"x": 1})
+    assert "extra" not in second_result
 
 
 # ============================================================
@@ -268,18 +329,26 @@ async def test_set_state_postgres_sql_updates_only_state_and_updated_at(
 
     Critical (Finding 6): data column must NOT be in SET — preserves existing
     data on UPDATE. INSERT path uses data={} (server_default).
+
+    F2 fix: replaced tautologically-True substring checks (`"set data"` with
+    space searched in string where spaces were removed; `'set"data"'` with
+    quotes for unquoted column `data`) with `_set_columns` regex parser that
+    extracts actual column names from SET clause regardless of order/whitespace.
     """
     await pg_storage.set_state(key, "BookingStates:entering_name")
 
     stmt = mock_session.execute.call_args[0][0]
     sql = _compile_sql(stmt)
-    # SET clause contains state
-    assert "state" in sql.lower()
-    # data column should NOT be in SET (preserved on conflict)
-    # Look for `SET data =` — should not appear (Postgres preserves data column)
-    set_clause_lower = sql.lower()
-    assert "set data" not in set_clause_lower.replace(" ", "")
-    assert 'set"data"' not in set_clause_lower.replace(" ", "")
+    set_cols = _set_columns(sql)
+
+    # state IS in SET (it's the column we want to update)
+    assert "state" in set_cols, f"Expected state in SET, got: {set_cols}"
+    # data MUST NOT be in SET (preserves existing data column — Finding 6)
+    assert "data" not in set_cols, (
+        f"data column in SET — Finding 6 regression (data should be preserved): {set_cols}"
+    )
+    # updated_at IS in SET (explicit bump, ORM onupdate doesn't fire on Core)
+    assert "updated_at" in set_cols, f"Expected updated_at in SET, got: {set_cols}"
 
 
 # ============================================================
@@ -320,7 +389,12 @@ async def test_set_data_postgres_sql_updates_only_data_and_updated_at(
     mock_session: AsyncMock,
     key: StorageKey,
 ) -> None:
-    """set_data Postgres SQL SET clause contains only data + updated_at (not state)."""
+    """set_data Postgres SQL SET clause contains only data + updated_at (not state).
+
+    W2 fix: replaced partial substring check (`"setstate"` only caught state
+    as FIRST column) with `_set_columns` regex parser — catches state in SET
+    regardless of column position.
+    """
     await pg_storage.set_data(key, {"k": "v"})
 
     # Second execute is the pg_insert.on_conflict_do_update
@@ -328,9 +402,15 @@ async def test_set_data_postgres_sql_updates_only_data_and_updated_at(
     sql = _compile_sql(stmt)
     assert "ON CONFLICT" in sql
     assert "DO UPDATE" in sql
-    set_clause_lower = sql.lower()
-    assert "setstate" not in set_clause_lower.replace(" ", "")
-    assert 'set"state"' not in set_clause_lower.replace(" ", "")
+    set_cols = _set_columns(sql)
+    # data IS in SET (it's the column we want to replace)
+    assert "data" in set_cols, f"Expected data in SET, got: {set_cols}"
+    # state MUST NOT be in SET (preserves existing state column)
+    assert "state" not in set_cols, (
+        f"state column in SET — set_data should not touch state: {set_cols}"
+    )
+    # updated_at IS in SET (explicit bump, ORM onupdate doesn't fire on Core)
+    assert "updated_at" in set_cols, f"Expected updated_at in SET, got: {set_cols}"
 
 
 # ============================================================
