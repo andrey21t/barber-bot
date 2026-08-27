@@ -34,6 +34,16 @@ def _make_message(user_id: int) -> MagicMock:
     return msg
 
 
+def _make_state() -> MagicMock:
+    """Mock FSMContext — clear() is AsyncMock (cmd_start calls state.clear()).
+
+    Этап 3 fix W1 (code-review 5.9): cmd_start now clears state at entry.
+    """
+    state = MagicMock()
+    state.clear = AsyncMock()
+    return state
+
+
 def _answer_text(msg: MagicMock) -> str:
     args = msg.answer.call_args.args
     return str(args[0]) if args else str(msg.answer.call_args.kwargs.get("text", ""))
@@ -45,27 +55,29 @@ def _answer_text(msg: MagicMock) -> str:
 
 
 @pytest.mark.asyncio
-async def test_cmd_start_admin_shows_welcome_and_admin_keyboard() -> None:
-    """/start from admin (ADMIN_ID) → welcome 'Привет, Екатерина!' + admin_keyboard.
+async def test_cmd_start_admin_shows_welcome_and_inline_menu() -> None:
+    """/start from admin (ADMIN_ID) → welcome 'Привет, Екатерина!' + inline menu.
 
-    The admin branch lists master commands (/addslots, /closeslot, /today, /week,
-    /services add) and attaches admin_keyboard (reply keyboard).
+    Этап 3 (Session 5.9): cmd_start показывает admin_inline_menu() (5 inline
+    кнопок) вместо admin_keyboard() (reply keyboard). Текст больше НЕ
+    перечисляет /addslots /closeslot /today /week /services — только welcome.
     """
     msg = _make_message(user_id=ADMIN_TG_ID)
-    await start_handlers.cmd_start(msg)
+    state = _make_state()
+    await start_handlers.cmd_start(msg, state)
 
     msg.answer.assert_awaited_once()
+    state.clear.assert_awaited_once()  # W1 fix: /start clears FSM state
     text = _answer_text(msg)
     assert "Привет, Екатерина" in text
-    assert "/addslots" in text
-    assert "/closeslot" in text
-    assert "/today" in text
-    assert "/week" in text
-    assert "/services" in text
-    # admin_keyboard is a reply_keyboard (ReplyKeyboardMarkup), passed as
-    # reply_markup kwarg
+    # Этап 3: текст больше НЕ перечисляет команды (только welcome)
+    assert "/addslots" not in text
+    assert "/closeslot" not in text
+    # admin_inline_menu — InlineKeyboardMarkup (не reply keyboard)
     reply_markup = msg.answer.call_args.kwargs.get("reply_markup")
-    assert reply_markup is not None, "admin /start must include admin_keyboard"
+    assert reply_markup is not None, "admin /start must include inline menu"
+    from aiogram.types import InlineKeyboardMarkup
+    assert isinstance(reply_markup, InlineKeyboardMarkup), "must be inline keyboard"
 
 
 # ============================================================
@@ -80,9 +92,11 @@ async def test_cmd_start_client_shows_booking_hint() -> None:
     No admin_keyboard — client gets booking instructions only.
     """
     msg = _make_message(user_id=NON_ADMIN_TG_ID)
-    await start_handlers.cmd_start(msg)
+    state = _make_state()
+    await start_handlers.cmd_start(msg, state)
 
     msg.answer.assert_awaited_once()
+    state.clear.assert_awaited_once()  # W1 fix: /start clears FSM state (any branch)
     text = _answer_text(msg)
     assert "Привет" in text
     assert "бот для записи к парикмахеру" in text

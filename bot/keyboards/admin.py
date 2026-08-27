@@ -87,13 +87,10 @@ async def admin_calendar_keyboard(min_date: datetime, max_date: datetime) -> Inl
 def admin_keyboard() -> ReplyKeyboardMarkup:
     """Back-compat reply keyboard with 5 master commands (alias для команд).
 
-    Оставлен для:
+    После Этапа 1.3 + Этапа 3 (Session 5.9) НЕ показывается в /start
+    (заменён на admin_inline_menu). Оставлен как alias для:
     - test_admin_handlers.py (54 теста на command handlers)
     - Екатерины если она запомнила команды /addslots /closeslot /today /week /services
-
-    ВРЕМЕННО показывается в /start (handlers/start.py:28) до Этапа 1.3 —
-    где будет заменён на admin_inline_menu(). После Этапа 1.3 — оставить
-    как alias, но убрать из cmd_start (или показывать только по команде /admin).
     """
     return ReplyKeyboardMarkup(
         keyboard=[
