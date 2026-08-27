@@ -32,6 +32,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback
 from aiogram_calendar.schemas import SimpleCalAct
+from sqlalchemy.exc import SQLAlchemyError
 
 from bot.config import get_settings
 from bot.db import async_session_factory
@@ -946,15 +947,217 @@ async def admin_services_cb(callback: CallbackQuery, state: FSMContext) -> None:
     """Menu tap: добавить услугу — start entering_service flow (3 шага).
 
     UX-edge: tap mid-FSM → state.clear() + set_state(entering_service_name).
-    Next handler (1.3d) asks for name → duration → price.
+    Next handlers (1.3d) ask for name → duration → price.
+
+    NB W1 (code-review 1.3a): resolve master+business на entry (НЕ в последнем
+    handler price_msg) — business_id нужен для create_service в конце flow.
+    Сохраняем в state, чтобы price_msg не делал повторный DB lookup.
     """
     if not _is_admin_callback(callback):
         await callback.answer()
         return
 
+    # _is_admin_callback guarantees callback.from_user is not None (type narrowing).
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    _master_id, business_id, _tz = resolved
+
     await state.clear()
+    await state.update_data(business_id=str(business_id))
     await state.set_state(AdminStates.entering_service_name)
 
     if callback.message is not None:
         await callback.message.answer("💇 Введите название услуги (можно с пробелами):")
     await callback.answer()
+
+
+# ============================================================
+# FSM services (Вариант B, spec.md 251) — Этап 1.3d
+#
+# 3 шага: name → duration → price → create_service.
+# Re-use cmd_services:349-388 logic (parse name/duration/price, validate,
+# create_service). State terminal в price_msg success — state.clear().
+#
+# NB INL-001 НЕ ПРИМЕНИМ для 1.3d: edit_message_text работает только для
+# callback→text переходов (calendar→ask hour в 1.3b/c), где edit убирает
+# календарь. В 1.3d между шагами — message от юзера + новое message от бота:
+# edit_message_text нечего редактировать (сообщение юзера нельзя править
+# ботом, предыдущее сообщение бота уже показано). Используем answer (как в
+# cmd_services) — чат засоряется, но для MVP acceptable.
+#
+# NB name: НЕ делаем replace("_", " ") (отличие от cmd_services:349). В 1.3d
+# юзер вводит name целиком через message.text, как написано так и сохраняем.
+# cmd_services делал replace из-за arg-splitting в одной строке ("/services
+# add Стрижка_мужская 60 1500" — args[1] = "Стрижка_мужская").
+#
+# W1 analog: ~F.text.startswith("/") в фильтре всех 3 msg handlers → /cancel
+# проваливается в client_router (escape hatch).
+# W2 analog: state.clear() в unrecoverable error ветках (state loss, master
+# not found).
+# ============================================================
+
+
+@router.message(StateFilter(AdminStates.entering_service_name), F.text, ~F.text.startswith("/"))
+async def admin_service_name_msg(message: Message, state: FSMContext) -> None:
+    """User typed service name → save + ask duration.
+
+    State stays в empty-name (ask again). set_state(entering_service_duration)
+    в success. /cancel через client_router escape hatch (W1 analog).
+    """
+    if not _is_admin(message):
+        return  # silently ignore non-admin
+
+    data = await state.get_data()
+    business_id_str = data.get("business_id")
+    if not business_id_str:
+        # State loss mid-flow (restart, timeout) — graceful exit, ask заново.
+        await state.clear()
+        await message.answer("❌ Сессия утеряна. Добавьте услугу заново через /menu")
+        return
+
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("❌ Название не может быть пустым. Введите название:")
+        return  # state stays — ask again
+    if len(name) > 255:
+        # S1 (code-review 1.3d): early validation — не ждать price_msg чтобы
+        # узнать про name>255 (create_service бы поднял ValueError, но после
+        # 3 впустую потраченных шагов). Лучше early fail.
+        await message.answer("❌ Слишком длинное название (макс 255 символов). Введите короче:")
+        return  # state stays
+
+    await state.update_data(name=name)
+    await state.set_state(AdminStates.entering_service_duration)
+    await message.answer(
+        f"Название: <b>{html.escape(name, quote=False)}</b>\n"
+        "Введите длительность (мин, число > 0):"
+    )
+
+
+@router.message(StateFilter(AdminStates.entering_service_duration), F.text, ~F.text.startswith("/"))
+async def admin_service_duration_msg(message: Message, state: FSMContext) -> None:
+    """User typed duration → parse + save + ask price.
+
+    State stays в parse-error / <=0 (ask again). set_state(entering_service_price)
+    в success. /cancel через client_router escape hatch (W1 analog).
+    """
+    if not _is_admin(message):
+        return  # silently ignore non-admin
+
+    data = await state.get_data()
+    # Defense-in-depth: проверяем что name и business_id ещё живы (state loss
+    # между шагами name→duration).
+    if not data.get("name") or not data.get("business_id"):
+        await state.clear()
+        await message.answer("❌ Сессия утеряна. Добавьте услугу заново через /menu")
+        return
+
+    text = (message.text or "").strip()
+    try:
+        duration = int(text)
+    except ValueError:
+        await message.answer("❌ Длительность должна быть числом минут (например 60)")
+        return  # state stays
+    if duration <= 0:
+        await message.answer("❌ Длительность должна быть > 0")
+        return  # state stays
+
+    await state.update_data(duration=duration)
+    await state.set_state(AdminStates.entering_service_price)
+    await message.answer(
+        f"Длительность: <b>{duration} мин</b>\n"
+        "Введите цену (₽, число, можно с копейками):"
+    )
+
+
+@router.message(StateFilter(AdminStates.entering_service_price), F.text, ~F.text.startswith("/"))
+async def admin_service_price_msg(message: Message, state: FSMContext) -> None:
+    """User typed price → parse + validate + create_service + render result.
+
+    Re-use cmd_services:356-388 logic (Decimal parse, validate >=0,
+    create_service, render). State terminal — state.clear() в success и
+    unrecoverable error. State stays в parse-error / ValueError от service
+    (админ может поправить ввод цены, retryable).
+
+    /cancel через client_router escape hatch (W1 analog).
+    """
+    if not _is_admin(message):
+        return  # silently ignore non-admin
+
+    data = await state.get_data()
+    name = data.get("name")
+    business_id_str = data.get("business_id")
+    duration = data.get("duration")
+    if not name or not business_id_str or duration is None:
+        # State loss mid-flow (restart, timeout) — graceful exit.
+        await state.clear()
+        await message.answer("❌ Сессия утеряна. Добавьте услугу заново через /menu")
+        return
+
+    text = (message.text or "").strip()
+    try:
+        price = Decimal(text)
+    except InvalidOperation:
+        await message.answer("❌ Цена должна быть числом (например 1500 или 1500.50)")
+        return  # state stays
+    if price < 0:
+        await message.answer("❌ Цена не может быть отрицательной")
+        return  # state stays
+    # F1 fix (code-review 1.3d): Decimal inf/nan/overflow ловим ДО create_service.
+    # Decimal("inf")/Decimal("nan") парсятся успешно, проходят price<0 check,
+    # но Postgres NUMERIC(10,2) не поддерживает inf/nan → DataError (НЕ
+    # ValueError) → except ValueError ниже не ловит → state hang. is_finite()
+    # возвращает False для inf/-inf/nan — единая проверка.
+    if not price.is_finite():
+        await message.answer("❌ Цена должна быть конечным числом (не inf/nan)")
+        return  # state stays
+    # NUMERIC(10, 2) max = 99999999.99 (models.py:79). 1e10 = overflow.
+    if price > Decimal("99999999.99"):
+        await message.answer("❌ Цена слишком большая (макс 99999999.99)")
+        return  # state stays
+
+    try:
+        business_id = UUID(business_id_str)
+    except ValueError:
+        # Corrupted state (business_id not valid UUID) — defense-in-depth.
+        await state.clear()
+        await message.answer("❌ Ошибка сессии (business_id). Начните заново через /menu")
+        return
+
+    # W1 fix (code-review 1.3d): int(duration) cast из Any state dict может
+    # поднять ValueError/TypeError если storage повреждён. Оборачиваем.
+    try:
+        duration_int = int(duration)
+    except (ValueError, TypeError):
+        await state.clear()
+        await message.answer("❌ Ошибка сессии (duration). Начните заново через /menu")
+        return
+
+    async with async_session_factory() as session:
+        try:
+            service = await create_service(session, business_id, name, duration_int, price)
+        except ValueError as exc:
+            # create_service defense-in-depth (name >255 — уже в name_msg,
+            # duration<=0 — duration_msg, price<0 — здесь выше). Если service
+            # всё же поднимает ValueError на edge case — state stays, retryable.
+            await message.answer(f"❌ {exc}")
+            return  # state stays
+        except SQLAlchemyError:
+            # W2 fix (code-review 1.3d): DB-level ошибки (IntegrityError на
+            # constraint, DataError на invalid value, OperationalError на
+            # connection loss) — НЕ ValueError, не ловились except выше.
+            # State hang — unrecoverable, очищаем.
+            await state.clear()
+            await message.answer("❌ Ошибка БД. Начните заново через /menu")
+            return
+
+    await state.clear()  # терминальный
+    await message.answer(
+        f"✅ Услуга добавлена:\n"
+        f"💇 <b>{html.escape(service.name, quote=False)}</b>\n"
+        f"⏱ {service.duration_minutes} мин\n"
+        f"💰 {service.price} ₽"
+    )
