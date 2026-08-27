@@ -504,42 +504,42 @@ databases:
 ## Quick start prompt для opencode (вставить в новую сессию)
 
 ```
-Продолжаем barber-bot Session 5.7 — Этап 1.3b (FSM для addslots) с учётом
-доноров, найденных в Session 5.6 (UznetDev/Aiogram-Bot-Template, INSIGHT INL-001
-edit_message_text для inline навигации). Session 5.5/5.6 — inline admin menu
-Варианта B в работе (Этап 1.3a завершён, points of entry в flow готовы, дальше —
-FSM-логика после тапа по кнопке).
+Продолжаем barber-bot Session 5.8 — Этап 1.3c (FSM для closeslot) с учётом
+паттерна, отработанного в 1.3b (commit 96d318a, запушен). Этап 1.3a (points of
+entry в flow, 5 inline menu callbacks) + 1.3b (FSM addslots: calendar handler
++ hours input) — завершены и запушены. Дальше — closeslot FSM (адаптация 1.3b).
 
 Прочитай ~/PycharmProjects/barber-bot/NEXT_SESSION_PROMPT.md — там полный
 контекст. Особое внимание:
 - "Quick start prompt" ниже (этот блок)
-- "Session 5.6 — доноры inline admin menu" ниже (новый раздел с INSIGHT)
+- "Session 5.7 — итоги Этап 1.3b" ниже (новый раздел с правками W1+W2)
+- "Session 5.6 — доноры inline admin menu" (INL-001 applied в 1.3b, applies
+  в 1.3c тоже — edit_message_text при calendar → ask hour)
 - "Session 5.5 — план Варианта B" (план A, 21 находка critic, все этапы 1.3-5)
 
 == СТАТУС ==
-- Sessions 1-4.5 закоммичены и запушены (origin/main).
-- Session 5 commit fda9263 + 4e90a9d: Dockerfile + docker-compose.yml +
-  host network fix (Telegram IPv6 blocked в Docker bridge на Timeweb).
-- Session 5.5 commit f239774: Этап 1.1 (AdminStates в states.py) + Этап 1.2
-  (inline menu keyboards в keyboards/admin.py). Deep-analysis 2 итерации
-  critic (SURFACE_LEVEL → INCOMPLETE по протоколу, max 2 iter). User выбрал
-  Вариант C (малые шаги с verify+review после каждого файла). Code-reviewer
-  LBTM (F1 docstring 'не показывается в /start' — ложно) → fixed → LGTM.
+- Sessions 1-5.6 закоммичены и запушены (origin/main).
 - Session 5.6 commit 4f996c7 + 228fcad (M1 fix): Этап 1.3a
   (_is_admin_callback + 5 menu callbacks в handlers/admin.py, ~577 строк).
-  Code-reviewer LGTM (0 critical, 7 warnings, 1 fix applied W4 → M1 в нашей
-  ревизии: assert вместо 'if user is not None else 0' полумеры).
-  StateFilter("*") для menu callbacks (UX-edge прерывание FSM тапом).
-  Today/week — НЕ трогают state (read-only peek без отмены текущего flow).
-  Deferred warnings: W1 (services без resolve — KISS, business_id нужен в 1.3d),
-  W2/W7 (try/except на DB query — отдельный проход), W3 (calendar-tap dangling —
-  ожидаемо для 1.3a, добавит 1.3b/1.3c), W5 (callback.answer в конце — design
-  choice match client.py), W6 (double-tap — acceptable MVP).
-  НЕ ДЕПЛОИТЬ 1.3a без 1.3b+1.3c — calendar-tap dangling (W3).
-- Session 5.6 доноры: UznetDev/Aiogram-Bot-Template (10 fork, aiogram 3.5)
-  изучен через gh api raw. 5 INSIGHT (INL-001..005), см. раздел ниже.
-  Карточка: ~/.config/opencode/references/donor-research/donors/UznetDev-aiogram-bot-template.md
-  Topic:   ~/.config/opencode/references/donor-research/topics/inline-admin-menu-aiogram.md
+- Session 5.7 commit 96d318a: Этап 1.3b (FSM addslots) — admin_addslots_calendar_cb
+  (SimpleCalendar handler, branch by act) + admin_addslots_hours_msg (text
+  input → parse → add_slots). 1 файл, +198/-5 строк. Code-reviewer LGTM
+  (0 critical, 2 warnings W1+W2 — ОБА fixed в этом же коммите). Verified:
+  ruff + mypy + 266 тестов — green.
+  - W1 fix: ~F.text.startswith("/") в фильтре hours_msg → /cancel проваливается
+    в client_router (Command("cancel") + StateFilter("*")) — escape hatch жив.
+    Verified: F.text.resolve() на text="/cancel" → ~startswith → False, filter
+    не матчит → провал в client_router. Полный catch-all для non-/ текст — 1.3e.
+  - W2 fix: state.clear() в branch "Мастер не найден" в hours_msg — consistency
+    с calendar handler (514-517) и past-date check (638-643). Unrecoverable
+    error → clear state.
+  - INL-001 applied: edit_message_text при calendar → ask hours (fallback на
+    answer при TelegramBadRequest, message >48h / удалено).
+  - Defensive checks: state loss mid-flow (selected_date None → graceful exit),
+    corrupted state (ValueError → clear + ask заново), not-past re-check
+    (между выбором даты и вводом часов мог пройти день).
+  - НЕ ДЕПЛОИТЬ 1.3a+1.3b без 1.3c — closeslot calendar-tap всё ещё dangling
+    (W3 code-review 1.3a, единственный оставшийся dangling flow).
 
 == РАЗВЁРТКА НА TIMWEB VPS (живой, 790₽/мес) ==
 - IP: 188.225.82.248, user: root, pass: hA+-PZrPCGmVV3
@@ -549,103 +549,77 @@ FSM-логика после тапа по кнопке).
   docker compose ps (статус)
 - БД seeded: Business 'Barber Ekaterina' (id 04d1be59-422a-4f92-88bf-242031f14d82)
   + Master 'Ekaterina' telegram_id=461355056. /today, /week, /addslots УЖЕ
-  работают на prod. Smoke test пройден частично (команды работают, FSM state
-  survives restart НЕ проверяли — нужно: /book mid-flow → docker compose
-  down → up → продолжить).
+  работают на prod (command-версии). Inline menu 1.3a+1.3b НЕ ДЕПЛОИТЬ без 1.3c.
 - Бот: @My_Barber_hair_bot (telegram), token 8935808150:AAEJOLoklDzQQrrmBH4KzHS2JphMa5uzIBQ
 - .env на сервере: /opt/barber-bot/.env (BOT_TOKEN, ADMIN_ID=461355056,
   POSTGRES_USER=barber, POSTGRES_PASSWORD=ChangeMe123, POSTGRES_DB=barber)
 
-== ДОНОРЫ SESSION 5.6 (UznetDev/Aiogram-Bot-Template, INSIGHT INL-001..005) ==
-
+== ДОНОРЫ (UznetDev/Aiogram-Bot-Template, INSIGHT INL-001..005) ==
 Полная карточка: ~/.config/opencode/references/donor-research/donors/UznetDev-aiogram-bot-template.md
 Полный topic:    ~/.config/opencode/references/donor-research/topics/inline-admin-menu-aiogram.md
 
-INL-001 · edit_message_text для inline навигации (UX pattern) · TODO 1.3b/1.3c ⏳
+INL-001 · edit_message_text для inline навигации (UX pattern) · APPLIED в 1.3b ✅
   Атрибуция: UznetDev/Aiogram-Bot-Template/handlers/admins/callback_query/main_admin_panel.py:30-34
-  Паттерн: при навигации между разделами админ-панели ИЗМЕНЯТЬ существующее
-  сообщение (edit_message_text / edit_reply_markup), не создавать новое (answer).
-  Чат админа не засоряется — один message, кнопки меняют его content.
-  Наш статус: НЕ применяем в 1.3a (там callback.message.answer создаёт новое
-  сообщение с calendar). Для 1.3b/1.3c — ПРИМЕНИТЬ: при показе calendar после
-  тапа по «➕ Открыть слоты» / «🔒 Закрыть слот» — заменить answer на
-  edit_message_text (старое сообщение «Выберите дату» → новое «Выберите час» +
-  новый keyboard). UX чище.
-  Применимость: для addslots/closeslot/services (новый flow, новое сообщение ОК
-  для calendar, но следующие шаги внутри flow — edit). Для today/week — НЕ
-  трогать (read-only, уже закоммичено 4f996c7).
+  Паттерн: при навигации между разделами ИЗМЕНЯТЬ существующее сообщение
+  (edit_message_text / edit_reply_markup), не создавать новое (answer).
+  Наш статус: APPLIED в 1.3b (admin_addslots_calendar_cb act=day — edit_text
+  "Введите часы", fallback на answer при TelegramBadRequest). ДЛЯ 1.3c —
+  ПРИМЕНИТЬ аналогично: при показе ask hour после тапа по дате calendar —
+  edit_message_text "Введите час (один, 0-23):" вместо answer.
+  Применимость: для closeslot (новый flow) — edit при calendar → ask hour.
 
 INL-002 · message_id cleanup в state · REJECT ❌ (нет pain)
-  Атрибуция: UznetDev/Aiogram-Bot-Template/handlers/admins/main_panel.py:43-50
-  Паттерн: сохранить message_id панели в state, при новом открытии — удалить
-  старое сообщение. Чат не засоряется сообщениями панели между сессиями.
-  Решение: НЕ внедрять. AGENTS.md § anti-overengineering правило 3 (5+ повторений
-  = pain). Pet-project MVP, нет pain signal. Если админ жалуется на засорение —
-  вернуться.
+  AGENTS.md § anti-overengineering правило 3 (5+ повторений = pain).
+  Pet-project MVP, нет pain signal.
 
 INL-003 · IsAdmin как BaseFilter · TODO Ур. 2.6 ⏳
   Атрибуция: UznetDev/Aiogram-Bot-Template/filters/admin.py:42-67
-  Паттерн: auth как BaseFilter — ставится декоратором на handler, декларативно.
-  Не нужно `if not _is_admin_callback(callback): await callback.answer(); return`
-  в каждом handler.
   Наш статус: _is_admin(message) + _is_admin_callback(callback) — императивно,
-  повторяется в 5 callbacks. Refactor в Ур. 2.6 (middleware/role.py уже в плане
-  barber-bot NEXT_SESSION_PROMPT). Donor подтверждает паттерн BaseFilter — но
-  наш план идёт дальше (middleware с DB lookup, не фильтр с settings.ADMIN_ID).
+  повторяется в handlers. Refactor в Ур. 2.6 (middleware/role.py уже в плане).
+  Donor подтверждает паттерн BaseFilter — но наш план идёт дальше (middleware
+  с DB lookup, не фильтр с settings.ADMIN_ID).
 
 INL-004 · их баг с message.from_user для CallbackQuery · APPLIED ✅
   Атрибуция: UznetDev/Aiogram-Bot-Template/filters/admin.py:50-67
   Баг: IsAdmin.__call__(message: Message) проверяет message.from_user.id ==
   ADMIN. Для CallbackQuery message = callback.message (исходное сообщение бота),
-  message.from_user = бот (кто отправил сообщение с кнопкой), НЕ тапер. Фильтр
-  проверяет ID бота, не ID админа — фактически любой тапер проходит.
-  Наш fix (commit 4f996c7): _is_admin_callback(callback) через callback.from_user
-  (НЕ message.from_user). Мы сделали правильно. Donor верифицировал наш подход.
+  message.from_user = бот, НЕ тапер. Фильтр проверяет ID бота, не ID админа.
+  Наш fix (commit 4f996c7): _is_admin_callback(callback) через callback.from_user.
+  Donor верифицировал наш подход. Действует в 1.3b calendar handler.
 
 INL-005 · CallbackData с action field · REJECT ❌ (наш подход type-safer)
   Атрибуция: UznetDev/Aiogram-Bot-Template/keyboards/inline/button.py:8-15
-  Паттерн: один CallbackData класс AdminCallback(action: str, data: str) для
-  всех admin actions. Фильтр по F.action == "...". Компактнее для >5 buttons.
-  Наш подход: 5 отдельных CallbackData (AdminAddslotsCallbackData,
-  AdminCloseslotCallbackData, AdminTodayCallbackData, AdminWeekCallbackData,
-  AdminServicesCallbackData), каждый со своим prefix. Type-safer, IDE autocomplete,
-  легче добавить новый action (новый класс, не новое поле в существующем).
-  Решение: НЕ менять. Для 5 buttons наш подход читаемее и type-safer. Если будет
-  >10 admin actions — пересмотреть.
+  Наш подход: 5 отдельных CallbackData, каждый со своим prefix. Type-safer,
+  IDE autocomplete, легче добавить новый action (новый класс, не новое поле).
+  Не менять. Для 5 buttons наш подход читаемее и type-safer.
 
-== ЧТО ОСТАЛОСЬ (Session 5.7 scope — Этап 1.3b, Вариант B) ==
-
-ПЛАН A (расширенный после 2 итераций deep-analysis-critic):
-- 21 находка critic (10 iter 1 + 11 iter 2) — все в плане, решаются в коде.
-- Вариант C: 1 файл → verify (pytest+ruff+mypy) → code-review → следующий.
+== ЧТО ОСТАЛОСЬ (Session 5.8 scope — Этап 1.3c, Вариант B) ==
 
 Этап 1.3 — bot/handlers/admin.py (САМЫЙ БОЛЬШОЙ, разбит на подэтапы):
   ✅ 1.3a (commit 4f996c7 + 228fcad M1 fix) — _is_admin_callback(callback) для
        auth CallbackQuery + 5 menu callback handlers (StateFilter("*") +
-       admin_* filter) — точки входа в flow. Каждый: callback.answer() +
-       state.clear() + state.set_state(AdminStates.<first_state>) + показать
-       calendar/ask. Today/week — read-only, state НЕ трогают.
-       НЕ ДЕПЛОИТЬ без 1.3b+1.3c — calendar-tap dangling (W3).
-  ⏳ 1.3b — FSM для addslots (AdminStates.adding_slots_date → adding_slots_hours):
-       SimpleCalendar handler с StateFilter(AdminStates.adding_slots_date) —
-       НОВЫЙ, текущий в client.py:213 привязан к BookingStates.selecting_date, НЕ
-       сработает для admin-state без правки. После выбора даты → ask hours
-       → parse + add_slots service → "✅ Слоты созданы" (re-use логики из
-       cmd_addslots:147-165). NB INL-001: для показа шага «ask hours» после
-       тапа по дате calendar — ИСПОЛЬЗОВАТЬ edit_message_text (не answer),
-       чат админа не засоряется. Calendar tap → edit_message_text с ask hours
-       + (если нужно) reply keyboard с часами ИЛИ text input.
+       admin_* filter) — точки входа в flow.
+  ✅ 1.3b (commit 96d318a) — FSM для addslots (calendar handler + hours input).
+       Code-reviewer LGTM, W1+W2 fixed. INL-001 applied.
   ⏳ 1.3c — FSM для closeslot (AdminStates.closing_slot_date → closing_slot_hour):
-       аналогично addslots. После выбора даты → ask hour (single, не multiple)
-       → close_slot service → "✅ Слот закрыт". NB INL-001: edit_message_text
-       при переходе calendar → ask hour.
+       АДАПТАЦИЯ 1.3b паттерна. После выбора даты → ask hour (SINGLE, не
+       multiple) → close_slot service → "✅ Слот закрыт". NB INL-001:
+       edit_message_text при переходе calendar → ask hour (fallback на answer).
+       Отличия от 1.3b:
+       - state: closing_slot_date → closing_slot_hour (НЕ adding_slots_*)
+       - hours input: SINGLE час (не список через пробел) — "Введите час (0-23):"
+       - validation: 0 <= hour <= 23 (одна проверка, не list)
+       - service: close_slot(session, slot_id) (НЕ add_slots). Нужно сначала
+         найти slot по (master_id, slot_date, slot_hour) — re-use cmd_closeslot
+         logic (admin.py:213-251, find slot by composite key, then close_slot).
+       - render: "✅ Слот {date} {hour}:00 закрыт" (НЕ список часов)
+       - W2 analog: state.clear() в branch "Мастер не найден" в hour_msg
+       - W1 analog: ~F.text.startswith("/") в фильтре hour_msg
   ⏳ 1.3d — FSM для services (3 шага: name → duration → price):
        AdminStates.entering_service_name → _duration → _price.
-       Name с пробелами ОК (create_service делает name.strip(), сохраняет
-       внутренние пробелы — не как cmd_services с replace('_', ' ')).
-       NB INL-001: edit_message_text между шагами (name → duration → price),
-       чат не засоряется. NB W1 code-review 1.3a: добавить _resolve_master_and_business
-       на entry (business_id нужен для create_service в конце flow).
+       NB INL-001: edit_message_text между шагами (name → duration → price).
+       NB W1 code-review 1.3a: добавить _resolve_master_and_business на entry
+       (business_id нужен для create_service в конце flow).
   ⏳ 1.3e — /cancel с StateFilter(AdminStates) в admin_router (перехватывает
        раньше client_router — router order main.py:117-119). +
        admin-state catch-all:
@@ -657,55 +631,33 @@ INL-005 · CallbackData с action field · REJECT ❌ (наш подход type-
 
 Этап 2 — middleware + spec + docstrings:
   2.1 — bot/middlewares/session_timeout.py:
-        + ADMIN_SESSION_TTL_SEC = 3600 (60 мин для админа, парикмахер
-          отвлекается на клиентов — 30 мин мало).
-        В __call__: if event.from_user.id == settings.ADMIN_ID:
-          ttl = ADMIN_SESSION_TTL_SEC else ttl = SESSION_TTL_SEC.
-        Текст оставить клиентский ("/book hint") — acceptable UX, не трогать
-        test_middlewares.py:291 assert "/book" in text.
-        test_middlewares.py:377 assert SESSION_TTL_SEC == 1800 — оставить
-        (клиентский), +новый тест на ADMIN_SESSION_TTL_SEC == 3600.
-  2.2 — spec.md правка 6+ точек (SSOT: "прав spec, не код"):
-        - spec.md:247 — добавить AdminStates
-        - spec.md:251 — inline menu вместо reply
-        - spec.md:255 — handlers/admin.py: callback + FSM
-        - spec.md:404 — команды как alias
-        - spec.md:405-410 — parsing-правила → FSM validate на каждом шаге
-        - spec.md:458 — checklist обновить под inline-flow
-        - spec.md:491 — /cancel контракт для admin-FSM
-        - spec.md:513 — ADMIN_SESSION_TTL_SEC = 3600
-        - + НОВАЯ точка: spec.md добавить INL-001 (edit_message_text для
-          inline навигации в admin FSM — UX паттерн, чат не засоряется).
-  2.3 — docstrings/comments:
-        - bot/handlers/admin.py:1-14 — уже "Stateful: PARTIAL" (commit 4f996c7),
-          при 1.3b обновить до "Stateful: YES" + "5 callback + FSM"
-        - bot/main.py:115 — comment про /cancel в admin-FSM
+        + ADMIN_SESSION_TTL_SEC = 3600 (60 мин для админа).
+  2.2 — spec.md правка 6+ точек (SSOT: "прав spec, не код").
+  2.3 — docstrings/comments: admin.py:1-14 "Stateful: YES" (уже в 96d318a),
+        main.py:115 comment про /cancel в admin-FSM.
 
 Этап 3 — bot/handlers/start.py:
   - Welcome для админа: убрать перечисление /addslots /closeslot /today /week
     /services из текста. Прикрепить admin_inline_menu() (inline keyboard).
-  - Правка tests/test_start_handlers.py:60-64 asserts (5 asserts на /addslots
+  - Правка tests/test_start_handlers.py:48-68 asserts (5 asserts на /addslots
     in text → упадут). Решение: переписать asserts на inline keyboard.
 
 Этап 4 — тесты:
-  4.1 — Правка существующих:
-        - tests/test_start_handlers.py:48-68 — asserts на inline keyboard
-        - tests/test_admin_handlers.py — 54 теста остаются (commands как alias)
-        - tests/test_middlewares.py:377 — оставить, +новый на ADMIN_SESSION_TTL_SEC
+  4.1 — Правка существующих (test_start_handlers.py, test_middlewares.py).
   4.2 — Новые тесты в tests/test_admin_handlers.py:
         - Menu callback — каждая из 5 кнопок триггерит правильный flow
-        - FSM addslots — календарь → выбор часа → создание
-        - FSM closeslot — календарь → выбор часа → закрытие
-        - FSM services — 3 шага (name/duration/price)
-        - /cancel в admin-FSM → state cleared + admin text
-        - admin-state fallback (text + callback)
+        - FSM addslots — календарь → выбор часа → создание (1.3b coverage)
+        - FSM closeslot — календарь → выбор часа → закрытие (1.3c coverage)
+        - FSM services — 3 шага (name/duration/price) (1.3d coverage)
+        - /cancel в admin-FSM → state cleared + admin text (1.3e coverage)
+        - admin-state fallback (text + callback) (1.3e coverage)
         - _is_admin_callback (админ vs не-админ)
         - TTL=60 для админа (middleware test)
         - INL-001: edit_message_text вызывается (not answer) при переходе
-          calendar → ask hours в 1.3b/1.3c
+          calendar → ask hours/hour в 1.3b/1.3c
 
 Этап 5 — verify + deploy:
-  5.1 — qa-verify-and-fix (локально): pytest + ruff + mypy, итеративный fix
+  5.1 — qa-verify-and-fix (локально): pytest + ruff + mypy
   5.2 — qa-code-review через code-reviewer subagent
   5.3 — git commit + push (pet-project free)
   5.4 — Deploy на Timeweb: ssh root@188.225.82.248 → git pull → docker compose
@@ -713,6 +665,7 @@ INL-005 · CallbackData с action field · REJECT ❌ (наш подход type-
   5.5 — Smoke test в Telegram (@My_Barber_hair_bot):
         - Екатерина жмёт /start → видит inline menu (5 кнопок)
         - Тапает "➕ Открыть слоты" → календарь → дата → ввод часов → слоты созданы
+        - Тапает "🔒 Закрыть слот" → календарь → дата → ввод часа → слот закрыт
         - Тапает "📅 Сегодня" → мгновенный список записей
         - Тапает "💇 Добавить услугу" → 3 шага → услуга создана
         - /cancel в mid-FSM → корректный выход
@@ -720,35 +673,71 @@ INL-005 · CallbackData с action field · REJECT ❌ (наш подход type-
         - Bot restart mid-admin-FSM → PostgresStorage сохраняет,
           admin-state fallback ловит stale taps
 
-== 21 НАХОДКА CRITIC (памятка — все решаются в коде, не "отложены") ==
-Блокирующие (3):
-  - test_middlewares.py:377 SESSION_TTL_SEC == 1800 — оставить (клиентский),
-    +ADMIN_SESSION_TTL_SEC = 3600 → Этап 2.1
-  - test_middlewares.py:291 "/book" in text — оставить клиентский текст
-    для админа (acceptable UX) → Этап 2.1
-  - StateFilter(AdminStates.*) синтаксис невалиден → правильно
-    StateFilter(AdminStates) (verified через python -c) → Этап 1.3e
-Дополнения (8):
-  - spec.md 6+ точек → Этап 2.2
-  - admin.py docstring (line 6 "Stateful: NO") → Этап 2.3 (уже "PARTIAL" в 4f996c7)
-  - main.py:115 comment → Этап 2.3
-  - UX-edge прерывание FSM тапом → ✅ Этап 1.3a (state.clear() + новый flow)
-  - SimpleCalendar для админа → ⏳ Этап 1.3b (новый handler)
-  - Auth для callbacks → ✅ Этап 1.3a (_is_admin_callback)
-  - /cancel клиентский текст для админа → ⏳ Этап 1.3e (admin-state /cancel)
-  - TTL=60 для админа → ⏳ Этап 2.1
-Остатки (10):
-  - catch-all filter exclude commands → 1 строка ~F.text.startswith("/") → 1.3e
-  - persistence inline keyboard → StateFilter("*") + admin_* handler → ✅ 1.3a
-  - dispatcher order внутри router → specific → /cancel → catch-all LAST → 1.3e
-  - admin-state callback fallback 2 уровня → StateFilter("*")+admin_* для menu,
-    StateFilter(AdminStates) catch-all для in-FSM → ✅ 1.3a + ⏳ 1.3e
-  - Bot restart mid-admin-FSM → PostgresStorage (уже L5) + admin-state fallback → 1.3e
-  - Double-tap inline → events_isolation сериализует + idempotent set_state → accept ✅
-  - /services name с пробелами в FSM → message.text принимает полное → 1.3d
-  - test_start_handlers правка → Этап 4.1
-  - test_middlewares правка → Этап 4.1
-  - test_admin_handlers 54 теста → оставить как alias → Этап 4.1
+== ЧТО ДЕЛАТЬ В 1.3c (пошагово) ==
+
+1. Прочитай bot/handlers/admin.py:667-700 (admin_closeslot_cb — точка входа в
+   closeslot flow, state.clear() + set_state(closing_slot_date) + calendar).
+   После тапа по дате — НЕТ handler (W3 dangling). Это 1.3c закрывает.
+2. Прочитай bot/handlers/admin.py:492-577 (admin_addslots_calendar_cb —
+   ПАТТЕРН для closeslot calendar handler. Branch by act: ignore/today+same-month/
+   day/cancel/navigation. Скопируй структуру, замени state на closing_slot_date,
+   render "Введите час (один, 0-23):" вместо "Введите часы через пробел".
+3. Прочитай bot/handlers/admin.py:580-665 (admin_addslots_hours_msg — ПАТЕРН для
+   closeslot hour_msg. Parse hours — но SINGLE, не список. Замени add_slots на
+   find-slot-by-composite-key + close_slot (re-use cmd_closeslot:213-251).
+4. Прочитай cmd_closeslot в admin.py:196-262 — там find slot by (master_id,
+   slot_date, slot_hour) + close_slot service. Это RE-USE для 1.3c hour_msg.
+5. Прочитай bot/services/slots.py:62-83 (close_slot signature: session, slot_id
+   → bool. Raises ValueError if slot is booked).
+
+РЕАЛИЗАЦИЯ 1.3c (новый код в admin.py, после admin_closeslot_cb ~700 строки):
+  - Новый handler admin_closeslot_calendar_cb:
+    @router.callback_query(SimpleCalendarCallback.filter(),
+                           StateFilter(AdminStates.closing_slot_date))
+    async def admin_closeslot_calendar_cb(callback, callback_data, state):
+        # Аналог admin_addslots_calendar_cb, но:
+        # - state: closing_slot_date → closing_slot_hour
+        # - act=day: save selected_date, set_state(closing_slot_hour),
+        #   INL-001: edit_message_text "Введите час (один, 0-23):"
+        #   (fallback на answer при TelegramBadRequest)
+        # - act=cancel: state.clear() + edit "Отменено"
+        # - act=ignore/today+same-month: callback.answer(cache_time=60)
+        # - act=navigation: callback.answer()
+  - Новый handler admin_closeslot_hour_msg:
+    @router.message(StateFilter(AdminStates.closing_slot_hour), F.text,
+                    ~F.text.startswith("/"))
+    async def admin_closeslot_hour_msg(message, state):
+        # Read selected_date из state (None → graceful exit + clear)
+        # Parse SINGLE hour (int(text.strip()), НЕ list)
+        # Validate 0 <= hour <= 23
+        # Resolve master (re-use _resolve_master_and_business)
+        # Find slot by (master_id, slot_date, slot_hour) — re-use cmd_closeslot:240-251
+        # close_slot service (re-use cmd_closeslot:253-257)
+        # Render "✅ Слот {date} {hour}:00 закрыт" (НЕ список)
+        # state.clear() в конце (терминальный)
+        # W2 analog: state.clear() в branch "Мастер не найден"
+        # W1 analog: ~F.text.startswith("/") в фильтре (уже в декораторе)
+
+ГЕЙТЫ 1.3c:
+- deep-analysis-protocol (state risk-класс, 4 прохода) — нетривиальная задача
+  (новый FSM flow, logic change). НЕ high-stakes (1 файл, ~100 строк, re-use
+  1.3b паттерна + cmd_closeslot logic). deep-analysis-critic skip.
+- qa-verify-and-fix: .venv/bin/ruff check + .venv/bin/mypy + .venv/bin/python -m pytest
+- qa-code-review через code-reviewer subagent (logic-change, новый FSM flow)
+- Вариант C: 1 файл (admin.py) → verify → code-review → commit
+- Коммит: "Этап 1.3c: FSM closeslot (calendar handler + hour input)"
+
+DONOR CROSS-REF (INL-001 — ПРИМЕНИТЬ в 1.3c):
+  - ~/.config/opencode/references/donor-research/topics/inline-admin-menu-aiogram.md
+  - INL-001: edit_message_text вместо answer при переходе calendar → ask hour.
+    Атрибуция: UznetDev/Aiogram-Bot-Template/handlers/admins/callback_query/main_admin_panel.py:30-34
+    Применение: в admin_closeslot_calendar_cb (act=day branch) —
+    callback.message.edit_text("Введите час (один, 0-23):") вместо answer.
+    Если message нельзя edit (>48h, удалено) — fallback на answer.
+
+NB: После 1.3c — ВСЕ 5 inline menu flows готовы (addslots full, closeslot full,
+today/week instant, services pending 1.3d). ДЕПЛОИТЬ 1.3a+1.3b+1.3c можно
+(services 1.3d добавится отдельно, не блокирует smoke test основных 4 кнопок).
 
 == ГЕЙТЫ (напоминание) ==
 - qa-verify-and-fix после правок кода (.venv/bin/python -m pytest + ruff + mypy)
@@ -758,64 +747,12 @@ INL-005 · CallbackData с action field · REJECT ❌ (наш подход type-
 - Push в origin/main после verify + code-review
 
 == NEXT ==
-Этап 1.3b — FSM для addslots (AdminStates.adding_slots_date → adding_slots_hours).
-
-ЧТО ДЕЛАТЬ (пошагово):
-1. Прочитай bot/handlers/admin.py (~577 строк после 1.3a + M1 fix, callbacks в
-   конце с 443 строки). Контекст: admin_addslots_cb (443) уже стартует flow —
-   state.clear() + state.set_state(AdminStates.adding_slots_date) + показывает
-   calendar через admin_calendar_keyboard. После тапа по дате — НЕТ handler
-   (W3 code-review 1.3a — calendar-tap dangling). Это Этап 1.3b закрывает.
-2. Прочитай bot/handlers/client.py:124-211 (_handle_simple_calendar — паттерн
-   для SimpleCalendar handler). Особенно строки 158-194 (act=day branch —
-   обработка выбора даты). Текущий simple_calendar_cb (213) привязан к
-   BookingStates.selecting_date через StateFilter — НЕ сработает для
-   AdminStates.adding_slots_date. Нужен НОВЫЙ handler в admin.py.
-3. Прочитай bot/handlers/client.py:77-94 (_calendar_range — паттерн для
-   range, у нас _admin_calendar_range уже есть в admin.py:429-440).
-4. Прочитай cmd_addslots в admin.py:121-190 — там parsing часов + add_slots
-   service + render результата. Это RE-USE для 1.3b (после выбора даты → ask
-   hours → parse → add_slots → "✅ Слоты созданы").
-
-РЕАЛИЗАЦИЯ 1.3b (новый код в admin.py, после admin_addslots_cb ~470 строки):
-  - Новый handler admin_addslots_calendar_cb:
-    @router.callback_query(SimpleCalendarCallback.filter(),
-                           StateFilter(AdminStates.adding_slots_date))
-    async def admin_addslots_calendar_cb(callback, callback_data, state):
-        # Аналог _handle_simple_calendar, но:
-        # - act=day: сохранить selected_date в state, set_state(adding_slots_hours),
-        #   INL-001: edit_message_text (НЕ answer) "Введите часы через пробел
-        #   (например 11 12 13):" — чат не засоряется
-        # - act=cancel: state.clear() + edit_message_text "Отменено"
-        # - act=navigation: edit_reply_markup (lib делает, handler answer)
-        # - act=ignore/today: callback.answer(cache_time=60)
-  - Новый handler admin_addslots_hours_msg:
-    @router.message(StateFilter(AdminStates.adding_slots_hours))
-    async def admin_addslots_hours_msg(message, state):
-        # parse hours (re-use cmd_addslots parsing:121-152)
-        # resolve master (re-use _resolve_master_and_business)
-        # validate slot_date not in past (re-use cmd_addslots:165-170)
-        # add_slots service (re-use cmd_addslots:172-180)
-        # render "✅ Открыты слоты на DATE: HOURS" (re-use cmd_addslots:182-190)
-        # state.clear() в конце (flow завершён)
-
-ГЕЙТЫ 1.3b:
-- qa-verify-and-fix: .venv/bin/ruff check + .venv/bin/mypy + .venv/bin/python -m pytest
-- qa-code-review через code-reviewer subagent (logic-change, новый FSM flow)
-- Вариант C: 1 файл (admin.py) → verify → code-review → commit
-- Коммит: "Этап 1.3b: FSM addslots (calendar handler + hours input)"
-
-DONOR CROSS-REF (INL-001 — ПРИМЕНИТЬ в 1.3b):
-  - ~/.config/opencode/references/donor-research/topics/inline-admin-menu-aiogram.md
-  - INL-001: edit_message_text вместо answer при переходе calendar → ask hours.
-    Атрибуция: UznetDev/Aiogram-Bot-Template/handlers/admins/callback_query/main_admin_panel.py:30-34
-    Паттерн: при навигации между разделами админ-панели ИЗМЕНЯТЬ существующее
-    сообщение, не создавать новое. Чат админа не засоряется.
-    Применение: в admin_addslots_calendar_cb (act=day branch) —
-    callback.message.edit_text("Введите часы...") вместо callback.message.answer().
-    Если message нельзя edit (старое, удалено) — fallback на answer.
-
-NB: НЕ ДЕПЛОИТЬ без 1.3b+1.3c — иначе calendar-tap dangling (W3 code-review 1.3a).
+Этап 1.3c — FSM для closeslot (AdminStates.closing_slot_date → closing_slot_hour).
+Адаптация 1.3b паттерна (calendar handler + text input), отличия:
+- SINGLE hour (не список)
+- close_slot service (не add_slots) — нужен find slot по composite key
+- render single "Слот закрыт" (не список часов)
+INL-001 edit_message_text, W1+W2 analogs — применить.
 ```
 
 ## Session 5.6 — доноры inline admin menu (UznetDev/Aiogram-Bot-Template, INSIGHT INL-001..005)
@@ -891,6 +828,95 @@ Aiogram-Bot-Template подтвердил наш паттерн (FSM states дл
 - `~/.config/opencode/references/donor-research/donors/UznetDev-aiogram-bot-template.md`
 - `~/.config/opencode/references/donor-research/topics/inline-admin-menu-aiogram.md`
 - INDEX обновлён: `~/.config/opencode/references/donor-research/INDEX.md` (2026-08-27 запись)
+
+## Session 5.7 — итоги Этап 1.3b (commit 96d318a, запушен)
+
+> Этап 1.3b — FSM для addslots (calendar handler + hours input). Закрыл W3
+> (calendar-tap dangling из 1.3a code-review). Adaptation паттерна из
+> client.py:124-211 (_handle_simple_calendar — branch by SimpleCalAct).
+
+### Что сделано
+
+1 файл (`bot/handlers/admin.py`), +198/-5 строк. 2 новых handler'а:
+
+- **`admin_addslots_calendar_cb`** (строки 492-577) — `@router.callback_query(
+  SimpleCalendarCallback.filter(), StateFilter(AdminStates.adding_slots_date))`.
+  Branch by `callback_data.act`:
+  - `ignore` / `today`+same-month → `callback.answer(cache_time=60)` (lib не вызывается)
+  - `day` → `state.update_data(selected_date=isoformat)` + `set_state(adding_slots_hours)`
+    + **INL-001** `edit_message_text` "Введите часы" (fallback на `answer` при
+    `TelegramBadRequest` — message >48h / удалено). `isinstance(callback.message,
+    Message)` сужает `Message | InaccessibleMessage` для mypy.
+  - `cancel` → `state.clear()` + `edit_text` "Отменено" (fallback на `answer`)
+  - navigation (prev_y/next_y/prev_m/next_m/today-diff-month) → `callback.answer()`
+    (lib сделал `edit_reply_markup`)
+
+- **`admin_addslots_hours_msg`** (строки 580-665) — `@router.message(
+  StateFilter(AdminStates.adding_slots_hours), F.text, ~F.text.startswith("/"))`.
+  Parse hours (`sorted(set(text.split()))` dedup), resolve master, defensive
+  not-past check (между выбором даты и вводом часов мог пройти день),
+  `add_slots` service, render "✅ Открыты слоты". `state.clear()` терминальный.
+
+### Imports добавлены
+
+- `from aiogram import F` (top-level, не `aiogram.filters`)
+- `from aiogram.exceptions import TelegramBadRequest`
+- `from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback`
+- `from aiogram_calendar.schemas import SimpleCalAct`
+
+### Docstring
+
+`admin.py:6` — `Stateful: PARTIAL` → `Stateful: YES`, "5 cmd + 5 menu + 2 FSM
+handlers (1.3b)".
+
+### Code-reviewer отчёт (LGTM, 0 critical, 2 warnings — ОБА fixed)
+
+- **W1** `/cancel` escape hatch: `~F.text.startswith("/")` в фильтре hours_msg —
+  `/cancel` НЕ матчится → проваливается в `client_router` (`cmd_cancel`,
+  client.py:443, `Command("cancel") + StateFilter("*")`) → `state.clear()`.
+  Verified: `F.text.resolve()` на text="/cancel" → `~startswith` → False.
+  Полный catch-all для non-/ текст — Этап 1.3e.
+- **W2** `state.clear()` в branch "Мастер не найден" в hours_msg — consistency
+  с calendar handler (514-517) и past-date check (638-643). Unrecoverable
+  error → clear state (иначе user typing valid hours → loop на gone master).
+
+### Self-verify (verified реальными вызовами, не цитатой правила)
+
+- `git show 96d318a --stat` → 1 файл, +198/-5
+- `read admin.py:476-665` → оба handler'а, все ветки
+- `read client.py:441-443` → cmd_cancel матчит /cancel в adding_slots_hours
+- `read main.py:96` → parse_mode=ParseMode.HTML (ask_text с `<b>`/`<code>` рендерится)
+- `.venv/bin/python F.text.resolve()` → text=None/"" → falsy (filter не матчит),
+  "/cancel" → startswith=True → ~ → False (filter не матчит → провал в client_router)
+- `inspect.getsource(SimpleCalendar.process_selection)` → act=day out-of-range:
+  lib сам делает `query.answer(alert)`, возвращает (False, None) — handler `return`
+  без answer корректен
+- `pytest --collect-only` → 266 тестов (54 admin_handlers, 10 slots) — regress target
+
+### Гейты пройдены
+
+- `qa-verify-and-fix`: ruff format + ruff check + mypy + pytest — all green (266 tests)
+- `qa-code-review` через code-reviewer subagent: LGTM, 0 critical, 2 warnings fixed
+- Коммит `96d318a` запушен в origin/main
+
+### Что НЕ сделано в 5.7 (план на 5.8 = Этап 1.3c)
+
+- **1.3c** (closeslot FSM) — единственный оставшийся dangling flow (W3 analog).
+  Адаптация 1.3b паттерна: calendar handler + SINGLE hour input + close_slot
+  service (find slot by composite key first, затем close_slot).
+- ДЕПЛОИТЬ 1.3a+1.3b без 1.3c — НЕЛЬЗЯ (closeslot calendar-tap dangling).
+
+### Заметки для 1.3c (отличия от 1.3b)
+
+- state: `closing_slot_date` → `closing_slot_hour` (НЕ `adding_slots_*`)
+- hour input: SINGLE (`int(text.strip())`, НЕ list через пробел)
+- validation: `0 <= hour <= 23` (одна проверка)
+- service: `close_slot(session, slot_id)` (НЕ `add_slots`). Сначала find slot по
+  `(master_id, slot_date, slot_hour)` — re-use `cmd_closeslot:213-251`
+- render: "✅ Слот {date} {hour}:00 закрыт" (НЕ список часов)
+- W1+W2 analogs: `~F.text.startswith("/")` в фильтре hour_msg, `state.clear()` в
+  "Мастер не найден" branch
+- INL-001: `edit_message_text` при calendar → ask hour (fallback на `answer`)
 
 ## Cross-refs
 
