@@ -521,6 +521,15 @@ menu + FSM)" ниже.
   critic (SURFACE_LEVEL → INCOMPLETE по протоколу, max 2 iter). User выбрал
   Вариант C (малые шаги с verify+review после каждого файла). Code-reviewer
   LBTM (F1 docstring 'не показывается в /start' — ложно) → fixed → LGTM.
+- Session 5.6 commit 4f996c7: Этап 1.3a (_is_admin_callback + 5 menu callbacks
+  в handlers/admin.py). Code-reviewer LGTM (0 critical, 7 warnings, 1 fix
+  applied: W4 dead code 'if user is None' removed). Deferred: W1 (services без
+  resolve — KISS, business_id нужен в 1.3d), W2/W7 (try/except на DB query —
+  отдельный проход), W3 (calendar-tap dangling — ожидаемо для 1.3a, добавит
+  1.3b/1.3c), W5 (callback.answer в конце — design choice match client.py),
+  W6 (double-tap — acceptable MVP). StateFilter("*") для menu callbacks
+  (UX-edge прерывание FSM тапом). Today/week — НЕ трогают state (read-only peek).
+  НЕ ДЕПЛОИТЬ 1.3a без 1.3b/1.3c — calendar-tap dangling.
 
 == РАЗВЁРТКА НА TIMWEB VPS (живой, 790₽/мес) ==
 - IP: 188.225.82.248, user: root, pass: hA+-PZrPCGmVV3
@@ -669,9 +678,14 @@ menu + FSM)" ниже.
 - Push в origin/main после verify + code-review
 
 == NEXT ==
-Этап 1.3a — _is_admin_callback + 5 menu callbacks (точки входа, без FSM
-логики). Стартуй с чтения bot/handlers/admin.py (386 строк) и
-bot/keyboards/admin.py (новый, 6 CallbackData factories).
+Этап 1.3b — FSM для addslots (AdminStates.adding_slots_date → adding_slots_hours):
+SimpleCalendar handler с StateFilter(AdminStates.adding_slots_date) — НОВЫЙ,
+текущий в client.py:213 привязан к BookingStates.selecting_date, НЕ сработает для
+admin-state без правки. После выбора даты → ask hours → parse + add_slots service
+→ "✅ Слоты созданы" (re-use логики из cmd_addslots:147-165).
+Стартуй с чтения bot/handlers/admin.py (теперь ~590 строк, callbacks в конце) и
+client.py:124 (_handle_simple_calendar — паттерн для SimpleCalendar handler).
+NB: НЕ ДЕПЛОИТЬ без 1.3b+1.3c — иначе calendar-tap dangling (W3 code-review 1.3a).
 ```
 
 ## Cross-refs
