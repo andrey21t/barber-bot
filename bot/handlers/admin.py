@@ -694,6 +694,195 @@ async def admin_closeslot_cb(callback: CallbackQuery, state: FSMContext) -> None
     await callback.answer()
 
 
+# ============================================================
+# FSM closeslot (Вариант B, spec.md 251) — Этап 1.3c
+#
+# Адаптация паттерна 1.3b (addslots), отличия:
+# - state: closing_slot_date → closing_slot_hour (НЕ adding_slots_*)
+# - hour input: SINGLE час (не список через пробел)
+# - service: close_slot (НЕ add_slots) — нужен find slot по (master, date, hour)
+# - render: "✅ Слот {date} {hour}:00 закрыт" (НЕ список часов)
+# - past-date re-check ОТСУТСТВУЕТ (отличие от 1.3b) — закрыть slot в прошлом
+#   валидно (отменить невыполненную запись). cmd_closeslot тоже не проверяет.
+#   Calendar min=today всё равно не даёт выбрать прошлое.
+# - INL-001: edit_message_text при calendar → ask hour (fallback на answer).
+# - W1 analog: ~F.text.startswith("/") в фильтре hour_msg → /cancel проваливается
+#   в client_router (escape hatch).
+# - W2 analog: state.clear() в branch "Мастер не найден" в hour_msg.
+# ============================================================
+
+
+@router.callback_query(SimpleCalendarCallback.filter(), StateFilter(AdminStates.closing_slot_date))
+async def admin_closeslot_calendar_cb(
+    callback: CallbackQuery,
+    callback_data: SimpleCalendarCallback,
+    state: FSMContext,
+) -> None:
+    """SimpleCalendar для closeslot — навигация + выбор даты.
+
+    Branch by callback_data.act (копия admin_addslots_calendar_cb, отличия:
+    state closing_slot_* вместо adding_slots_*, текст "Введите час (один, 0-23):"
+    вместо "Введите часы через пробел", "Закрытие слота отменено" вместо
+    "Открытие слотов отменено").
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+
+    # _is_admin_callback guarantees callback.from_user is not None (type narrowing).
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await state.clear()
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    _master_id, _business_id, tz = resolved
+
+    # act=ignore/today+same-month: lib не вызывается (early return), handler answers
+    if callback_data.act == SimpleCalAct.ignore:
+        await callback.answer(cache_time=60)
+        return
+    if callback_data.act == SimpleCalAct.today:
+        today_sys = datetime.now().replace(tzinfo=None)
+        if today_sys.year == callback_data.year and today_sys.month == callback_data.month:
+            await callback.answer(cache_time=60)
+            return
+
+    cal = SimpleCalendar(locale="ru_RU", cancel_btn="Отмена", today_btn="Сегодня")
+    cal.set_dates_range(*_admin_calendar_range(tz))
+    selected, selected_date = await cal.process_selection(callback, callback_data)
+
+    if callback_data.act == SimpleCalAct.day:
+        if not selected:
+            return  # out-of-range — lib answered alert
+        slot_date = selected_date.date()
+        await state.update_data(selected_date=slot_date.isoformat())
+        await state.set_state(AdminStates.closing_slot_hour)
+
+        # INL-001: edit_message_text — чат не засоряется.
+        ask_text = (
+            f"Дата: <b>{slot_date.strftime('%d %B %Y')}</b>\n"
+            "Введите час (один, 0-23):"
+        )
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(ask_text, reply_markup=None)
+            except TelegramBadRequest:
+                await callback.message.answer(ask_text)
+        await callback.answer()
+        return
+
+    if callback_data.act == SimpleCalAct.cancel:
+        await state.clear()
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(
+                    "❌ Закрытие слота отменено. /menu — заново",
+                    reply_markup=None,
+                )
+            except TelegramBadRequest:
+                await callback.message.answer("❌ Закрытие слота отменено. /menu — заново")
+        await callback.answer()
+        return
+
+    # Navigation (prev_y/next_y/prev_m/next_m/today-diff-month):
+    # lib сделал edit_reply_markup, handler answers.
+    await callback.answer()
+
+
+@router.message(StateFilter(AdminStates.closing_slot_hour), F.text, ~F.text.startswith("/"))
+async def admin_closeslot_hour_msg(message: Message, state: FSMContext) -> None:
+    """User typed hour → parse + find slot + close_slot + render result.
+
+    Re-use cmd_closeslot:218-267 logic (parse hour, resolve master, find slot
+    by composite key, close_slot service). State терминальный — state.clear()
+    в success / already-closed / unrecoverable error ветках. State stays в
+    "slot not found" / "slot booked" / parse-error (админ может поправить ввод).
+
+    NB W1 (code-review 1.3b): `~F.text.startswith("/")` в фильтре — НЕ ловит
+    команды. `/cancel` из этого state проваливается в client_router (escape
+    hatch). Полный catch-all — Этап 1.3e.
+    """
+    if not _is_admin(message):
+        return  # silently ignore non-admin
+
+    data = await state.get_data()
+    selected_date_iso = data.get("selected_date")
+    if not selected_date_iso:
+        # State loss mid-flow (restart, timeout) — graceful exit, ask заново.
+        await state.clear()
+        await message.answer("❌ Дата не выбрана. Закройте слот заново через /menu")
+        return
+
+    try:
+        slot_date = date.fromisoformat(selected_date_iso)
+    except ValueError:
+        # Защита от протухшего/повреждённого state (defense-in-depth).
+        await state.clear()
+        await message.answer("❌ Ошибка даты в сессии. Начните заново через /menu")
+        return
+
+    # Parse SINGLE hour (отличие от 1.3b — int, не list[int] из text.split()).
+    text = (message.text or "").strip()
+    try:
+        hour = int(text)
+    except ValueError:
+        await message.answer("❌ Час должен быть числом 0-23 (например 14)")
+        return  # state stays — ask again
+    if not 0 <= hour <= 23:
+        await message.answer("❌ Час должен быть 0-23")
+        return  # state stays
+
+    admin_id = _require_admin_or_silent(message)
+    assert admin_id is not None
+    resolved = await _resolve_master_and_business(admin_id)
+    if resolved is None:
+        # W2 analog (code-review 1.3b): clear state — unrecoverable error,
+        # consistency с calendar handler выше.
+        await state.clear()
+        await message.answer("❌ Мастер не найден. Обратитесь к администратору.")
+        return
+    master_id, _business_id, _tz = resolved
+
+    # NB: past-date re-check ОТСУТСТВУЕТ (отличие от 1.3b:635-643). Закрыть slot
+    # в прошлом валидно (отменить невыполненную запись). cmd_closeslot тоже не
+    # проверяет. Calendar min=today не даёт выбрать прошлое через UI, но если
+    # админ ввёл дату вручную через /closeslot — past валиден.
+
+    # Find slot by (master, date, hour) — re-use cmd_closeslot:243-253 logic.
+    from sqlalchemy import select
+
+    from bot.models import Slot
+
+    async with async_session_factory() as session:
+        stmt = select(Slot).where(
+            Slot.master_id == master_id,
+            Slot.slot_date == slot_date,
+            Slot.slot_hour == hour,
+        )
+        slot = (await session.execute(stmt)).scalar_one_or_none()
+        if slot is None:
+            # State stays — админ мог опечататься в часе, попробовать другой.
+            await message.answer(f"❌ Слот {slot_date.strftime('%d %B')} {hour}:00 не найден")
+            return
+
+        try:
+            updated = await close_slot(session, slot.id)
+        except ValueError as exc:
+            # Slot booked — close_slot raises ValueError. State stays — админ
+            # может попробовать другой час (этот slot не закрывается).
+            await message.answer(f"❌ {exc}")
+            return
+
+    await state.clear()  # терминальный
+    if updated:
+        await message.answer(f"✅ Слот {slot_date.strftime('%d %B')} {hour}:00 закрыт")
+    else:
+        # close_slot вернул False — slot не найден (гонка: удалён между
+        # SELECT и UPDATE). Редкий кейс, считаем терминальным.
+        await message.answer(f"❌ Слот {slot_date.strftime('%d %B')} {hour}:00 не найден")
+
+
 @router.callback_query(AdminTodayCallbackData.filter(), StateFilter("*"))
 async def admin_today_cb(callback: CallbackQuery) -> None:
     """Menu tap: сегодня — мгновенный список записей (no FSM).
