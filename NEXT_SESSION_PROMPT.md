@@ -1,6 +1,6 @@
-# NEXT_SESSION_PROMPT — Session 5.8 закрыт (Этапы 1.3c+1.3d done, deployed на prod), Session 5.9 готов (1.3e: /cancel + admin-state catch-all).
+# NEXT_SESSION_PROMPT — Session 5.8 закрыт (Этапы 1.3c+1.3d done, deployed), Session 5.9 готов (1.3e + Этап 3 start.py inline menu + /menu command).
 
-> Дата: 2026-08-27 · Session 5.8 commit 5029d85 (1.3c FSM closeslot, deployed) + a631ad5 (1.3d FSM services, deployed). ВСЕ 5 inline menu flow'ов готовы на prod (@My_Barber_hair_bot). Code-reviewer: 1.3c LGTM (0 critical), 1.3d LBTM→fixes→re-review LGTM (F1 Decimal inf/nan/overflow, W1+W2 DB catch, S1+S2). **Готов к Этапу 1.3e (admin-state catch-all + /cancel в admin_router — последний подэтап 1.3).**
+> Дата: 2026-08-27 · Session 5.8 commit 5029d85 (1.3c) + a631ad5 (1.3d) + dc3d7c8 (NEXT_SESSION_PROMPT 5.7 итог) + 9aed5aa (security: VPS password + bot token removed —(credentials rotated). ВСЕ 5 inline menu flow'ов готовы на prod (@My_Barber_hair_bot). Code-reviewer: 1.3c LGTM, 1.3d LBTM→fixes→re-review LGTM. **Готов к Session 5.9: Этап 1.3e (/cancel + admin-state catch-all) + Этап 3 (start.py inline menu + /menu command — discovered gap: admin.py сообщения ссылаются на /menu "заново", но команды /menu НЕТ в коде).**
 
 ## Контекст проекта
 
@@ -504,10 +504,18 @@ databases:
 ## Quick start prompt для opencode (вставить в новую сессию)
 
 ```
-Продолжаем barber-bot Session 5.9 — Этап 1.3e (/cancel + admin-state
-catch-all в admin_router) — ПОСЛЕДНИЙ подэтап 1.3. Этапы 1.3a (points of
-entry, 5 menu callbacks) + 1.3b (FSM addslots) + 1.3c (FSM closeslot) +
+Продолжаем barber-bot Session 5.9 — ДВА этапа в одной сессии:
+  (1) Этап 1.3e (/cancel + admin-state catch-all) — последний подэтап 1.3
+  (2) Этап 3 (start.py inline menu для админа + /menu command) — discovered
+      gap: admin.py 13 сообщений ссылаются на "/menu — заново", но команды
+      /menu НЕТ в коде. Без /menu — dead-end UX (админ читает "/menu — заново"
+      и не знает что делать).
+
+Этапы 1.3a (5 menu callbacks) + 1.3b (FSM addslots) + 1.3c (FSM closeslot) +
 1.3d (FSM services) — завершены, запушены и ДЕПЛОЕНЫ на prod.
+Security incident (commit 9aed5aa): VPS password + bot token были в публичном
+git history с 7194163. Credentials rotated (VPS passwd + BotFather /revoke +
+.env update). См. раздел "Security incident 2026-08-27" ниже.
 
 Прочитай ~/PycharmProjects/barber-bot/NEXT_SESSION_PROMPT.md — там полный
 контекст. Особое внимание:
@@ -534,9 +542,14 @@ entry, 5 menu callbacks) + 1.3b (FSM addslots) + 1.3c (FSM closeslot) +
   check ДО create_service. W1 (int(duration) cast) + W2 (SQLAlchemyError
   catch) — fixed. S1 (name>255 early validation) + S2 (redundant save)
   — fixed. +204/-1 строк.
-- ДЕПЛОЙ на prod (Timeweb, @My_Barber_hair_bot): 5029d85 (1.3a+1.3b+1.3c),
-  затем a631ad5 (1.3d). ВСЕ 5 inline menu flow'ов работают на prod.
-  Smoke test в Telegram — вручную (см. раздел "Smoke test plan" ниже).
+- Session 5.8 commit dc3d7c8: NEXT_SESSION_PROMPT 5.7 итог.
+- Session 5.8 commit 9aed5aa: SECURITY — VPS password + bot token + postgres
+  password удалены из NEXT_SESSION_PROMPT (были в публичном git history с
+  7194163). Credentials rotated пользователем вручную (passwd + /revoke +
+  .env update + docker compose up -d). Бот живой на prod с новым token.
+- ДЕПЛОЙ на prod (Timeweb, @My_Barber_hair_bot): 5029d85 (1.3a-c), a631ad5
+  (1.3d). ВСЕ 5 inline menu flow'ов работают на prod (НО inline menu НЕ
+  показывается при /start — это Этап 3, ниже).
 
 == РАЗВЁРТКА НА TIMWEB VPS (живой, 790₽/мес) ==
 - IP: 188.225.82.248, user: root, pass: <VPS_PASSWORD в 1Password/secrets manager>
@@ -591,13 +604,23 @@ INL-005 · CallbackData с action field · REJECT ❌ (наш подход type-
   2.3 — docstrings/comments: admin.py:1-14 "Stateful: YES" (уже в 96d318a),
         main.py:115 comment про /cancel в admin-FSM.
 
-Этап 3 — bot/handlers/start.py:
-  - Welcome для админа: убрать перечисление /addslots /closeslot /today /week
-    /services из текста. Прикрепить admin_inline_menu() (inline keyboard).
-  - Правка tests/test_start_handlers.py:48-68 asserts (5 asserts на /addslots
-    in text → упадут). Решение: переписать asserts на inline keyboard.
+Этап 3 — bot/handlers/start.py + /menu command в admin.py (ВКЛЮЧЁН В Session 5.9):
+  3.1 — cmd_start для админа: убрать перечисление /addslots /closeslot /today
+       /week /services из текста. Прикрепить admin_inline_menu()
+       (inline keyboard из keyboards/admin.py:56, УЖЕ СОЗДАНА, НЕ
+       используется). Убрать старую reply keyboard (admin_keyboard()).
+  3.2 — /menu command в admin.py (НОВАЯ команда): StateFilter(None),
+       _is_admin check, answer "📋 Меню:" + admin_inline_menu(). 13 сообщений
+       в admin.py ссылаются на "/menu — заново" (grep "/menu" → 13 строк) —
+       БЕЗ /menu это dead-end UX (админ не знает что делать после отмены).
+  3.3 — admin_menu_cb callback handler (ОПЦИОНАЛЬНО): AdminMenuCallbackData
+       (keyboards/admin.py:28, УЖЕ СОЗДАН, НЕ используется) — re-show menu
+       из inline кнопки. Рекомендую добавить (кнопка "📋 Меню" в welcome).
+  3.4 — Правка tests/test_start_handlers.py:48-68 — 5 asserts на
+       "/addslots" in text (строки 60-64) упадут после 3.1. Решение:
+       переписать asserts на inline keyboard (isinstance InlineKeyboardMarkup).
 
-Этап 4 — тесты:
+Этап 4 — тесты (после 1.3e + Этап 3):
   4.1 — Правка существующих (test_start_handlers.py, test_middlewares.py).
   4.2 — Новые тесты в tests/test_admin_handlers.py:
         - Menu callback — каждая из 5 кнопок триггерит правильный flow
@@ -693,7 +716,76 @@ INL-005 · CallbackData с action field · REJECT ❌ (наш подход type-
         if not _is_admin_callback(callback):
             await callback.answer()
             return
-        await callback.answer("Используйте /cancel для отмены", show_alert=False)
+         await callback.answer("Используйте /cancel для отмены", show_alert=False)
+
+== ЧТО ДЕЛАТЬ В ЭТАПЕ 3 (пошагово) ==
+
+1. Прочитай bot/handlers/start.py:18-32 (cmd_start — текущий код показывает
+   admin_keyboard() = reply keyboard с /addslots /closeslot /today /week
+   /services add + текст с перечислением команд).
+2. Прочитай bot/keyboards/admin.py:56-66 (admin_inline_menu — УЖЕ СОЗДАНА,
+   5 кнопок на русском: ➕ Открыть слоты, 🔒 Закрыть слот, 📅 Сегодня,
+   🗓 Неделя, 💇 Добавить услугу. НЕ используется нигде — grep пусто).
+3. Прочитай bot/keyboards/admin.py:28-32 (AdminMenuCallbackData — УЖЕ СОЗДАН,
+   prefix="admin_menu". НЕ используется — для кнопки "📋 Меню" в welcome).
+4. Прочитай tests/test_start_handlers.py:48-68 (test_cmd_start_admin — 5
+   asserts на "/addslots" in text упадут после 3.1).
+
+РЕАЛИЗАЦИЯ Этап 3 (3 файла: start.py, admin.py, test_start_handlers.py):
+
+  3.1 — bot/handlers/start.py: cmd_start для админа
+  Заменить:
+    - import: from bot.keyboards.admin import admin_keyboard
+    → from bot.keyboards.admin import admin_inline_menu
+    - admin branch: убрать текст с перечислением /addslots /closeslot /today
+      /week /services. Новый текст: "Привет, Екатерина! 👋\nУправление
+      записями — кнопки ниже:"
+    - reply_markup: admin_keyboard() → admin_inline_menu()
+  Client branch — БЕЗ ИЗМЕНЕНИЙ (booking hint, reply_markup=None).
+
+  3.2 — bot/handlers/admin.py: /menu command (НОВАЯ)
+  Добавить В НАЧАЛО admin.py (после imports, перед cmd_addslots):
+    @router.message(Command("menu"), StateFilter(None))
+    async def cmd_menu(message: Message) -> None:
+        """Show admin inline menu (re-show after actions).
+
+        13 сообщений в admin.py ссылаются на '/menu — заново' (grep) — без
+        этой команды dead-end UX. StateFilter(None) — НЕ ловит mid-FSM (там
+        /cancel сначала, потом /menu). _is_admin check — non-admin silent.
+        """
+        if not _is_admin(message):
+            return
+        await message.answer("📋 Меню:", reply_markup=admin_inline_menu())
+  NB: import admin_inline_menu в admin.py (сейчас импортируется только
+  admin_calendar_keyboard из bot.keyboards.admin — admin.py:38-45).
+
+  3.3 — bot/handlers/admin.py: admin_menu_cb callback (ОПЦИОНАЛЬНО)
+  Если в welcome сообщении будет кнопка "📋 Меню" — нужен callback handler:
+    @router.callback_query(AdminMenuCallbackData.filter(), StateFilter("*"))
+    async def admin_menu_cb(callback: CallbackQuery) -> None:
+        if not _is_admin_callback(callback):
+            await callback.answer()
+            return
+        if callback.message is not None:
+            await callback.message.answer("📋 Меню:", reply_markup=admin_inline_menu())
+        await callback.answer()
+  Можно пропустить если /menu command достаточно. Рекомендую добавить
+  (кнопка "📋 Меню" в welcome → удобнее, не набирать /menu).
+
+  3.4 — tests/test_start_handlers.py: правка asserts (строки 60-64)
+  Заменить:
+    assert "/addslots" in text
+    assert "/closeslot" in text
+    assert "/today" in text
+    assert "/week" in text
+    assert "/services" in text
+  На:
+    reply_markup = msg.answer.call_args.kwargs.get("reply_markup")
+    assert reply_markup is not None, "admin /start must include inline menu"
+    from aiogram.types import InlineKeyboardMarkup
+    assert isinstance(reply_markup, InlineKeyboardMarkup), "must be inline"
+  Убрать assert "/addslots" in text (текст больше не перечисляет команды).
+  Оставить assert "Привет, Екатерина" in text (welcome остаётся).
 
 ПОРЯДОК РЕГИСТРАЦИИ внутри admin_router (ВАЖНО — aiogram router order):
   1. Специфичные commands (/addslots /closeslot /today /week /services) — StateFilter(None)
@@ -747,9 +839,13 @@ NB: После 1.3e — Этап 1.3 ПОЛНОСТЬЮ готов. Дальше
 - Push в origin/main после verify + code-review
 
 == NEXT ==
-Этап 1.3e — /cancel с StateFilter(AdminStates) в admin_router + admin-state
-catch-all (text + callback). Последний подэтап 1.3. После — Этап 2 (middleware
-TTL) или Этап 3 (start.py welcome для админа).
+Session 5.9 — ДВА этапа:
+  (1) Этап 1.3e: /cancel + admin-state catch-all в admin_router.
+  (2) Этап 3: cmd_start для админа → admin_inline_menu() (вместо admin_keyboard),
+      /menu command (13 ссылок в admin.py на "/menu — заново" — без команды
+      dead-end UX), admin_menu_cb callback (опционально), правка тестов.
+После 5.9 — Этап 1.3 полностью готов. Дальше Этап 2 (middleware TTL) или
+Этап 4 (тесты для 1.3a-d + 1.3e + Этап 3).
 ```
 
 ## Session 5.6 — доноры inline admin menu (UznetDev/Aiogram-Bot-Template, INSIGHT INL-001..005)
@@ -1067,6 +1163,49 @@ Re-review (BP-10 A2 verify fixes): **LGTM** — все 5 fixes верифици�
 - Этап 2 (middleware TTL 60 мин для админа) — после 1.3e.
 - Этап 3 (start.py welcome для админа + inline menu) — после 1.3e.
 - Этап 4 (тесты для 1.3a-d) — после 1.3e.
+
+### Security incident 2026-08-27 (post-5.8, commit 9aed5aa)
+
+**Что случилось:** VPS пароль `hA+-PZrPCGmVV3` + bot token
+`8935808150:AAEJOLoklDzQQrrmBH4KzHS2JphMa5uzIBQ` + Postgres пароль
+`ChangeMe123` лежали в `NEXT_SESSION_PROMPT.md` с commit `7194163` (Session 5.5,
+2026-08-27 11:32). Репо `github.com/andrey21t/barber-bot` — PUBLIC
+(`gh repo view --json isPrivate` → `false`). Любой мог открыть git history,
+найти credentials, зайти на VPS под root / управлять ботом.
+
+**Mitigation (выполнено, 27 авг 2026 16:35 MSK):**
+1. ✅ VPS пароль сменён через `ssh root@188.225.82.248` → `passwd`.
+   Старый пароль мёртв.
+2. ✅ Bot token rotated через @BotFather → `/revoke`. Старый token revoked.
+3. ✅ `/opt/barber-bot/.env` обновлён новым token, бот перезапущен
+   (`docker compose up -d`), логи: `Run polling for bot @My_Barber_hair_bot`.
+4. ✅ Commit `9aed5aa` — credentials заменены на плейсхолдеры
+   `<VPS_PASSWORD в 1Password>` / `<BOT_TOKEN в /opt/barber-bot/.env>` /
+   `<в .env>` в NEXT_SESSION_PROMPT.md. Запушен.
+5. ⚠️ Postgres пароль `ChangeMe123` НЕ сменён (Postgres на 127.0.0.1, снаружи
+   недоступен — низкий риск). TODO: сменить в .env на сервере + docker compose
+   down → up (опционально, не блокирующее).
+6. ⚠️ git history НЕ переписан (filter-repo + force-push + GitHub cache purge —
+   overkill для pet-project после rotate credentials, старые значения
+   бесполезны). Pragmatic решение принято пользователем.
+
+**Корневая причина (root cause):** при написании NEXT_SESSION_PROMPT (Session 5.5,
+план Вариант B) пользователь вставил VPS credentials для контекста следующей
+сессии (deploy info). AI-ассистент скопировал их в .md файл, не пометив как
+секрет. Файл закоммитили в публичный репо. Incident обнаружен при verify
+работы Session 5.8 (independent check кода через `gh repo view`).
+
+**Lesson learned (для будущих сессий):**
+- НИКАКИХ credentials в .md файлах репо (даже private). Только плейсхолдеры:
+  `<VPS_PASSWORD в 1Password>`, `<BOT_TOKEN в .env>`.
+- `.env` всегда в `.gitignore` (проверить: `git ls-files | grep .env` должен
+  вернуть пусто).
+- `.env.example` — OK (плейсхолдеры, не реальные значения).
+- AI-ассистент: при виде credentials в пользовательском тексте — сразу
+  предложить плейсхолдер, НЕ копировать в файл.
+- Pet-project pet-project pet-project ≠ private. Barber-bot репо PUBLIC —
+  та же логика для всех будущих пет-проектов: считаем репо публичным по
+  умолчанию, никаких секретов в git history.
 
 ## Cross-refs
 
