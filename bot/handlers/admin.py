@@ -451,9 +451,10 @@ async def admin_addslots_cb(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         return
 
-    # _is_admin_callback guarantees callback.from_user is not None.
-    user_id = callback.from_user.id if callback.from_user is not None else 0
-    resolved = await _resolve_master_and_business(user_id)
+    # _is_admin_callback guarantees callback.from_user is not None (mypy не сужает тип
+    # после вызова функции — assert здесь как type narrowing, runtime no-op).
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
     if resolved is None:
         await callback.answer("❌ Мастер не найден", show_alert=True)
         return
@@ -481,9 +482,9 @@ async def admin_closeslot_cb(callback: CallbackQuery, state: FSMContext) -> None
         await callback.answer()
         return
 
-    # _is_admin_callback guarantees callback.from_user is not None.
-    user_id = callback.from_user.id if callback.from_user is not None else 0
-    resolved = await _resolve_master_and_business(user_id)
+    # _is_admin_callback guarantees callback.from_user is not None (type narrowing).
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
     if resolved is None:
         await callback.answer("❌ Мастер не найден", show_alert=True)
         return
@@ -510,9 +511,9 @@ async def admin_today_cb(callback: CallbackQuery) -> None:
         await callback.answer()
         return
 
-    # _is_admin_callback guarantees callback.from_user is not None.
-    user_id = callback.from_user.id if callback.from_user is not None else 0
-    resolved = await _resolve_master_and_business(user_id)
+    # _is_admin_callback guarantees callback.from_user is not None (type narrowing).
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
     if resolved is None:
         await callback.answer("❌ Мастер не найден", show_alert=True)
         return
@@ -539,9 +540,9 @@ async def admin_week_cb(callback: CallbackQuery) -> None:
         await callback.answer()
         return
 
-    # _is_admin_callback guarantees callback.from_user is not None.
-    user_id = callback.from_user.id if callback.from_user is not None else 0
-    resolved = await _resolve_master_and_business(user_id)
+    # _is_admin_callback guarantees callback.from_user is not None (type narrowing).
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
     if resolved is None:
         await callback.answer("❌ Мастер не найден", show_alert=True)
         return
