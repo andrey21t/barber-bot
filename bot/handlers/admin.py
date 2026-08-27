@@ -4,10 +4,12 @@ Contract (spec.md 200-213, 251, 307-309):
 - Auth: F.from_user.id == settings.ADMIN_ID (MVP single-master). TODO Ур. 2.6:
   extract to middleware/role.py (spec 258) — DB lookup current_business, current_master.
   _is_admin — для Message, _is_admin_callback — для CallbackQuery (callback.from_user).
-- Stateful: PARTIAL — command handlers (/addslots /closeslot /today /week /services)
-  run StateFilter(None) (no FSM). Inline-menu callbacks (Этап 1.3a) — StateFilter("*"),
-  стартуют FSM-потоки через state.set_state(AdminStates.*).
-- 5 command handlers + 5 inline-menu callbacks (alias точки входа в flow).
+- Stateful: YES — 5 command handlers (/addslots /closeslot /today /week /services)
+  run StateFilter(None) (no FSM). 5 inline-menu callbacks (Этап 1.3a) — StateFilter("*"),
+  стартуют FSM-потоки через state.set_state(AdminStates.*). FSM addslots (1.3b) —
+  calendar handler + hours message handler, переход calendar→hours через edit_message_text
+  (INL-001). FSM closeslot (1.3c) — TODO. FSM services (1.3d) — TODO.
+- 5 command handlers + 5 inline-menu callbacks + 2 addslots FSM handlers (1.3b).
 - Pure I/O: parse args, call service, render result. NO business logic here.
 - HTML escape: client_name_snapshot already escaped in DB (booking.py), render
   WITHOUT re-escape (Telegram parse_mode=HTML). Newlines in snapshot are
@@ -23,10 +25,13 @@ from decimal import Decimal, InvalidOperation
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from aiogram import Router
+from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
+from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback
+from aiogram_calendar.schemas import SimpleCalAct
 
 from bot.config import get_settings
 from bot.db import async_session_factory
@@ -469,6 +474,194 @@ async def admin_addslots_cb(callback: CallbackQuery, state: FSMContext) -> None:
             reply_markup=await admin_calendar_keyboard(*_admin_calendar_range(tz)),
         )
     await callback.answer()
+
+
+# ============================================================
+# Inline menu callbacks (Вариант B, spec.md 251) — Этап 1.3b
+#
+# FSM для addslots: date (SimpleCalendar) → hours (text input) → create.
+# Calendar handler закрыл W3 (calendar-tap dangling из 1.3a code-review).
+#
+# INL-001 (donor: UznetDev/Aiogram-Bot-Template/main_admin_panel.py:30-34):
+# при переходе calendar → ask hours ИСПОЛЬЗУЕМ edit_message_text (НЕ answer),
+# чат админа не засоряется. Fallback на answer если message нельзя edit
+# (>48h / удалено — TelegramBadRequest).
+# ============================================================
+
+
+@router.callback_query(SimpleCalendarCallback.filter(), StateFilter(AdminStates.adding_slots_date))
+async def admin_addslots_calendar_cb(
+    callback: CallbackQuery,
+    callback_data: SimpleCalendarCallback,
+    state: FSMContext,
+) -> None:
+    """SimpleCalendar для addslots — навигация + выбор даты.
+
+    Branch by callback_data.act (паттерн из client.py:124-211):
+    - ignore/today+same-month: callback.answer(cache_time=60) — lib не вызывается
+    - day: сохраняем selected_date, set_state(adding_slots_hours), edit_message_text
+    - cancel: state.clear() + edit "Отменено"
+    - navigation (prev_y/next_y/prev_m/next_m/today-diff-month): lib сделал
+      edit_reply_markup, handler answers
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+
+    # _is_admin_callback guarantees callback.from_user is not None (type narrowing).
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await state.clear()
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    _master_id, _business_id, tz = resolved
+
+    # act=ignore/today+same-month: lib не вызывается (early return), handler answers
+    # cache_time=60 — contract с aiogram_calendar 0.6.0 (lib answer на этих ветках
+    # сам если бы вызвался, handler делает это вместо).
+    if callback_data.act == SimpleCalAct.ignore:
+        await callback.answer(cache_time=60)
+        return
+    if callback_data.act == SimpleCalAct.today:
+        # lib использует system-local datetime.now() для same-month check
+        # (simple_calendar.py:173) — handler матч'ит чтобы избежать TZ-mismatch.
+        today_sys = datetime.now().replace(tzinfo=None)
+        if today_sys.year == callback_data.year and today_sys.month == callback_data.month:
+            await callback.answer(cache_time=60)
+            return  # same-month: lib бы answer cache_time=60, handler вместо
+
+    cal = SimpleCalendar(locale="ru_RU", cancel_btn="Отмена", today_btn="Сегодня")
+    cal.set_dates_range(*_admin_calendar_range(tz))
+    selected, selected_date = await cal.process_selection(callback, callback_data)
+
+    if callback_data.act == SimpleCalAct.day:
+        if not selected:
+            return  # out-of-range — lib answered alert, do nothing
+        slot_date = selected_date.date()
+        await state.update_data(selected_date=slot_date.isoformat())
+        await state.set_state(AdminStates.adding_slots_hours)
+
+        # INL-001: edit_message_text — чат не засоряется.
+        # reply_markup=None убирает calendar keyboard.
+        # isinstance сужает Message | InaccessibleMessage → Message (у
+        # InaccessibleMessage нет edit_text, mypy:union-attr).
+        ask_text = (
+            f"Дата: <b>{slot_date.strftime('%d %B %Y')}</b>\n"
+            "Введите часы через пробел (например <code>11 12 13 14</code>):"
+        )
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(ask_text, reply_markup=None)
+            except TelegramBadRequest:
+                # message нельзя edit (>48h, удалено) — fallback на новое сообщение
+                await callback.message.answer(ask_text)
+        await callback.answer()
+        return
+
+    if callback_data.act == SimpleCalAct.cancel:
+        await state.clear()
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(
+                    "❌ Открытие слотов отменено. /menu — заново",
+                    reply_markup=None,
+                )
+            except TelegramBadRequest:
+                await callback.message.answer("❌ Открытие слотов отменено. /menu — заново")
+        await callback.answer()
+        return
+
+    # Navigation (prev_y/next_y/prev_m/next_m/today-diff-month):
+    # lib сделал edit_reply_markup, handler answers.
+    await callback.answer()
+
+
+@router.message(StateFilter(AdminStates.adding_slots_hours), F.text, ~F.text.startswith("/"))
+async def admin_addslots_hours_msg(message: Message, state: FSMContext) -> None:
+    """User typed hours → parse + add_slots + render result.
+
+    Re-use парсинга из cmd_addslots:148-180. State терминальный — state.clear() в конце.
+
+    NB W1 (code-review 1.3b): `~F.text.startswith("/")` в фильтре — НЕ ловит команды.
+    `/cancel` из этого state проваливается в client_router (client.py:443,
+    Command("cancel") + StateFilter("*")) — документированный escape hatch.
+    Полный catch-all (для non-/ текст) — Этап 1.3e.
+    """
+    if not _is_admin(message):
+        return  # silently ignore non-admin
+
+    data = await state.get_data()
+    selected_date_iso = data.get("selected_date")
+    if not selected_date_iso:
+        # State loss mid-flow (restart, timeout) — graceful exit, ask заново.
+        await state.clear()
+        await message.answer("❌ Дата не выбрана. Откройте слоты заново через /menu")
+        return
+
+    try:
+        slot_date = date.fromisoformat(selected_date_iso)
+    except ValueError:
+        # Защита от протухшего/повреждённого state (defense-in-depth).
+        await state.clear()
+        await message.answer("❌ Ошибка даты в сессии. Начните заново через /menu")
+        return
+
+    # Parse hours (re-use cmd_addslots:148-154 logic).
+    text = message.text or ""
+    try:
+        hours_raw = [int(h) for h in text.split()]
+    except ValueError:
+        await message.answer("❌ Часы должны быть числами 0-23 (например 11 12 13)")
+        return  # state stays — ask again
+
+    if not hours_raw:
+        await message.answer("❌ Введите хотя бы один час (например 11 12 13)")
+        return  # state stays
+
+    hours = sorted(set(hours_raw))  # dedup (composite UNIQUE в DB)
+
+    admin_id = _require_admin_or_silent(message)
+    assert admin_id is not None
+    resolved = await _resolve_master_and_business(admin_id)
+    if resolved is None:
+        # W2 (code-review 1.3b): clear state — unrecoverable error, consistency
+        # с calendar handler (514-517) и past-date check ниже.
+        await state.clear()
+        await message.answer("❌ Мастер не найден. Обратитесь к администратору.")
+        return
+    master_id, _business_id, tz = resolved
+
+    # spec.md 401: slot_date must not be in the past (defensive — calendar уже фильтровал,
+    # но между выбором даты и вводом часов мог пройти день).
+    today_local = datetime.now(ZoneInfo(tz)).date()
+    if slot_date < today_local:
+        await message.answer(
+            f"❌ Нельзя создать слот в прошлом. Сегодня: {today_local.strftime('%d.%m.%Y')}"
+        )
+        await state.clear()
+        return
+
+    async with async_session_factory() as session:
+        try:
+            created = await add_slots(session, master_id, slot_date, hours)
+        except ValueError as exc:
+            await message.answer(f"❌ {exc}")
+            return  # state stays — может исправить часы
+        except SlotAlreadyExistsError:
+            await message.answer("❌ Один из слотов уже существует (гонка). Попробуйте ещё раз.")
+            return
+
+    await state.clear()  # терминальный
+    if created:
+        hours_str = ", ".join(str(s.slot_hour) for s in created)
+        await message.answer(
+            f"✅ Открыты слоты на {slot_date.strftime('%d %B')}:\n<b>{hours_str}</b>"
+        )
+    else:
+        await message.answer(
+            f"Все слоты на {slot_date.strftime('%d %B')} уже открыты — ничего не добавлено."
+        )
 
 
 @router.callback_query(AdminCloseslotCallbackData.filter(), StateFilter("*"))
