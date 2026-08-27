@@ -539,7 +539,9 @@ entry, 5 menu callbacks) + 1.3b (FSM addslots) + 1.3c (FSM closeslot) +
   Smoke test в Telegram — вручную (см. раздел "Smoke test plan" ниже).
 
 == РАЗВЁРТКА НА TIMWEB VPS (живой, 790₽/мес) ==
-- IP: 188.225.82.248, user: root, pass: hA+-PZrPCGmVV3
+- IP: 188.225.82.248, user: root, pass: <VPS_PASSWORD в 1Password/secrets manager>
+  NB: пароль ранее был в этом файле в публичном git history (commit 7194163) —
+  СКОМПРОМЕТИРОВАН. Сменить через ssh root@188.225.82.248 → passwd (Шаг 2).
 - Команды: ssh root@188.225.82.248
   cd /opt/barber-bot && git pull && docker compose down && docker compose up -d --build
   docker compose logs bot --tail 30 (логи)
@@ -547,9 +549,11 @@ entry, 5 menu callbacks) + 1.3b (FSM addslots) + 1.3c (FSM closeslot) +
 - БД seeded: Business 'Barber Ekaterina' + Master 'Ekaterina' telegram_id=461355056.
   /today, /week, /addslots, /closeslot, /services — command-версии работают.
   Inline menu (1.3a-d) — ДЕПЛОЕНО, все 5 кнопок live.
-- Бот: @My_Barber_hair_bot (telegram), token 8935808150:AAEJOLoklDzQQrrmBH4KzHS2JphMa5uzIBQ
+- Бот: @My_Barber_hair_bot (telegram), token: <BOT_TOKEN в /opt/barber-bot/.env>
+  NB: token ранее был в этом файле в публичном git history (commit 7194163) —
+  СКОМПРОМЕТИРОВАН. Rotate через @BotFather /revoke (Шаг 2).
 - .env на сервере: /opt/barber-bot/.env (BOT_TOKEN, ADMIN_ID=461355056,
-  POSTGRES_USER=barber, POSTGRES_PASSWORD=ChangeMe123, POSTGRES_DB=barber)
+  POSTGRES_USER=barber, POSTGRES_PASSWORD=<в .env>, POSTGRES_DB=barber)
 - sshpass на macOS НЕ установлен — деплой через expect-скрипт (см. session
   5.8 deploy-barber.expect pattern). Пароль в expect-скрипте, удалять после.
 
