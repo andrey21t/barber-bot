@@ -56,28 +56,44 @@ def _answer_text(msg: MagicMock) -> str:
 
 @pytest.mark.asyncio
 async def test_cmd_start_admin_shows_welcome_and_inline_menu() -> None:
-    """/start from admin (ADMIN_ID) → welcome 'Привет, Екатерина!' + inline menu.
+    """/start from admin (ADMIN_ID) → cleanup reply keyboard + inline menu.
 
     Этап 3 (Session 5.9): cmd_start показывает admin_inline_menu() (5 inline
     кнопок) вместо admin_keyboard() (reply keyboard). Текст больше НЕ
     перечисляет /addslots /closeslot /today /week /services — только welcome.
+
+    Fix (post-deploy): admin-ветка отправляет 2 сообщения — сначала cleanup
+    (ReplyKeyboardRemove), потом inline menu. Telegram не убирает старую
+    reply keyboard автоматически, нужен явный ReplyKeyboardRemove.
     """
     msg = _make_message(user_id=ADMIN_TG_ID)
     state = _make_state()
     await start_handlers.cmd_start(msg, state)
 
-    msg.answer.assert_awaited_once()
+    # 2 вызова answer: (1) cleanup reply keyboard, (2) inline menu
+    assert msg.answer.await_count == 2
     state.clear.assert_awaited_once()  # W1 fix: /start clears FSM state
-    text = _answer_text(msg)
+
+    # Второй вызов — inline menu
+    second_call = msg.answer.await_args_list[1]
+    text = str(second_call.args[0]) if second_call.args else str(
+        second_call.kwargs.get("text", "")
+    )
     assert "Привет, Екатерина" in text
     # Этап 3: текст больше НЕ перечисляет команды (только welcome)
     assert "/addslots" not in text
     assert "/closeslot" not in text
-    # admin_inline_menu — InlineKeyboardMarkup (не reply keyboard)
-    reply_markup = msg.answer.call_args.kwargs.get("reply_markup")
+    reply_markup = second_call.kwargs.get("reply_markup")
     assert reply_markup is not None, "admin /start must include inline menu"
-    from aiogram.types import InlineKeyboardMarkup
+    from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardRemove
     assert isinstance(reply_markup, InlineKeyboardMarkup), "must be inline keyboard"
+
+    # Первый вызов — cleanup reply keyboard
+    first_call = msg.answer.await_args_list[0]
+    first_rm = first_call.kwargs.get("reply_markup")
+    assert isinstance(first_rm, ReplyKeyboardRemove), (
+        "first message must cleanup old reply keyboard"
+    )
 
 
 # ============================================================
