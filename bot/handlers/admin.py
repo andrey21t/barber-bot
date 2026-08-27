@@ -39,10 +39,12 @@ from bot.db import async_session_factory
 from bot.keyboards.admin import (
     AdminAddslotsCallbackData,
     AdminCloseslotCallbackData,
+    AdminMenuCallbackData,
     AdminServicesCallbackData,
     AdminTodayCallbackData,
     AdminWeekCallbackData,
     admin_calendar_keyboard,
+    admin_inline_menu,
 )
 from bot.models import Booking
 from bot.services.admin import (
@@ -119,6 +121,48 @@ def _require_admin_or_silent(message: Message) -> int | None:
     if not _is_admin(message):
         return None
     return message.from_user.id if message.from_user is not None else None
+
+
+# ============================================================
+# Этап 3 (Session 5.9) — /menu command + admin_menu_cb callback
+# ============================================================
+# /menu — re-show inline menu (13 сообщений в admin.py ссылаются на
+# "/menu — заново" — без команды dead-end UX). StateFilter(None) — НЕ ловит
+# mid-FSM (там /cancel сначала, потом /menu). admin_menu_cb — для кнопки
+# "📋 Меню" в welcome (если будет добавлена в admin_inline_menu() в будущем).
+# ============================================================
+
+
+@router.message(Command("menu"), StateFilter(None))
+async def cmd_menu(message: Message) -> None:
+    """Show admin inline menu (re-show after actions).
+
+    13 сообщений в admin.py ссылаются на '/menu — заново' (grep) — без
+    этой команды dead-end UX. StateFilter(None) — НЕ ловит mid-FSM (там
+    /cancel сначала, потом /menu). _is_admin check — non-admin silent.
+    """
+    if not _is_admin(message):
+        return
+    await message.answer("📋 Меню:", reply_markup=admin_inline_menu())
+
+
+@router.callback_query(AdminMenuCallbackData.filter(), StateFilter("*"))
+async def admin_menu_cb(callback: CallbackQuery) -> None:
+    """Re-show admin inline menu from inline button '📋 Меню'.
+
+    AdminMenuCallbackData (keyboards/admin.py:28) — empty callback для
+    кнопки '📋 Меню' в welcome. Кнопка пока НЕ добавлена в admin_inline_menu()
+    (5 кнопок по spec.md 251), но callback handler зарегистрирован для
+    будущего использования (если пользователь добавит 6-ю кнопку).
+    StateFilter("*") — матчит в любом state (включая admin FSM), НЕ чистит
+    state (только re-show menu — пользователь может вернуться к flow).
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    if callback.message is not None:
+        await callback.message.answer("📋 Меню:", reply_markup=admin_inline_menu())
+    await callback.answer()
 
 
 # ============================================================
@@ -1161,3 +1205,68 @@ async def admin_service_price_msg(message: Message, state: FSMContext) -> None:
         f"⏱ {service.duration_minutes} мин\n"
         f"💰 {service.price} ₽"
     )
+
+
+# ============================================================
+# Этап 1.3e — /cancel в admin_router + admin-state catch-all
+# (ПОСЛЕДНИЙ подэтап 1.3, Session 5.9)
+# ============================================================
+# Регистрация В КОНЦЕ admin.py — aiogram router обрабатывает в порядке
+# декораторов. Catch-all должен быть ПОСЛЕ всех специфичных handlers
+# (cmd_addslots, calendar_cb, hours_msg, hour_msg, name_msg, duration_msg,
+# price_msg), иначе перехватит раньше. /cancel — ПОСЛЕ FSM handlers, но
+# ПЕРЕД catch-all (точка 4 в порядке регистрации ниже).
+# Порядок внутри admin_router:
+#   1. Специфичные commands (/addslots /closeslot /today /week /services) — StateFilter(None)
+#   2. Menu callbacks (admin_addslots_cb и др.) — StateFilter("*") + callback filter
+#   3. FSM handlers (calendar_cb, hours_msg, hour_msg, name_msg, duration_msg,
+#      price_msg) — StateFilter(specific)
+#   4. /cancel (admin_cancel_msg) — StateFilter(AdminStates) + Command("cancel")
+#   5. Catch-all text — StateFilter(AdminStates) + F.text + ~startswith("/")
+#   6. Catch-all callback — StateFilter(AdminStates)
+# admin_router включается ПЕРЕД client_router (main.py:118-119), поэтому
+# /cancel из admin FSM states ловится ЗДЕСЬ, не в client_router cancel_msg
+# (client.py:443, booking-specific "Ввод отменён. /book чтобы начать заново").
+# ============================================================
+
+
+@router.message(Command("cancel"), StateFilter(AdminStates))
+async def admin_cancel_msg(message: Message, state: FSMContext) -> None:
+    """Cancel admin FSM flow — clears state, admin-specific message.
+
+    StateFilter(AdminStates) матчит ЛЮБОЙ из 7 admin states. /cancel в
+    BookingStates или StateFilter(None) НЕ матчится — проваливается в
+    client_router cancel_msg (client.py:443).
+    state.clear() BEFORE answer (race condition, MY-VIBE-RULES.md 24).
+    """
+    if not _is_admin(message):
+        return  # non-admin в admin state — edge case (storage isolation), silent
+    await state.clear()
+    await message.answer("Админ-режим отменён. /menu для меню")
+
+
+@router.message(StateFilter(AdminStates), F.text, ~F.text.startswith("/"))
+async def admin_state_catchall_text(message: Message) -> None:
+    """Catch-all для non-/ текста в admin FSM state.
+
+    Если специфичный handler (name/duration/price/hours/hour) не заматчился
+    (например, юзер в entering_service_name, но ввёл что-то не то) — бот
+    НЕ молчит, а подсказывает /cancel. ~F.text.startswith("/") — /commands
+    (включая /cancel) НЕ ловит, проваливаются в свои handlers.
+    """
+    if not _is_admin(message):
+        return
+    await message.answer("Используйте /cancel для отмены")
+
+
+@router.callback_query(StateFilter(AdminStates))
+async def admin_state_catchall_callback(callback: CallbackQuery) -> None:
+    """Catch-all для stale callback в admin FSM state.
+
+    Stale calendar tap после отмены flow (callback от старого keyboard).
+    Без catch-all бот молчит, callback.answer() убирает loading spinner.
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    await callback.answer("Используйте /cancel для отмены", show_alert=False)
