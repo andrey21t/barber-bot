@@ -1,6 +1,6 @@
-# NEXT_SESSION_PROMPT — Session 4 + 4.5 закрыты. Session 5 (Render smoke test + L2 atomicity) готова к старту.
+# NEXT_SESSION_PROMPT — Session 5 закрыт (Render smoke через Timeweb VPS), Session 5.5 готов (Вариант B: inline admin menu + FSM).
 
-> Дата: 2026-08-24 · Session 4 + 4.5 закоммичены и запушены (commits `66e11e4` + `e3cf1dc` + `8d70a76` + `38f5dc2` + `559ccbe` + `357b616`). FSM PostgresStorage реализован (L5 + L1 callback fallback), L4 dropped (ContextVar не работает с AsyncIOScheduler). L3 — batched NOT EXISTS subquery. Session 4.5: Findings 4-7 (refactor) + Postgres SQL construction tests 100% coverage + LBTM re-review (tautological assertions fixed). Deep-analysis: 3 critic итерации. Code-review iter 1 LGTM + 4 warnings applied (W1 race / W2 contract / W3 onupdate / W4 events_isolation). Session 4.5 code-review iter 1 LBTM (2 critical) + iter 2 LGTM (mutation tests verified). **Готов к user GO → Session 5.**
+> Дата: 2026-08-27 · Session 5 commit fda9263 + 4e90a9d (Docker на Timeweb VPS, 790₽/мес, бот @My_Barber_hair_bot живой). Session 5.5 commit f239774 (Этап 1.1 AdminStates + Этап 1.2 inline menu keyboards). Deep-analysis 2 итерации critic (SURFACE_LEVEL → INCOMPLETE по протоколу max 2). User выбрал Вариант C (малые шаги + verify+review). Code-reviewer LBTM (F1 docstring ложный) → fixed → LGTM. **Готов к Этапу 1.3 (handlers/admin.py — самый большой, разбит на 1.3a-e).**
 
 ## Контекст проекта
 
@@ -504,62 +504,174 @@ databases:
 ## Quick start prompt для opencode (вставить в новую сессию)
 
 ```
-Продолжаем barber-bot Session 5 (Render smoke test + L2 atomicity + new features).
+Продолжаем barber-bot Session 5.5 — реализация Варианта B (inline admin menu +
+FSM для мастера Екатерины). Session 5 частично закрыта (Render smoke выполнен
+через Timeweb VPS, admin UX refactor в процессе).
 
-Прочитай ~/PycharmProjects/barber-bot/NEXT_SESSION_PROMPT.md — там полный контекст:
-- Sessions 1-4 закоммичены и запушены (origin/main, последний commit 357b616).
-- Session 4 (commit 66e11e4 + e3cf1dc + 8d70a76): PostgresStorage (L5 + L1 callback fallback),
-  L3 batched NOT EXISTS, L4 dropped (ContextVar incompatible с AsyncIOScheduler).
-- Session 4.5 (commit 38f5dc2 + 559ccbe + 357b616): Findings 4-7 (refactor:
-  alembic 003 SQLite TIMESTAMP timezone, dialect_name cache, removed redundant
-  SELECT in _upsert_state, single atomic pg_insert.on_conflict_do_update с JSONB
-  || excluded.data merge) + Postgres SQL construction tests (15 тестов, 100%
-  coverage на fsm_storage.py) + LBTM re-review (2 critical tautological assertions
-  fixed, mutation-tested).
+Прочитай ~/PycharmProjects/barber-bot/NEXT_SESSION_PROMPT.md — там полный
+контекст. Особое внимание разделу "Session 5.5 — план Варианта B (inline admin
+menu + FSM)" ниже.
 
-Статус: READY FOR SESSION 5. Sessions 1-4.5 closed, всё запушено в origin/main.
+== СТАТУС ==
+- Sessions 1-4.5 закоммичены и запушены (origin/main).
+- Session 5 commit fda9263 + 4e90a9d: Dockerfile + docker-compose.yml +
+  host network fix (Telegram IPv6 blocked в Docker bridge на Timeweb).
+- Session 5.5 commit f239774: Этап 1.1 (AdminStates в states.py) + Этап 1.2
+  (inline menu keyboards в keyboards/admin.py). Deep-analysis 2 итерации
+  critic (SURFACE_LEVEL → INCOMPLETE по протоколу, max 2 iter). User выбрал
+  Вариант C (малые шаги с verify+review после каждого файла). Code-reviewer
+  LBTM (F1 docstring 'не показывается в /start' — ложно) → fixed → LGTM.
 
-Что осталось (Session 5 scope):
-1. Render smoke test (ВРУЧНУЮ — нужен деплой + реальный Telegram):
-   - /start → бот отвечает
-   - /book → выбор даты/слота/имени/услуги → бронь создаётся
-   - Master notification приходит на settings.ADMIN_ID
-   - FSM state survives restart: /book mid-flow → Render restart (15 min) →
-     продолжить → state preserved (новый PostgresStorage, миграция 003 выполнена)
-   - /mybookings → [🚠 Отменить] → отменяется → EXCLUDE не срабатывает на той
-     же дате/времени (UNIQUE slot_id fallback на SQLite, EXCLUDE USING gist на Postgres)
-   - [🔄 Перенести] → выбор нового слота → перенос выполняется, старый slot освобождается
-   - Bot restart mid-FSM → tap stale inline button → no_state_callback_fallback
-     показывает popup "Сессия истекла — начните через /book"
-2. L2 atomicity (production-level, materially changes):
-   - Двухфазная схема log_notification: INSERT с sent_at=NULL → UPDATE sent_at=now()
-     после успешного send_message → reaper для зависших (sent_at=NULL старше N минут)
-   - Меняет contract notifications_log (sent_at становится nullable, добавляется
-     reaper job в scheduler). Нужен deep-analysis (logic change + state machine).
-3. Postgres JSONB runtime coverage (Honest limitation):
-   - SQL construction покрыт (test_fsm_storage_postgres.py, 15 тестов, 100% line)
-   - Runtime: JSONB || merge semantics, ON CONFLICT target matching, RETURNING
-     population — НЕ exercised (needs testcontainers Postgres ИЛИ Render smoke).
-   - Pragmatic для pet: оставить как Honest limitation, Render smoke покроет.
+== РАЗВЁРТКА НА TIMWEB VPS (живой, 790₽/мес) ==
+- IP: 188.225.82.248, user: root, pass: hA+-PZrPCGmVV3
+- Команды: ssh root@188.225.82.248
+  cd /opt/barber-bot && git pull && docker compose down && docker compose up -d --build
+  docker compose logs bot --tail 30 (логи)
+  docker compose ps (статус)
+- БД seeded: Business 'Barber Ekaterina' (id 04d1be59-422a-4f92-88bf-242031f14d82)
+  + Master 'Ekaterina' telegram_id=461355056. /today, /week, /addslots УЖЕ
+  работают на prod. Smoke test пройден частично (команды работают, FSM state
+  survives restart НЕ проверяли — нужно: /book mid-flow → docker compose
+  down → up → продолжить).
+- Бот: @My_Barber_hair_bot (telegram), token 8935808150:AAEJOLoklDzQQrrmBH4KzHS2JphMa5uzIBQ
+- .env на сервере: /opt/barber-bot/.env (BOT_TOKEN, ADMIN_ID=461355056,
+  POSTGRES_USER=barber, POSTGRES_PASSWORD=ChangeMe123, POSTGRES_DB=barber)
 
-Master handlers end-to-end на Render (Урок 2.5+):
-- /today уже работает локально (admin.py:243), проверить на prod
-- master_new/cancel/transfer УЖЕ реализованы в handlers (client.py:423-427,
-  609-613, 843-847), покрыты тестами — закрыто без новой работы
+== ЧТО ОСТАЛОСЬ (Session 5.5 scope — Вариант B) ==
 
-Гейты (напоминание):
-- qa-verify-and-fix после правок кода (pytest + ruff + mypy)
+ПЛАН A (расширенный после 2 итераций deep-analysis-critic):
+- 21 находка critic (10 iter 1 + 11 iter 2) — все в плане, решаются в коде.
+- Вариант C: 1 файл → verify (pytest+ruff+mypy) → code-review → следующий.
+
+Этап 1.3 — bot/handlers/admin.py (САМЫЙ БОЛЬШОЙ, ~300-400 строк, разбит на
+подэтапы):
+  1.3a — _is_admin_callback(callback) для auth CallbackQuery (admin.py:70-77
+         _is_admin работает только с Message.from_user, НЕ подходит для
+         CallbackQuery). + 5 menu callback handlers (StateFilter(None) +
+         admin_* filter) — точки входа в flow. Каждый: callback.answer() +
+         state.set_state(AdminStates.<first_state>) + показать calendar/ask.
+  1.3b — FSM для addslots (AdminStates.adding_slots_date → adding_slots_hours):
+         SimpleCalendar handler с StateFilter(AdminStates.adding_slots_date)
+         (новый, текущий в client.py:213 привязан к BookingStates — НЕ
+         сработает для admin-state без правки). После выбора даты → ask hours
+         → parse + add_slots service → "✅ Слоты созданы".
+  1.3c — FSM для closeslot (AdminStates.closing_slot_date → closing_slot_hour):
+         аналогично addslots. После выбора даты → ask hour → close_slot
+         service → "✅ Слот закрыт".
+  1.3d — FSM для services (3 шага: name → duration → price):
+         AdminStates.entering_service_name → _duration → _price.
+         Name с пробелами ОК (create_service делает name.strip(), сохраняет
+         внутренние пробелы — не как cmd_services с replace('_', ' ')).
+  1.3e — /cancel с StateFilter(AdminStates) в admin_router (перехватывает
+         раньше client_router — router order main.py:117-119). +
+         admin-state catch-all:
+         - text: StateFilter(AdminStates), F.text, ~F.text.startswith("/")
+           → "Используйте /cancel для отмены" (иначе бот молчит — критик D, E)
+         - callback: StateFilter(AdminStates) + не-команда callback
+           → "Используйте /cancel"
+         Порядок регистрации внутри admin_router: specific → /cancel → catch-all.
+
+Этап 2 — middleware + spec + docstrings:
+  2.1 — bot/middlewares/session_timeout.py:
+        + ADMIN_SESSION_TTL_SEC = 3600 (60 мин для админа, парикмахер
+          отвлекается на клиентов — 30 мин мало).
+        В __call__: if event.from_user.id == settings.ADMIN_ID:
+          ttl = ADMIN_SESSION_TTL_SEC else ttl = SESSION_TTL_SEC.
+        Текст оставить клиентский ("/book hint") — acceptable UX, не трогать
+        test_middlewares.py:291 assert "/book" in text.
+        test_middlewares.py:377 assert SESSION_TTL_SEC == 1800 — оставить
+        (клиентский), +новый тест на ADMIN_SESSION_TTL_SEC == 3600.
+  2.2 — spec.md правка 6+ точек (SSOT: "прав spec, не код"):
+        - spec.md:247 — добавить AdminStates
+        - spec.md:251 — inline menu вместо reply
+        - spec.md:255 — handlers/admin.py: callback + FSM
+        - spec.md:404 — команды как alias
+        - spec.md:405-410 — parsing-правила → FSM validate на каждом шаге
+        - spec.md:458 — checklist обновить под inline-flow
+        - spec.md:491 — /cancel контракт для admin-FSM
+        - spec.md:513 — ADMIN_SESSION_TTL_SEC = 3600
+  2.3 — docstrings/comments:
+        - bot/handlers/admin.py:1-14 — "Stateful: YES" + "5 callback + FSM"
+        - bot/main.py:115 — comment про /cancel в admin-FSM
+
+Этап 3 — bot/handlers/start.py:
+  - Welcome для админа: убрать перечисление /addslots /closeslot /today /week
+    /services из текста. Прикрепить admin_inline_menu() (inline keyboard).
+  - Правка tests/test_start_handlers.py:60-64 asserts (5 asserts на /addslots
+    in text → упадут). Решение: переписать asserts на inline keyboard.
+
+Этап 4 — тесты:
+  4.1 — Правка существующих:
+        - tests/test_start_handlers.py:48-68 — asserts на inline keyboard
+        - tests/test_admin_handlers.py — 54 теста остаются (commands как alias)
+        - tests/test_middlewares.py:377 — оставить, +новый на ADMIN_SESSION_TTL_SEC
+  4.2 — Новые тесты в tests/test_admin_handlers.py:
+        - Menu callback — каждая из 5 кнопок триггерит правильный flow
+        - FSM addslots — календарь → выбор часа → создание
+        - FSM closeslot — календарь → выбор часа → закрытие
+        - FSM services — 3 шага (name/duration/price)
+        - /cancel в admin-FSM → state cleared + admin text
+        - admin-state fallback (text + callback)
+        - _is_admin_callback (админ vs не-админ)
+        - TTL=60 для админа (middleware test)
+
+Этап 5 — verify + deploy:
+  5.1 — qa-verify-and-fix (локально): pytest + ruff + mypy, итеративный fix
+  5.2 — qa-code-review через code-reviewer subagent
+  5.3 — git commit + push (pet-project free)
+  5.4 — Deploy на Timeweb: ssh root@188.225.82.248 → git pull → docker compose
+        down → up -d --build
+  5.5 — Smoke test в Telegram (@My_Barber_hair_bot):
+        - Екатерина жмёт /start → видит inline menu (5 кнопок)
+        - Тапает "➕ Открыть слоты" → календарь → дата → ввод часов → слоты созданы
+        - Тапает "📅 Сегодня" → мгновенный список записей
+        - Тапает "💇 Добавить услугу" → 3 шага → услуга создана
+        - /cancel в mid-FSM → корректный выход
+        - 30+ мин бездействия → middleware даёт TTL=60 для админа
+        - Bot restart mid-admin-FSM → PostgresStorage сохраняет,
+          admin-state fallback ловит stale taps
+
+== 21 НАХОДКА CRITIC (памятка — все решаются в коде, не "отложены") ==
+Блокирующие (3):
+  - test_middlewares.py:377 SESSION_TTL_SEC == 1800 — оставить (клиентский),
+    +ADMIN_SESSION_TTL_SEC = 3600 → Этап 2.1
+  - test_middlewares.py:291 "/book" in text — оставить клиентский текст
+    для админа (acceptable UX) → Этап 2.1
+  - StateFilter(AdminStates.*) синтаксис невалиден → правильно
+    StateFilter(AdminStates) (verified через python -c) → Этап 1.3e
+Дополнения (8):
+  - spec.md 6+ точек → Этап 2.2
+  - admin.py docstring (line 6 "Stateful: NO") → Этап 2.3
+  - main.py:115 comment → Этап 2.3
+  - UX-edge прерывание FSM тапом → Этап 1.3a (state.clear() + новый flow)
+  - SimpleCalendar для админа → Этап 1.3b (новый handler)
+  - Auth для callbacks → Этап 1.3a (_is_admin_callback)
+  - /cancel клиентский текст для админа → Этап 1.3e (admin-state /cancel)
+  - TTL=60 для админа → Этап 2.1
+Остатки (10):
+  - catch-all filter exclude commands → 1 строка ~F.text.startswith("/") → 1.3e
+  - persistence inline keyboard → StateFilter(None) + admin_* handler → 1.3a
+  - dispatcher order внутри router → specific → /cancel → catch-all LAST → 1.3e
+  - admin-state callback fallback 2 уровня → StateFilter(None)+admin_* для menu,
+    StateFilter(AdminStates) catch-all для in-FSM → 1.3a + 1.3e
+  - Bot restart mid-admin-FSM → PostgresStorage (уже L5) + admin-state fallback → 1.3e
+  - Double-tap inline → events_isolation сериализует + idempotent set_state → accept
+  - /services name с пробелами в FSM → message.text принимает полное → 1.3d
+  - test_start_handlers правка → Этап 4.1
+  - test_middlewares правка → Этап 4.1
+  - test_admin_handlers 54 теста → оставить как alias → Этап 4.1
+
+== ГЕЙТЫ (напоминание) ==
+- qa-verify-and-fix после правок кода (.venv/bin/python -m pytest + ruff + mypy)
 - qa-code-review через code-reviewer subagent на logic-change
+- Вариант C: 1 файл → verify → code-review → следующий файл
 - Коммиты свободно (pet-project, AGENTS.md § git-repo-categories)
 - Push в origin/main после verify + code-review
 
-Honest limitations (not blockers):
-- No Postgres runtime tests (SQL construction covered, runtime — Render smoke)
-- Render free web service sleep 15 мин (on_startup_scan catches)
-- L2 atomicity deferred to backlog (production-level, materially changes)
-
-NEXT: Session 5 — Render smoke test (manual) + L2 atomicity (if user GO) +
-Урок 2.5+ new features.
+== NEXT ==
+Этап 1.3a — _is_admin_callback + 5 menu callbacks (точки входа, без FSM
+логики). Стартуй с чтения bot/handlers/admin.py (386 строк) и
+bot/keyboards/admin.py (новый, 6 CallbackData factories).
 ```
 
 ## Cross-refs
