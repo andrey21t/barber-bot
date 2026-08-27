@@ -1,17 +1,100 @@
-"""Reply keyboards for master (admin).
+"""Keyboards for master (admin) — inline menu + back-compat reply keyboard.
 
-Spec.md 245: reply-клавиатура для мастера с командами
-/addslots /closeslot /today /week /services.
+Spec.md 251 (Вариант B): inline keyboard с 5 кнопками для мастера Екатерины.
+Каждая кнопка триггерит callback → FSM flow (multi-step для 3 из 5):
+- ➕ Открыть слоты → adding_slots (date → hours)
+- 🔒 Закрыть слот → closing_slot (date → hour)
+- 📅 Сегодня → мгновенный список (no FSM)
+- 🗓 Неделя → мгновенный список (no FSM)
+- 💇 Добавить услугу → entering_service (name → duration → price)
 
-Shown to ADMIN_ID on /start. Client never sees this keyboard — only inline buttons
-in booking flow (keyboards/client.py).
+Back-compat: admin_keyboard() (reply) оставлен как alias для тестов test_admin_handlers.py
+(54 теста на command handlers) и для Екатерины если она запомнила команды.
 """
 
-from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
+from datetime import datetime
+from typing import cast
+
+from aiogram.filters.callback_data import CallbackData
+from aiogram.types import (
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram_calendar import SimpleCalendar
+
+
+class AdminMenuCallbackData(CallbackData, prefix="admin_menu"):
+    """Empty callback — opens admin inline menu.
+
+    Будет подключён в Этап 1.3 (handlers/start.py) для кнопки '📋 Меню'
+    в welcome-сообщении мастера.
+    """
+
+
+class AdminAddslotsCallbackData(CallbackData, prefix="admin_addslots"):
+    """Trigger adding_slots flow — открыть слоты на дату."""
+
+
+class AdminCloseslotCallbackData(CallbackData, prefix="admin_closeslot"):
+    """Trigger closing_slot flow — закрыть слот."""
+
+
+class AdminTodayCallbackData(CallbackData, prefix="admin_today"):
+    """Trigger today bookings list — мгновенный callback, no FSM."""
+
+
+class AdminWeekCallbackData(CallbackData, prefix="admin_week"):
+    """Trigger week bookings list — мгновенный callback, no FSM."""
+
+
+class AdminServicesCallbackData(CallbackData, prefix="admin_services"):
+    """Trigger entering_service flow — добавить услугу."""
+
+
+def admin_inline_menu() -> InlineKeyboardMarkup:
+    """Inline keyboard с 5 кнопками для мастера (spec.md 251, Вариант B).
+
+    Layout: 2 + 2 + 1 (3 rows). Каждая кнопка = отдельный callback_data.
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Открыть слоты", callback_data=AdminAddslotsCallbackData().pack())
+    builder.button(text="🔒 Закрыть слот", callback_data=AdminCloseslotCallbackData().pack())
+    builder.button(text="📅 Сегодня", callback_data=AdminTodayCallbackData().pack())
+    builder.button(text="🗓 Неделя", callback_data=AdminWeekCallbackData().pack())
+    builder.button(text="💇 Добавить услугу", callback_data=AdminServicesCallbackData().pack())
+    builder.adjust(2, 2, 1)
+    return builder.as_markup()
+
+
+async def admin_calendar_keyboard(min_date: datetime, max_date: datetime) -> InlineKeyboardMarkup:
+    """SimpleCalendar для admin FSM (adding_slots_date / closing_slot_date).
+
+    Re-uses aiogram_calendar.SimpleCalendar с ru_RU locale (как client.py:82).
+    Caller must `await` this function и strip tzinfo via .replace(tzinfo=None).
+    """
+    cal = SimpleCalendar(
+        locale="ru_RU",
+        cancel_btn="Отмена",
+        today_btn="Сегодня",
+    )
+    cal.set_dates_range(min_date=min_date, max_date=max_date)
+    # aiogram_calendar has no type stubs — cast to satisfy mypy.
+    return cast(InlineKeyboardMarkup, await cal.start_calendar())
 
 
 def admin_keyboard() -> ReplyKeyboardMarkup:
-    """Reply keyboard with 5 master commands. Resize + one-time per spec.md 245."""
+    """Back-compat reply keyboard with 5 master commands (alias для команд).
+
+    Оставлен для:
+    - test_admin_handlers.py (54 теста на command handlers)
+    - Екатерины если она запомнила команды /addslots /closeslot /today /week /services
+
+    ВРЕМЕННО показывается в /start (handlers/start.py:28) до Этапа 1.3 —
+    где будет заменён на admin_inline_menu(). После Этапа 1.3 — оставить
+    как alias, но убрать из cmd_start (или показывать только по команде /admin).
+    """
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="/addslots"), KeyboardButton(text="/closeslot")],
