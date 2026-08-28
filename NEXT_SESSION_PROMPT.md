@@ -1,6 +1,6 @@
 # NEXT_SESSION_PROMPT — Session 5.14 завершён (5.4 done), Session 5.15 готов (5.5 next).
 
-> Дата: 2026-08-28 · Session 5.14 — implementation Этапа 5 Вариант B. Шаг 5.4 завершён (commit pending в origin/main, НЕ задеплоен). Тестов 286 (baseline 281 → +5 в 5.4: 1 regression + 4 workday_slots). ruff + mypy strict чисто. Осталось 7 шагов (5.1, 5.5-5.10 + aliases + миграция 006).
+> Дата: 2026-08-28 · Session 5.14 — implementation Этапа 5 Вариант B. Шаг 5.4 завершён (commit `069274d` в origin/main, НЕ задеплоен). Тестов 286 (baseline 281 → +5 в 5.4: 1 regression + 4 workday_slots). ruff + mypy strict чисто. Осталось 7 шагов (5.1, 5.5-5.10 + aliases + миграция 006).
 > Prod остаётся на `c64b31d` (Session 5.9). Миграция 005 НЕ накатывалась на prod — smoke-test на dev-копии обязателен (one-way door, данные Екатерины).
 
 ## ⚡ TL;DR для Session 5.15 (handoff)
@@ -9,7 +9,7 @@
 
 **Главный артефакт:** `~/PycharmProjects/barber-bot/PLANS.md` — living-документ Этапа 5. ЧИТАТЬ ПЕРВЫМ. Progress Session 5.14 (5.4 done), Decision Log (3 blocker'а + 7 gaps + Gap 8 SQL parens), Plan of Work.
 
-## Что сделано в Session 5.14 (commit pending) — шаг 5.4 завершён:
+## Что сделано в Session 5.14 (commit `069274d`, pushed) — шаг 5.4 завершён:
 
 1. **bot/services/admin.py** — KEY CHANGE:
    - `get_today_bookings` / `get_week_bookings`: removed `JOIN Slot`, filter via `Booking.start_at` (UTC) с `datetime.combine(today_local, time(0,0), tzinfo=tz).astimezone(UTC)` для window bounds (DST-safe pattern)
