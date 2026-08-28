@@ -71,11 +71,13 @@ def admin_inline_menu() -> InlineKeyboardMarkup:
 async def admin_calendar_keyboard(min_date: datetime, max_date: datetime) -> InlineKeyboardMarkup:
     """SimpleCalendar для admin FSM (adding_slots_date / closing_slot_date).
 
-    Re-uses aiogram_calendar.SimpleCalendar с ru_RU locale (как client.py:82).
+    locale='ru_RU.UTF-8' — точное имя локали (как в `locale -a`). Без суффикса
+    .UTF-8 setlocale падает на python:3.12-slim даже после locale-gen
+    (incident Session 5.9 smoke test).
     Caller must `await` this function и strip tzinfo via .replace(tzinfo=None).
     """
     cal = SimpleCalendar(
-        locale="ru_RU",
+        locale="ru_RU.UTF-8",
         cancel_btn="Отмена",
         today_btn="Сегодня",
     )

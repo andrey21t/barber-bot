@@ -151,7 +151,7 @@ async def _handle_simple_calendar(
             await callback.answer(cache_time=60)
             return  # same-month: lib would answer cache_time=60, handler does it instead
 
-    cal = SimpleCalendar(locale="ru_RU", cancel_btn="Отмена", today_btn="Сегодня")
+    cal = SimpleCalendar(locale="ru_RU.UTF-8", cancel_btn="Отмена", today_btn="Сегодня")
     cal.set_dates_range(*_calendar_range(settings))
     selected, selected_date = await cal.process_selection(callback, callback_data)
 

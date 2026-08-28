@@ -576,7 +576,7 @@ async def admin_addslots_calendar_cb(
             await callback.answer(cache_time=60)
             return  # same-month: lib бы answer cache_time=60, handler вместо
 
-    cal = SimpleCalendar(locale="ru_RU", cancel_btn="Отмена", today_btn="Сегодня")
+    cal = SimpleCalendar(locale="ru_RU.UTF-8", cancel_btn="Отмена", today_btn="Сегодня")
     cal.set_dates_range(*_admin_calendar_range(tz))
     selected, selected_date = await cal.process_selection(callback, callback_data)
 
@@ -793,7 +793,7 @@ async def admin_closeslot_calendar_cb(
             await callback.answer(cache_time=60)
             return
 
-    cal = SimpleCalendar(locale="ru_RU", cancel_btn="Отмена", today_btn="Сегодня")
+    cal = SimpleCalendar(locale="ru_RU.UTF-8", cancel_btn="Отмена", today_btn="Сегодня")
     cal.set_dates_range(*_admin_calendar_range(tz))
     selected, selected_date = await cal.process_selection(callback, callback_data)
 
