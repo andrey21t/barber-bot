@@ -90,7 +90,7 @@ async def open_workday(
 
     await _acquire_advisory_lock(session, master_id, work_date)
 
-    existing = await _select_workday(session, master_id, work_date)
+    existing = await select_workday(session, master_id, work_date)
     if existing is None:
         workday = WorkDay(
             master_id=master_id,
@@ -218,11 +218,12 @@ async def close_workday(
     return True
 
 
-async def _select_workday(
+async def select_workday(
     session: AsyncSession, master_id: UUID, work_date: date
 ) -> WorkDay | None:
     """Lookup WorkDay by (master_id, work_date). Mirrors _select_workday_for_slot
-    in booking.py:117 but exposed here for /openday service use.
+    in booking.py:117 but exposed here for /openday handler use (was_closed UX fix,
+    Session 5.18 F1 — handler reads is_active BEFORE open_workday re-opens it).
     """
     stmt = select(WorkDay).where(WorkDay.master_id == master_id, WorkDay.work_date == work_date)
     result = await session.execute(stmt)
