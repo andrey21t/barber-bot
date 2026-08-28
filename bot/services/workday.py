@@ -35,9 +35,8 @@ it via _resolve_master_and_business) — service layer stays config-free.
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, time
-from zoneinfo import ZoneInfo
-
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -134,9 +133,7 @@ async def update_workday(
             OR end_at > new_end_utc — admin cancels them first.
     """
     if new_end_time <= new_start_time:
-        raise ValueError(
-            f"end_time {new_end_time} must be > start_time {new_start_time}"
-        )
+        raise ValueError(f"end_time {new_end_time} must be > start_time {new_start_time}")
 
     workday = await session.get(WorkDay, workday_id)
     if workday is None:
@@ -216,9 +213,7 @@ async def close_workday(
             f"booking(s) remain. Cancel them first: {[str(b.id) for b in conflicts]}"
         )
 
-    await session.execute(
-        update(WorkDay).where(WorkDay.id == workday_id).values(is_active=False)
-    )
+    await session.execute(update(WorkDay).where(WorkDay.id == workday_id).values(is_active=False))
     await session.commit()
     return True
 
@@ -229,9 +224,7 @@ async def _select_workday(
     """Lookup WorkDay by (master_id, work_date). Mirrors _select_workday_for_slot
     in booking.py:117 but exposed here for /openday service use.
     """
-    stmt = select(WorkDay).where(
-        WorkDay.master_id == master_id, WorkDay.work_date == work_date
-    )
+    stmt = select(WorkDay).where(WorkDay.master_id == master_id, WorkDay.work_date == work_date)
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
 

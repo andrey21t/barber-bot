@@ -33,8 +33,23 @@ class AdminMenuCallbackData(CallbackData, prefix="admin_menu"):
     """
 
 
+class AdminOpendayCallbackData(CallbackData, prefix="admin_openday"):
+    """Trigger opening_workday flow — открыть рабочий день (Этап 5.1).
+
+    Replaces AdminAddslotsCallbackData as the primary 'open window' action —
+    WorkDay [start_time, end_time] instead of per-hour Slot list. addslots
+    button stays as deprecated alias until 5.10 (PLANS.md Plan of Work
+    п.11), then removed from the inline menu.
+    """
+
+
 class AdminAddslotsCallbackData(CallbackData, prefix="admin_addslots"):
-    """Trigger adding_slots flow — открыть слоты на дату."""
+    """Trigger adding_slots flow — открыть слоты на дату (DEPRECATED after 5.1).
+
+    Kept in the inline menu until 5.10 (PLANS.md Plan of Work п.11) for
+    backwards compat with Екатерина's muscle memory; /addslots command alias
+    stays even after the button is removed.
+    """
 
 
 class AdminCloseslotCallbackData(CallbackData, prefix="admin_closeslot"):
@@ -54,17 +69,22 @@ class AdminServicesCallbackData(CallbackData, prefix="admin_services"):
 
 
 def admin_inline_menu() -> InlineKeyboardMarkup:
-    """Inline keyboard с 5 кнопками для мастера (spec.md 251, Вариант B).
+    """Inline keyboard с 6 кнопками для мастера (spec.md 251, Вариант B + Этап 5.1).
 
-    Layout: 2 + 2 + 1 (3 rows). Каждая кнопка = отдельный callback_data.
+    Layout: 3 + 2 + 1 (3 rows). Каждая кнопка = отдельный callback_data.
+    Row 1 (открытие/закрытие): 📅 Открыть день (5.1, primary), ➕ Открыть слоты
+        (deprecated alias до 5.10), 🔒 Закрыть слот (deprecated до 5.10).
+    Row 2 (просмотр): 📅 Сегодня, 🗓 Неделя — мгновенные callbacks, no FSM.
+    Row 3 (услуги): 💇 Добавить услугу — entering_service flow.
     """
     builder = InlineKeyboardBuilder()
+    builder.button(text="📅 Открыть день", callback_data=AdminOpendayCallbackData().pack())
     builder.button(text="➕ Открыть слоты", callback_data=AdminAddslotsCallbackData().pack())
     builder.button(text="🔒 Закрыть слот", callback_data=AdminCloseslotCallbackData().pack())
     builder.button(text="📅 Сегодня", callback_data=AdminTodayCallbackData().pack())
     builder.button(text="🗓 Неделя", callback_data=AdminWeekCallbackData().pack())
     builder.button(text="💇 Добавить услугу", callback_data=AdminServicesCallbackData().pack())
-    builder.adjust(2, 2, 1)
+    builder.adjust(3, 2, 1)
     return builder.as_markup()
 
 
