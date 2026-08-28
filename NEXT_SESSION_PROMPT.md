@@ -1,64 +1,110 @@
-# NEXT_SESSION_PROMPT — Session 5.11 закрыт (deep-analysis Этапа 5 завершён, VERDICT DEEP_ENOUGH), Session 5.12 готов (implementation Варианта B).
+# NEXT_SESSION_PROMPT — Session 5.12 частично завершён (5.2 WorkDay + миграция 005), Session 5.13 готов (5.3+).
 
-> Дата: 2026-08-28 · Session 5.11 — чисто аналитическая сессия (БЕЗ правок кода, БЕЗ коммитов). Цель: deep-analysis Pass 1-4 + critic для Этапа 5 «Вариант B» (8 паттернов мастера Екатерины). Результат: VERDICT DEEP_ENOUGH, готов к implementation в Session 5.12.
-> Session 5.10 commit `68cf591` (feat: remove price from FSM creation flow) — НЕ задеплоен. Prod остаётся на `c64b31d`. 265 тестов зелёные, ruff+mypy чисто.
+> Дата: 2026-08-28 · Session 5.12 — implementation Этапа 5 Вариант B. Шаг 5.2 завершён (коммиты `90c0000` + `9345a7b` в origin/main, НЕ задеплоены). Тестов 274 (baseline 265 → +9 в 5.2). ruff + mypy чисто. Осталось 9 шагов (5.3-5.10 + aliases + миграция 006).
+> Prod остаётся на `c64b31d` (Session 5.9). Миграция 005 НЕ накатывалась на prod — smoke-test на dev-копии обязателен (one-way door, данные Екатерины).
 
-## ⚡ TL;DR для Session 5.12 (handoff после compact)
+## ⚡ TL;DR для Session 5.13 (handoff)
 
-**Цель 5.12:** implementation Этапа 5 Вариант B по PLANS.md (13 шагов, ~400-600 строк).
+**Цель 5.13:** продолжить implementation по PLANS.md Plan of Work (13 шагов). Шаг 5.2 ✅, следующий — **5.3 Booking-диапазон + invariants**.
 
-**Главный артефакт:** `~/PycharmProjects/barber-bot/PLANS.md` (255 строк) — living-документ Этапа 5. ЧИТАТЬ ПЕРВЫМ. Содержит:
-- Purpose, Progress (Session 5.11 — deep-analysis)
-- Surprises & Discoveries (7 пунктов)
-- **Decision Log** — решения по 3 blocker'ам + 7 gaps критика + Gap 8 (SQL parens)
-- Plan of Work (13 шагов: 5.2 → 5.10 + aliases + миграция 006)
-- Validation (гейты, тесты по фазам)
+**Главный артефакт:** `~/PycharmProjects/barber-bot/PLANS.md` — living-документ Этапа 5. ЧИТАТЬ ПЕРВЫМ. Progress Session 5.12 (5.2 done), Decision Log (3 blocker'а + 7 gaps + Gap 8 SQL parens), Plan of Work (13 шагов).
 
-**3 blocker'а (решено в PLANS.md Decision Log):**
+**Что сделано в Session 5.12 (commits `90c0000` + `9345a7b`, pushed):**
 
-1. **Архитектурный подход** → **B**: WorkDay (master_id, date, start_time, end_time, max_concurrent_clients, is_active) + Booking на диапазоне через start_at/end_at. Slot deprecated (миграция 005 переносит данные, 006 drop). Подходы A и C отклонены (A — клиент видит "24ч свободно"; C нарушает BB-007 — рекуррентный шаблон, а B на конкретную дату).
+1. **bot/models.py** — класс `WorkDay` (44 строки, перед Booking):
+   - Поля: `id` (Uuid PK), `master_id` (FK masters.id ondelete=CASCADE), `work_date` (Date — НЕ `date`, конфликт с типом `date` в Mapped), `start_time` (Time), `end_time` (Time), `max_concurrent_clients` (int default 1), `is_active` (bool default True), `created_at` (DateTime timezone-aware)
+   - Constraints: `CheckConstraint("end_time > start_time")`, `UNIQUE(master_id, work_date)` (index ux_work_days_master_date), partial Index `is_active=TRUE` на Postgres (idx_work_days_master_date_active)
 
-2. **Multi-client** → **1 booking = 1 client, N bookings с перекрывающимися диапазонами + WorkDay.max_concurrent_clients (capacity)**. Drop EXCLUDE constraint (002, ломает multi-client). App-level check (SELECT count + INSERT) + retry на IntegrityError + Postgres `pg_advisory_xact_lock(master_id, day)` (BB-008 adoption — откат от "заменён на EXCLUDE" обоснован changing requirements). `client_id NOT NULL` остаётся.
+2. **alembic/versions/005_workday.py** (172 строки):
+   - CREATE TABLE work_days (cross-DB, server_default для is_active=sa.true() и max_concurrent_clients=text("1") — паттерн 001_initial)
+   - Перенос данных из slots: `SELECT master_id, slot_date, MIN/MAX(slot_hour) GROUP BY` → Python loop → `op.bulk_insert` через `sa.table`
+   - Буфер +60мин (покрывает 60-мин услуги); edge max_h=23 → +30мин (midnight overflow avoidance)
+   - DROP CONSTRAINT no_overlap на Postgres (EXCLUDE constraint из 002 ломает multi-client в 5.5)
+   - SQLite: no-op (002 был no-op, UNIQUE(slot_id) на bookings остаётся до 006)
+   - Downgrade: DROP TABLE work_days БЕЗ восстановления EXCLUDE (one-way door, PLANS.md Gap 6)
 
-3. **30-мин шаг** → **drop slot_hour** (int 0-23 не поддерживает минуты). WorkDay.start_time/end_time = `time` (HH:MM). Booking.start_at = `datetime` (полная свобода минут). 30-мин шаг — на уровне `/slots` UI (генерация кнопок T, T+30, T+60, ... из WorkDay.start_time → end_time). Blast radius: 7 файлов (booking.py:79-83, 86-90; slots.py:28; keyboards/client.py:105, 174; conftest.py:114; admin.py:618, 832).
+3. **tests/test_workday.py** (247 строк, 9 тестов):
+   - 4 модель: create_minimal, unique_master_date, check_constraint_end_after_start, multi_client_capacity_2
+   - 5 миграция: single_slot, multiple_slots, multiple_days, no_slots, max_hour_23_no_overflow
+   - `_run_migration_logic` helper — переиграет SQL+Python логику миграции через ORM (не через op.bulk_insert)
+   - Конвертация str→UUID и str→date (на SQLite через text() типы приходят как строки)
 
-**Critic iter 1 → NEEDS_MORE_ANALYSIS (7 gaps) → iter 2 → DEEP_ENOUGH (6/7 closed, Gap 6 → Gap 8 fix):**
-- Gap 8 (SQL precedence bug): `WHERE (start_at < new_start_time OR end_at > new_end_time) AND status IN (...)` — parens ОБЯЗАТЕЛЬНЫ (без parens `AND` binds tighter → false positive на cancelled bookings). Зашит в PLANS.md Gap 6 decision.
+4. **NEXT_SESSION_PROMPT.md** — TL;DR (этот блок)
 
-**Risk-класс: HIGH-STAKES** — миграция БД на live-базе Екатерины (one-way door) + persistence layer change + > 5 файлов.
+**Гейты 5.2 (все зелёные):**
+- format/lint/typecheck: ✅
+- tests: 274 ✅ (baseline 265 → +9)
+- qa-code-review (subagent [REDACTED-SESSION-ID]): **LGTM**, 3 warnings fixed (W1 server_default, W2 SQLite bulk_insert note, W3 буфер +60мин)
+- self-review после коммита: F1 (устаревший docstring 005:14) → фикс `9345a7b`; S1 (PLANS.md `date`→`work_date` 4 места) → sync
 
-**Baseline: 265 тестов** (verified `grep -c` в critic iter 1 и iter 2). Цель: +30-50 тестов в Этап 5.
+**3 blocker'а (решено в PLANS.md Decision Log, актуально для 5.3+):**
 
-**Порядок impl в 5.12** (по PLANS.md Plan of Work):
-1. 5.2 WorkDay модель + миграция 005 (CREATE work_days + DROP EXCLUDE + INSERT из Slot)
-2. 5.7 перенос данных Slot → WorkDay (в миграции 005, one-way door — тестировать на dev-копии prod базы)
-3. 5.3 Booking-диапазон + invariants (drop slot_id FK в миграции 006)
-4. 5.4 30-мин шаг + перепись `_build_start_at`
-5. 5.1 `/openday` command + FSM
-6. 5.5 multi-client (max_concurrent_clients default 1, UPDATE до 2 для Екатерины)
-7. 5.6 «Мест нет» в /slots (occupancy check)
-8. 5.8 `/slots` command + slot picker keyboard (30-мин кнопки)
-9. 5.9 `/movslot` + admin_move_booking (без client_id pin, без 24h правила)
-10. 5.10 inline-часы toggle в FSM (переделка admin_addslots_hours_msg / admin_closeslot_hour_msg)
-11. /addslots /closeslot deprecated aliases
-12. Миграция 006 drop table slots (после smoke-test неделю)
+1. **Архитектурный подход B**: WorkDay (master_id, work_date, start_time, end_time, max_concurrent_clients, is_active) + Booking на диапазоне через start_at/end_at. Slot deprecated (005 переносит данные, 006 drop).
 
-**Гейты (MY-VIBE-RULES.md):** после каждой фазы — qa-verify-and-fix (format/lint/typecheck/tests) + qa-code-review (для нетривиальных: 5.2 миграция, 5.5 multi-client race, 5.9 admin_move). Pre-push ревью (pet-проект — git free по AGENTS.md § git-repo-categories, но чек-лист pr-review-rules применять).
+2. **Multi-client**: 1 booking = 1 client, N bookings с перекрывающимися диапазонами + WorkDay.max_concurrent_clients (capacity). EXCLUDE constraint (002) — DROP в 005 (сделано ✅). App-level check + retry + pg_advisory_xact_lock (BB-008) — в 5.5.
 
-**Файлы на старте 5.12:**
-- `bot/models.py` — Slot (slot_hour:int), Booking (slot_id NOT NULL FK, start_at/end_at) — добавить WorkDay, prepare deprecate Slot
-- `bot/services/booking.py` (686) — `_build_start_at` (79-83), `_build_end_at` (86-90), create_booking, cancel_booking, transfer_booking
+3. **30-мин шаг**: drop slot_hour (int 0-23). WorkDay.start_time/end_time = `time`. Booking.start_at = `datetime`. 30-мин шаг — на уровне /slots UI. Blast radius: 7 файлов (booking.py:79-83, 86-90; slots.py:28; keyboards/client.py:105, 174; conftest.py:114; admin.py:618, 832).
+
+**Следующий шаг — 5.3 Booking-диапазон + invariants (по PLANS.md Plan of Work п.3):**
+
+- Drop `Booking.slot_id` FK — в миграции 006 (НЕ сейчас, после smoke-test на prod ~1 неделя)
+- Добавить invariants на service layer в `create_booking`:
+  - `Booking.start_at >= WorkDay.start_time` (привести к datetime через work_date + start_time)
+  - `Booking.end_at <= WorkDay.end_time` (work_date + end_time)
+  - Перед INSERT — SELECT WorkDay для (master_id, work_date), validate, refuse с `BookingOutsideWorkDayError`
+- `_build_start_at`/`_build_end_at` в booking.py:79-90 пока ОСТАЮТСЯ (drop в 5.4)
+- Тесты: test_booking_invariants (start_at >= workday.start_time, end_at <= workday.end_time, BookingOutsideWorkDayError)
+
+**Risk-класс:** HIGH-STAKES — миграция БД на live-базе Екатерины (one-way door) + persistence layer change + > 5 файлов.
+
+**Baseline: 274 теста** (после 5.2). Цель: +30-50 тестов в Этап 5.
+
+**Порядок impl в 5.13+** (по PLANS.md Plan of Work):
+1. ✅ 5.2 WorkDay модель + миграция 005 — СДЕЛАНО
+2. ⏭️ 5.3 Booking-диапазон + invariants — СЛЕДУЮЩИЙ
+3. 5.4 30-мин шаг + перепись `_build_start_at` (drop slot_hour, blast radius 7 файлов)
+4. 5.1 `/openday` command + FSM (idempotent через UNIQUE master/work_date)
+5. 5.5 multi-client (max_concurrent_clients UPDATE до 2 для Екатерины, app-level check + retry, pg_advisory_xact_lock)
+6. 5.6 «Мест нет» в /slots (occupancy check, count bookings WHERE tstzrange &&)
+7. 5.8 /slots command + slot picker keyboard (30-мин кнопки T, T+30, T+60, ...)
+8. 5.9 /movslot + admin_move_booking (без client_id pin, без 24h правила, уведомление клиенту)
+9. 5.10 inline-часы toggle в FSM (переделка admin_addslots_hours_msg / admin_closeslot_hour_msg)
+10. /addslots /closeslot deprecated aliases (warning + делегирование на /openday)
+11. Миграция 006 drop table slots (после smoke-test на prod ~1 неделя наблюдения)
+
+**Гейты (MY-VIBE-RULES.md):** после каждой фазы — qa-verify-and-fix (format/lint/typecheck/tests) + qa-code-review (для нетривиальных: 5.3 invariants, 5.5 multi-client race, 5.9 admin_move). Pre-push ревью (pet-проект — git free по AGENTS.md § git-repo-categories, но чек-лист pr-review-rules применять).
+
+**Файлы на старте 5.13:**
+- `bot/models.py` — WorkDay добавлен ✅, Booking.slot_id FK остаётся (drop в 006)
+- `bot/services/booking.py` (686) — `_build_start_at` (79-83), `_build_end_at` (86-90), create_booking (183 — INSERT 'confirmed'), cancel_booking (345 — UPDATE 'cancelled'), transfer_booking (451-686, client_id pin на 566)
 - `bot/services/slots.py` (102) — add_slots/close_slot/get_available_slots (переписать в 5.4-5.6)
 - `bot/services/admin.py` (163) — get_today_bookings/get_week_bookings JOIN Slot (переписать в 5.3)
-- `bot/handlers/admin.py` (1238) — /addslots, /closeslot, /today, /week, /services, FSM addslots/closeslot (admin.py:618, 832)
-- `alembic/versions/001_initial.py` (249), `002_postgres_exclude.py` (53, drop в 005), `004_service_price_nullable.py` (образец стиля batch_alter_table для 005)
-- `tests/conftest.py` (148) — seed_data Slot → WorkDay в 5.2
-- `donor-research/topics/booking-bot-architecture.md:158-166` — BB-007 (Schedule-as-template REJECT — НЕ нарушается B)
+- `bot/handlers/admin.py` (1238) — /addslots, /closeslot, FSM addslots/closeslot (618, 832)
+- `alembic/versions/005_workday.py` (172) — CREATE work_days + DROP EXCLUDE + INSERT из Slot ✅
+- `tests/test_workday.py` (247) — 9 тестов ✅
+- `tests/conftest.py` (148) — seed_data Slot (WorkDay добавим в 5.4 при переписи seed)
+- `donor-research/topics/booking-bot-architecture.md:158-166` — BB-007 (НЕ нарушается B)
 
-**Не сделано в 5.11 (преднамеренно):**
-- PLANS.md НЕ закоммичен (в `.git/info/exclude`, рабочий документ, не уходит в remote)
-- NEXT_SESSION_PROMPT.md обновляется сейчас (этим edit)
-- Implementation — Session 5.12+
+**Smoke-test на dev-копии prod базы перед deploy миграции 005** (PLANS.md:203, one-way door):
+```bash
+# 1. Бэкап prod базы
+pg_dump $DATABASE_URL > backup-$(date +%Y%m%d).sql
+# 2. Создать dev-копию
+createdb barber_dev && psql barber_dev < backup-$(date +%Y%m%d).sql
+# 3. Прогнать миграцию на dev-копии
+DATABASE_URL=postgresql://...barber_dev alembic upgrade head
+# 4. Проверить: SELECT count(*) FROM work_days; (должно = кол-во уникальных master_id+slot_date в slots)
+# 5. Проверить: SELECT * FROM work_days LIMIT 5; (start_time, end_time адекватные)
+# 6. Проверить: bookings на месте, EXCLUDE no_overlap удалён (\d bookings на Postgres)
+# 7. Если ОК → deploy на prod: alembic upgrade head
+# 8. Smoke-test на prod: /today, /week, /book — всё работает
+# 9. Наблюдение 1 неделя → миграция 006 (drop table slots)
+```
+
+**Не сделано в 5.12 (преднамеренно):**
+- Миграция 005 НЕ накатывалась на prod (smoke-test на dev-копии обязателен)
+- booking.py БЕЗ правок (5.3 — следующий шаг)
+- conftest.py seed_data БЕЗ WorkDay (добавим в 5.4 при переписи seed под 30-мин шаг)
 
 ---
 
