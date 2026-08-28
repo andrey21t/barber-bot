@@ -504,27 +504,35 @@ databases:
 ## Quick start prompt для opencode (вставить в новую сессию)
 
 ```
-Продолжаем barber-bot Session 5.9 — ДВА этапа в одной сессии:
-  (1) Этап 1.3e (/cancel + admin-state catch-all) — последний подэтап 1.3
-  (2) Этап 3 (start.py inline menu для админа + /menu command) — discovered
-      gap: admin.py 13 сообщений ссылаются на "/menu — заново", но команды
-      /menu НЕТ в коде. Без /menu — dead-end UX (админ читает "/menu — заново"
-      и не знает что делать).
+Продолжаем barber-bot Session 5.10 — ПЕРВЫЙ ЗАПРОС ПОЛЬЗОВАТЕЛЯ:
+«Деплой 5.9 прошёл, но smoke test на prod вскрыл 3 бага (locale, reply keyboard,
+admin no-state catch-all) — уже фикшены и деплоены. Что осталось?».
 
-Этапы 1.3a (5 menu callbacks) + 1.3b (FSM addslots) + 1.3c (FSM closeslot) +
-1.3d (FSM services) — завершены, запушены и ДЕПЛОЕНЫ на prod.
-Security incident (commit 9aed5aa): VPS password + bot token были в публичном
-git history с 7194163. Credentials rotated (VPS passwd + BotFather /revoke +
-.env update). См. раздел "Security incident 2026-08-27" ниже.
+ОТВЕТ: Этап 1.3 ПОЛНОСТЬЮ готов (1.3a-e). Этап 3 готов. Бот ДЕПЛОЕН на prod
+(@My_Barber_hair_bot) и проходит smoke test. Smoke test выявил новые
+BACKLOG-фичи (список ниже в "BACKLOG Session 5.10+").
+
+ВТОРОЙ ЗАПРОС: «Передать бота Екатерине» — поменять ADMIN_ID в .env на VPS.
+Для этого нужно узнать telegram_id Екатерины (через @userinfobot).
 
 Прочитай ~/PycharmProjects/barber-bot/NEXT_SESSION_PROMPT.md — там полный
 контекст. Особое внимание:
 - "Quick start prompt" ниже (этот блок)
-- "Session 5.8 — итоги Этап 1.3c+1.3d" ниже (commits 5029d85 + a631ad5,
-  deployed, code-reviewer LGTM after fixes)
-- "Session 5.7 — итоги Этап 1.3b" (W1+W2 pattern — применён в 1.3c+1.3d)
-- "Session 5.6 — доноры inline admin menu" (INL-001 applied в 1.3b+c,
-  REJECT для 1.3d text→text)
+- "Session 5.9 — итоги Этап 1.3e + Этап 3 + 3 prod-fix" ниже (новая секция)
+- "Session 5.8 — итоги Этап 1.3c+1.3d" (commits 5029d85 + a631ad5)
+- "Session 5.6 — доноры inline admin menu" (INL-001 applied в 1.3b+c)
+- "Анализ расписания Екатерины (6 недель, июнь-август 2026)" ниже (NEW —
+  эмпирические данные для Этапа 5 Вариант B, спецификация модели WorkDay)
+- "Donor: winnerxxx13/barbershop-telegram-bot" ниже (NEW — production
+  барбершоп-бот, multi-master + waitlist + напоминания, для заимствования
+  паттернов в Этап 5)
+
+Этапы 1.3a (5 menu callbacks) + 1.3b (FSM addslots) + 1.3c (FSM closeslot) +
+1.3d (FSM services) + 1.3e (/cancel catch-all) + Этап 3 (cmd_start inline
+menu + /menu command) — ВСЕ завершены, запушены, ДЕПЛОЕНЫ на prod.
+Security incident (commit 9aed5aa): VPS password + bot token были в публичном
+git history с 7194163. Credentials rotated (VPS passwd + BotFather /revoke +
+.env update). См. раздел "Security incident 2026-08-27" ниже.
 
 == СТАТУС ==
 - Sessions 1-5.8 закоммичены и запушены (origin/main).
@@ -550,6 +558,105 @@ git history с 7194163. Credentials rotated (VPS passwd + BotFather /revoke +
 - ДЕПЛОЙ на prod (Timeweb, @My_Barber_hair_bot): 5029d85 (1.3a-c), a631ad5
   (1.3d). ВСЕ 5 inline menu flow'ов работают на prod (НО inline menu НЕ
   показывается при /start — это Этап 3, ниже).
+
+== Session 5.9 — итоги Этап 1.3e + Этап 3 + 3 prod-fix ==
+
+Session 5.9 commit 81b414e: Этап 1.3e + Этап 3 в одном коммите.
+  1.3e (последний подэтап 1.3 — /cancel + catch-all в admin_router):
+  - admin_cancel_msg: @router.message(Command("cancel"), StateFilter(AdminStates))
+    → state.clear() BEFORE answer, "Админ-режим отменён. /menu для меню"
+    (перехватывает раньше client_router cancel_msg для admin FSM states)
+  - admin_state_catchall_text: non-/ текст в admin state → "Используйте /cancel"
+  - admin_state_catchall_callback: stale callback → callback.answer() убирает spinner
+  Этап 3 (start.py inline menu + /menu command):
+  - 3.1 cmd_start: admin_keyboard (reply) → admin_inline_menu (inline), текст
+    упрощён (убрано перечисление /addslots /closeslot /today /week /services)
+  - 3.2 cmd_menu: НОВАЯ команда /menu (StateFilter(None), _is_admin check,
+    "📋 Меню:" + admin_inline_menu). 13 ссылок в admin.py на "/menu — заново"
+    больше НЕ dead-end UX
+  - 3.3 admin_menu_cb: callback для AdminMenuCallbackData (для буд. кнопки "📋 Меню")
+  - 3.4 test_cmd_start_admin: asserts на isinstance InlineKeyboardMarkup
+  Code-review W1 fix: cmd_start теперь state.clear() в начале (fresh start).
+  Code-review S2 fix: docstring admin_keyboard() обновлён.
+  Gates: ruff + mypy + 266 pytest passed. Code-reviewer LGTM.
+
+Session 5.9 PROD FIX 1 (commit 18b6c15): ReplyKeyboardRemove в cmd_start.
+  Smoke test: /start показал inline menu ✅, НО старая reply keyboard
+  (/addslots /closeslot /today /week /services) осталась снизу. Telegram НЕ
+  убирает reply keyboard автоматически — нужен явный ReplyKeyboardRemove().
+  Fix: cmd_start отправляет 2 сообщения — (1) cleanup "👋" + ReplyKeyboardRemove,
+  (2) welcome + admin_inline_menu. Тесты правлены (await_count == 2).
+
+Session 5.9 PROD FIX 2 (commits bd3b5fc + 033728c): ru_RU.UTF-8 locale.
+  Smoke test: кнопки ➕ Открыть слоты и 🔒 Закрыть слот НЕ реагировали на tap.
+  Логи: locale.Error: unsupported locale setting в SimpleCalendar(locale="ru_RU").
+  Причина: python:3.12-slim не содержит ru_RU по умолчанию + Python требует
+  ТОЧНОЕ совпадение имени (ru_RU.UTF-8, НЕ ru_RU).
+  Fix: (1) Dockerfile — locales + locale-gen ru_RU.UTF-8. (2) 5 мест в коде
+  (admin.py:579,796 + keyboards/admin.py:78 + keyboards/client.py:83 +
+  handlers/client.py:154) — все заменены на locale="ru_RU.UTF-8".
+
+Session 5.9 PROD FIX 3 (commit c64b31d): admin no-state catch-all.
+  Smoke test: админ закрыл слот (state.clear), ввёл "12" → провалился в
+  client_router fallback "Начните запись через /book" — клиентский hint для
+  админа. Confusing.
+  Fix: admin_no_state_catchall_text — StateFilter(None) + F.text +
+  ~startswith("/") + _is_admin → "📋 /menu для действий". Non-admin → silent,
+  проваливается в client_router (OK для клиентов).
+
+ДЕПЛОЙ на prod (Session 5.9): 4 деплоя в одной сессии (81b414e, 18b6c15,
+bd3b5fc, 033728c, c64b31d). Бот на prod = commit c64b31d.
+
+== BACKLOG Session 5.10+ (приоритеты smoke test + анализа Екатерины) ==
+
+А. ПЕРЕДАЧА БОТА ЕКАТЕРИНЕ (high, блокер):
+   - Узнать telegram_id Екатерины (через @userinfobot — она отправит /start)
+   - На VPS: поменять ADMIN_ID=461355056 → ADMIN_ID=<id_екатерины> в .env
+   - docker compose down && docker compose up -d
+   - Старый админ (id 461355056) станет клиентом
+
+Б. ЭТАП 5 — ВАРИАНТ B (critical, большая переработка модели данных):
+   Анализ расписания Екатерины (6 недель, июнь-август 2026) выявил что текущая
+   модель (фиксированные часовые слоты, /addslots 11 12 13) НЕ совпадает с
+   реальным workflow. См. "Анализ расписания Екатерины" ниже.
+   5.1 — /openday <дата> [начало конец] — открыть рабочий день с плавающим
+        временем (дефолт 11-18, можно явно 12 16)
+   5.2 — WorkDay модель (date, start_time, end_time, master_id)
+   5.3 — Booking занимает ДИАПАЗОН времени (не 1 слот), длительность=услуги
+   5.4 — 30-мин шаг для стартовых времён (10:00, 10:30, 11:00, ...)
+   5.5 — Multi-client booking (семья/друзья: "Татьяна и Максим", "Дима и Тима")
+   5.6 — "Мест нет" — когда WorkDay полностью занят, бот НЕ показывает дату
+        клиентам
+   5.7 — Миграция старых Slot → WorkDay (или оставить как legacy)
+   5.8 — /slots <дата> — показать свободные слоты на дату (мастер видит
+        картину дня: свободно/занято/закрыто)
+   5.9 — /movslot <дата> <старое_время> <новое_время> — перенести слот
+   5.10 — Inline-часы для /addslots + /closeslot (toggle галочками вместо
+         ввода текстом "11 12 13"). Реализуемо через SlotToggleCallbackData +
+         edit_reply_markup (INL-001).
+   Оценка: ~400-600 строк, не за одну сессию, итеративно.
+   Донор: winnerxxx13/barbershop-telegram-bot (multi-master с первого дня,
+   waitlist, напоминания 24h+2h, перенос, оценки). См. карточку донора ниже.
+
+В. УБРАТЬ ЦЕНУ ИЗ FSM (medium):
+   - Price сделать nullable=True (миграция alter column)
+   - Удалить price_msg handler из FSM создания услуги
+   - Оставить name → duration (без price)
+   - Цена клиенту НЕ показывается (grep client.py по price пусто), только
+     в БД + ответе админу "💰 {price} ₽". Для частного мастера цена
+     озвучивается отдельно в чате — лишний шаг в FSM.
+
+Г. ЭТАП 2 — MIDDLEWARE TTL (medium, можно параллельно с Этапом 5):
+   - ADMIN_SESSION_TTL_SEC = 3600 в session_timeout.py (60 мин для админа)
+   - spec.md правка 6+ точек
+
+Д. ЭТАП 4 — ТЕСТЫ (low, после 5.10):
+   - tests/test_admin_handlers.py: menu callbacks, FSM flows, /cancel, catch-all
+
+Е. MULTI-MASTER (TODO Ур. 2.6, после того как Екатерина начнёт пользоваться):
+   - Заменить _is_admin на DB lookup Master WHERE telegram_id == from_user.id
+   - Убрать ADMIN_ID из .env (или оставить как fallback/seed-админ)
+   - Донор: winnerxxx13 — multi-master с первого дня
 
 == РАЗВЁРТКА НА TIMWEB VPS (живой, 790₽/мес) ==
 - IP: 188.225.82.248, user: root, pass: <VPS_PASSWORD в 1Password/secrets manager>
@@ -838,14 +945,119 @@ NB: После 1.3e — Этап 1.3 ПОЛНОСТЬЮ готов. Дальше
 - Коммиты свободно (pet-project, AGENTS.md § git-repo-categories)
 - Push в origin/main после verify + code-review
 
+== Анализ расписания Екатерины (6 недель, июнь-август 2026) ==
+
+Источник: 7 постов Екатерины в чате "Мурино Парикмахер" (22.06 - 02.08 2026),
+скинутых пользователем в Session 5.9 для анализа реального workflow.
+Цель: эмпирические данные для Этапа 5 (Вариант B — модель WorkDay).
+
+Паттерн 1. График ПЛАВАЮЩИЙ по дням (не фиксированный):
+  - Понедельник: 12:00-13:00 начало (22.06, 13.07, 27.07)
+  - Вторник-Четверг: 11:00-12:30 начало (чаще 11:00, иногда 12:00/12:30)
+  - Пятница: 11:00 или ВЫХОДНОЙ (26.06 вых., 3.07/10.07/17.07/24.07 раб.,
+    31.07 вых.)
+  - Суббота: 12:00-15:00 начало (обычно 12:00, 11.07 только 15:00)
+  - Воскресенье: 12:00 (стабильно)
+  Вывод: НЕЛЬЗЯ захардкодить "10-18". Нужен /openday с плавающим началом/концом.
+
+Паттерн 2. Самое РАННЕЕ начало за 6 недель = 11:00 (НЕ 10:00).
+  Самое ПОЗДНЕЕ окончание = 18:00. Дефолт для /openday без параметров:
+  DEFAULT_WORK_START=11, DEFAULT_WORK_END=18. Между ними — плавающие значения
+  (12:30, 13:00, 13:30, 14:00, 15:00, 16:00, 16:30, 17:00).
+
+Паттерн 3. 30-минутные слоты — НОРМА, не исключение:
+  12:30 (28.07), 13:30 (Татьяна 25.06, Ольга 17.07, Алла 24.07, 30.07),
+  14:30 (Юрий 30.07), 15:30 (Татьяна 21.07, 17.07), 16:30 (Маша 9.07,
+  Алексей 17.07, Инна 21.07, 30.07).
+  Вывод: 30-мин шаг для стартовых времён нужен (10:00, 10:30, 11:00, ...).
+
+Паттерн 4. Услуги РАЗНОЙ длительности:
+  - Стрижка — 1 час (Игорь 14:00 → 15:00 свободен)
+  - Окрашивание + стрижка — 2 часа (Лера 12:00 → 14:00 следующая)
+  - Тонировка + стрижка — 2 часа (Юлия 12:00 → 14:00)
+  - Окрашивание корней — 2 часа (Александра 15:00 → 17:00)
+  Вывод: Booking занимает ДИАПАЗОН времени (не 1 слот). Длительность = услуга.
+
+Паттерн 5. КОРОТКИЕ дни (не всегда 8 часов):
+  Пн 13.07: только 3 слота (13, 14, 15). Вт 14.07: 3 записи. Вт 21.07: 3 записи
+  с большими окнами. Чт 23.07: последняя 14:00. Сб 11.07: одна запись 15:00.
+  Вывод: мастер сам решает когда начать/закончить, /openday поддерживает это.
+
+Паттерн 6. MULTI-CLIENT booking (семья/друзья одновременно):
+  - "Татьяна и Максим" 13:00 (23.07)
+  - "Наталья и Ксения окрашивание и стрижки" 12:00 (25.07)
+  - "Дима и Тима" 12:00 (2.08)
+  - "Вика, Лёша, Олег" 13:00 (2.08) — 3 человека!
+  - "Вика, Лёша" 13:00 (на след неделе)
+  Вывод: Booking может иметь несколько client_name. Занимает одно время,
+  но несколько клиентов. Текущая модель (1 слот = 1 клиент) не укладывается.
+
+Паттерн 7. "Мест нет" — явный сигнал:
+  Вт 30.06: "Мест нет". Екатерина пишет когда день полностью занят, чтобы
+  клиенты не просились. В боте — WorkDay полностью занят → НЕ показывать дату
+  клиентам в /book.
+
+Паттерн 8. Формат записи — имя + услуга в скобках:
+  "12:00(Людмила окрашивание и стрижка)". Не отдельное сообщение, а дополнение
+  к расписанию. В боте — Booking хранит client_name + service_title.
+
+== Donor: winnerxxx13/barbershop-telegram-bot ==
+
+Найден через `gh search repos "barbershop telegram"` 2026-08-28 при ресёрше
+"есть ли готовые /openweek + multi-master решения". 0⭐, но production v2.0.
+
+Полная карточка: ~/.config/opencode/references/donor-research/donors/
+  winnerxxx13-barbershop-telegram-bot.md
+Topic INSIGHT: ~/.config/opencode/references/donor-research/topics/
+  booking-bot-architecture.md (новая секция INSIGHT после таблицы доноров)
+
+Что есть релевантного:
+1. Multi-master с первого дня (Master.telegram_id DB lookup, не ADMIN_ID env)
+   — закрывает наш TODO Ур. 2.6
+2. Скользящее окно слотов — админ задаёт смену, слоты генерируются из
+   длительности услуг (30/60/90 мин) и шага 30 мин. Альтернатива нашему
+   /addslots — НЕ "открыть день по часам", а "указать смену → слоты сами".
+3. Лист ожидания (waitlist) — когда слот занят → клиент в waitlist → при
+   отмене предлагается освободившийся слот (time-limited offer)
+4. Напоминания — APScheduler, за 24h и 2h до записи. Кнопка "Я приду"
+5. Атомарный перенос записи — с дедлайном (по TZ барбершопа, не клиента)
+6. Оценки — 1-5 + комментарий после завершения
+7. Статусы — confirmed/completed/cancelled/no_show с переходами
+8. CSV-экспорт — за 7/30/всё, UTF-8 BOM для Excel
+
+Что НЕ подходит (REJECT):
+1. SQLite + своя migrations.py (у нас Postgres + alembic)
+2. Reply keyboard как основное меню (у нас inline, Этап 1.3+)
+3. License НЕ указана → заимствуем паттерны, НЕ код (пока)
+
+Порядок заимствования для следующих сессий:
+1. Multi-master (Ур. 2.6) — заменить _is_admin на DB lookup
+2. Напоминания (APScheduler, 24h+2h)
+3. Статусы записей (confirmed/completed/cancelled/no_show)
+4. Лист ожидания (waitlist) — если Екатерина скажет что слots постоянно заняты
+5. Перенос записи с дедлайном
+6. /openweek (наша фича, нет у донора) — как упрощённый аналог для MVP
+
+Контраст с нашим подходом:
+| Аспект | Наш бот | winnerxxx13 |
+| Mасштаб | Single-master (ADMIN_ID env) | Multi-master с первого дня |
+| Слоты | /addslots вручную (часы перечислением) | Авто-генерация из смены+услуги |
+| Меню | Inline (Этап 1.3) | Reply keyboard |
+| БД | Postgres + alembic | SQLite + своя migrations |
+| Напоминания | Нет (TODO Этап 2) | APScheduler, 24h+2h |
+| Перенос | Нет | Атомарный с дедлайном |
+| Лист ожидания | Нет | Есть |
+| Оценки | Нет | 1-5 + комментарий |
+| Статусы | Записан/отменён | 4 статуса + переходы |
+| Экспорт | Нет | CSV |
+
 == NEXT ==
-Session 5.9 — ДВА этапа:
-  (1) Этап 1.3e: /cancel + admin-state catch-all в admin_router.
-  (2) Этап 3: cmd_start для админа → admin_inline_menu() (вместо admin_keyboard),
-      /menu command (13 ссылок в admin.py на "/menu — заново" — без команды
-      dead-end UX), admin_menu_cb callback (опционально), правка тестов.
-После 5.9 — Этап 1.3 полностью готов. Дальше Этап 2 (middleware TTL) или
-Этап 4 (тесты для 1.3a-d + 1.3e + Этап 3).
+Session 5.10 — ПЕРВЫЙ ШАГ: передача бота Екатерине (поменять ADMIN_ID в .env
+на VPS после того как она пришлёт свой telegram_id через @userinfobot).
+ВТОРОЙ ШАГ: начать Этап 5 (Вариант B — модель WorkDay + /openday + 30-мин
+шаг + Booking-диапазон). Оценка ~400-600 строк, итеративно по подэтапам 5.1-5.10.
+Донор для паттернов: winnerxxx13/barbershop-telegram-bot (карточка выше).
+Этапы 2 (middleware TTL), 4 (тесты) — параллельно или после 5.10.
 ```
 
 ## Session 5.6 — доноры inline admin menu (UznetDev/Aiogram-Bot-Template, INSIGHT INL-001..005)
