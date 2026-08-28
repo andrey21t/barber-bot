@@ -1,8 +1,13 @@
 """Admin queries — bookings list + service CRUD (master side).
 
 Contract (spec.md 200-213, 307-309):
-- get_today_bookings / get_week_bookings: filter by LOCAL date in business.timezone,
-  NOT UTC. slot.slot_hour stored as LOCAL hour — JOIN via Booking.slot_id → Slot.slot_date.
+- get_today_bookings / get_week_bookings (Этап 5.4): filter by LOCAL date in business.timezone
+  via Booking.start_at (UTC), NOT Slot.slot_date. Booking.start_at already stores the full
+  UTC datetime of the booking window start — JOIN Slot is unnecessary and would miss bookings
+  where slot.slot_date and booking.start_at LOCAL date diverge (legacy /addslots created Slot
+  with slot_date=LOCAL date, but booking.start_at is built from slot.slot_hour LOCAL → UTC).
+  Filter: `start_at >= start_of_today_local_utc AND start_at < start_of_tomorrow_local_utc`
+  (computed via combine(today_local, time(0,0), tzinfo=tz).astimezone(UTC)).
 - Booking.client_name_snapshot / service_title_snapshot — already html.escape()'d
   in booking.py:create_booking BEFORE INSERT. Render in /today /week WITHOUT re-escape.
 - create_service: no name uniqueness check in MVP (master may add "Стрижка" twice —
@@ -11,14 +16,15 @@ Contract (spec.md 200-213, 307-309):
   только upcoming + active status (confirmed/transferred), без past/cancelled.
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.models import Booking, Service, Slot
+from bot.models import Booking, Service
 
 
 async def get_today_bookings(
@@ -30,23 +36,38 @@ async def get_today_bookings(
 ) -> list[Booking]:
     """Confirmed/transferred bookings for today (LOCAL date in business.timezone).
 
-    `now_utc` injected for tests (production uses datetime.now(UTC)).
-    """
-    from zoneinfo import ZoneInfo
+    Filter by Booking.start_at (UTC) — start_at already stores the full UTC datetime
+    of the booking window start, so JOIN Slot is unnecessary (Этап 5.4 Gap 1).
 
+    Window: [start_of_today_local_utc, start_of_tomorrow_local_utc) where
+    today_local = ref.astimezone(tz).date(). Half-open interval avoids off-by-one
+    on bookings exactly at midnight (edge case, but defensive).
+
+    `now_utc` injected for tests (production uses datetime.now(UTC)).
+    Bug fix 5.4: default was `datetime.now(tz)` (aware in tz, NOT UTC — naming lie).
+    Now `datetime.now(UTC)` matches the parameter name and downstream UTC arithmetic.
+    """
     tz = ZoneInfo(business_timezone)
-    ref = now_utc or datetime.now(tz)
+    ref = now_utc or datetime.now(UTC)
     today_local = ref.astimezone(tz).date()
+    start_of_today_utc = datetime.combine(today_local, time(0, 0), tzinfo=tz).astimezone(UTC)
+    # Combine through LOCAL date, NOT +timedelta(days=1) on UTC datetime —
+    # DST-safe (same pattern as get_week_bookings:94-95). For non-DST tz (Russia
+    # since 2014) both are equivalent; for DST tz this avoids ±1h off-by-one
+    # on the spring-forward / fall-back day.
+    start_of_tomorrow_utc = datetime.combine(
+        today_local + timedelta(days=1), time(0, 0), tzinfo=tz
+    ).astimezone(UTC)
 
     stmt = (
         select(Booking)
-        .join(Slot, Booking.slot_id == Slot.id)
         .where(
             Booking.master_id == master_id,
-            Slot.slot_date == today_local,
+            Booking.start_at >= start_of_today_utc,
+            Booking.start_at < start_of_tomorrow_utc,
             Booking.status.in_(("confirmed", "transferred")),
         )
-        .order_by(Slot.slot_hour)
+        .order_by(Booking.start_at)
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())
@@ -65,25 +86,30 @@ async def get_week_bookings(
     Spec.md says "/week = 7 days" → with days_ahead=7, returns today + 6 future days = 7 days
     total (NOT today + 7 = 8 days). `end_local = today + (days_ahead - 1)`.
 
-    `now_utc` injected for tests.
-    """
-    from zoneinfo import ZoneInfo
+    Filter by Booking.start_at (UTC) — Этап 5.4 Gap 1 (see get_today_bookings docstring).
+    Window: [start_of_today_local_utc, start_of_(today+N)_local_utc). Half-open.
 
+    `now_utc` injected for tests. Bug fix 5.4: default `datetime.now(UTC)` (was
+    `datetime.now(tz)` — aware in tz, naming lie).
+    """
     tz = ZoneInfo(business_timezone)
-    ref = now_utc or datetime.now(tz)
+    ref = now_utc or datetime.now(UTC)
     today_local = ref.astimezone(tz).date()
     end_local = today_local + timedelta(days=days_ahead - 1)
+    start_of_today_utc = datetime.combine(today_local, time(0, 0), tzinfo=tz).astimezone(UTC)
+    start_of_end_utc = datetime.combine(
+        end_local + timedelta(days=1), time(0, 0), tzinfo=tz
+    ).astimezone(UTC)
 
     stmt = (
         select(Booking)
-        .join(Slot, Booking.slot_id == Slot.id)
         .where(
             Booking.master_id == master_id,
-            Slot.slot_date >= today_local,
-            Slot.slot_date <= end_local,
+            Booking.start_at >= start_of_today_utc,
+            Booking.start_at < start_of_end_utc,
             Booking.status.in_(("confirmed", "transferred")),
         )
-        .order_by(Slot.slot_date, Slot.slot_hour)
+        .order_by(Booking.start_at)
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())

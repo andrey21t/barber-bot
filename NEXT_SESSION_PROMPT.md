@@ -1,25 +1,109 @@
-# NEXT_SESSION_PROMPT — Session 5.13 завершён (5.3 invariants done), Session 5.14 готов (5.4 next).
+# NEXT_SESSION_PROMPT — Session 5.14 завершён (5.4 done), Session 5.15 готов (5.5 next).
 
-> Дата: 2026-08-28 · Session 5.13 — implementation Этапа 5 Вариант B. Шаг 5.3 завершён (коммит `aedf1a0` в origin/main, НЕ задеплоен). Тестов 281 (baseline 274 → +7 в 5.3: 5 invariant + 2 boundary). ruff + mypy чисто. Осталось 8 шагов (5.4-5.10 + aliases + миграция 006).
+> Дата: 2026-08-28 · Session 5.14 — implementation Этапа 5 Вариант B. Шаг 5.4 завершён (commit pending в origin/main, НЕ задеплоен). Тестов 286 (baseline 281 → +5 в 5.4: 1 regression + 4 workday_slots). ruff + mypy strict чисто. Осталось 7 шагов (5.1, 5.5-5.10 + aliases + миграция 006).
 > Prod остаётся на `c64b31d` (Session 5.9). Миграция 005 НЕ накатывалась на prod — smoke-test на dev-копии обязателен (one-way door, данные Екатерины).
 
-## ⚡ TL;DR для Session 5.14 (handoff)
+## ⚡ TL;DR для Session 5.15 (handoff)
 
-**Цель 5.14:** продолжить implementation по PLANS.md Plan of Work. Шаг 5.3 ✅, следующий — **5.4 30-мин шаг + `_build_start_at` перепись**.
+**Цель 5.15:** продолжить implementation по PLANS.md Plan of Work. Шаг 5.4 ✅, следующий — **5.5 multi-client (max_concurrent_clients UPDATE 2 + app-level check + retry)**.
 
-**Главный артефакт:** `~/PycharmProjects/barber-bot/PLANS.md` — living-документ Этапа 5. ЧИТАТЬ ПЕРВЫМ. Progress Session 5.13 (5.3 done), Decision Log (3 blocker'а + 7 gaps + Gap 8 SQL parens), Plan of Work (13 шагов).
+**Главный артефакт:** `~/PycharmProjects/barber-bot/PLANS.md` — living-документ Этапа 5. ЧИТАТЬ ПЕРВЫМ. Progress Session 5.14 (5.4 done), Decision Log (3 blocker'а + 7 gaps + Gap 8 SQL parens), Plan of Work.
 
-**Что сделано в Session 5.12 (commits `90c0000` + `9345a7b`, pushed) — база для 5.3+:**
+## Что сделано в Session 5.14 (commit pending) — шаг 5.4 завершён:
 
-1. **bot/models.py** — класс `WorkDay` (44 строки, перед Booking):
-   - Поля: `id` (Uuid PK), `master_id` (FK masters.id ondelete=CASCADE), `work_date` (Date — НЕ `date`, конфликт с типом `date` в Mapped), `start_time` (Time), `end_time` (Time), `max_concurrent_clients` (int default 1), `is_active` (bool default True), `created_at` (DateTime timezone-aware)
-   - Constraints: `CheckConstraint("end_time > start_time")`, `UNIQUE(master_id, work_date)` (index ux_work_days_master_date), partial Index `is_active=TRUE` на Postgres (idx_work_days_master_date_active)
+1. **bot/services/admin.py** — KEY CHANGE:
+   - `get_today_bookings` / `get_week_bookings`: removed `JOIN Slot`, filter via `Booking.start_at` (UTC) с `datetime.combine(today_local, time(0,0), tzinfo=tz).astimezone(UTC)` для window bounds (DST-safe pattern)
+   - `order_by(Booking.start_at)` вместо `Slot.slot_hour`
+   - Bug fix: `now_utc` default был `datetime.now(tz)` (aware в business tz, naming lie) → `datetime.now(UTC)`
 
-2. **alembic/versions/005_workday.py** (172 строки):
-   - CREATE TABLE work_days + DROP EXCLUDE no_overlap (002) на Postgres + перенос данных из slots через bulk_insert (group by master_id, slot_date → MIN/MAX(slot_hour) + 60мин буфер; edge max_h=23 → +30мин)
-   - SQLite: no-op (002 был no-op). Downgrade: DROP TABLE БЕЗ восстановления EXCLUDE (one-way door)
+2. **bot/services/booking.py** — `_build_start_at_from_workday(workday, start_time_local, business_timezone) -> datetime` (WorkDay.work_date + LOCAL HH:MM → aware UTC, 30-min granularity); `_build_start_at(slot, ...)` DEPRECATED (kept for legacy /book flow до 5.8).
 
-3. **tests/test_workday.py** (247 строк, 9 тестов): 4 модель + 5 миграция logic (через `_run_migration_logic` helper, не op.bulk_insert)
+3. **bot/services/slots.py** — `TimeSlot30` frozen dataclass + `get_30min_slots_from_workday(workday, business_timezone, *, now_utc=None) -> list[TimeSlot30]` (half-open [start_time, end_time), 30-min step, past-filter strict `>`, no occupancy check — 5.6 concern); legacy funcs DEPRECATED.
+
+4. **bot/keyboards/client.py** — `slot_picker_keyboard_30min(slots)` (uses pre-formatted labels, `callback_data="noop"` placeholder — TODO 5.8: BookSlot30CallbackData) + `_format_booking_summary_from_start_at(start_at, ...)` (decouples summary rendering от Slot model); `slot_picker_keyboard` DEPRECATED.
+
+5. **tests/test_admin.py** — regression `test_get_today_filters_by_booking_start_at_not_slot_date` (slot.slot_date=today, booking.start_at=tomorrow → excluded).
+
+6. **tests/test_workday_slots.py** (NEW, 4 теста):
+   - `test_build_start_at_from_workday_30min` (Moscow UTC+3, 14:30 LOCAL → 11:30 UTC)
+   - `test_get_30min_slots_from_workday` (4 slots from [10:00, 12:00), half-open)
+   - `test_get_30min_slots_filters_past` (now_utc=11:00 LOCAL → only 11:30 kept)
+   - `test_slot_picker_30min_keyboard` (4 slots → 3+1 rows, empty → "Нет свободных слотов")
+
+**Гейты 5.4 (все зелёные):**
+- format/lint/typecheck: ✅ (ruff check 0 errors, mypy --strict 0 issues, 6 source files)
+- tests: **286 ✅** (baseline 281 → +5: 1 regression + 4 workday_slots)
+- qa-code-review (subagent [REDACTED-SESSION-ID]): **LGTM**
+  - W1 fixed pre-commit: DST-bug в `get_today_bookings` (`+timedelta(days=1)` → `combine(today_local + timedelta(days=1), ...)` — синхронизировано с `get_week_bookings:94-95`)
+  - S3 fixed pre-commit: misleading docstring `.replace(tzinfo=UTC)` "no-op on aware values" → уточнён contract
+  - S1 (dead code booking.py:154-163 pre-existing 5.3) — observation, не в 5.4 scope
+  - S2 (days_ahead<=0 валидация) — Suggestion, не критично для happy path
+  - S4 (DST в 30-min grid) — Suggestion, латентный для РФ (нет DST с 2014)
+
+## Что осталось — Session 5.15+ (по PLANS.md Plan of Work):
+
+1. ✅ 5.2 WorkDay модель + миграция 005 — СДЕЛАНО
+2. ✅ 5.3 WorkDay invariants в create_booking — СДЕЛАНО
+3. ✅ 5.4 30-мин шаг + `_build_start_at_from_workday` + admin.py Booking.start_at filter — СДЕЛАНО
+4. ⏭️ **5.5 multi-client** (max_concurrent_clients UPDATE 2 для Екатерины, app-level check + retry, pg_advisory_xact_lock) — СЛЕДУЮЩИЙ
+5. 5.1 `/openday` command + FSM (idempotent через UNIQUE master/work_date)
+6. 5.6 «Мест нет» в /slots (occupancy check, count bookings WHERE tstzrange &&)
+7. 5.8 /slots command + slot picker keyboard (30-мин кнопки T, T+30, T+60, ...)
+8. 5.9 /movslot + admin_move_booking (без client_id pin, без 24h правила, уведомление клиенту)
+9. 5.10 inline-часы toggle в FSM (переделка admin_addslots_hours_msg / admin_closeslot_hour_msg)
+10. /addslots /closeslot deprecated aliases (warning + делегирование на /openday)
+11. Миграция 006 drop table slots (после smoke-test на prod ~1 неделя наблюдения)
+
+**Risk-класс 5.5:** HIGH-STAKES — race condition (multi-client overlap), app-level check + retry нужен для конкурирующих INSERT'ов. pg_advisory_xact_lock для serializable на уровне транзакции.
+
+**Baseline: 286 тест** (после 5.4). Цель: +30-50 тестов в Этап 5.
+
+---
+
+## Smoke-test на dev-копии prod базы перед deploy миграции 005 (PLANS.md:203, one-way door)
+
+```bash
+# 1. Бэкап prod базы
+pg_dump $DATABASE_URL > backup-$(date +%Y%m%d).sql
+# 2. Создать dev-копию
+createdb barber_dev && psql barber_dev < backup-$(date +%Y%m%d).sql
+# 3. Прогнать миграцию на dev-копии
+DATABASE_URL=postgresql://...barber_dev alembic upgrade head
+# 4. Проверить: SELECT count(*) FROM work_days; (должно = кол-во уникальных master_id+slot_date в slots)
+# 5. Проверить: SELECT * FROM work_days LIMIT 5; (start_time, end_time адекватные)
+# 6. Проверить: bookings на месте, EXCLUDE no_overlap удалён (\d bookings на Postgres)
+# 7. Если ОК → deploy на prod: alembic upgrade head
+# 8. Smoke-test на prod: /today, /week, /book — всё работает
+# 9. Наблюдение 1 неделя → миграция 006 (drop table slots)
+```
+
+---
+
+## Файлы на старте 5.15:
+
+- `bot/models.py` — WorkDay ✅, Booking.slot_id FK остаётся (drop в 006)
+- `bot/services/booking.py` — WorkDay invariants ✅ + `_build_start_at_from_workday` ✅. **5.5 доработка**: `_validate_booking_within_workday` extension на multi-client (count overlapping bookings vs `max_concurrent_clients`, retry на IntegrityError)
+- `bot/services/admin.py` — `get_today/week_bookings` через `Booking.start_at` ✅
+- `bot/services/slots.py` — `TimeSlot30` + `get_30min_slots_from_workday` ✅ (5.6 доработка: occupancy filter)
+- `bot/keyboards/client.py` — `slot_picker_keyboard_30min` ✅ + `_format_booking_summary_from_start_at` ✅ (5.8 подключение к /slots)
+- `bot/handlers/admin.py` (1238) — `/addslots`, `/closeslot`, FSM (618, 832) — НЕ тронуты в 5.4, переносятся на 5.10
+- `alembic/versions/005_workday.py` (172) — CREATE work_days + DROP EXCLUDE + INSERT из Slot ✅
+- `tests/test_workday.py` (247) — 9 тестов ✅
+- `tests/test_booking_invariants.py` — 7 тестов ✅
+- `tests/test_workday_slots.py` (NEW) — 4 теста ✅
+- `tests/test_admin.py` — regression + 7 existing ✅
+- `tests/conftest.py` — seed_data Slot + WorkDay (Slot остаётся пока для legacy /book flow, drop при переписи seed в 5.8)
+- `donor-research/topics/booking-bot-architecture.md:158-166` — BB-007 (НЕ нарушается B)
+
+**Гейты:** после 5.5 — qa-verify-and-fix (format/lint/typecheck/tests) + qa-code-review (multi-client race — нетривиальная логика, обязательна).
+
+**Формат работы:** `MY-VIBE-RULES.md` — dev-режим, гейты: deep-analysis → impl → verify → code-review.
+
+---
+
+## Исторический контекст (не читать в начале Session 5.15)
+
+Ниже — детальные итоги предыдущих сессий (5.11, 5.13, 5.9, 5.8, 5.7, 5.6, Sessions 1-2). Читать только если нужны детали.
 
 ## Что сделано в Session 5.13 (commit `aedf1a0`, pushed) — шаг 5.3 завершён:
 

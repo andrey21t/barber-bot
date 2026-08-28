@@ -411,6 +411,53 @@ async def test_get_week_orders_by_date_then_hour(
     assert result[2].start_at == _utc_naive("2026-03-17", 16, tz)
 
 
+@pytest.mark.asyncio
+async def test_get_today_filters_by_booking_start_at_not_slot_date(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Regression (Этап 5.4 Gap 1): filter by Booking.start_at, NOT Slot.slot_date.
+
+    Create a booking where slot.slot_date == today (LOCAL) but booking.start_at
+    in LOCAL time falls on tomorrow. Legacy JOIN Slot would WRONGLY include it
+    in today's list (Slot.slot_date == today); new Booking.start_at filter
+    correctly excludes it (start_at is in tomorrow's UTC window).
+
+    Setup: today = 2026-03-15 LOCAL (Europe/Moscow, UTC+3).
+    - slot.slot_date = 2026-03-15 (LOCAL date — legacy /addslots writes this)
+    - booking.start_at = 2026-03-16 02:00 UTC = 2026-03-16 05:00 LOCAL (tomorrow)
+
+    Expected: get_today_bookings returns [] (booking is tomorrow by start_at,
+    even though slot_date says today).
+    """
+    tz = "Europe/Moscow"
+    now_utc = _local_dt("2026-03-15", 12, tz)  # 2026-03-15 12:00 LOCAL = 09:00 UTC
+
+    # Slot with slot_date=today (15th) — legacy writes this; new code ignores it.
+    slot = await _make_slot(
+        session,
+        master_id=seed_data["master_id"],
+        slot_date_local=datetime.fromisoformat("2026-03-15T00:00:00+03:00"),
+        hour_local=5,  # nominal hour 05:00 (consistent with start_at LOCAL time)
+    )
+    # Booking.start_at = tomorrow 05:00 LOCAL = 2026-03-16 02:00 UTC
+    await _make_booking(
+        session,
+        slot_id=slot.id,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        client_id=seed_data["client"].id,
+        start_at_utc=datetime(2026, 3, 16, 2, 0),  # naive UTC, matches SQLite storage
+    )
+
+    result = await get_today_bookings(session, seed_data["master_id"], tz, now_utc=now_utc)
+    # Booking excluded: start_at (tomorrow) is OUTSIDE today's [15th 00:00, 16th 00:00) LOCAL.
+    assert result == [], (
+        "expected empty — start_at is tomorrow, slot_date is today. "
+        "Filter must use start_at, not slot_date (Этап 5.4 Gap 1 regression)."
+    )
+
+
 # ============================================================
 # create_service
 # ============================================================
