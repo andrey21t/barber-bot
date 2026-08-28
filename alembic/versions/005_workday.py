@@ -11,7 +11,10 @@ created: 2026-08-28
    max_concurrent_clients=1, is_active=True)
    + UNIQUE(master_id, work_date) — идемпотент /openday на ту же дату (UPDATE, не INSERT)
 2. Перенос данных из slots: для каждого (master_id, slot_date) — окно
-   [min(slot_hour), max(slot_hour)+30min].
+   [min(slot_hour), max(slot_hour)+60min]. Буфер 60мин покрывает 60-мин услуги
+   (если есть услуги >60мин — data-fix в 5.3, расширение WorkDay.end_time).
+   Edge: max_h=23 → +30мин (не +60мин, чтобы не перейти в полночь →
+   CheckConstraint violation на end_time < start_time).
    Multi-client capacity = 1 (для Екатерины UPDATE до 2 в 5.5).
 3. DROP EXCLUDE constraint no_overlap (миграция 002) на Postgres — ломает multi-client
    (запрещает любые overlap'ы, multi-client = разрешённые overlap'ы).
