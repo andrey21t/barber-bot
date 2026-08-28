@@ -28,7 +28,7 @@ Why handler tests (not just service tests):
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from datetime import time as dt_time
 from typing import Any
 from uuid import UUID
@@ -79,7 +79,7 @@ async def _seed_workday(
     session: AsyncSession,
     *,
     master_id: UUID,
-    work_date: datetime,
+    work_date: date,
     start_time: dt_time,
     end_time: dt_time,
     is_active: bool = True,
@@ -100,12 +100,12 @@ async def _seed_workday(
     return wd
 
 
-def _tomorrow() -> datetime:
+def _tomorrow() -> date:
     """Future date — guaranteed > today_local (avoids past-date rejection)."""
     return (datetime.now(UTC) + timedelta(days=1)).date()
 
 
-def _future(days: int) -> datetime:
+def _future(days: int) -> date:
     """Future date N days ahead (used by shrink test to avoid same-day overlaps)."""
     return (datetime.now(UTC) + timedelta(days=days)).date()
 
@@ -155,9 +155,9 @@ async def test_openday_idempotent_update_no_duplicate_row(
     [10:00, 19:00] on same date → UPDATE (not INSERT), no duplicate row,
     no 'день был закрыт' message (was_closed=False).
     """
+    target = _tomorrow()  # single compute — avoid midnight-UTC flaky race (S2)
     async with session_factory() as session:
         ctx = await _seed_admin_stack(session)
-        target = _tomorrow()
         await _seed_workday(
             session,
             master_id=ctx["master_id"],
@@ -167,7 +167,6 @@ async def test_openday_idempotent_update_no_duplicate_row(
             is_active=True,
         )
 
-    target = _tomorrow()
     msg = _make_message(
         user_id=ADMIN_TG_ID,
         text=f"/openday {target} 10:00 19:00",
@@ -201,9 +200,9 @@ async def test_openday_shrink_error_message_rendered(
     but invoked via cmd_openday handler (not service directly) — verifies handler UX
     catches the service exception and renders the message.
     """
+    target = _future(11)  # single compute — avoid midnight-UTC flaky race (S2)
     async with session_factory() as session:
         ctx = await _seed_admin_stack(session)
-        target = _future(11)
         await _seed_workday(
             session,
             master_id=ctx["master_id"],
@@ -229,7 +228,6 @@ async def test_openday_shrink_error_message_rendered(
             status="confirmed",
         )
 
-    target = _future(11)
     msg = _make_message(
         user_id=ADMIN_TG_ID,
         text=f"/openday {target} 10:00 18:00",  # shrink end 20:00 → 18:00
@@ -261,9 +259,9 @@ async def test_openday_reopen_shows_message(
     `"" if True else "..."` = `""` → message NEVER shown. F1 fixed by capturing
     `was_closed` BEFORE open_workday in handler.
     """
+    target = _tomorrow()  # single compute — avoid midnight-UTC flaky race (S2)
     async with session_factory() as session:
         ctx = await _seed_admin_stack(session)
-        target = _tomorrow()
         await _seed_workday(
             session,
             master_id=ctx["master_id"],
@@ -273,7 +271,6 @@ async def test_openday_reopen_shows_message(
             is_active=False,  # ← closed day — re-open scenario
         )
 
-    target = _tomorrow()
     msg = _make_message(
         user_id=ADMIN_TG_ID,
         text=f"/openday {target} 10:00 19:00",  # new window
@@ -303,9 +300,9 @@ async def test_openday_open_no_reopen_message_when_was_active(
     (idempotent UPDATE) → message must NOT contain 'день был закрыт'
     (was_closed=False — day was already active, no re-open happened).
     """
+    target = _tomorrow()  # single compute — avoid midnight-UTC flaky race (S2)
     async with session_factory() as session:
         ctx = await _seed_admin_stack(session)
-        target = _tomorrow()
         await _seed_workday(
             session,
             master_id=ctx["master_id"],
@@ -315,7 +312,6 @@ async def test_openday_open_no_reopen_message_when_was_active(
             is_active=True,  # already active — no re-open
         )
 
-    target = _tomorrow()
     msg = _make_message(
         user_id=ADMIN_TG_ID,
         text=f"/openday {target} 11:00 18:00",  # same window → idempotent
