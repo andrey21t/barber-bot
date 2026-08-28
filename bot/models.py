@@ -160,6 +160,7 @@ class WorkDay(Base):
 
     __table_args__ = (
         CheckConstraint("end_time > start_time", name="ck_workday_window_positive"),
+        CheckConstraint("max_concurrent_clients >= 1", name="ck_workday_capacity_positive"),
         # UNIQUE (master_id, work_date) — идемпотент /openday на ту же дату (UPDATE, не INSERT)
         Index("ux_work_days_master_date", "master_id", "work_date", unique=True),
         Index(

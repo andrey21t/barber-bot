@@ -1624,15 +1624,35 @@ async def test_create_booking_concurrent_race_integrity_error(
     test_create_booking_idempotency_unique_guard covers via sequential double-call
     (where slot.status='booked' is visible on SELECT).
     """
-    slot = seed_data["slot"]
-    slot_id = slot.id  # capture before any rollback (avoid expired-attr access)
+    # Create a fresh slot WITHOUT WorkDay on a separate date — capacity check
+    # (Этап 5.5) is skipped when no WorkDay exists, so the UNIQUE(slot_id) guard
+    # remains the only catch path (which is what this test exercises). If we
+    # reused seed_data["slot"] (which has WorkDay cap=1), the capacity check
+    # would raise WorkDayCapacityExceededError before reaching the UNIQUE flush.
+    fresh_date = (datetime.now(UTC) + timedelta(days=30)).date()
+    fresh_slot = Slot(
+        master_id=seed_data["master_id"],
+        slot_date=fresh_date,
+        slot_hour=14,
+        status="open",
+    )
+    session.add(fresh_slot)
+    await session.commit()
+    slot_id = fresh_slot.id
     master_id = seed_data["master_id"]
-    slot_date = slot.slot_date
-    slot_hour = slot.slot_hour
+    slot_date = fresh_date
+    slot_hour = 14
 
-    # Pre-create a booking with slot.id (commits slot_id to bookings table)
-    await _seed_confirmed_booking(session, seed_data)
-    # slot.status now 'booked' in DB, booking row exists with slot_id=slot.id
+    # Pre-create a booking with fresh_slot.id (commits slot_id to bookings table)
+    fresh_payload = await _make_payload(slot_id)
+    await create_booking(
+        session,
+        fresh_payload,
+        business_id=seed_data["business_id"],
+        master_id=master_id,
+        telegram_id=seed_data["client_telegram_id"],
+    )
+    # fresh_slot.status now 'booked' in DB, booking row exists with slot_id
 
     # Stale DETACHED slot — what _select_open_slot would have seen pre-book
     stale_slot = Slot(
