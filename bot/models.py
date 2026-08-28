@@ -1,5 +1,5 @@
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any
 
@@ -13,6 +13,7 @@ from sqlalchemy import (
     Integer,
     Numeric,
     String,
+    Time,
     Uuid,
     text,
 )
@@ -126,6 +127,46 @@ class Slot(Base):
             "master_id",
             "slot_date",
             postgresql_where=text("status = 'open'"),
+        ),
+    )
+
+
+class WorkDay(Base):
+    """Рабочий день мастера — окно приёма (Этап 5.2, замена Slot).
+
+    Slot хранил час как int (slot_hour 0-23). WorkDay хранит окно [start_time, end_time]
+    на конкретную дату. 30-мин слоты генерируются на лету в /slots (Этап 5.4).
+    Multi-client capacity — max_concurrent_clients (Этап 5.5).
+
+    Slot deprecated после миграции 005 (данные перенесены). Drop table — миграция 006
+    (после smoke-test на prod, ~1 неделя наблюдения).
+    """
+
+    __tablename__ = "work_days"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    master_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("masters.id", ondelete="CASCADE"), nullable=False
+    )
+    work_date: Mapped[date] = mapped_column()
+    start_time: Mapped[time] = mapped_column(Time)
+    end_time: Mapped[time] = mapped_column(Time)
+    max_concurrent_clients: Mapped[int] = mapped_column(default=1)
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True).with_variant(TIMESTAMP(timezone=True), "postgresql"),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint("end_time > start_time", name="ck_workday_window_positive"),
+        # UNIQUE (master_id, work_date) — идемпотент /openday на ту же дату (UPDATE, не INSERT)
+        Index("ux_work_days_master_date", "master_id", "work_date", unique=True),
+        Index(
+            "idx_work_days_master_date_active",
+            "master_id",
+            "work_date",
+            postgresql_where=text("is_active = TRUE"),
         ),
     )
 
