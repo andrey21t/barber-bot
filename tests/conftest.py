@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 from datetime import UTC, date, datetime, timedelta
+from datetime import time as dt_time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -31,7 +32,7 @@ os.environ["ADMIN_ID"] = "461355056"
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./barber.db"
 
 from bot.db import Base  # noqa: E402
-from bot.models import Business, Client, Master, Slot  # noqa: E402
+from bot.models import Business, Client, Master, Slot, WorkDay  # noqa: E402
 
 
 @pytest_asyncio.fixture
@@ -93,7 +94,12 @@ async def session(
 async def seed_data(
     session: AsyncSession,
 ) -> dict[str, Any]:
-    """Seed one business, one master, one client, one slot — minimal context for booking tests."""
+    """Seed one business, one master, one client, one slot + one WorkDay covering that slot.
+
+    WorkDay window [10:00, 20:00] LOCAL Moscow covers slot_hour=14 → booking [14:00, 15:00]
+    fits (Этап 5.3 invariant check passes). Slot deprecated after 5.2 migration but kept
+    in seed until 5.4 rewrites /book flow to use WorkDay directly.
+    """
     biz = Business(name="Test Barbershop", telegram_owner_id=461355056, timezone="Europe/Moscow")
     session.add(biz)
     await session.flush()  # populate biz.id
@@ -115,6 +121,18 @@ async def seed_data(
         status="open",
     )
     session.add(slot)
+
+    # WorkDay covers tomorrow [10:00, 20:00] LOCAL — slot_hour=14 fits.
+    # Этап 5.3 invariant check: create_booking SELECTs this WorkDay and validates.
+    workday = WorkDay(
+        master_id=master.id,
+        work_date=tomorrow,
+        start_time=dt_time(10, 0),
+        end_time=dt_time(20, 0),
+        max_concurrent_clients=1,
+        is_active=True,
+    )
+    session.add(workday)
     await session.commit()
 
     return {
@@ -122,6 +140,7 @@ async def seed_data(
         "master": master,
         "client": client,
         "slot": slot,
+        "workday": workday,
         "business_id": biz.id,
         "master_id": master.id,
         "client_telegram_id": 111222333,
