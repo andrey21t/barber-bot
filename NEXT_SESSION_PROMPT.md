@@ -1,13 +1,303 @@
-# NEXT_SESSION_PROMPT — Session 5.14 завершён (5.4 done), Session 5.15 готов (5.5 next).
+# NEXT_SESSION_PROMPT — Session 5.16 завершён (5.5 impl + LBTM fixes), Session 5.17 готов (5.1 /openday).
 
-> Дата: 2026-08-28 · Session 5.14 — implementation Этапа 5 Вариант B. Шаг 5.4 завершён (commit `069274d` в origin/main, НЕ задеплоен). Тестов 286 (baseline 281 → +5 в 5.4: 1 regression + 4 workday_slots). ruff + mypy strict чисто. Осталось 7 шагов (5.1, 5.5-5.10 + aliases + миграция 006).
+> Дата: 2026-08-28 · Session 5.16 — implementation шага 5.5 multi-client + qa-verify-and-fix + qa-code-review (LBTM) + 3 правки (F1 Critical + W1 + W2). Код готов, коммит НЕ сделан (сессия упала перед commit). Тестов 296 passed + 2 skipped (baseline 286 → +10 в 5.5). ruff + mypy strict чисто. Prod на `c64b31d`.
 > Prod остаётся на `c64b31d` (Session 5.9). Миграция 005 НЕ накатывалась на prod — smoke-test на dev-копии обязателен (one-way door, данные Екатерины).
 
-## ⚡ TL;DR для Session 5.15 (handoff)
+## ⚡ TL;DR для Session 5.17 (handoff)
 
-**Цель 5.15:** продолжить implementation по PLANS.md Plan of Work. Шаг 5.4 ✅, следующий — **5.5 multi-client (max_concurrent_clients UPDATE 2 + app-level check + retry)**.
+**Цель 5.17:** (1) Commit + push Session 5.16 правок (pet-project, free per AGENTS.md § git-repo-categories). (2) Продолжить implementation по PLANS.md Plan of Work → шаг **5.1 `/openday` command + FSM** (idempotent через UNIQUE master/work_date).
 
-**Главный артефакт:** `~/PycharmProjects/barber-bot/PLANS.md` — living-документ Этапа 5. ЧИТАТЬ ПЕРВЫМ. Progress Session 5.14 (5.4 done), Decision Log (3 blocker'а + 7 gaps + Gap 8 SQL parens), Plan of Work.
+**Главный артефакт:** `~/PycharmProjects/barber-bot/PLANS.md` — living-документ Этапа 5. ЧИТАТЬ ПЕРВЫМ. Progress Session 5.16 (5.5 done, code-review LBTM fixed), Decision Log (3 blocker'а + 7 gaps + Gap 8 SQL parens), Plan of Work п.5 (5.1).
+
+## Статус Этапа 5 Вариант B:
+
+- ✅ 5.2 WorkDay + миграция 005 (commits 90c0000 + 9345a7b, pushed)
+- ✅ 5.3 WorkDay invariants в create_booking (commit aedf1a0, pushed, +7 тестов → 281)
+- ✅ 5.4 30-мин шаг + admin.py Booking.start_at filter (commit 069274d, pushed, +5 → 286)
+- ⏭️ **5.5 multi-client** — ЗАВЕРШЁН в Session 5.16 (impl + LBTM fixes), НО коммит НЕ сделан (сессия упала перед commit). **ПЕРВЫЙ ШАГ 5.17 — commit + push**.
+- 5.1 `/openday` command + FSM (idempotent через UNIQUE master/work_date) — СЛЕДУЮЩИЙ после commit
+- 5.6 «Мест нет» в /slots (occupancy check)
+- 5.8 /slots command + slot picker keyboard
+- 5.9 /movslot + admin_move_booking
+- 5.10 inline-часы toggle в FSM
+- /addslots /closeslot deprecated aliases
+- Миграция 006 drop table slots (после smoke-test на prod ~1 неделя)
+
+## Что сделано в Session 5.16 (impl шаг 5.5, БЕЗ commit):
+
+### Implementation (по iter 2 plan, gaps 1-9 критика закрыты)
+
+1. **bot/services/booking.py** — KEY CHANGES:
+   - `WorkDayCapacityExceededError` (новое исключение)
+   - `_check_multi_client_capacity(session, *, workday_id, capacity, master_id, start_at, end_at, excluded_booking_id=None)` — cross-DB overlap `Booking.start_at < new_end AND Booking.end_at > new_start AND status IN ('confirmed', 'transferred')`, half-open. `excluded_booking_id` для transfer_booking (F1 fix — skip self при same-date transfer, default None для create_booking).
+   - `_acquire_advisory_lock(session, master_id, work_date)` — Postgres-only `pg_advisory_xact_lock(hashtext(:master_id::text), :work_date_ordinal)`, SQLite no-op (via `session.bind.dialect.name` check).
+   - create_booking integration (B1 fix): capture `workday_id` + `workday_capacity` ДО `_select_or_create_client` (line 428-429), acquire + capacity check ПОСЛЕ (line 442-451), перед Booking INSERT (line 453).
+   - transfer_booking integration (B2 fix): after `new_end_at` build (line 837), before UPDATE booking (line 880). Pass `excluded_booking_id=booking_id` (F1 fix).
+   - Dead code 154-163 убран (5.3 artifact, code-reviewer 5.4 S1).
+
+2. **bot/models.py** — `CheckConstraint("max_concurrent_clients >= 1", name="ck_workday_capacity_positive")` в `WorkDay.__table_args__` (defense-in-depth, no migration — dev create_all picks up; prod needs separate small migration later).
+
+3. **tests/test_multi_client.py** (NEW, 12 тестов = 9 functional + 1 same-date transfer F1 + 2 skipif SQLite race):
+   - test_create_booking_capacity_1_blocks_2nd_overlap
+   - test_create_booking_capacity_2_allows_2_overlaps
+   - test_create_booking_capacity_2_blocks_3rd_overlap
+   - test_create_booking_cancelled_excluded_from_capacity
+   - test_create_booking_transferred_counted_in_capacity
+   - test_create_booking_boundary_touching_no_overlap (half-open)
+   - test_create_booking_no_workday_skip_capacity_check (backwards compat)
+   - test_create_booking_workday_inactive_still_enforce_capacity
+   - test_transfer_booking_capacity_check_on_new_slot (B2 fix)
+   - **test_transfer_booking_same_date_overlap_excludes_self** (F1 fix — same-date transfer succeeds)
+   - test_create_booking_concurrent_race_postgres (skipif SQLite)
+   - test_transfer_booking_concurrent_race_postgres (skipif SQLite)
+   - Helpers: `_seed_capacity_test`, `_direct_insert_booking`, `_local_to_utc`, `_make_payload`
+
+4. **tests/test_booking.py** — `test_create_booking_concurrent_race_integrity_error` adapted: fresh slot 30 days ahead WITHOUT WorkDay (capacity check skipped, UNIQUE path reachable — иначе capacity check поднимает WorkDayCapacityExceededError до UNIQUE flush).
+
+### Гейты 5.5:
+
+- **deep-analysis-protocol** — ✅ Pass 1-4 + critic iter 1 NEEDS_MORE_ANALYSIS → iter 2 plan применён.
+- **qa-verify-and-fix** — ✅ ruff format/check 0 errors, mypy --strict 0 issues, **pytest 296 passed + 2 skipped** (baseline 286 → +10 multi-client + 1 adapted test_booking).
+- **qa-code-review** (subagent) → **LBTM** → 3 правки фикса:
+  - **F1 Critical**: transfer_booking capacity check считает сам booking (status='confirmed' pre-UPDATE) в overlap → false positive на same-date transfer. Fix: `excluded_booking_id: UUID | None = None` в сигнатуру `_check_multi_client_capacity`, pass `excluded_booking_id=booking_id` из transfer_booking, `Booking.id != excluded_booking_id` в WHERE (conditional — only if not None). Test 9b добавлен.
+  - **W1**: race test 11 `mock_scheduler = type("MockScheduler", (), {})()` lacks `add_job`/`remove_job` → AttributeError на Postgres если 1st transfer wins (scheduler hooks на lines 985-986 after commit). Fix: `AsyncIOScheduler(jobstores={"default": MemoryJobStore()})` — add_job/remove_job работают без `start()` (verified Python REPL).
+  - **W2**: add test `test_transfer_booking_same_date_overlap_excludes_self` (Test 9b) — booking [14:00, 15:30] confirmed → transfer to slot [15:00, 16:00] same date → succeeds (после F1 fix).
+- **Repeat verify-and-fix** после F1+W1+W2 — ✅ **296 passed + 2 skipped**, ruff + mypy чисто.
+
+## Файлы для commit в начале Session 5.17:
+
+```
+git status:
+ M NEXT_SESSION_PROMPT.md
+ M bot/models.py            (+1: CheckConstraint ck_workday_capacity_positive)
+ M bot/services/booking.py (+178: WorkDayCapacityExceededError, _check_multi_client_capacity, _acquire_advisory_lock, create+transfer integration)
+ M tests/test_booking.py   (+34/-: test_create_booking_concurrent_race_integrity_error adapted — fresh slot 30 days ahead WITHOUT WorkDay)
+?? tests/test_multi_client.py (NEW, 12 тестов)
+```
+
+Также PLANS.md изменён (Session 5.16 Progress + Known limitations 5.5 appended).
+
+**Commit message** (для 5.17 первого шага):
+```
+feat(services): multi-client capacity check (Этап 5.5 Вариант B)
+
+- WorkDayCapacityExceededError, _check_multi_client_capacity, _acquire_advisory_lock
+- create_booking: capture workday_id/capacity BEFORE _select_or_create_client (B1),
+  acquire + capacity check AFTER, before Booking INSERT
+- transfer_booking: acquire + capacity check AFTER new_end_at build, before UPDATE booking
+  (B2 fix), excluded_booking_id=booking_id (F1 fix — same-date transfer excludes self)
+- Cross-DB overlap: Booking.start_at < new_end AND Booking.end_at > new_start
+  (half-open, no tstzrange && branching)
+- pg_advisory_xact_lock: Postgres-only via session.bind.dialect.name check, SQLite no-op
+- CheckConstraint max_concurrent_clients >= 1 in WorkDay.__table_args__
+- 12 new tests (test_multi_client.py): 9 functional + 1 same-date transfer + 2 skipif SQLite race
+- test_booking.py adapted: concurrent_race_integrity_error uses fresh slot WITHOUT WorkDay
+- Baseline 286 → 296 passed + 2 skipped (Postgres-only race)
+
+Refs: PLANS.md Session 5.15 (deep-analysis) + 5.16 (impl + LBTM fixes)
+```
+
+## Quick start prompt для Session 5.17:
+
+```
+Продолжаем barber-bot Session 5.17 — ПЕРВЫЙ ЗАПРОС ПОЛЬЗОВАТЕЛЯ:
+«Session 5.16 сделала impl 5.5 multi-client + 3 правки по code-review (F1+W1+W2).
+Verify-and-fix зелёный (296 passed + 2 skip). Коммит НЕ сделан — сессия упала перед commit.
+Сделай commit + push, потом переходим к 5.1 /openday».
+
+ОТВЕТ:
+1. Сначала commit + push 5.16 правок (pet-project, git free per AGENTS.md § git-repo-categories):
+   - git add bot/services/booking.py bot/models.py tests/test_multi_client.py tests/test_booking.py PLANS.md NEXT_SESSION_PROMPT.md
+   - git commit -m "feat(services): multi-client capacity check (Этап 5.5 Вариант B) ..." (см. commit message выше)
+   - git push origin main
+2. Затем deep-analysis-protocol на 5.1 /openday scope (если не high-stakes — mini),
+   impl, verify, code-review.
+
+Сначала прочитай ~/PycharmProjects/barber-bot/PLANS.md (Progress Session 5.16 — 5.5 done
++ Known limitations, Decision Log Blocker A/B/C, Plan of Work п.5 — 5.1) и
+~/PycharmProjects/barber-bot/NEXT_SESSION_PROMPT.md (этот файл — TL;DR handoff для 5.17).
+
+== СТАТУС 5.5 ==
+✅ impl + LBTM fixes applied, verify-and-fix green (296 + 2 skip), НО commit не сделан.
+Файлы: bot/services/booking.py (+178), bot/models.py (+1), tests/test_multi_client.py (NEW, 12),
+       tests/test_booking.py (adapted), PLANS.md (Progress appended), NEXT_SESSION_PROMPT.md (этот файл).
+
+== ПЕРВЫЙ ШАГ 5.17 ==
+git commit + push 5.16 правок. Pet-project — git free (AGENTS.md § git-repo-categories).
+
+== ВТОРОЙ ШАГ 5.17 — 5.1 /openday command + FSM ==
+По PLANS.md Plan of Work п.5:
+- /openday 2026-03-17 11:00 18:00 (одно окно) ИЛИ FSM (calendar → ask window)
+- Idempotent через UNIQUE(WorkDay.master_id, WorkDay.work_date) — повторный /openday
+  на ту же дату → UPDATE start_time/end_time (через update_workday с Gap 6 checks:
+  shrink refuse при активных bookings, расширение разрешено)
+- WorkDay lifecycle one-way door (Gap 6): сокращение end_time < max(active Booking.end_at)
+  → booking выходит за окно → refuse с WorkDayShrinkError
+- Реализация в новом модуле bot/services/workday.py (НЕ slots.py — там Slot-логика)
+
+== ГЕЙТЫ ==
+- deep-analysis-protocol: на 5.1 — проанализировать risk-class (FSM + new service module + idempotent
+  UPDATE → возможно high-stakes)
+- qa-verify-and-fix: ruff + mypy --strict + pytest (296 → ~301-306)
+- qa-code-review: обязательно (FSM + new service module + idempotent UPDATE — нетривиально)
+- Pre-push НЕ нужен — barber-bot личный репо (AGENTS.md § git-repo-categories)
+
+== Risk-класс 5.1 ==
+MEDIUM (new service module + FSM + idempotent UPDATE, но НЕ persistence layer change).
+deep-analysis Pass 1-4 + опционально critic (если Pass 1 классифицирует как high-stakes).
+
+== Файлы на старте 5.17 ==
+- bot/services/booking.py (1011) — 5.5 done, не трогать
+- bot/services/slots.py (102) — add_slots DEPRECATED, /openday → новый модуль workday.py
+- bot/handlers/admin.py (1238) — /addslots deprecated alias на /openday в 5.1
+- bot/services/workday.py (NEW) — open_workday, update_workday (Gap 6 checks), close_workday
+- tests/test_workday_service.py (NEW) — 5+ тестов: open, idempotent, shrink refuse, expand ok,
+  close_workday
+- tests/conftest.py — seed_data cap=1 (WorkDay, line 132)
+
+== Формат работы ==
+MY-VIBE-RULES.md — dev-режим, гейты: deep-analysis → impl → verify → code-review.
+Pet-project, git free per AGENTS.md § git-repo-categories.
+```
+
+## Known limitations 5.5 (для будущих сессий)
+
+1. **Capacity check conservative upper-bound**: `count(overlap) >= capacity` может отклонить OK случаи. Pet-project acceptable, документировано в docstring `_check_multi_client_capacity`.
+2. **cap=2 для Екатерины — ручной psql UPDATE** после deploy (НЕ миграция): `UPDATE work_days SET max_concurrent_clients=2 WHERE master_id=...`. Документировать в deploy-чек-листе.
+3. **Race тесты только на Postgres**: skipif SQLite (engine_concurrent — file-based SQLite, no advisory lock). Manual run: `DATABASE_URL=postgresql://... pytest tests/test_multi_client.py -k concurrent_race_postgres`.
+4. **CheckConstraint `max_concurrent_clients >= 1`** — добавлен в `WorkDay.__table_args__` (models.py:163). Dev create_all picks up; prod needs separate small migration (after 005) — отложить до deploy.
+5. **EXCLUDE constraint drop (migration 005)** — EXCLUDE уже удалён, но app-level check + pg_advisory_xact_lock заменяет его только для single-master serial access. Concurrent bookings с одинаковым master_id сериализуются через advisory lock; cross-master parallel остаётся без DB-level гарантий (pet-project, single-tenant — Екатерина единственный master).
+
+## Исторический контекст (Session 5.15 и ранее — не читать в начале Session 5.17)
+
+Ниже — детальные итоги предыдущих сессий (5.15, 5.14, 5.13, 5.11, 5.9, 5.8, 5.7, 5.6, Sessions 1-2). Читать только если нужны детали.
+
+---
+
+## Что сделано в Session 5.15 (БЕЗ коммитов, только анализ):
+
+1. **Pass 1-4 главного агента** — Risk: HIGH-STAKES. Planned diff: +WorkDayCapacityExceededError, +_check_multi_client_capacity, +_acquire_advisory_lock, интеграция в create_booking.
+2. **deep-analysis-critic ([REDACTED-SESSION-ID]) → VERDICT: NEEDS_MORE_ANALYSIS** — 2 blocker + 7 gaps:
+   - **[BLOCKER B1] Acquire ordering**: план главного ставил acquire ДО `_select_or_create_client` (booking.py:328), но эта функция вызывает `session.rollback()` (line 254) → освобождает lock → race. **Fix iter 2**: acquire ПОСЛЕ line 328, перед line 330; capture `workday.max_concurrent_clients` ДО line 328 (B1 pattern — как slot_id/master_id на lines 296, 318-319).
+   - **[BLOCKER B2] transfer_booking race**: booking.py:608-843 НЕ acquire + НЕ capacity check на new_start_at/new_end_at. Race между create и transfer. **Fix iter 2**: расширить 5.5 scope на transfer — acquire + capacity check после line 714, перед line 719.
+   - **[gap] Mechanism cap=2 для Екатерины**: НЕ миграция (миграция 006 только drop slots). Ручной `psql UPDATE work_days SET max_concurrent_clients=2 WHERE master_id=...` после deploy. Документировать в PLANS.md. В seed_data для теста — WorkDay cap=2.
+   - **[gap] engine_concurrent race test**: conftest:55-81 (file-based SQLite, no advisory lock). `pytest.mark.skipif(dialect != "postgresql")` — race тест только на Postgres (через env DATABASE_URL=postgresql). НЕ xfail (race реальный).
+   - **[gap] CheckConstraint `max_concurrent_clients >= 1`**: models.py:161-170 отсутствует. Добавить в WorkDay.__table_args__.
+   - **[minor] Dead code booking.py:154-163**: duplicate validation block (5.3 artifact, code-reviewer 5.4 S1). Убрать в 5.5 (рядом с точкой интеграции).
+   - **[gap, неверное утверждение главного] Cross-DB aware/naive TypeError**: `Booking.start_at < new_end_at` это SQL expression, компилируется в SQL, НЕ Python comparison. TypeError НЕ возникает. Убрать из плана.
+   - **[gap] mypy strict**: `session.bind.dialect.name` на AsyncSession — проверить existing pattern через `grep -rn "dialect.name\|get_bind" bot/`. Если нет — `session.get_bind().dialect.name`.
+   - **[gap, non-blocking] Conservative capacity check**: `count(overlap) >= capacity` upper bound, может reject OK cases (non-overlapping bookings могут быть посчитаны как overlap если диапазоны touch). Document в docstring, pet-project acceptable.
+
+3. **Iter 2 plan (применяет gaps 1-9)** — применён в Session 5.16 (см. выше).
+
+## Planned diff для Session 5.16 (после согласия пользователя, iter 2 plan):
+
+| Файл | Изменение | Объём |
+|---|---|---|
+| `bot/services/booking.py` | + `WorkDayCapacityExceededError`, `_check_multi_client_capacity(session, workday, master_id, work_date, start_at, end_at)` (cross-DB overlap: Postgres `func.tstzrange().op('&&')`, SQLite `Booking.start_at < new_end AND Booking.end_at > new_start`), `_acquire_advisory_lock(session, master_id, work_date)` (Postgres-only `pg_advisory_xact_lock(hashtext(master_id::text), work_date.toordinal())`, SQLite no-op). Интеграция в `create_booking` ПОСЛЕ `_select_or_create_client` (line 328, перед line 330) + `transfer_booking` (после line 714, перед 719). Capture `workday.max_concurrent_clients` ДО `_select_or_create_client` (B1 extension). Убрать dead code 154-163. | +120 строк |
+| `bot/models.py` | + `CheckConstraint("max_concurrent_clients >= 1", name="ck_workday_capacity_positive")` в `WorkDay.__table_args__` | +1 строка |
+| `tests/test_multi_client.py` | NEW — 10 тестов: capacity=1 blocks 2nd overlap; capacity=2 allows 2 overlap; cancelled excluded; transferred counted; boundary touching [14:00,15:00)+[15:00,16:00)=no overlap; no-workday skip; inactive workday enforced; transfer race (skipif SQLite); create+transfer race (skipif SQLite) | +180 строк |
+| `PLANS.md` | append Progress Session 5.15 (analysis only) + Session 5.16 (impl) + Blocker B1/B2 fix + known limitation (SQLite race, cap=2 manual UPDATE) | +40 строк |
+| `NEXT_SESSION_PROMPT.md` | update TL;DR для 5.17 | rewrite |
+
+## Ключевые решения iter 2 (для быстрого старта 5.16):
+
+1. **Acquire ordering (B1 fix)**: ПОСЛЕ `_select_or_create_client` (line 328), ПЕРЕД booking INSERT (line 330). Capture `workday.max_concurrent_clients` ДО line 328 (B1 pattern — workday instance expired after rollback в _select_or_create_client).
+2. **transfer_booking (B2 fix)**: acquire + capacity check на (master_id, new_work_date, new_start_at, new_end_at) после line 714 (build new_end_at), перед line 719 (UPDATE booking).
+3. **Cross-DB overlap**: SQL expression `Booking.start_at < new_end_at AND Booking.end_at > new_start_at` (half-open, эквивалент `tstzrange &&`). Postgres может юзать `func.tstzrange().op('&&')` но SQLite эмуляция проще и работает на обеих БД — ИСПОЛЬЗУЕМ эмуляцию (один код, не dialect branching).
+4. **pg_advisory_xact_lock**: Postgres-only, `SELECT pg_advisory_xact_lock(hashtext(:master_id::text), :work_date_ordinal)`. SQLite no-op. Dialect check: `session.get_bind().dialect.name == 'postgresql'` (verify existing pattern через grep).
+5. **cap=2 для Екатерины**: ручной `psql UPDATE` после deploy (НЕ миграция — миграция 006 только drop slots). В seed_data для тестов — WorkDay cap=2.
+6. **Race тесты**: `pytest.mark.skipif` на SQLite (engine_concurrent fixture — file-based SQLite, no advisory lock). Race тесты только на Postgres (через env DATABASE_URL=postgresql, manual run).
+7. **CheckConstraint**: `max_concurrent_clients >= 1` в WorkDay.__table_args__ (defense-in-depth, models.py:161-170).
+8. **Dead code 154-163**: убрать (duplicate validation block, 5.3 artifact).
+
+## Файлы для чтения в начале Session 5.16:
+
+- `PLANS.md` (359 строк) — Progress 5.14, Decision Log Blocker B, Plan of Work п.6
+- `NEXT_SESSION_PROMPT.md` (этот файл) — TL;DR 5.16
+- `bot/services/booking.py:328-342` — точка интеграции в create_booking (после _select_or_create_client, перед INSERT)
+- `bot/services/booking.py:714-735` — точка интеграции в transfer_booking (после build new_end_at, перед UPDATE)
+- `bot/services/booking.py:234-257` — _select_or_create_client (B1 rollback pattern, line 254)
+- `bot/models.py:134-171` — WorkDay (добавить CheckConstraint)
+- `tests/test_booking_invariants.py` — pattern тестов для 5.5 (no_workday_skip, workday_inactive_still_enforced)
+- `tests/conftest.py:55-81` — engine_concurrent fixture (file-based SQLite, no advisory lock)
+
+## Гейты (MY-VIBE-RULES.md):
+
+- **deep-analysis-protocol** — ✅ Pass 1-4 + critic iter 1 NEEDS_MORE_ANALYSIS → iter 2 plan применяет gaps 1-9. Iter 2 НЕ отправлен критику (контекст упал на 13%). Решение: в 5.16 — либо отправить iter 2 критику (если контекст позволяет), либо proceed к impl (iter 2 plan детальный, gaps закрыты). Рекомендация: proceed к impl, critic iter 2 — опционально (gaps 1-9 конкретные, plan детальный).
+- **qa-verify-and-fix** — после impl: ruff format/check, mypy --strict, pytest (286 → ~296)
+- **qa-code-review** — ОБЯЗАТЕЛЬНО (multi-client race — нетривиальная логика, NEW exception, NEW integration points)
+- **Pre-push**: НЕ нужен — barber-bot личный репо (AGENTS.md § git-repo-categories)
+- **Коммитить свободно** — pet-проект, после verify + code-review
+
+## Quick start prompt для Session 5.16:
+
+```
+Продолжаем barber-bot Session 5.16 — ПЕРВЫЙ ЗАПРОС ПОЛЬЗОВАТЕЛЯ:
+«Session 5.15 сделала deep-analysis для 5.5 multi-client (critic NEEDS_MORE_ANALYSIS,
+iter 2 plan готов). Impl НЕ начат — сессия упала на 13%. Погнали impl».
+
+ОТВЕТ: Implementation шага 5.5 multi-client по iter 2 plan (gaps 1-9 критика закрыты).
+
+Сначала прочитай ~/PycharmProjects/barber-bot/PLANS.md (living-документ Этапа 5,
+читать ПЕРВЫМ — Progress Session 5.15 analysis-only, Decision Log Blocker B, Plan
+of Work п.6) и ~/PycharmProjects/barber-bot/NEXT_SESSION_PROMPT.md (TL;DR handoff
+для 5.16 — iter 2 plan с gaps 1-9, planned diff, ключевые решения).
+
+== КЛЮЧЕВЫЕ РЕШЕНИЯ ITER 2 (критика gaps 1-9 закрыты) ==
+- B1 (acquire ordering): ПОСЛЕ _select_or_create_client (booking.py:328), ПЕРЕД
+  INSERT (line 330). Capture workday.max_concurrent_clients ДО line 328 (B1 pattern).
+- B2 (transfer race): acquire + capacity check в transfer_booking после line 714,
+  перед line 719.
+- Cross-DB overlap: SQL `Booking.start_at < new_end AND Booking.end_at > new_start`
+  (half-open, работает на обеих БД, НЕ dialect branching).
+- pg_advisory_xact_lock: Postgres-only, hashtext+toordinal. SQLite no-op.
+- cap=2 для Екатерины: ручной psql UPDATE после deploy (НЕ миграция).
+- Race тесты: skipif SQLite (engine_concurrent — file-based SQLite, no advisory).
+- CheckConstraint max_concurrent_clients >= 1 в WorkDay.__table_args__.
+- Убрать dead code booking.py:154-163 (5.3 artifact).
+
+== ПЛАН IMPL ==
+1. bot/services/booking.py — +WorkDayCapacityExceededError, +_check_multi_client_capacity,
+   +_acquire_advisory_lock, интеграция в create_booking (after line 328) + transfer_booking
+   (after line 714). Capture workday.max_concurrent_clients BEFORE _select_or_create_client.
+   Убрать dead code 154-163.
+2. bot/models.py — +CheckConstraint max_concurrent_clients >= 1.
+3. tests/test_multi_client.py (NEW) — 10 тестов (capacity 1/2, cancelled/transferred,
+   boundary, no-workday, inactive, transfer race skipif SQLite).
+4. PLANS.md — append Progress 5.15 (analysis) + 5.16 (impl) + known limitations.
+5. NEXT_SESSION_PROMPT.md — update TL;DR для 5.17.
+
+== ГЕЙТЫ ==
+- qa-verify-and-fix: ruff + mypy --strict + pytest (286 → ~296)
+- qa-code-review: ОБЯЗАТЕЛЬНО (multi-client race — нетривиально)
+- Коммитить свободно (pet-проект, git free по AGENTS.md § git-repo-categories)
+
+== СТАТУС ЭТАПА 5 ВАРИАНТ B ==
+- ✅ 5.2 WorkDay + миграция 005 (commits 90c0000 + 9345a7b)
+- ✅ 5.3 WorkDay invariants (commit aedf1a0, +7 тестов → 281)
+- ✅ 5.4 30-мин slots + Booking.start_at filter (commit 069274d, +5 → 286)
+- ⏭️ 5.5 multi-client — СЛЕДУЮЩИЙ (этот промт, impl в 5.16)
+- 5.1 /openday command + FSM
+- 5.6 «Мест нет» occupancy check в /slots
+- 5.8 /slots command + slot picker keyboard
+- 5.9 /movslot + admin_move_booking
+- 5.10 inline-часы toggle в FSM
+- /addslots /closeslot deprecated aliases
+- Миграция 006 drop table slots (после smoke-test ~1 неделя)
+
+== ФАЙЛЫ НА СТАРТЕ 5.16 ==
+- bot/services/booking.py (843) — dead code 154-163, точка интеграции 328, 714
+- bot/models.py (280) — WorkDay 134-171 (добавить CheckConstraint)
+- tests/conftest.py (167) — seed_data cap=1, engine_concurrent (file SQLite)
+- tests/test_booking_invariants.py — pattern 5.3 (7 тестов)
+- alembic/versions/005_workday.py (175) — EXCLUDE already dropped ✅
+
+Risk-класс 5.5: HIGH-STAKES — race condition, persistence, new exception.
+Формат: MY-VIBE-RULES.md dev-режим, гейты: deep-analysis (done) → impl → verify → code-review.
+```
+
+---
 
 ## Что сделано в Session 5.14 (commit `069274d`, pushed) — шаг 5.4 завершён:
 

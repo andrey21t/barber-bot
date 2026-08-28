@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from scheduler import remove_jobs_for_booking, schedule_for_booking
-from sqlalchemy import select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -45,12 +45,34 @@ class SlotClosedError(Exception):
 class BookingOutsideWorkDayError(Exception):
     """Booking [start_at, end_at] exceeds WorkDay window [start_time, end_time] for the date.
 
-    Raised by create_booking (Этап 5.3) when WorkDay exists for (master_id, slot_date) AND
-    the requested booking range falls outside the workday window. Comparison in UTC:
+    Raised by create_booking (Этап 5.3) and transfer_booking (Этап 5.5) when WorkDay
+    exists for (master_id, work_date) AND the requested booking range falls outside
+    the workday window. Comparison in UTC:
     combine(work_date, workday.start_time/end_time, business_tz).astimezone(UTC).
 
     Skipped (no raise) when WorkDay not found — backwards compat for slot-only data
     created via legacy /addslots before /openday rollout (Этап 5.1).
+    """
+
+
+class WorkDayCapacityExceededError(Exception):
+    """Multi-client capacity overflow — too many overlapping active bookings.
+
+    Raised by create_booking and transfer_booking (Этап 5.5) when WorkDay exists for
+    (master_id, work_date) AND count of overlapping active bookings
+    (status IN ('confirmed','transferred') WHERE Booking.start_at < new_end_at AND
+    Booking.end_at > new_start_at) >= WorkDay.max_concurrent_clients.
+
+    Half-open overlap (start_at < new_end_at AND end_at > new_start_at) — touching
+    ranges [14:00,15:00]+[15:00,16:00] do NOT overlap (boundary inclusive on start,
+    exclusive on end). Equivalently tstzrange && on Postgres, but cross-DB SQL
+    expression avoids dialect branching (works on SQLite + Postgres).
+
+    Race protection: _acquire_advisory_lock (pg_advisory_xact_lock on Postgres,
+    no-op on SQLite) is called BEFORE _check_multi_client_capacity to serialize
+    concurrent INSERTs on same (master_id, work_date). SQLite serializes via
+    DB-level lock — race tests skipif SQLite because advisory lock semantics are
+    Postgres-only.
     """
 
 
@@ -151,16 +173,99 @@ def _validate_booking_within_workday(
             f"Booking end_at={end_at} > workday end {workday_end_utc} "
             f"(workday_id={workday.id}, work_date={workday.work_date})"
         )
-    if start_at < workday_start_utc:
-        raise BookingOutsideWorkDayError(
-            f"Booking start_at={start_at} < workday start {workday_start_utc} "
-            f"(workday_id={workday.id}, work_date={workday.work_date})"
+
+
+async def _check_multi_client_capacity(
+    session: AsyncSession,
+    *,
+    workday_id: UUID,
+    capacity: int,
+    master_id: UUID,
+    start_at: datetime,
+    end_at: datetime,
+    excluded_booking_id: UUID | None = None,
+) -> None:
+    """Raise WorkDayCapacityExceededError if overlapping active bookings >= capacity.
+
+    Half-open overlap (Этап 5.5, PLANS.md Gap 4 occupancy definition):
+        SELECT count(*) FROM bookings
+        WHERE master_id = :master_id
+          AND start_at < :new_end_at   -- touching ranges: end == next start → no overlap
+          AND end_at   > :new_start_at
+          AND status IN ('confirmed', 'transferred')
+          AND id != :excluded_booking_id  -- optional: skip self (same-date transfer)
+
+    Cross-DB SQL expression (no tstzrange && operator) — works on SQLite + Postgres
+    without dialect branching. On Postgres this is functionally equivalent to
+    tstzrange && (verified by SQL semantics: a < c AND b > d for ranges [a,b) [c,d)
+    overlap ⟺ a < d AND b > c).
+
+    Args:
+        workday_id: WorkDay.id (for error message — caller captured BEFORE any
+            rollback-prone operation per B1 pattern, since WorkDay instance may
+            expire after session.rollback() in _select_or_create_client).
+        capacity: WorkDay.max_concurrent_clients — captured by caller BEFORE any
+            rollback-prone operation (B1 pattern, see create_booking:~340).
+        master_id: master whose bookings to count (also captured before rollback).
+        start_at, end_at: new booking range (aware UTC) — overlap window.
+        excluded_booking_id: optional Booking.id to exclude from overlap count.
+            Used by transfer_booking to skip the booking being transferred (its
+            own OLD range overlaps with NEW range on same-date transfer, but it's
+            "moving itself" — should not count). None (default) for create_booking
+            (new booking has no id yet → no self to exclude).
+
+    Note: capacity check is conservative upper-bound — count overlap >= capacity
+    rejects the N+1th concurrent booking. Pet-project acceptable; documented in
+    PLANS.md 5.5 known limitations.
+    """
+    overlap_stmt = (
+        select(func.count())
+        .select_from(Booking)
+        .where(
+            Booking.master_id == master_id,
+            Booking.start_at < end_at,
+            Booking.end_at > start_at,
+            Booking.status.in_(("confirmed", "transferred")),
         )
-    if end_at > workday_end_utc:
-        raise BookingOutsideWorkDayError(
-            f"Booking end_at={end_at} > workday end {workday_end_utc} "
-            f"(workday_id={workday.id}, work_date={workday.work_date})"
+    )
+    if excluded_booking_id is not None:
+        overlap_stmt = overlap_stmt.where(Booking.id != excluded_booking_id)
+    result = await session.execute(overlap_stmt)
+    overlap_count = result.scalar_one()
+    if overlap_count >= capacity:
+        raise WorkDayCapacityExceededError(
+            f"WorkDay {workday_id} capacity {capacity} exceeded: "
+            f"{overlap_count} overlapping bookings for master {master_id} "
+            f"in [{start_at}, {end_at})"
         )
+
+
+async def _acquire_advisory_lock(session: AsyncSession, master_id: UUID, work_date: date) -> None:
+    """Postgres-only pg_advisory_xact_lock for serializable multi-client race.
+
+    SQLite: no-op (file-based SQLite serializes writes via DB-level lock; in-memory
+    SQLite — single connection — no concurrent race). Race tests skipif SQLite
+    because advisory lock semantics are Postgres-only.
+
+    Key: hashtext(master_id::text) + work_date.toordinal() — deterministic int pair.
+    pg_advisory_xact_lock is transaction-scoped (auto-release on commit/rollback),
+    so callers MUST hold an open transaction (create_booking / transfer_booking do
+    this implicitly via session.add + commit pattern).
+
+    Dialect check via `session.bind.dialect.name` — same pattern as
+    fsm_storage.py:95 (`bind.dialect.name`).
+    """
+    engine = session.bind
+    if engine is None or engine.dialect.name != "postgresql":
+        return
+    stmt = text("SELECT pg_advisory_xact_lock(hashtext(:master_id::text), :work_date_ordinal)")
+    await session.execute(
+        stmt,
+        {
+            "master_id": str(master_id),
+            "work_date_ordinal": work_date.toordinal(),
+        },
+    )
 
 
 def _build_start_at(slot: Slot, business_timezone: str) -> datetime:
@@ -318,14 +423,41 @@ async def create_booking(
     slot_master_id = slot.master_id
     slot_date = slot.slot_date
     workday = await _select_workday_for_slot(session, slot_master_id, slot_date)
+    workday_id: UUID | None = None
+    workday_capacity = 0  # sentinel — capacity check skipped when workday is None
     if workday is not None:
         _validate_booking_within_workday(workday, start_at, end_at, business_tz)
+        # B1 pattern (Этап 5.5): capture workday.id + max_concurrent_clients BEFORE
+        # _select_or_create_client (line 443 below) — that call may invoke
+        # session.rollback() on concurrent client INSERT race (line 254), which
+        # expires ALL attached instances (including workday). Accessing
+        # workday.max_concurrent_clients after that rollback would trigger
+        # MissingGreenlet (sync lazy load on async session). UUID/int are immutable
+        # and already loaded from SELECT → safe to capture here.
+        workday_id = workday.id
+        workday_capacity = workday.max_concurrent_clients
 
     # HTML escape BEFORE INSERT — stored escaped, rendered without double-escape
     escaped_name = html.escape(payload.client_name, quote=False)
     escaped_service = html.escape(payload.service_title, quote=False)
 
     client = await _select_or_create_client(session, telegram_id)
+
+    # Multi-client capacity check (Этап 5.5, B1 fix): acquire advisory lock + count
+    # overlapping active bookings AFTER _select_or_create_client (rollback-prone
+    # above) but BEFORE Booking INSERT (line 447). workday_id/capacity captured
+    # before the rollback-prone call (B1 pattern). Skipped when WorkDay is None
+    # (backwards compat — legacy slot-only data has no capacity constraint).
+    if workday_id is not None:
+        await _acquire_advisory_lock(session, slot_master_id, slot_date)
+        await _check_multi_client_capacity(
+            session,
+            workday_id=workday_id,
+            capacity=workday_capacity,
+            master_id=slot_master_id,
+            start_at=start_at,
+            end_at=end_at,
+        )
 
     booking = Booking(
         slot_id=slot_id,
@@ -712,6 +844,30 @@ async def transfer_booking(
     # Look up service for end_at duration (booking.service_id may be None — fallback to default).
     service = await _select_service(session, booking.service_id)
     new_end_at = _build_end_at(new_start_at, service, settings.SERVICE_DEFAULT_DURATION_MIN)
+
+    # Multi-client capacity check on NEW slot (Этап 5.5, B2 fix): SELECT WorkDay
+    # for (new_slot.master_id, new_slot.slot_date). Validate + acquire advisory
+    # lock + count overlapping active bookings BEFORE UPDATE booking (line 833).
+    # Without this, a concurrent create_booking on the new slot could slip through
+    # the EXCLUDE drop (migration 005) and double-book the slot window.
+    # Backwards compat: no WorkDay → skip (legacy slot-only data).
+    new_slot_master_id = new_slot.master_id
+    new_slot_date = new_slot.slot_date
+    new_workday = await _select_workday_for_slot(session, new_slot_master_id, new_slot_date)
+    if new_workday is not None:
+        _validate_booking_within_workday(new_workday, new_start_at, new_end_at, business_tz)
+        new_workday_id = new_workday.id
+        new_workday_capacity = new_workday.max_concurrent_clients
+        await _acquire_advisory_lock(session, new_slot_master_id, new_slot_date)
+        await _check_multi_client_capacity(
+            session,
+            workday_id=new_workday_id,
+            capacity=new_workday_capacity,
+            master_id=new_slot_master_id,
+            start_at=new_start_at,
+            end_at=new_end_at,
+            excluded_booking_id=booking_id,
+        )
 
     # Step 8: UPDATE booking with start_at-in-WHERE for concurrent-transfer race protection.
     # Loser's WHERE clause `start_at = <old_start_at captured at SELECT>` fails after
