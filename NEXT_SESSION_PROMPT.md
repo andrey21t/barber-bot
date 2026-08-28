@@ -1,150 +1,197 @@
-# NEXT_SESSION_PROMPT — Session 5.16 завершён (5.5 impl + LBTM fixes), Session 5.17 готов (5.1 /openday).
+# NEXT_SESSION_PROMPT — Session 5.17 завершён (5.1 impl + known UX-bug F1), Session 5.18 — фикс F1 + handler-тесты.
 
-> Дата: 2026-08-28 · Session 5.16 — impl шага 5.5 multi-client + qa-verify-and-fix + qa-code-review (LBTM) + 3 правки (F1+W1+W2) + commit `379ebd6` + push. Тестов 296 passed + 2 skipped (baseline 286 → +10 в 5.5). ruff + mypy strict чисто. Prod на `c64b31d`.
+> Дата: 2026-08-28 · Session 5.17 — impl шага 5.1 /openday + workday service + qa-verify-and-fix (309 passed) + qa-code-review (LGTM + 3 правки W1+S1+S2) + commit `147081e` + push. **Known UX-bug F1 найден при self-review в конце сессии — отсрочен в 5.18 (context на 13%).**
 > Prod остаётся на `c64b31d` (Session 5.9). Миграция 005 НЕ накатывалась на prod — smoke-test на dev-копии обязателен (one-way door, данные Екатерины).
 
-## ⚡ TL;DR для Session 5.17 (handoff — grep-карта, НЕ копировать файлы целиком)
+## ⚡ TL;DR для Session 5.18
 
-**Цель 5.17:** шаг **5.1 `/openday` command + FSM** (idempotent через UNIQUE master/work_date) по PLANS.md Plan of Work п.5.
+**Цель 5.18:** **(1) фикс UX-бага F1** + **(2) handler-тесты на cmd_openday / admin_openday FSM** (ловят F1 и регрессии).
 
-**Главный артефакт:** `PLANS.md` (исключён из git в `.git/info/exclude` — читается локально). ЧИТАТЬ ПЕРВЫМ для Decision Log и Plan of Work. Далее — по grep-карте ниже (точечные чтения, НЕ целые файлы).
+**Главный артефакт:** `PLANS.md` (Session 5.17 section, F1 описание). Читается ПЕРВЫМ для контекста.
 
 ## Статус Этапа 5 Вариант B (на 2026-08-28):
 
-- ✅ 5.2 WorkDay + миграция 005 (commits `90c0000` + `9345a7b`, pushed)
+- ✅ 5.2 WorkDay + миграция 005 (commits `90c0000` + `9345a7b`)
 - ✅ 5.3 WorkDay invariants (commit `aedf1a0`, +7 → 281)
 - ✅ 5.4 30-мин шаг + admin.py Booking.start_at filter (commit `069274d`, +5 → 286)
-- ✅ 5.5 multi-client (commit `379ebd6`, +10 → 296, includes F1+W1+W2 LBTM fixes)
-- ⏭️ **5.1 `/openday` command + FSM** — СЛЕДУЮЩИЙ (Session 5.17)
+- ✅ 5.5 multi-client (commit `379ebd6`, +10 → 296)
+- ⚠️ **5.1 `/openday` command + FSM** (commit `147081e`, +13 → 309) — **DONE с known UX-bug F1**
 - 5.6 / 5.8 / 5.9 / 5.10 / aliases / миграция 006 — backlog
 
-## grep-карта для Session 5.17 (читать ТОЛЬКО нужные строки, не файлы целиком):
+## Known UX-bug F1 (детальный разбор для 5.18)
 
-### Решения по 5.1 (читать в PLANS.md по якорям):
+### Что не так
+
+`bot/handlers/admin.py:332` (cmd_openday) и `bot/handlers/admin.py:1060` (admin_openday_end_msg):
+```python
++ ("" if workday.is_active else "\n(день был закрыт — открыт заново)")
+```
+
+`bot/services/workday.py:108-117` — re-open ветка:
+```python
+updated = await update_workday(session, existing.id, start_time, end_time, business_tz)
+if not existing.is_active:  # was closed
+    await session.execute(update(WorkDay).where(...).values(is_active=True))
+    await session.commit()
+    await session.refresh(updated)  # ← updated.is_active now True
+return updated  # ← is_active=True
+```
+
+В handler `workday.is_active = True` (после refresh) → `"" if True else "..."` = `""` → **сообщение «день был закрыт — открыт заново» НЕ покажется никогда**.
+
+### Почему code-reviewer не поймал
+
+Code-reviewer verified `is_active=True` для re-open как **correct behavior** (тест `test_open_workday_reopens_closed` проверяет `reopened.is_active is True` — проходит). Но не связал это с handler-сообщением, которое зависит от `workday.is_active` для already-closed кейса. Confirmation bias — сервисный тест зелёный, но handler-поведение не покрыто.
+
+### Почему self-review в конце сессии поймал
+
+Главный агент применил § review-discipline Пара 2 (ad-hoc review): `**Source:** grep "is_active|день был закрыт"` → нашёл 2 места в admin.py → прочёл workday.py:108-117 → увидел расхождение между контрактом сервиса (re-open → is_active=True) и UX-сообщением (depends on is_active=False).
+
+### Фикс — вариант B (рекомендуемый, НЕ меняет контракт сервиса)
+
+**Локальный фикс в handler'ах, без правок workday.py:**
+
+1. **Экспортировать `_select_workday` из workday.py** (переименовать в `select_workday` или оставить с underscored — Python не private):
+   - Сейчас `bot/services/workday.py:221-229` — `_select_workday` (private по конвенции).
+   - Добавить в публичный API: либо переименовать, либо создать wrapper. Рекомендую — переименовать в `select_workday` (drop underscore), обновить call site `workday.py:93`.
+
+2. **В `cmd_openday` (admin.py:262-333)** — перед `open_workday`:
+   ```python
+   from bot.services.workday import open_workday, select_workday, WorkDayShrinkError
+   # ...
+   async with async_session_factory() as session:
+       existing = await select_workday(session, master_id, work_date)
+       was_closed = existing is not None and not existing.is_active
+       try:
+           workday = await open_workday(session, master_id, work_date, start_time, end_time, business_tz=tz)
+       except (ValueError, WorkDayShrinkError, SQLAlchemyError):
+           # ... existing handling
+   # ...
+   + ("\n(день был закрыт — открыт заново)" if was_closed else "")
+   ```
+
+3. **В `admin_openday_end_msg` (admin.py:1004-1057)** — тот же pattern. `was_closed` вычисляется перед `open_workday`, используется в финальном сообщении.
+
+4. **НЕ трогать `workday.is_active`** в условии — он всегда True после open_workday, больше не нужен для UX.
+
+### Альтернатива — вариант A (меняет контракт, НЕ рекомендуем)
+
+`open_workday` возвращает кортеж `(WorkDay, was_reopened: bool)`. Меняет сигнатуру → надо править все caller'ы (cmd_openday, admin_openday_end_msg, 2 теста). Больше изменений, больше риск регрессии. Вариант B проще.
+
+### Тесты на handler (W2 — добавляются в 5.18 вместе с фиксом F1)
+
+PLANS.md:361 требовал:
+- `test_openday_command` — cmd_openday text args (success path)
+- `test_openday_idempotent` — повторный /openday → UPDATE (mock session, verify no INSERT)
+- `test_openday_shrink_with_active_bookings` — WorkDayShrinkError → message
+
+Дополнительно для F1:
+- `test_openday_reopen_shows_message` — was_closed=True → сообщение содержит «день был закрыт — открыт заново»
+- `test_openday_open_no_message` — was_closed=False → сообщение НЕ содержит «день был закрыт»
+
+**Шаблон handler-тестов:** `tests/test_admin_handlers.py` (52 теста на command handlers) + `tests/test_admin.py` (20 тестов на inline callbacks) — aiogram mock Bot + dp.feed_update pattern.
+
+### Гейты для 5.18
+
+- deep-analysis-protocol: trivial (handler-уровень фикс, не logic-change в сервисе) → skip Pass 2-3, 1-строчный self-verify.
+- qa-verify-and-fix: ruff + mypy --strict + pytest (309 → ~314, +5 handler-тестов).
+- qa-code-review: опционально (fixes F1 — semantic change в handler UX, но не logic). Если хочется — запускать.
+- Pre-push НЕ нужен — barber-bot personal pet-project.
+
+## grep-карта для Session 5.18
+
+### F1 — читать по якорям:
 
 | Якорь | Что читать | Зачем |
 |---|---|---|
-| `PLANS.md:287-295` | Gap 6 — WorkDay lifecycle one-way door | shrink refuse при активных bookings (через parens `(start_at < new OR end_at > new) AND status IN (...)`, Gap 8 SQL precedence fix) |
-| `PLANS.md:311` | Race на два /openday — UNIQUE(master_id, work_date), idempotent UPDATE | Идемпотентность повторного /openday |
-| `PLANS.md:264` | Подход B vs BB-007 — WorkDay на конкретную дату, не рекуррентный | Подтверждение что B не нарушает BB-007 |
-| `PLANS.md:361` | Тесты 5.1 — test_openday_command, test_openday_idempotent, test_openday_shrink_with_active_bookings | Список тестов для 5.1 |
-| `PLANS.md:142-186` | Session 5.16 Progress (5.5 done) | Понять что уже готово (capacity check, WorkDay model, migration 005) |
+| `bot/handlers/admin.py:329-333` | cmd_openday — финальное сообщение | Где править UX (вариант B) |
+| `bot/handlers/admin.py:1042-1057` | admin_openday_end_msg — финальное сообщение | Где править UX (вариант B) |
+| `bot/services/workday.py:64-117` | open_workday — re-open ветка | Понять is_active behavior |
+| `bot/services/workday.py:221-229` | `_select_workday` | Что экспортировать (drop underscore) |
+| `tests/test_admin_handlers.py:1-50` | Образец handler-теста (cmd handlers, mock Bot) | Шаблон для новых 5 тестов |
+| `tests/test_admin.py:1-50` | Образец callback-теста (inline menu) | Шаблон для admin_openday_cb теста |
 
-### Код для чтения (точечные grep, НЕ весь файл):
-
-| `file:line` | Что искать | Зачем |
-|---|---|---|
-| `bot/models.py:134-170` | `class WorkDay`, `work_date`, `max_concurrent_clients`, `__table_args__` (UNIQUE + CheckConstraint) | Модель для /openday (CREATE/UPDATE) |
-| `bot/services/slots.py:131-167` | `add_slots` DEPRECATED (Этап 5.4) | Шаблон для нового `open_workday` (НЕ реюз — slots.py Slot-логика, workday.py новый модуль) |
-| `bot/services/slots.py:176-207` | `close_slot` DEPRECATED | Шаблон для `close_workday` |
-| `bot/handlers/admin.py:170-244` | `cmd_addslots` handler (Command("addslots"), StateFilter(None)) | Deprecated alias → /openday, FSM старт |
-| `bot/handlers/admin.py:486-518` | `admin_addslots_cb` (callback_query, StateFilter("*")) | Inline-menu callback → FSM addslots_date |
-| `bot/handlers/admin.py:530-617` | `admin_addslots_calendar_cb` (SimpleCalendarCallback, FSM date) | FSM date select pattern для /openday |
-| `bot/handlers/admin.py:618-704` | `admin_addslots_hours_msg` (text input → slot list) | FSM hours → TODO 5.10 inline-часы (НЕ в 5.1 scope, 5.1 = window через text ИЛИ inline) |
-| `bot/services/booking.py:56-90` | `WorkDayCapacityExceededError` + `_check_multi_client_capacity` сигнатура | Образец исключения + cross-DB overlap (для `WorkDayShrinkError` + overlap query) |
-| `bot/services/booking.py:234-260` | `_acquire_advisory_lock` (Postgres-only) | Образец для /openday race (опционально — UNIQUE уже даёт idempotent) |
-| `tests/test_multi_client.py:51-113` | `_seed_capacity_test` helper (WorkDay + 3 slots + 3 services) | Образец setup для /openday тестов |
-| `tests/test_booking_invariants.py` | 7 тестов WorkDay invariants | Образец тест-стиля (inside/outside/boundary/no-workday/inactive) |
-
-### Что НУЖНО создать в 5.1:
+### Что НУЖНО сделать в 5.18:
 
 | Файл | Что | Объём (оценка) |
 |---|---|---|
-| `bot/services/workday.py` (NEW) | `open_workday(session, master_id, work_date, start_time, end_time)`, `update_workday` (Gap 6 shrink checks), `close_workday` (set is_active=False with active-bookings check), `WorkDayShrinkError` | ~120 строк |
-| `bot/handlers/admin.py` (extend) | `/openday` command + FSM openday (date → start_time → end_time → open_workday) | ~150 строк |
-| `tests/test_workday_service.py` (NEW) | 5+ тестов: open, idempotent (UPDATE не INSERT), shrink refuse, expand ok, close with active bookings refuse | ~150 строк |
-| `tests/test_openday_handler.py` (NEW, опционально) | FSM flow через aiogram mock | ~80 строк |
+| `bot/services/workday.py` | Переименовать `_select_workday` → `select_workday` (drop underscore) | 1 правка (line 221, 93) |
+| `bot/handlers/admin.py` | cmd_openday + admin_openday_end_msg — was_closed pattern (вариант B) | ~15 строк в 2 местах |
+| `tests/test_openday_handlers.py` (NEW) | 5 тестов: cmd_openday success/idempotent/shrink, reopen shows message, open no message | ~150 строк |
 
-### Что НЕ трогать в 5.1:
+### Что НЕ трогать в 5.18:
 
-- `bot/services/booking.py` (5.5 done, не трогать)
-- `bot/services/slots.py` (DEPRECATED, замена на workday.py — НЕ реюз slots.py, там Slot-логика)
-- `alembic/versions/005_workday.py` (уже applied на dev, smoke-test на prod отдельно)
-- `bot/models.py` (WorkDay готов, новая миграция для CheckConstraint `max_concurrent_clients >= 1` на prod — отложить до deploy)
+- `bot/services/workday.py` логика (open/update/close — корректно, verified)
+- `bot/keyboards/admin.py` (готово)
+- `bot/states.py` (готово)
+- `tests/test_workday_service.py` (13 тестов — корректны, Gap 8 parens verified)
 
-## Risk-класс 5.1: MEDIUM
+## Risk-класс 5.18: LOW
 
-- New service module (`workday.py`) + new exception (`WorkDayShrinkError`) + FSM
-- НЕ persistence layer change (WorkDay model готова с 5.2)
-- Idempotent UPDATE через UNIQUE(master_id, work_date) — стандартный pattern
-- Gap 6 one-way door (shrink refuse) — единственный нетривиальный момент
+- Handler-уровень фикс (не logic в сервисе)
+- Тесты на handler (mock Bot, no DB race)
+- НЕ persistence layer change
 
-**Гейты:** deep-analysis Pass 1-4 (mini, не high-stakes) → impl → qa-verify-and-fix → qa-code-review (обязательно — FSM + idempotent UPDATE + shrink checks нетривиально).
+**Гейты:** deep-analysis mini (trivial) → impl → qa-verify-and-fix → qa-code-review (опционально).
 
-## Known limitations 5.5 (унаследованы, НЕ трогать в 5.1):
-
-1. **cap=2 для Екатерины** — ручной `psql UPDATE work_days SET max_concurrent_clients=2 WHERE master_id=...` после deploy.
-2. **Race тесты только на Postgres** — skipif SQLite.
-3. **CheckConstraint `max_concurrent_clients >= 1`** — в `WorkDay.__table_args__` (models.py:163). Dev create_all picks up; prod needs separate small migration.
-4. **EXCLUDE constraint drop (migration 005)** — app-level check + pg_advisory_xact_lock заменяет только для single-master serial. Cross-master parallel без DB-level гарантий (pet-project, single-tenant — Екатерина единственный master).
-
-## Quick start prompt для Session 5.17:
+## Quick start prompt для Session 5.18
 
 ```
-Продолжаем barber-bot Session 5.17 — шаг 5.1 /openday command + FSM.
+Продолжаем barber-bot Session 5.18 — фикс UX-бага F1 + handler-тесты на /openday.
 
 Сначала:
-1. Прочитай ~/PycharmProjects/barber-bot/PLANS.md (living-документ, исключён из git
-   через .git/info/exclude) — Progress Session 5.16 (5.5 done), Decision Log Gap 6 (line 287-295)
-   + Plan of Work п.5.
+1. Прочитай ~/PycharmProjects/barber-bot/PLANS.md (Session 5.17 section, F1
+   детальный разбор) — context для бага.
 2. Прочитай ~/PycharmProjects/barber-bot/NEXT_SESSION_PROMPT.md (этот файл) —
-   grep-карта выше. ЧИТАЙ ТОЛЬКО строки из grep-карты, НЕ копируй файлы целиком
-   (контекст следующей сессии дорого стоит).
+   variant B fix + grep-карта. ЧИТАЙ ТОЛЬКО строки из grep-карты, НЕ копируй
+   файлы целиком.
 
-== ЦЕЛЬ 5.17 ==
-Шаг 5.1 /openday command + FSM:
-- /openday 2026-03-17 11:00 18:00 (одно окно, text args) ИЛИ FSM (calendar → window)
-- Idempotent через UNIQUE(WorkDay.master_id, WorkDay.work_date) — повторный /openday
-  на ту же дату → UPDATE start_time/end_time (через update_workday с Gap 6 checks)
-- WorkDay lifecycle one-way door (Gap 6, PLANS.md:287-295):
-  сокращение end_time < max(active Booking.end_at) → refuse с WorkDayShrinkError
-  (список conflict bookings в сообщении)
-- Реализация в НОВОМ модуле bot/services/workday.py (НЕ slots.py — там Slot-логика)
-
-== ПЛАН IMPL ==
-1. bot/services/workday.py (NEW) — open_workday, update_workday (Gap 6 checks),
-   close_workday, WorkDayShrinkError. ~120 строк.
-2. bot/handlers/admin.py (extend) — /openday command + FSM openday (date → start_time →
-   end_time → open_workday). ~150 строк.
-3. tests/test_workday_service.py (NEW) — 5+ тестов: open, idempotent, shrink refuse,
-   expand ok, close with active bookings. ~150 строк.
+== ЦЕЛЬ 5.18 ==
+1. Фикс UX-бага F1 (вариант B — handler-level, без правок контракта сервиса):
+   - Экспортировать `_select_workday` → `select_workday` (drop underscore)
+     в bot/services/workday.py
+   - В cmd_openday (admin.py:329-333) и admin_openday_end_msg (admin.py:1042-
+     1057): перед open_workday вычислить was_closed = existing is not None
+     and not existing.is_active, использовать was_closed для сообщения вместо
+     workday.is_active.
+2. Handler-тесты (tests/test_openday_handlers.py NEW):
+   - test_openday_command_text_args (success path)
+   - test_openday_idempotent_update (mock session, verify no INSERT)
+   - test_openday_shrink_error_message (WorkDayShrinkError → user message)
+   - test_openday_reopen_shows_message (was_closed=True → "день был закрыт")
+   - test_openday_open_no_message (was_closed=False → без "день был закрыт")
+   Шаблон: tests/test_admin_handlers.py (mock Bot + dp.feed_update).
 
 == РИСК ==
-MEDIUM. New service module + FSM + idempotent UPDATE + shrink checks (Gap 6 one-way door).
-НЕ persistence layer change (WorkDay готова с 5.2).
-deep-analysis Pass 1-4 (mini), опционально critic если Pass 1 классифицирует как high-stakes.
+LOW. Handler-уровень фикс + mock-тесты. НЕ persistence layer.
 
 == ГЕЙТЫ ==
-- deep-analysis-protocol: Pass 1-4 (mini — не high-stakes по self-verify)
-- qa-verify-and-fix: ruff + mypy --strict + pytest (296 → ~301-306)
-- qa-code-review: ОБЯЗАТЕЛЬНО (FSM + idempotent UPDATE + shrink checks — нетривиально)
-- Pre-push НЕ нужен — barber-bot личный репо (AGENTS.md § git-repo-categories)
+- deep-analysis: trivial (handler UX fix) → skip Pass 2-3, 1-строчный self-verify
+- qa-verify-and-fix: ruff + mypy --strict + pytest (309 → ~314)
+- qa-code-review: опционально (semantic UX change, но не logic)
+- Pre-push НЕ нужен — barber-bot personal pet-project
 
 == ФОРМАТ ==
-MY-VIBE-RULES.md — dev-режим, гейты: deep-analysis → impl → verify → code-review.
-Pet-project, git free (AGENTS.md § git-repo-categories).
+MY-VIBE-RULES.md — dev-режим, гейты. Pet-project, git free.
 
 == ВАЖНО ==
-НЕ копируй файлы целиком в промпт следующей сессии. Используй grep-карту выше —
-читай только нужные строки. PLANS.md — ЧИТАТЬ ПЕРВЫМ (живёт локально, в git
-исключён через .git/info/exclude).
+НЕ копируй файлы целиком в промпт. Используй grep-карту выше. PLANS.md —
+читать Session 5.17 section (F1 детальный разбор + variant B fix).
 ```
 
 ## Исторический контекст (Session 5.16 и ранее — читать ТОЛЬКО при необходимости)
 
 > Детальные итоги сессий 5.15, 5.14, 5.13, 5.11, 5.9, 5.8, 5.7, 5.6, Sessions 1-2 —
-> в архиве ниже. Для 5.17 они НЕ нужны — grep-карта + PLANS.md Decision Log
-> содержат все нужные ссылки. Читай архив только если нужны детали impl предыдущих фаз
-> (например, шаблон FSM из 5.3 или образец миграции из 5.2).
+> в архиве ниже. Для 5.18 они НЕ нужны — grep-карта + PLANS.md Session 5.17
+> содержат все нужные ссылки.
 >
 > **Сводка по сессиям (для быстрой ориентации, без деталей):**
 >
-> - **Session 5.16** (commit `379ebd6`, pushed): impl 5.5 multi-client + LBTM fixes (F1+W1+W2). 296 passed + 2 skip. См. PLANS.md:142-186.
+> - **Session 5.17** (commit `147081e`, pushed): impl 5.1 /openday + workday service. 309 passed + 2 skip. Known UX-bug F1 (отсрочен в 5.18). См. PLANS.md Session 5.17 section.
+> - **Session 5.16** (commit `379ebd6`, pushed): impl 5.5 multi-client + LBTM fixes (F1+W1+W2). 296 passed. См. PLANS.md:142-186.
 > - **Session 5.15** (БЕЗ коммитов, analysis only): deep-analysis Pass 1-4 + critic iter 1 NEEDS_MORE_ANALYSIS → iter 2 plan. См. PLANS.md:133-141.
-> - **Session 5.14** (commit `069274d`, pushed): 5.4 — 30-мин шаг + `_build_start_at_from_workday` + admin.py Booking.start_at filter. 286 passed. См. PLANS.md:90-131 + архив ниже (offset 430).
-> - **Session 5.13** (commit `aedf1a0`, pushed): 5.3 — WorkDay invariants в create_booking. 281 passed. См. PLANS.md:56-89 + архив (offset 526).
-> - **Session 5.12** (commits `90c0000` + `9345a7b`, pushed): 5.2 — WorkDay модель + миграция 005 (DROP EXCLUDE, INSERT из Slot). 274 passed. См. PLANS.md:38-55.
-> - **Session 5.11** (БЕЗ коммитов, analysis only): deep-analysis-critic iter 1 → NEEDS_MORE_ANALYSIS → iter 2 DEEP_ENOUGH. PLANS.md создан. См. PLANS.md:25-37 + архив (offset 636).
-> - **Sessions 1-2**: cross-DB schema + миграции 001/002 + Render deploy. См. архив (offset 655+).
-
----
+> - **Session 5.14** (commit `069274d`, pushed): 5.4 — 30-мин шаг + `_build_start_at_from_workday` + admin.py Booking.start_at filter. 286 passed.
+> - **Session 5.13** (commit `aedf1a0`, pushed): 5.3 — WorkDay invariants в create_booking. 281 passed.
+> - **Session 5.12** (commits `90c0000` + `9345a7b`, pushed): 5.2 — WorkDay модель + миграция 005 (DROP EXCLUDE, INSERT из Slot). 274 passed.
+> - **Session 5.11** (БЕЗ коммитов, analysis only): deep-analysis-critic iter 1 → NEEDS_MORE_ANALYSIS → iter 2 DEEP_ENOUGH. PLANS.md создан.
+> - **Sessions 1-2**: cross-DB schema + миграции 001/002 + Render deploy.
