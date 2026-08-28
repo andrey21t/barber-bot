@@ -1,6 +1,85 @@
-# NEXT_SESSION_PROMPT — Session 5.10 закрыт (цена убрана из FSM, commit `68cf591`), Session 5.11 готов (Вариант B / Этап 5 — high-stakes).
+# NEXT_SESSION_PROMPT — Session 5.11 закрыт (deep-analysis Этапа 5 завершён, VERDICT DEEP_ENOUGH), Session 5.12 готов (implementation Варианта B).
 
-> Дата: 2026-08-28 · Session 5.10 commit `68cf591` (feat: remove price from FSM creation flow) — запушен, НЕ задеплоен. Prod остаётся на `c64b31d` (Session 5.9). 265 тестов зелёные, ruff + mypy чисто. **Готов к Session 5.11: Вариант B (Этап 5) — high-stakes. Нужен deep-analysis Pass 1-4 + critic subagent + PLANS.md. Анализ Екатерины (8 паттернов) в строках ~990-1040, backlog 5.1-5.10 в строках 618-640.**
+> Дата: 2026-08-28 · Session 5.11 — чисто аналитическая сессия (БЕЗ правок кода, БЕЗ коммитов). Цель: deep-analysis Pass 1-4 + critic для Этапа 5 «Вариант B» (8 паттернов мастера Екатерины). Результат: VERDICT DEEP_ENOUGH, готов к implementation в Session 5.12.
+> Session 5.10 commit `68cf591` (feat: remove price from FSM creation flow) — НЕ задеплоен. Prod остаётся на `c64b31d`. 265 тестов зелёные, ruff+mypy чисто.
+
+## ⚡ TL;DR для Session 5.12 (handoff после compact)
+
+**Цель 5.12:** implementation Этапа 5 Вариант B по PLANS.md (13 шагов, ~400-600 строк).
+
+**Главный артефакт:** `~/PycharmProjects/barber-bot/PLANS.md` (255 строк) — living-документ Этапа 5. ЧИТАТЬ ПЕРВЫМ. Содержит:
+- Purpose, Progress (Session 5.11 — deep-analysis)
+- Surprises & Discoveries (7 пунктов)
+- **Decision Log** — решения по 3 blocker'ам + 7 gaps критика + Gap 8 (SQL parens)
+- Plan of Work (13 шагов: 5.2 → 5.10 + aliases + миграция 006)
+- Validation (гейты, тесты по фазам)
+
+**3 blocker'а (решено в PLANS.md Decision Log):**
+
+1. **Архитектурный подход** → **B**: WorkDay (master_id, date, start_time, end_time, max_concurrent_clients, is_active) + Booking на диапазоне через start_at/end_at. Slot deprecated (миграция 005 переносит данные, 006 drop). Подходы A и C отклонены (A — клиент видит "24ч свободно"; C нарушает BB-007 — рекуррентный шаблон, а B на конкретную дату).
+
+2. **Multi-client** → **1 booking = 1 client, N bookings с перекрывающимися диапазонами + WorkDay.max_concurrent_clients (capacity)**. Drop EXCLUDE constraint (002, ломает multi-client). App-level check (SELECT count + INSERT) + retry на IntegrityError + Postgres `pg_advisory_xact_lock(master_id, day)` (BB-008 adoption — откат от "заменён на EXCLUDE" обоснован changing requirements). `client_id NOT NULL` остаётся.
+
+3. **30-мин шаг** → **drop slot_hour** (int 0-23 не поддерживает минуты). WorkDay.start_time/end_time = `time` (HH:MM). Booking.start_at = `datetime` (полная свобода минут). 30-мин шаг — на уровне `/slots` UI (генерация кнопок T, T+30, T+60, ... из WorkDay.start_time → end_time). Blast radius: 7 файлов (booking.py:79-83, 86-90; slots.py:28; keyboards/client.py:105, 174; conftest.py:114; admin.py:618, 832).
+
+**Critic iter 1 → NEEDS_MORE_ANALYSIS (7 gaps) → iter 2 → DEEP_ENOUGH (6/7 closed, Gap 6 → Gap 8 fix):**
+- Gap 8 (SQL precedence bug): `WHERE (start_at < new_start_time OR end_at > new_end_time) AND status IN (...)` — parens ОБЯЗАТЕЛЬНЫ (без parens `AND` binds tighter → false positive на cancelled bookings). Зашит в PLANS.md Gap 6 decision.
+
+**Risk-класс: HIGH-STAKES** — миграция БД на live-базе Екатерины (one-way door) + persistence layer change + > 5 файлов.
+
+**Baseline: 265 тестов** (verified `grep -c` в critic iter 1 и iter 2). Цель: +30-50 тестов в Этап 5.
+
+**Порядок impl в 5.12** (по PLANS.md Plan of Work):
+1. 5.2 WorkDay модель + миграция 005 (CREATE work_days + DROP EXCLUDE + INSERT из Slot)
+2. 5.7 перенос данных Slot → WorkDay (в миграции 005, one-way door — тестировать на dev-копии prod базы)
+3. 5.3 Booking-диапазон + invariants (drop slot_id FK в миграции 006)
+4. 5.4 30-мин шаг + перепись `_build_start_at`
+5. 5.1 `/openday` command + FSM
+6. 5.5 multi-client (max_concurrent_clients default 1, UPDATE до 2 для Екатерины)
+7. 5.6 «Мест нет» в /slots (occupancy check)
+8. 5.8 `/slots` command + slot picker keyboard (30-мин кнопки)
+9. 5.9 `/movslot` + admin_move_booking (без client_id pin, без 24h правила)
+10. 5.10 inline-часы toggle в FSM (переделка admin_addslots_hours_msg / admin_closeslot_hour_msg)
+11. /addslots /closeslot deprecated aliases
+12. Миграция 006 drop table slots (после smoke-test неделю)
+
+**Гейты (MY-VIBE-RULES.md):** после каждой фазы — qa-verify-and-fix (format/lint/typecheck/tests) + qa-code-review (для нетривиальных: 5.2 миграция, 5.5 multi-client race, 5.9 admin_move). Pre-push ревью (pet-проект — git free по AGENTS.md § git-repo-categories, но чек-лист pr-review-rules применять).
+
+**Файлы на старте 5.12:**
+- `bot/models.py` — Slot (slot_hour:int), Booking (slot_id NOT NULL FK, start_at/end_at) — добавить WorkDay, prepare deprecate Slot
+- `bot/services/booking.py` (686) — `_build_start_at` (79-83), `_build_end_at` (86-90), create_booking, cancel_booking, transfer_booking
+- `bot/services/slots.py` (102) — add_slots/close_slot/get_available_slots (переписать в 5.4-5.6)
+- `bot/services/admin.py` (163) — get_today_bookings/get_week_bookings JOIN Slot (переписать в 5.3)
+- `bot/handlers/admin.py` (1238) — /addslots, /closeslot, /today, /week, /services, FSM addslots/closeslot (admin.py:618, 832)
+- `alembic/versions/001_initial.py` (249), `002_postgres_exclude.py` (53, drop в 005), `004_service_price_nullable.py` (образец стиля batch_alter_table для 005)
+- `tests/conftest.py` (148) — seed_data Slot → WorkDay в 5.2
+- `donor-research/topics/booking-bot-architecture.md:158-166` — BB-007 (Schedule-as-template REJECT — НЕ нарушается B)
+
+**Не сделано в 5.11 (преднамеренно):**
+- PLANS.md НЕ закоммичен (в `.git/info/exclude`, рабочий документ, не уходит в remote)
+- NEXT_SESSION_PROMPT.md обновляется сейчас (этим edit)
+- Implementation — Session 5.12+
+
+---
+
+## Session 5.11 — что сделано (для истории)
+
+**Только анализ, БЕЗ правок кода и коммитов:**
+
+1. Загружен скилл `deep-analysis-protocol`
+2. Прочитаны все исходники: models.py, booking.py (686), slots.py (102), admin.py (1238), services/admin.py (163), keyboards/client.py (177), conftest.py (148), миграции 001-004, handlers
+3. Explore subagent собрал факты по handlers/keyboards/middlewares
+4. Greenfield-проверка: `grep -rni 'workday\|openday'` пусто — ничего откатывать
+5. Pass 1-4 главного агента (Понимание, Edge cases, State-переходы, Self-verify)
+6. Critic iter 1 (`[REDACTED-SESSION-ID]`) → **NEEDS_MORE_ANALYSIS** (7 gaps)
+7. Дополнения Pass 1-4 по 7 gaps → создан `PLANS.md` (255 строк)
+8. Critic iter 2 (`[REDACTED-SESSION-ID]`) → **DEEP_ENOUGH** (6/7 closed, Gap 6 → Gap 8 fix)
+9. Self-check после compaction: найдены и исправлены 2 бага в PLANS.md (markdown в SQL parens, дубликат секции critic iter 2)
+10. Этот handoff-блок добавлен в NEXT_SESSION_PROMPT.md
+
+**Подробности всех решений:** `~/PycharmProjects/barber-bot/PLANS.md` (читать первым в Session 5.12).
+
+---
 
 ## Контекст проекта
 
