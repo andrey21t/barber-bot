@@ -76,7 +76,7 @@ class Service(Base):
     )
     name: Mapped[str] = mapped_column(String(255))
     duration_minutes: Mapped[int] = mapped_column()
-    price: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+    price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
     is_active: Mapped[bool] = mapped_column(default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True).with_variant(TIMESTAMP(timezone=True), "postgresql"),

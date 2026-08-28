@@ -34,7 +34,8 @@ class AdminStates(StatesGroup):
     Multi-step flows для 3 из 5 кнопок админ-меню:
     - adding_slots: date (SimpleCalendar) → hours (text input) → create
     - closing_slot: date (SimpleCalendar) → hour (text input) → close
-    - entering_service: name → duration → price → create
+    - entering_service: name → duration → create (price убран в Session 5.10,
+      мастер озвучивает цену отдельно в чате; поле Service.price nullable)
 
     Today/week — мгновенные callback handlers БЕЗ FSM (read-only queries).
     """
@@ -45,4 +46,3 @@ class AdminStates(StatesGroup):
     closing_slot_hour = State()
     entering_service_name = State()
     entering_service_duration = State()
-    entering_service_price = State()

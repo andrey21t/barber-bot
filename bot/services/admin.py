@@ -94,9 +94,12 @@ async def create_service(
     business_id: UUID,
     name: str,
     duration_minutes: int,
-    price: Decimal,
+    price: Decimal | None = None,
 ) -> Service:
     """Create a service. No name uniqueness check in MVP (see module docstring).
+
+    Price is optional (Session 5.10): master announces price separately in
+    chat, not via FSM. Field kept nullable for future use.
 
     Raises ValueError on invalid input (caller-handler validates, but defense-in-depth).
     """
@@ -106,7 +109,7 @@ async def create_service(
         raise ValueError("service name too long (max 255 chars)")
     if duration_minutes <= 0:
         raise ValueError("duration_minutes must be > 0")
-    if price < 0:
+    if price is not None and price < 0:
         raise ValueError("price must be >= 0")
 
     service = Service(
