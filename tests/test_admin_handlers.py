@@ -9,9 +9,10 @@ Coverage (AUTONOMOUS_COVERAGE_PROMPT.md T1):
   already closed (idempotent)
 - cmd_today: happy + не-админ + master not found + empty
 - cmd_week: happy + не-админ + master not found + empty
-- cmd_services: happy + не-админ + no args/args[0] != "add" + len != 4 +
-  невалидный duration + невалидный price + duration <= 0 + price < 0 + master not found +
+- cmd_services: happy + не-админ + no args/args[0] != "add" + len != 3 +
+  невалидный duration + duration <= 0 + master not found +
   ValueError from create_service
+  (price убран в Session 5.10 — тесты на price удалены)
 - _render_bookings: empty list + mixed statuses (confirmed/transferred/cancelled)
 - _is_admin, _require_admin_or_silent, _resolve_master_and_business: direct unit
 
@@ -19,7 +20,7 @@ Why handler tests (not just service tests, AGENTS.md § anti-overengineering rul
 admin handlers contain partition decisions computed in the handler:
 - /addslots past-date check (handler compares slot_date < today_local)
 - /closeslot hour range check (handler validates 0-23 before service call)
-- /services args validation (handler parses duration/price before service)
+- /services args validation (handler parses duration before service)
 Display math that mirrors service invariants is a logic-change risk, not pure I/O.
 
 Pattern (NEXT_SESSION_PROMPT.md 38, mirror of test_client_handlers.py):
@@ -31,7 +32,6 @@ Avoids `dp.feed_update` ceremony — no Dispatcher/router-wiring needed.
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
@@ -898,24 +898,27 @@ async def test_cmd_services_happy_creates_service(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """Happy: 'services add Стрижка 60 1500' → '✅ Услуга добавлена' + Service row."""
+    """Happy: 'services add Стрижка 60' → '✅ Услуга добавлена' + Service row.
+
+    Price убран в Session 5.10 — поле Service.price nullable, не вводится
+    через FSM. Здесь проверяем только name + duration.
+    """
     async with session_factory() as session:
         await _seed_admin_stack(session)
 
-    msg = _make_message(user_id=ADMIN_TG_ID, text="/services add Стрижка 60 1500")
-    await admin_handlers.cmd_services(msg, _make_command("add Стрижка 60 1500"))
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services add Стрижка 60")
+    await admin_handlers.cmd_services(msg, _make_command("add Стрижка 60"))
 
     text = _answer_text(msg)
     assert "✅ Услуга добавлена" in text
     assert "Стрижка" in text
     assert "60" in text  # duration
-    assert "1500" in text  # price
 
     async with session_factory() as verify:
         svc = (await verify.execute(select(Service))).scalar_one()
         assert svc.name == "Стрижка"
         assert svc.duration_minutes == 60
-        assert svc.price == Decimal("1500")
+        assert svc.price is None  # Session 5.10: price nullable, not entered via FSM
 
 
 @pytest.mark.asyncio
@@ -927,8 +930,8 @@ async def test_cmd_services_non_admin_silent_ignore(
     async with session_factory() as session:
         await _seed_admin_stack(session)
 
-    msg = _make_message(user_id=NON_ADMIN_TG_ID, text="/services add Стрижка 60 1500")
-    await admin_handlers.cmd_services(msg, _make_command("add Стрижка 60 1500"))
+    msg = _make_message(user_id=NON_ADMIN_TG_ID, text="/services add Стрижка 60")
+    await admin_handlers.cmd_services(msg, _make_command("add Стрижка 60"))
 
     assert _answer_call_count(msg) == 0
 
@@ -972,15 +975,20 @@ async def test_cmd_services_wrong_args_count_shows_error(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """'services add Стрижка 60' (3 args instead of 4) → '❌ Нужно 3 параметра'."""
+    """'services add Стрижка' (2 args instead of 3) → '❌ Нужно 2 параметра'.
+
+    Session 5.10: price убран, формат стал 'add NAME DURATION' (3 args
+    включая 'add'). Wrong count теперь 2 args ('add Стрижка') или 4 args
+    ('add Стрижка 60 1500').
+    """
     async with session_factory() as session:
         await _seed_admin_stack(session)
 
-    msg = _make_message(user_id=ADMIN_TG_ID, text="/services add Стрижка 60")
-    await admin_handlers.cmd_services(msg, _make_command("add Стрижка 60"))
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services add Стрижка")
+    await admin_handlers.cmd_services(msg, _make_command("add Стрижка"))
 
     text = _answer_text(msg)
-    assert "Нужно 3 параметра" in text
+    assert "Нужно 2 параметра" in text
 
 
 @pytest.mark.asyncio
@@ -988,31 +996,15 @@ async def test_cmd_services_non_numeric_duration_shows_error(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """'add Стрижка xx 1500' → int('xx') ValueError → '❌ Длительность должна быть числом'."""
+    """'add Стрижка xx' → int('xx') ValueError → '❌ Длительность должна быть числом'."""
     async with session_factory() as session:
         await _seed_admin_stack(session)
 
-    msg = _make_message(user_id=ADMIN_TG_ID, text="/services add Стрижка xx 1500")
-    await admin_handlers.cmd_services(msg, _make_command("add Стрижка xx 1500"))
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services add Стрижка xx")
+    await admin_handlers.cmd_services(msg, _make_command("add Стрижка xx"))
 
     text = _answer_text(msg)
     assert "Длительность должна быть числом" in text
-
-
-@pytest.mark.asyncio
-async def test_cmd_services_non_numeric_price_shows_error(
-    session_factory: Any,
-    patched_session_factory: Any,
-) -> None:
-    """'add Стрижка 60 xx' → Decimal('xx') InvalidOperation → '❌ Цена должна быть числом'."""
-    async with session_factory() as session:
-        await _seed_admin_stack(session)
-
-    msg = _make_message(user_id=ADMIN_TG_ID, text="/services add Стрижка 60 xx")
-    await admin_handlers.cmd_services(msg, _make_command("add Стрижка 60 xx"))
-
-    text = _answer_text(msg)
-    assert "Цена должна быть числом" in text
 
 
 @pytest.mark.asyncio
@@ -1024,27 +1016,11 @@ async def test_cmd_services_zero_duration_shows_error(
     async with session_factory() as session:
         await _seed_admin_stack(session)
 
-    msg = _make_message(user_id=ADMIN_TG_ID, text="/services add Стрижка 0 1500")
-    await admin_handlers.cmd_services(msg, _make_command("add Стрижка 0 1500"))
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services add Стрижка 0")
+    await admin_handlers.cmd_services(msg, _make_command("add Стрижка 0"))
 
     text = _answer_text(msg)
     assert "Длительность должна быть > 0" in text
-
-
-@pytest.mark.asyncio
-async def test_cmd_services_negative_price_shows_error(
-    session_factory: Any,
-    patched_session_factory: Any,
-) -> None:
-    """price=-100 → '❌ Цена не может быть отрицательной'."""
-    async with session_factory() as session:
-        await _seed_admin_stack(session)
-
-    msg = _make_message(user_id=ADMIN_TG_ID, text="/services add Стрижка 60 -100")
-    await admin_handlers.cmd_services(msg, _make_command("add Стрижка 60 -100"))
-
-    text = _answer_text(msg)
-    assert "Цена не может быть отрицательной" in text
 
 
 @pytest.mark.asyncio
@@ -1056,8 +1032,8 @@ async def test_cmd_services_master_not_found_shows_error(
     async with session_factory() as session:
         await _seed_admin_stack(session, admin_telegram_id=777777777)
 
-    msg = _make_message(user_id=ADMIN_TG_ID, text="/services add Стрижка 60 1500")
-    await admin_handlers.cmd_services(msg, _make_command("add Стрижка 60 1500"))
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services add Стрижка 60")
+    await admin_handlers.cmd_services(msg, _make_command("add Стрижка 60"))
 
     text = _answer_text(msg)
     assert "Мастер не найден" in text
@@ -1073,16 +1049,15 @@ async def test_cmd_services_service_validation_error_from_create_service(
     handler catches and shows '❌ {exc}'.
 
     We trigger via empty name — service raises 'service name must not be empty'.
-    Note: 'add 60 1500' — args[1] is '' → after strip is empty → service raises.
-    The handler parses `args[1].replace('_', ' ')` = '' before calling service.
+    Note: 'add _ 60' — args[1] is '' → after strip is empty → service raises.
     """
     async with session_factory() as session:
         await _seed_admin_stack(session)
 
     # Name='' (empty) passes handler parse, but service rejects on `not name.strip()`
-    msg = _make_message(user_id=ADMIN_TG_ID, text="/services add _ 60 1500")
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services add _ 60")
     # '_' becomes ' ' (replace), then service gets ' ' which fails `not name.strip()`
-    await admin_handlers.cmd_services(msg, _make_command("add _ 60 1500"))
+    await admin_handlers.cmd_services(msg, _make_command("add _ 60"))
 
     text = _answer_text(msg)
     assert "service name must not be empty" in text

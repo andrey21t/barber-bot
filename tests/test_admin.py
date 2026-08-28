@@ -540,6 +540,26 @@ async def test_create_service_name_too_long_raises(
         )
 
 
+@pytest.mark.asyncio
+async def test_create_service_price_none_persists(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """price=None (Session 5.10) → service.price is None, no ValueError.
+
+    Price стал nullable: мастер озвучивает цену в чате, не через FSM.
+    Проверяем что create_service без price работает и сохраняет None.
+    """
+    service = await create_service(
+        session,
+        business_id=seed_data["business_id"],
+        name="Стрижка",
+        duration_minutes=60,
+        # price не передаётся — дефолт None
+    )
+    assert service.price is None
+
+
 # ============================================================
 # Edge case: extreme timezone (Asia/Kamchatka UTC+12)
 # ============================================================
