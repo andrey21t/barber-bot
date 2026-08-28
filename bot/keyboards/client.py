@@ -29,10 +29,20 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram_calendar import SimpleCalendar
 
 from bot.models import Booking, Slot
+from bot.services.slots import TimeSlot30
 
 
 class BookSlotCallbackData(CallbackData, prefix="book_slot"):
-    """Slot picker callback — payload is slot UUID."""
+    """Slot picker callback — payload is slot UUID.
+
+    NB: used by legacy slot-based /book flow (slot_picker_keyboard). The new
+    30-мин WorkDay-based flow (slot_picker_keyboard_30min, Этап 5.4) does NOT
+    have a slot UUID — booking is created from WorkDay + selected start_time.
+    /slots UI in 5.8 will introduce a new CallbackData carrying workday_id +
+    start_time_local (or a synthetic key) — until then this prefix is shared
+    by both flows (kept simple for 5.4 helper release; 5.8 may introduce a
+    distinct prefix if the payload differs significantly).
+    """
 
     slot_id: UUID
 
@@ -92,6 +102,11 @@ async def calendar_keyboard(min_date: datetime, max_date: datetime) -> InlineKey
 def slot_picker_keyboard(slots: list[Slot]) -> InlineKeyboardMarkup:
     """Build inline keyboard with available slots.
 
+    DEPRECATED (Этап 5.4): kept for the legacy slot-based /book flow until
+    5.8 introduces /slots command + WorkDay-based booking. New code should
+    use `slot_picker_keyboard_30min` which renders TimeSlot30 buttons with
+    "HH:MM" labels (30-min step grid from WorkDay).
+
     Each button shows slot_hour (e.g. "14:00"), callback_data carries slot UUID.
     Empty slots list → single "Нет свободных слотов" button (disabled).
     """
@@ -105,6 +120,37 @@ def slot_picker_keyboard(slots: list[Slot]) -> InlineKeyboardMarkup:
         label = f"{slot.slot_hour:02d}:00"
         builder.button(text=label, callback_data=cb.pack())
     builder.adjust(3)  # 3 slots per row
+    return builder.as_markup()
+
+
+def slot_picker_keyboard_30min(slots: list[TimeSlot30]) -> InlineKeyboardMarkup:
+    """Build inline keyboard from 30-мин WorkDay slots (Этап 5.4).
+
+    Each TimeSlot30 carries a pre-formatted `label` ("HH:MM" in business tz),
+    so this helper does not need to know the timezone — generation logic lives
+    in `get_30min_slots_from_workday` (separation of concerns: grid generation
+    vs keyboard layout).
+
+    Empty list → single "Нет свободных слотов" button (matches legacy
+    slot_picker_keyboard UX). Adjust(3) — 3 buttons per row.
+
+    NB: callback_data for 30-мин slots is NOT YET implemented — /slots command
+    (5.8) will introduce a BookSlot30CallbackData carrying workday_id +
+    start_time_local (or encode them). This helper is released in 5.4 as
+    infrastructure for 5.8; until 5.8 wires up the handler, the callback_data
+    field uses a placeholder "noop" string (so the keyboard renders but taps
+    are no-ops — 5.8 will replace with real BookSlot30CallbackData).
+    """
+    builder = InlineKeyboardBuilder()
+    if not slots:
+        builder.button(text="Нет свободных слотов", callback_data="noop")
+        return builder.as_markup()
+
+    for slot in slots:
+        # TODO 5.8: replace "noop" with BookSlot30CallbackData(workday_id=...,
+        # start_time_local=slot.start_time_local.isoformat()).pack()
+        builder.button(text=slot.label, callback_data="noop")
+    builder.adjust(3)
     return builder.as_markup()
 
 
@@ -165,6 +211,11 @@ def _format_booking_summary(
 ) -> str:
     """Format booking summary message for confirming state.
 
+    DEPRECATED (Этап 5.4): kept for the legacy slot-based /book flow. New code
+    should use `_format_booking_summary_from_start_at` which takes the
+    Booking.start_at (UTC datetime) directly — works for both slot-based and
+    WorkDay-based bookings, decouples summary rendering from the Slot model.
+
     Used by handler to render summary before ✅/❌ buttons.
     """
     from datetime import time as dtime
@@ -174,4 +225,36 @@ def _format_booking_summary(
         slot.slot_date, dtime(hour=slot.slot_hour), tzinfo=ZoneInfo(business_timezone)
     )
     formatted = local_dt.strftime("%d %B %Y, %H:%M")
+    return f"📅 {formatted}\n💇 {service_title}\n👤 {client_name}\n"
+
+
+def _format_booking_summary_from_start_at(
+    start_at: datetime,
+    client_name: str,
+    service_title: str,
+    business_timezone: str = "Europe/Moscow",
+) -> str:
+    """Format booking summary from Booking.start_at (UTC) — Этап 5.4.
+
+    Decouples summary rendering from the Slot model: works for slot-based
+    bookings (legacy /addslots) AND WorkDay-based bookings (5.8 /slots).
+    start_at is aware UTC (built by _build_start_at or _build_start_at_from_workday).
+
+    Defensive .replace(tzinfo=UTC): converts DB-read naive datetime (SQLite stores
+    naive) to aware UTC. NB: no-op ONLY when start_at is already aware UTC OR
+    naive — if a caller passes aware non-UTC (e.g. Moscow tzinfo), .replace would
+    overwrite tzinfo without conversion (wall-clock interpreted as UTC → silent
+    3h shift for Moscow). Contract: caller passes aware UTC (in-memory built) or
+    naive (DB-read); aware non-UTC is a contract violation.
+
+    Args:
+        start_at: aware UTC datetime OR naive (treated as UTC) — Booking.start_at.
+        client_name, service_title: caller responsibility to html.escape()
+            (helper renders as-is in HTML parse mode).
+        business_timezone: IANA tz name for LOCAL rendering.
+    """
+    from zoneinfo import ZoneInfo
+
+    local_time = start_at.replace(tzinfo=UTC).astimezone(ZoneInfo(business_timezone))
+    formatted = local_time.strftime("%d %B %Y, %H:%M")
     return f"📅 {formatted}\n💇 {service_title}\n👤 {client_name}\n"
