@@ -80,7 +80,7 @@ async def calendar_keyboard(min_date: datetime, max_date: datetime) -> InlineKey
         Russian "Отмена" / "Сегодня" buttons.
     """
     cal = SimpleCalendar(
-        locale="ru_RU",
+        locale="ru_RU.UTF-8",
         cancel_btn="Отмена",
         today_btn="Сегодня",
     )
