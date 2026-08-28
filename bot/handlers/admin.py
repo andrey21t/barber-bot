@@ -1270,3 +1270,35 @@ async def admin_state_catchall_callback(callback: CallbackQuery) -> None:
         await callback.answer()
         return
     await callback.answer("Используйте /cancel для отмены", show_alert=False)
+
+
+# ============================================================
+# Этап 3.5 — admin no-state catch-all (UX fix post-deploy Session 5.9)
+# ============================================================
+# Баг (smoke test на prod): админ завершил FSM (state.clear), затем ввёл
+# произвольный текст (не команду, например "12") → проваливается в
+# client_router fallback → "Начните запись через /book" (клиентский hint,
+# не админский). Confusing для Екатерины — она админ, а не клиент.
+#
+# Fix: перехватываем в admin_router (registered ПЕРЕД client_router в
+# main.py:117-119). StateFilter(None) — только no-FSM state (НЕ трогает
+# admin FSM states — там admin_state_catchall_text). _is_admin check —
+# non-admin silent return, проваливается в client_router fallback (OK
+# для клиентов — /book hint правильный).
+# ============================================================
+
+
+@router.message(StateFilter(None), F.text, ~F.text.startswith("/"))
+async def admin_no_state_catchall_text(message: Message) -> None:
+    """Catch-all для произвольного текста от админа в no-FSM state.
+
+    Перехватывает произвольный текст (НЕ команды) от админа в State(None),
+    подсказывает /menu вместо того, чтобы проваливаться в client_router
+    fallback ("Начните запись через /book" — клиентский hint для админа).
+
+    Non-admin → silent return, проваливается в client_router fallback (OK).
+    /commands → НЕ матчит (~F.text.startswith("/")), идут в свои handlers.
+    """
+    if not _is_admin(message):
+        return
+    await message.answer("📋 /menu для действий")
