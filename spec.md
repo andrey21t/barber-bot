@@ -29,7 +29,7 @@ Telegram-бот для записи к парикмахеру-одиночке: 
    - `/closeslot 2026-03-17 14` — закрыть слот (например, для окрашивания на 2 часа)
    - `/today` — записи на сегодня
    - `/week` — записи на неделю
-   - `/services add <name> <duration_min> <price>` — добавить услугу (для snapshot в booking)
+    - `/services add <name> <duration_min>` — добавить услугу (для snapshot в booking)
 
 2. **Клиент** записывается через inline-кнопки (FSM, БЕЗ name/phone в начале):
    - `/start` → кнопка "Записаться"
@@ -111,7 +111,7 @@ CREATE TABLE services (
     business_id     UUID NOT NULL REFERENCES businesses(id),
     name            VARCHAR(255) NOT NULL,
     duration_minutes INT NOT NULL CHECK (duration_minutes > 0),
-    price           NUMERIC(10,2) NOT NULL,
+     price           NUMERIC(10,2),  -- nullable с Session 5.10 (мастер озвучивает цену в чате)
     is_active       BOOLEAN NOT NULL DEFAULT TRUE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );

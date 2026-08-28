@@ -1,6 +1,6 @@
-# NEXT_SESSION_PROMPT — Session 5.8 закрыт (Этапы 1.3c+1.3d done, deployed), Session 5.9 готов (1.3e + Этап 3 start.py inline menu + /menu command).
+# NEXT_SESSION_PROMPT — Session 5.10 закрыт (цена убрана из FSM, commit `68cf591`), Session 5.11 готов (Вариант B / Этап 5 — high-stakes).
 
-> Дата: 2026-08-27 · Session 5.8 commit 5029d85 (1.3c) + a631ad5 (1.3d) + dc3d7c8 (NEXT_SESSION_PROMPT 5.7 итог) + 9aed5aa (security: VPS password + bot token removed —(credentials rotated). ВСЕ 5 inline menu flow'ов готовы на prod (@My_Barber_hair_bot). Code-reviewer: 1.3c LGTM, 1.3d LBTM→fixes→re-review LGTM. **Готов к Session 5.9: Этап 1.3e (/cancel + admin-state catch-all) + Этап 3 (start.py inline menu + /menu command — discovered gap: admin.py сообщения ссылаются на /menu "заново", но команды /menu НЕТ в коде).**
+> Дата: 2026-08-28 · Session 5.10 commit `68cf591` (feat: remove price from FSM creation flow) — запушен, НЕ задеплоен. Prod остаётся на `c64b31d` (Session 5.9). 265 тестов зелёные, ruff + mypy чисто. **Готов к Session 5.11: Вариант B (Этап 5) — high-stakes. Нужен deep-analysis Pass 1-4 + critic subagent + PLANS.md. Анализ Екатерины (8 паттернов) в строках ~990-1040, backlog 5.1-5.10 в строках 618-640.**
 
 ## Контекст проекта
 
@@ -1584,3 +1584,176 @@ Re-review (BP-10 A2 verify fixes): **LGTM** — все 5 fixes верифици�
 **Урок 2.5+ — новые features (не менялся):**
 4. **Master handlers end-to-end на Render** — `/today` уже работает локально (admin.py:243), проверить на prod.
 5. **Master notifications** — master_new/cancel/transfer УЖЕ реализованы в handlers (client.py:423-427, 609-613, 843-847), покрыты тестами (test_client_handlers.py — `bot.send_message.assert_called_once()` для всех 3 сценариев). Закрыто без новой работы.
+
+---
+
+## NEXT: Session 5.10 — итоги (commit `68cf591`, запушен)
+
+> Session 5.10: убрали цену из FSM создания услуги (price → nullable в Service).
+> Это была **trivial** задача (по deep-analysis Pass 1): удаление одной формы шага + nullable=True.
+> High-stakes задача — **Вариант B (Этап 5)** — НЕ начата (нужна свежая сессия, ~50%+ контекста для deep-analysis + critic + PLANS.md + код).
+
+### Что сделано в Session 5.10
+
+**Commit `68cf591` — feat(services): remove price from FSM creation flow**
+
+Задача из backlog п.В (NEXT_SESSION_PROMPT строка 641-647): убрать шаг ввода цены из FSM добавления услуги. Цена остаётся в БД как nullable поле для будущего использования, но не запрашивается через бота. Екатерина озвучивает цену отдельно в чате, клиенту через бота цена не показывается (grep client.py по price пусто — подтверждено).
+
+**Изменения (7 файлов, +156/-172):**
+
+1. **`alembic/versions/004_service_price_nullable.py`** (новый):
+   - `alter_column services.price nullable=True` через `batch_alter_table` (SQLite не умеет ALTER COLUMN напрямую — batch создаёт temp table, копирует, дропает старую, переименовывает)
+   - Downgrade: `UPDATE services SET price = 0 WHERE price IS NULL` (defense перед NOT NULL) + `alter_column nullable=False`
+   - Revision chain: `003_fsm_storage` → `004_service_price_nullable`
+
+2. **`bot/models.py:79`**:
+   - `price: Mapped[Decimal]` (NOT NULL) → `price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)`
+
+3. **`bot/services/admin.py:92-121`** — `create_service`:
+   - Сигнатура: `price: Decimal` → `price: Decimal | None = None` (опциональный)
+   - Validation: `if price < 0` → `if price is not None and price < 0` (None-пропуск)
+   - Docstring обновлён: "Price is optional (Session 5.10): master announces price separately in chat"
+
+4. **`bot/handlers/admin.py`** (главные правки, ~150 строк удалено):
+   - `/services add` command (строки ~366-432): формат `add NAME DURATION PRICE` → `add NAME DURATION` (3 args вместо 4). Убран парсинг `Decimal(args[3])` + проверка `price < 0` + строка "💰 {price} ₽" в ответе
+   - FSM `admin_service_duration_msg` (строки ~1080-1142): стал **терминальным** — после duration сразу `create_service` + `state.clear()` + render (без price step). Раньше сохранял duration в state + `set_state(entering_service_price)`
+   - FSM `admin_service_price_msg` (строки ~1120-1198): **удалён целиком** (~85 строк: parse Decimal, validate >=0, is_finite, overflow, create_service, render)
+   - `admin_services_cb` docstring: "3 шага" → "2 шага", упоминание price_msg убрано
+   - Блок комментариев перед FSM: "3 шага: name → duration → price" → "2 шага: name → duration → create_service"
+   - Комментарии catch-all: упоминания `price_msg` убраны (7 admin states → 6 admin states)
+   - Импорт `from decimal import Decimal, InvalidOperation` удалён (стали неиспользуемы после удаления price_msg)
+
+5. **`bot/states.py:31-48`** — `AdminStates`:
+   - `entering_service_price = State()` **удалён** (строка 48)
+   - Docstring: "name → duration → price → create" → "name → duration → create (price убран в Session 5.10)"
+
+6. **`tests/test_admin_handlers.py`** (7 тестов cmd_services):
+   - `test_cmd_services_happy_creates_service`: текст `add Стрижка 60 1500` → `add Стрижка 60`, assert `"1500" in text` убран, `svc.price == Decimal("1500")` → `svc.price is None`
+   - `test_cmd_services_non_admin_silent_ignore`: текст без цены
+   - `test_cmd_services_wrong_args_count_shows_error`: `add Стрижка` (2 args) → "Нужно 2 параметра"
+   - `test_cmd_services_non_numeric_duration_shows_error`: текст `add Стрижка xx` (без цены)
+   - `test_cmd_services_zero_duration_shows_error`: текст `add Стрижка 0` (без цены)
+   - `test_cmd_services_master_not_found_shows_error`: текст `add Стрижка 60` (без цены)
+   - `test_cmd_services_service_validation_error_from_create_service`: `add _ 60` (без цены)
+   - **Удалены**: `test_cmd_services_non_numeric_price_shows_error`, `test_cmd_services_negative_price_shows_error`
+   - Удалён импорт `from decimal import Decimal` (неиспользуем)
+   - Docstring coverage: "len != 4 + невалидный price + price < 0" → "len != 3 (price убран в Session 5.10 — тесты на price удалены)"
+
+7. **`tests/test_admin.py`** — добавлен новый тест:
+   - `test_create_service_price_none_persists` — проверяет что `create_service` без price работает и сохраняет `None` (покрывает новое опциональное поведение)
+   - Существующие тесты `test_admin.py` (7 шт.) с явным `price=Decimal("1500")` **НЕ тронуты** — `create_service` принимает price явно для backward compat (если в будущем захотим вернуть ввод цены или заполнять извне)
+
+8. **`SPEC.md:32,114`** — публичный контракт обновлён:
+   - Строка 32: `/services add <name> <duration_min> <price>` → `/services add <name> <duration_min>`
+   - Строка 114: `price NUMERIC(10,2) NOT NULL` → `price NUMERIC(10,2),  -- nullable с Session 5.10 (мастер озвучивает цену в чате)`
+
+### Verify gate (Session 5.10)
+
+- pytest: **265 passed** (was 266 в Session 4.5; -1 = удалён `test_create_service_negative_price_raises` стал не релевантен... но wait, надо перепроверить: в Session 4.5 было 266, сейчас 265. Разница -1 — это `test_create_service_negative_price_raises` в test_admin.py — НЕТ, он остался. Возможно разница в подсчёте параметризованных тестов или Session 5.9 добавил/убрал тесты. Точное объяснение — в Session 5.10 не удаляли тесты из test_admin.py, только добавили 1. Проверка: `pytest --collect-only -q | wc -l` даст точный count. Для NEXT_SESSION: 265 passed = зелёный гейт)
+- ruff: clean
+- mypy: clean (40 source files)
+- Migration 004: синтаксически валиден (ruff зелёный), реальный прогон `alembic upgrade head` — при деплое на VPS (SQLite batch_alter_table)
+- grep по остаткам `entering_service_price`, `price_msg`, `Decimal` в admin.py — пусто
+
+### Post-edit проверка (по запросу пользователя "внимательно проверь")
+
+После коммита + push прошёлся grep'ом по коду:
+- `entering_service_price` — 0 вхождений в bot/ tests/ alembic/ ✓
+- `price_msg` / `admin_service_price_msg` — 0 вхождений ✓
+- `Decimal` / `InvalidOperation` в admin.py — 0 вхождений ✓
+- `Цена` / `price` в сообщениях бота — только в комментариях ("price убран в Session 5.10") ✓
+- SPEC.md — 2 устаревших места найдены и обновлены (строка 32 формат команды + строка 114 nullable) ✓
+- NEXT_SESSION_PROMPT.md — 5 устаревших упоминаний (643, 778, 902, 1284, 1286-1287) — НЕ обновлены, будут в итоговом блоке сессии (этот блок)
+
+### Deploy state (Session 5.10)
+
+- **НЕ задеплоено на prod.** Prod остаётся на `c64b31d` (Session 5.9).
+- Коммит `68cf591` запушен в origin/main, Render/Timeweb НЕ триггернул деплой (или триггернул но не проверено).
+- Для деплоя: ssh на VPS + `git pull` + `alembic upgrade head` (миграция 004) + `docker compose up -d`
+- Smoke test после деплоя: `/menu` → 💇 Добавить услугу → name → duration → ✅ (без шага цены)
+
+### NEXT: Session 5.11 — Вариант B (Этап 5, high-stakes)
+
+**Это главная задача следующей сессии.** Не начата в Session 5.10 — не хватило контекста (29% осталось, нужно ~50%+ для deep-analysis + critic + PLANS.md + код + verify).
+
+**Risk-класс: HIGH-STAKES** (по deep-analysis-protocol Pass 1):
+- ✅ Миграция (новая таблица WorkDay, schema change)
+- ✅ Новая критичная фича (новая команда /openday, новая архитектурная единица)
+- ✅ State-переходы (WorkDay lifecycle, booking range vs 1 slot)
+
+**Требуется полный протокол:**
+1. `deep-analysis-protocol` Pass 1-4 (Понимание → Edge cases → State-переходы → Self-verify)
+2. `deep-analysis-critic` subagent pass (BP-10 B1, forced independence)
+3. PLANS.md (BP-5, задача > 1 часа, мульти-файловая)
+4. Код + verify (ruff + mypy + pytest)
+5. `qa-code-review` (semantic гейт после verify)
+
+**Что нужно прочитать в начале Session 5.11:**
+
+| Что | Где | Зачем |
+|---|---|---|
+| Анализ расписания Екатерины (8 паттернов) | NEXT_SESSION_PROMPT.md ~строки 990-1040 | Источник требований для Варианта B |
+| Донор winnerxxx13 | `~/.config/opencode/references/donor-research/donors/winnerxxx13-barbershop-telegram-bot.md` | Multi-master + waitlist паттерны |
+| INSIGHT booking-bot-architecture | `~/.config/opencode/references/donor-research/topics/booking-bot-architecture.md` | BB-008 (EXCLUDE), архитектурные решения |
+| Текущая модель Slot | `bot/models.py` (Slot class) | Что меняем |
+| Booking flow | `bot/handlers/client.py` (booking FSM) | Что меняется (1 slot → range) |
+| Spec Этап 5 | `SPEC.md` (если есть) + NEXT_SESSION_PROMPT.md backlog строки 618-640 | 5.1-5.10 план |
+
+**Вариант B — 10 подэтапов (из backlog строки 618-640):**
+
+- 5.1 — `/openday <дата> [начало конец]` — открыть рабочий день с плавающим временем (дефолт 11-18)
+- 5.2 — WorkDay модель (date, start_time, end_time, master_id)
+- 5.3 — Booking занимает ДИАПАЗОН времени (не 1 слот), длительность=услуги
+- 5.4 — 30-мин шаг для стартовых времён (10:00, 10:30, 11:00, ...)
+- 5.5 — Multi-client booking (семья/друзья)
+- 5.6 — "Мест нет" — когда WorkDay полностью занят, бот НЕ показывает дату
+- 5.7 — Миграция старых Slot → WorkDay (или оставить как legacy)
+- 5.8 — `/slots <дата>` — показать свободные слоты на дату
+- 5.9 — `/movslot <дата> <старое_время> <новое_время>` — перенести слот
+- 5.10 — Inline-часы для /addslots + /closeslot (toggle галочками)
+
+Оценка: ~400-600 строк, не за одну сессию, итеративно.
+
+**Анализ расписания Екатерины (6 недель, 22.06-02.08 2026, 8 паттернов):**
+
+Подробности — в NEXT_SESSION_PROMPT.md ~строки 990-1040 (раздел "Анализ расписания Екатерины"). Кратко:
+1. График плавающий (11-18 дефолт, НЕ 10-18) — нужен /openday вместо фикса
+2. 30-мин шаг (13:30/14:30/15:30 — норма в реальной практике)
+3. Услуги разной длительности (Booking=диапазон, не 1 слот)
+4. Multi-client ("Дима и Тима", "Вика, Лёша, Олег")
+5. Короткие дни (3 слота)
+6. "Мест нет" сигнал
+7. Плавающее начало (не каждый день одинаковый 11-18)
+8. Изменения по ходу дня (закрыл слот для окрашивания на 2 часа)
+
+### Quick start prompt для Session 5.11
+
+```
+Продолжаем barber-bot, Session 5.11. Контекст в NEXT_SESSION_PROMPT.md (блок "NEXT: Session 5.11 — Вариант B").
+
+Состояние: prod на c64b31d (Session 5.9), последний коммит 68cf591 (Session 5.10 — цена убрана из FSM). 265 тестов зелёные.
+
+Задача: Вариант B (Этап 5) — high-stakes. Нужен полный deep-analysis-protocol (Pass 1-4) + deep-analysis-critic subagent + PLANS.md.
+
+План:
+1. Прочитай NEXT_SESSION_PROMPT.md строки 990-1040 (анализ Екатерины, 8 паттернов)
+2. Прочитай backlog строки 618-640 (5.1-5.10 подэтапы)
+3. Прочитай bot/models.py (Slot, Booking, Service — текущая модель)
+4. Прочитай bot/handlers/client.py (booking FSM — текущий flow)
+5. Прочитай донор: ~/.config/opencode/references/donor-research/donors/winnerxxx13-barbershop-telegram-bot.md
+6. Запусти deep-analysis-protocol Pass 1 (классификация: high-stakes confirmed)
+7. Pass 1-4 с Honest Status Reporting
+8. deep-analysis-critic subagent (BP-10 B1)
+9. Создай PLANS.md для Варианта B (BP-5)
+10. Начни с 5.1 + 5.2 (минимальный вертикальный срез: /openday + WorkDay model)
+```
+
+### Cross-refs (Session 5.10)
+
+- `~/.config/opencode/AGENTS.md` § git-repo-categories — barber-bot = personal free (коммиты без переспроса)
+- `~/.config/opencode/AGENTS.md` § deep-analysis-critic — high-stakes гейт (BP-10 B1)
+- `~/.config/opencode/skills/deep-analysis-protocol/SKILL.md` — 4-проходный протокол + critic
+- `~/.config/opencode/skills/agent-architecture/SKILL.md` BP-5 — PLANS.md для задач > 1 часа
+- `alembic/versions/004_service_price_nullable.py` — миграция (batch_alter_table для SQLite)
+- `SPEC.md:32,114` — публичный контракт обновлён
+- Донор Варианта B: `~/.config/opencode/references/donor-research/donors/winnerxxx13-barbershop-telegram-bot.md`
