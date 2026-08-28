@@ -61,6 +61,7 @@ from bot.services.slots import (
 from bot.services.workday import (
     WorkDayShrinkError,
     open_workday,
+    select_workday,
 )
 from bot.states import AdminStates
 
@@ -305,8 +306,13 @@ async def cmd_openday(message: Message, command: CommandObject) -> None:
         return
 
     async with async_session_factory() as session:
+        # F1 fix (Session 5.18, variant B): capture was_closed BEFORE open_workday
+        # re-opens the day. After open_workday, workday.is_active is always True →
+        # the UX message "день был закрыт — открыт заново" never showed.
+        existing = await select_workday(session, master_id, work_date)
+        was_closed = existing is not None and not existing.is_active
         try:
-            workday = await open_workday(
+            await open_workday(
                 session, master_id, work_date, start_time, end_time, business_tz=tz
             )
         except ValueError as exc:
@@ -329,7 +335,7 @@ async def cmd_openday(message: Message, command: CommandObject) -> None:
     await message.answer(
         f"✅ День открыт на {work_date.strftime('%d %B %Y')}:\n"
         f"<b>{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}</b>"
-        + ("" if workday.is_active else "\n(день был закрыт — открыт заново)")
+        + ("\n(день был закрыт — открыт заново)" if was_closed else "")
     )
 
 
@@ -1031,8 +1037,12 @@ async def admin_openday_end_msg(message: Message, state: FSMContext) -> None:
         return
 
     async with async_session_factory() as session:
+        # F1 fix (Session 5.18, variant B): capture was_closed BEFORE open_workday
+        # re-opens the day (mirror cmd_openday).
+        existing = await select_workday(session, master_id, work_date)
+        was_closed = existing is not None and not existing.is_active
         try:
-            workday = await open_workday(
+            await open_workday(
                 session, master_id, work_date, start_time, end_time, business_tz=tz
             )
         except ValueError as exc:
@@ -1057,7 +1067,7 @@ async def admin_openday_end_msg(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"✅ День открыт на {work_date.strftime('%d %B %Y')}:\n"
         f"<b>{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}</b>"
-        + ("" if workday.is_active else "\n(день был закрыт — открыт заново)")
+        + ("\n(день был закрыт — открыт заново)" if was_closed else "")
     )
 
 
