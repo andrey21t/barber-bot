@@ -5,11 +5,15 @@ Contract (MY-VIBE-RULES.md, spec.md 307-309):
 - HTML escape: client_name_snapshot + service_title_snapshot — escape in service BEFORE INSERT
 - UNIQUE(slot_id) — SQLite fallback for no-double-booking
 - SQLite race protection: UPDATE slot ... WHERE status='open' + rowcount check
+- WorkDay invariants (Этап 5.3, PLANS.md Gap 6): if WorkDay exists for (master_id, slot_date),
+  booking [start_at, end_at] must fit inside [workday.start_time, end_time] in business tz → UTC.
+  WorkDay lookup is OPTIONAL — slot-only data (legacy /addslots before /openday rollout in 5.1)
+  has no WorkDay → invariant skipped (backwards compat, no BookingOutsideWorkDayError).
 """
 
 import html
 from dataclasses import dataclass
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, cast
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -22,7 +26,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import get_settings
-from bot.models import Booking, Client, NotificationLog, Service, Slot
+from bot.models import Booking, Client, NotificationLog, Service, Slot, WorkDay
 from bot.schemas import BookingCreate
 
 
@@ -36,6 +40,18 @@ class SlotInPastError(Exception):
 
 class SlotClosedError(Exception):
     """slot.status != 'open' — slot was closed by master."""
+
+
+class BookingOutsideWorkDayError(Exception):
+    """Booking [start_at, end_at] exceeds WorkDay window [start_time, end_time] for the date.
+
+    Raised by create_booking (Этап 5.3) when WorkDay exists for (master_id, slot_date) AND
+    the requested booking range falls outside the workday window. Comparison in UTC:
+    combine(work_date, workday.start_time/end_time, business_tz).astimezone(UTC).
+
+    Skipped (no raise) when WorkDay not found — backwards compat for slot-only data
+    created via legacy /addslots before /openday rollout (Этап 5.1).
+    """
 
 
 @dataclass(frozen=True)
@@ -74,6 +90,77 @@ async def _select_business_timezone(session: AsyncSession, business_id: UUID) ->
     result = await session.execute(stmt)
     tz = result.scalar_one_or_none()
     return tz or "Europe/Moscow"
+
+
+async def _select_workday_for_slot(
+    session: AsyncSession, master_id: UUID, work_date: date
+) -> WorkDay | None:
+    """Lookup WorkDay for (master_id, work_date). Returns None if not found.
+
+    Этап 5.3 (PLANS.md Gap 6 "Invariants"): create_booking uses this to enforce
+    booking [start_at, end_at] ∈ [workday.start_time, end_time]. Skipped when
+    WorkDay is None — backwards compat for slot-only data (legacy /addslots before
+    /openday in 5.1).
+
+    No filter on is_active — even inactive WorkDay bounds the window (closed day =
+    no slots shown in 5.6, but a stale booking request still must fit the window
+    if a WorkDay record exists). This matches the "1 booking = 1 client" model
+    where WorkDay is the master's declared work window for that date.
+    """
+    stmt = select(WorkDay).where(WorkDay.master_id == master_id, WorkDay.work_date == work_date)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+def _validate_booking_within_workday(
+    workday: WorkDay,
+    start_at: datetime,
+    end_at: datetime,
+    business_tz: str,
+) -> None:
+    """Raise BookingOutsideWorkDayError if [start_at, end_at] exceeds [start_time, end_time].
+
+    Comparison in UTC: combine(work_date, workday.start_time/end_time, business_tz)
+    .astimezone(UTC). start_at and end_at are aware UTC, built in-memory by
+    _build_start_at / _build_end_at (NOT read from DB — no SQLite naive/aware concern
+    at this call site). Cross-DB aware/naive handling lives in cancel_booking /
+    transfer_booking where booking.start_at IS DB-read (sqlite stores naive).
+
+    Edge: workday.end_time <= workday.start_time is blocked by CheckConstraint
+    "end_time > start_time" — no defensive check needed here.
+
+    Operators are strict (<, >): boundary inclusive — start_at == workday.start_time
+    and end_at == workday.end_time are ACCEPTED (booking fills the entire window
+    from start to end is a valid case). Boundary tests in test_booking_invariants.py
+    lock the semantics so a regression to <=/>= is caught.
+    """
+    tz = ZoneInfo(business_tz)
+    workday_start_utc = datetime.combine(
+        workday.work_date, workday.start_time, tzinfo=tz
+    ).astimezone(UTC)
+    workday_end_utc = datetime.combine(workday.work_date, workday.end_time, tzinfo=tz).astimezone(
+        UTC
+    )
+    if start_at < workday_start_utc:
+        raise BookingOutsideWorkDayError(
+            f"Booking start_at={start_at} < workday start {workday_start_utc} "
+            f"(workday_id={workday.id}, work_date={workday.work_date})"
+        )
+    if end_at > workday_end_utc:
+        raise BookingOutsideWorkDayError(
+            f"Booking end_at={end_at} > workday end {workday_end_utc} "
+            f"(workday_id={workday.id}, work_date={workday.work_date})"
+        )
+    if start_at < workday_start_utc:
+        raise BookingOutsideWorkDayError(
+            f"Booking start_at={start_at} < workday start {workday_start_utc} "
+            f"(workday_id={workday.id}, work_date={workday.work_date})"
+        )
+    if end_at > workday_end_utc:
+        raise BookingOutsideWorkDayError(
+            f"Booking end_at={end_at} > workday end {workday_end_utc} "
+            f"(workday_id={workday.id}, work_date={workday.work_date})"
+        )
 
 
 def _build_start_at(slot: Slot, business_timezone: str) -> datetime:
@@ -139,11 +226,17 @@ async def create_booking(
       2. If slot.status != 'open' → raise SlotClosedError / SlotAlreadyBookedError
       3. Build start_at (UTC) from slot.slot_hour (LOCAL in business.timezone)
       4. If start_at <= now() → raise SlotInPastError
-      5. html.escape(client_name, service_title) BEFORE INSERT
-      6. INSERT booking (UNIQUE slot_id guard catches double-click)
-      7. UPDATE slot.status='booked' WHERE id=? AND status='open' — rowcount check (SQLite race)
-      8. INSERT notifications_log(master_new) — UNIQUE guard
-      9. Return BookingCreatedData with master_notification_text
+      5. Build end_at = start_at + service.duration_minutes (or default)
+      6. WorkDay invariant (Этап 5.3, PLANS.md Gap 6):
+         - SELECT WorkDay WHERE master_id=slot.master_id AND work_date=slot.slot_date
+         - If found: validate [start_at, end_at] ∈ [workday.start_time, end_time]
+           (compared in UTC via business_tz). Outside → BookingOutsideWorkDayError.
+         - If not found: skip (backwards compat, slot-only data via legacy /addslots).
+      7. html.escape(client_name, service_title) BEFORE INSERT
+      8. INSERT booking (UNIQUE slot_id guard catches double-click)
+      9. UPDATE slot.status='booked' WHERE id=? AND status='open' — rowcount check (SQLite race)
+     10. INSERT notifications_log(master_new) — UNIQUE guard
+     11. Return BookingCreatedData with master_notification_text
     """
     settings = get_settings()
 
@@ -163,6 +256,24 @@ async def create_booking(
 
     service = await _select_service(session, payload.service_id)
     end_at = _build_end_at(start_at, service, settings.SERVICE_DEFAULT_DURATION_MIN)
+
+    # WorkDay invariants (Этап 5.3, PLANS.md Gap 6): capture master_id + slot_date
+    # BEFORE _select_or_create_client (rollback-prone — B1 pattern). Lookup is
+    # OPTIONAL: if WorkDay exists for (master_id, slot_date), validate [start_at,
+    # end_at] ∈ [workday.start_time, end_time]. If WorkDay not found (legacy slot-
+    # only data created via /addslots before /openday rollout in 5.1) → skip check.
+    #
+    # Transitional artifact (5.2 → 5.4): if master opens slot via /addslots (no
+    # WorkDay), then later adds a WorkDay with a narrower window via /openday,
+    # new bookings on the old slot will raise BookingOutsideWorkDayError. Existing
+    # bookings are NOT retroactively validated (per-call invariant, not retroactive).
+    # Expected during migration — /addslots deprecated in 5.4, master sees the
+    # conflict and either widens the WorkDay window or cancels the stale slot.
+    slot_master_id = slot.master_id
+    slot_date = slot.slot_date
+    workday = await _select_workday_for_slot(session, slot_master_id, slot_date)
+    if workday is not None:
+        _validate_booking_within_workday(workday, start_at, end_at, business_tz)
 
     # HTML escape BEFORE INSERT — stored escaped, rendered without double-escape
     escaped_name = html.escape(payload.client_name, quote=False)
