@@ -31,9 +31,13 @@ class TransferStates(StatesGroup):
 class AdminStates(StatesGroup):
     """FSM states для admin inline-menu flow (Вариант B, spec.md 251).
 
-    Multi-step flows для 3 из 5 кнопок админ-меню:
+    Multi-step flows для 4 из 5 кнопок админ-меню:
     - adding_slots: date (SimpleCalendar) → hours (text input) → create
+      (deprecated after 5.10 inline-часы; /addslots alias оставлен до 5.10)
     - closing_slot: date (SimpleCalendar) → hour (text input) → close
+      (deprecated after 5.10 inline-часы)
+    - opening_workday: date (SimpleCalendar) → start_time (HH:MM text) →
+      end_time (HH:MM text) → open_workday (Этап 5.1, replaces /addslots)
     - entering_service: name → duration → create (price убран в Session 5.10,
       мастер озвучивает цену отдельно в чате; поле Service.price nullable)
 
@@ -44,5 +48,8 @@ class AdminStates(StatesGroup):
     adding_slots_hours = State()
     closing_slot_date = State()
     closing_slot_hour = State()
+    opening_workday_date = State()
+    opening_workday_start = State()
+    opening_workday_end = State()
     entering_service_name = State()
     entering_service_duration = State()
