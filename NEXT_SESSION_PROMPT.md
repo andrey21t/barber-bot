@@ -1,68 +1,89 @@
-# NEXT_SESSION_PROMPT — Session 5.12 частично завершён (5.2 WorkDay + миграция 005), Session 5.13 готов (5.3+).
+# NEXT_SESSION_PROMPT — Session 5.13 завершён (5.3 invariants done), Session 5.14 готов (5.4 next).
 
-> Дата: 2026-08-28 · Session 5.12 — implementation Этапа 5 Вариант B. Шаг 5.2 завершён (коммиты `90c0000` + `9345a7b` в origin/main, НЕ задеплоены). Тестов 274 (baseline 265 → +9 в 5.2). ruff + mypy чисто. Осталось 9 шагов (5.3-5.10 + aliases + миграция 006).
+> Дата: 2026-08-28 · Session 5.13 — implementation Этапа 5 Вариант B. Шаг 5.3 завершён (коммит `aedf1a0` в origin/main, НЕ задеплоен). Тестов 281 (baseline 274 → +7 в 5.3: 5 invariant + 2 boundary). ruff + mypy чисто. Осталось 8 шагов (5.4-5.10 + aliases + миграция 006).
 > Prod остаётся на `c64b31d` (Session 5.9). Миграция 005 НЕ накатывалась на prod — smoke-test на dev-копии обязателен (one-way door, данные Екатерины).
 
-## ⚡ TL;DR для Session 5.13 (handoff)
+## ⚡ TL;DR для Session 5.14 (handoff)
 
-**Цель 5.13:** продолжить implementation по PLANS.md Plan of Work (13 шагов). Шаг 5.2 ✅, следующий — **5.3 Booking-диапазон + invariants**.
+**Цель 5.14:** продолжить implementation по PLANS.md Plan of Work. Шаг 5.3 ✅, следующий — **5.4 30-мин шаг + `_build_start_at` перепись**.
 
-**Главный артефакт:** `~/PycharmProjects/barber-bot/PLANS.md` — living-документ Этапа 5. ЧИТАТЬ ПЕРВЫМ. Progress Session 5.12 (5.2 done), Decision Log (3 blocker'а + 7 gaps + Gap 8 SQL parens), Plan of Work (13 шагов).
+**Главный артефакт:** `~/PycharmProjects/barber-bot/PLANS.md` — living-документ Этапа 5. ЧИТАТЬ ПЕРВЫМ. Progress Session 5.13 (5.3 done), Decision Log (3 blocker'а + 7 gaps + Gap 8 SQL parens), Plan of Work (13 шагов).
 
-**Что сделано в Session 5.12 (commits `90c0000` + `9345a7b`, pushed):**
+**Что сделано в Session 5.12 (commits `90c0000` + `9345a7b`, pushed) — база для 5.3+:**
 
 1. **bot/models.py** — класс `WorkDay` (44 строки, перед Booking):
    - Поля: `id` (Uuid PK), `master_id` (FK masters.id ondelete=CASCADE), `work_date` (Date — НЕ `date`, конфликт с типом `date` в Mapped), `start_time` (Time), `end_time` (Time), `max_concurrent_clients` (int default 1), `is_active` (bool default True), `created_at` (DateTime timezone-aware)
    - Constraints: `CheckConstraint("end_time > start_time")`, `UNIQUE(master_id, work_date)` (index ux_work_days_master_date), partial Index `is_active=TRUE` на Postgres (idx_work_days_master_date_active)
 
 2. **alembic/versions/005_workday.py** (172 строки):
-   - CREATE TABLE work_days (cross-DB, server_default для is_active=sa.true() и max_concurrent_clients=text("1") — паттерн 001_initial)
-   - Перенос данных из slots: `SELECT master_id, slot_date, MIN/MAX(slot_hour) GROUP BY` → Python loop → `op.bulk_insert` через `sa.table`
-   - Буфер +60мин (покрывает 60-мин услуги); edge max_h=23 → +30мин (midnight overflow avoidance)
-   - DROP CONSTRAINT no_overlap на Postgres (EXCLUDE constraint из 002 ломает multi-client в 5.5)
-   - SQLite: no-op (002 был no-op, UNIQUE(slot_id) на bookings остаётся до 006)
-   - Downgrade: DROP TABLE work_days БЕЗ восстановления EXCLUDE (one-way door, PLANS.md Gap 6)
+   - CREATE TABLE work_days + DROP EXCLUDE no_overlap (002) на Postgres + перенос данных из slots через bulk_insert (group by master_id, slot_date → MIN/MAX(slot_hour) + 60мин буфер; edge max_h=23 → +30мин)
+   - SQLite: no-op (002 был no-op). Downgrade: DROP TABLE БЕЗ восстановления EXCLUDE (one-way door)
 
-3. **tests/test_workday.py** (247 строк, 9 тестов):
-   - 4 модель: create_minimal, unique_master_date, check_constraint_end_after_start, multi_client_capacity_2
-   - 5 миграция: single_slot, multiple_slots, multiple_days, no_slots, max_hour_23_no_overflow
-   - `_run_migration_logic` helper — переиграет SQL+Python логику миграции через ORM (не через op.bulk_insert)
-   - Конвертация str→UUID и str→date (на SQLite через text() типы приходят как строки)
+3. **tests/test_workday.py** (247 строк, 9 тестов): 4 модель + 5 миграция logic (через `_run_migration_logic` helper, не op.bulk_insert)
 
-4. **NEXT_SESSION_PROMPT.md** — TL;DR (этот блок)
+## Что сделано в Session 5.13 (commit `aedf1a0`, pushed) — шаг 5.3 завершён:
 
-**Гейты 5.2 (все зелёные):**
-- format/lint/typecheck: ✅
-- tests: 274 ✅ (baseline 265 → +9)
-- qa-code-review (subagent [REDACTED-SESSION-ID]): **LGTM**, 3 warnings fixed (W1 server_default, W2 SQLite bulk_insert note, W3 буфер +60мин)
-- self-review после коммита: F1 (устаревший docstring 005:14) → фикс `9345a7b`; S1 (PLANS.md `date`→`work_date` 4 места) → sync
+1. **bot/services/booking.py** — WorkDay invariants в `create_booking`:
+   - `class BookingOutsideWorkDayError` — новое исключение
+   - `_select_workday_for_slot(session, master_id, work_date) -> WorkDay | None` — OPTIONAL lookup (нет WorkDay → skip check, backwards compat для slot-only данных до /openday rollout в 5.1)
+   - `_validate_booking_within_workday(workday, start_at, end_at, business_tz)` — operators `<`/`>` strict, boundary inclusive (start_at == workday.start_time и end_at == workday.end_time принимаются)
+   - В `create_booking`: SELECT WorkDay между `_build_end_at` и `html.escape`, capture `slot.master_id`/`slot.slot_date` ДО `_select_or_create_client` (B1 rollback-prone pattern)
+   - Transitional artifact закомментирован: master добавил WorkDay с уже существующим slot через /addslots → новые bookings вне окна поднимут `BookingOutsideWorkDayError` (expected в миграции 5.2→5.4, /addslots deprecated)
+   - `_build_start_at`/`_build_end_at` (booking.py:79-90) ОСТАЮТСЯ — drop в 5.4
 
-**3 blocker'а (решено в PLANS.md Decision Log, актуально для 5.3+):**
+2. **tests/conftest.py** — `seed_data` добавляет WorkDay `[10:00, 20:00]` LOCAL Moscow на tomorrow (slot_hour=14 + default 60min помещается в окно)
+
+3. **tests/test_booking_invariants.py** (NEW, 7 тестов):
+   - `inside_window`: slot=14, wd=[10,20] → ok
+   - `outside_start`: slot=8, wd=[10,20] → raise (08:00 < 10:00)
+   - `outside_end`: slot=19+service120min, wd=[10,20] → raise (21:00 > 20:00)
+   - `no_workday_skip`: slot без WorkDay → skip check, no raise (backwards compat)
+   - `workday_inactive`: wd.is_active=False → invariant still enforced (defense-in-depth)
+   - `boundary_start`: slot=10, wd=[10,20] → ok (start_at == start_time, strict `<`)
+   - `boundary_end`: slot=19+default60min, wd=[10,20] → ok (end_at == end_time, strict `>`)
+
+**Гейты 5.3 (все зелёные):**
+- format/lint/typecheck: ✅ (ruff check 0 errors, mypy strict 0 issues)
+- tests: **281 ✅** (baseline 274 → +7: 5 invariant + 2 boundary)
+- qa-code-review (subagent [REDACTED-SESSION-ID]): **LGTM** (после фиксов)
+  - W1 fixed: docstring `_validate_booking_within_workday` — naive/aware self-contradictory (аргументы in-memory aware, не DB-read)
+  - W2 fixed: добавлены 2 boundary теста (start_equals, end_equals) — lock strict `<`/`>` операторов
+  - S1 fixed: transitional artifact комментарий в `create_booking`
+
+## 3 blocker'а (решено в PLANS.md Decision Log, актуально для 5.4+):
 
 1. **Архитектурный подход B**: WorkDay (master_id, work_date, start_time, end_time, max_concurrent_clients, is_active) + Booking на диапазоне через start_at/end_at. Slot deprecated (005 переносит данные, 006 drop).
 
 2. **Multi-client**: 1 booking = 1 client, N bookings с перекрывающимися диапазонами + WorkDay.max_concurrent_clients (capacity). EXCLUDE constraint (002) — DROP в 005 (сделано ✅). App-level check + retry + pg_advisory_xact_lock (BB-008) — в 5.5.
 
-3. **30-мин шаг**: drop slot_hour (int 0-23). WorkDay.start_time/end_time = `time`. Booking.start_at = `datetime`. 30-мин шаг — на уровне /slots UI. Blast radius: 7 файлов (booking.py:79-83, 86-90; slots.py:28; keyboards/client.py:105, 174; conftest.py:114; admin.py:618, 832).
+3. **30-мин шаг**: drop slot_hour (int 0-23). WorkDay.start_time/end_time = `time`. Booking.start_at = `datetime`. 30-мин шаг — на уровне /slots UI. **Blast radius 7 файлов (5.4):**
+   - `bot/services/booking.py:79-83` — `_build_start_at` (через `time(hour=slot.slot_hour)`)
+   - `bot/services/booking.py:86-90` — `_build_end_at`
+   - `bot/services/slots.py:28` — validation `0 <= hour <= 23`
+   - `bot/keyboards/client.py:105` — slot_picker_keyboard label "HH:00"
+   - `bot/keyboards/client.py:174` — `_format_booking_summary` (slot)
+   - `tests/conftest.py:114` — seed_data slot_hour=14
+   - `bot/handlers/admin.py:618` — `admin_addslots_hours_msg` (text.split())
+   - `bot/handlers/admin.py:832` — `admin_closeslot_hour_msg` (single `int(text)`)
 
-**Следующий шаг — 5.3 Booking-диапазон + invariants (по PLANS.md Plan of Work п.3):**
+## Следующий шаг — 5.4 30-мин шаг + `_build_start_at` перепись (по PLANS.md Plan of Work п.4):
 
-- Drop `Booking.slot_id` FK — в миграции 006 (НЕ сейчас, после smoke-test на prod ~1 неделя)
-- Добавить invariants на service layer в `create_booking`:
-  - `Booking.start_at >= WorkDay.start_time` (привести к datetime через work_date + start_time)
-  - `Booking.end_at <= WorkDay.end_time` (work_date + end_time)
-  - Перед INSERT — SELECT WorkDay для (master_id, work_date), validate, refuse с `BookingOutsideWorkDayError`
-- `_build_start_at`/`_build_end_at` в booking.py:79-90 пока ОСТАЮТСЯ (drop в 5.4)
-- Тесты: test_booking_invariants (start_at >= workday.start_time, end_at <= workday.end_time, BookingOutsideWorkDayError)
+- Drop `slot_hour` int (0-23) — WorkDay.start_time / end_time = `time` (HH:MM), Booking.start_at / end_at = `datetime` (полная свобода минут)
+- `_build_start_at`/`_build_end_at` перепись: build из WorkDay.start_time + offset (30-мин шаг), НЕ из slot.slot_hour
+- 30-мин шаг — на уровне `/slots` UI (генерация кнопок T, T+30, T+60, ... от start_time до end_time). `/book` создаёт booking на 30-мин окне (start_at = T, end_at = T + service.duration_minutes, может быть > 30 мин если service.duration > 30)
+- WorkDay invariants (5.3 ✅) — продолжают работать: start_at >= workday.start_time, end_at <= workday.end_time
+- **admin.py JOIN Slot → JOIN WorkDay** (`get_today_bookings`/`get_week_bookings` в `bot/services/admin.py:24-90`) — входит в 5.4 (PLANS.md Gap 1)
+- Тесты: test_build_start_at_30min, test_slots_picker_30min, обновить conftest.py seed_data (Slot → WorkDay primary, slot deprecated)
+- `_select_open_slot` в booking.py:57-67 — переписать на WorkDay-based выбор (или сохранить как deprecated shim)
 
-**Risk-класс:** HIGH-STAKES — миграция БД на live-базе Екатерины (one-way door) + persistence layer change + > 5 файлов.
+**Risk-класс:** HIGH-STAKES — persistence layer change + blast radius 7 файлов + admin.py JOIN rewrite.
 
-**Baseline: 274 теста** (после 5.2). Цель: +30-50 тестов в Этап 5.
+**Baseline: 281 тест** (после 5.3). Цель: +30-50 тестов в Этап 5.
 
-**Порядок impl в 5.13+** (по PLANS.md Plan of Work):
+**Порядок impl в 5.14+** (по PLANS.md Plan of Work):
 1. ✅ 5.2 WorkDay модель + миграция 005 — СДЕЛАНО
-2. ⏭️ 5.3 Booking-диапазон + invariants — СЛЕДУЮЩИЙ
-3. 5.4 30-мин шаг + перепись `_build_start_at` (drop slot_hour, blast radius 7 файлов)
+2. ✅ 5.3 WorkDay invariants в create_booking — СДЕЛАНО
+3. ⏭️ 5.4 30-мин шаг + перепись `_build_start_at` (drop slot_hour, blast radius 7 файлов) — СЛЕДУЮЩИЙ
 4. 5.1 `/openday` command + FSM (idempotent через UNIQUE master/work_date)
 5. 5.5 multi-client (max_concurrent_clients UPDATE до 2 для Екатерины, app-level check + retry, pg_advisory_xact_lock)
 6. 5.6 «Мест нет» в /slots (occupancy check, count bookings WHERE tstzrange &&)
@@ -72,17 +93,19 @@
 10. /addslots /closeslot deprecated aliases (warning + делегирование на /openday)
 11. Миграция 006 drop table slots (после smoke-test на prod ~1 неделя наблюдения)
 
-**Гейты (MY-VIBE-RULES.md):** после каждой фазы — qa-verify-and-fix (format/lint/typecheck/tests) + qa-code-review (для нетривиальных: 5.3 invariants, 5.5 multi-client race, 5.9 admin_move). Pre-push ревью (pet-проект — git free по AGENTS.md § git-repo-categories, но чек-лист pr-review-rules применять).
+**Гейты (MY-VIBE-RULES.md):** после каждой фазы — qa-verify-and-fix (format/lint/typecheck/tests) + qa-code-review (для нетривиальных: 5.4 перепись _build_start_at, 5.5 multi-client race, 5.9 admin_move). Pre-push ревью (pet-проект — git free по AGENTS.md § git-repo-categories, но чек-лист pr-review-rules применять).
 
-**Файлы на старте 5.13:**
+**Файлы на старте 5.14:**
 - `bot/models.py` — WorkDay добавлен ✅, Booking.slot_id FK остаётся (drop в 006)
-- `bot/services/booking.py` (686) — `_build_start_at` (79-83), `_build_end_at` (86-90), create_booking (183 — INSERT 'confirmed'), cancel_booking (345 — UPDATE 'cancelled'), transfer_booking (451-686, client_id pin на 566)
+- `bot/services/booking.py` — WorkDay invariants добавлены ✅ (BookingOutsideWorkDayError, _select_workday_for_slot, _validate_booking_within_workday). `_build_start_at` (79-83), `_build_end_at` (86-90) ОСТАЮТСЯ (drop в 5.4), `_select_open_slot` (57-67, переписать в 5.4)
 - `bot/services/slots.py` (102) — add_slots/close_slot/get_available_slots (переписать в 5.4-5.6)
-- `bot/services/admin.py` (163) — get_today_bookings/get_week_bookings JOIN Slot (переписать в 5.3)
+- `bot/services/admin.py` (163) — get_today_bookings/get_week_bookings JOIN Slot (переписать в 5.4)
+- `bot/keyboards/client.py` — slot_picker_keyboard (105, label "HH:00"), _format_booking_summary (174, slot)
 - `bot/handlers/admin.py` (1238) — /addslots, /closeslot, FSM addslots/closeslot (618, 832)
 - `alembic/versions/005_workday.py` (172) — CREATE work_days + DROP EXCLUDE + INSERT из Slot ✅
 - `tests/test_workday.py` (247) — 9 тестов ✅
-- `tests/conftest.py` (148) — seed_data Slot (WorkDay добавим в 5.4 при переписи seed)
+- `tests/test_booking_invariants.py` (NEW) — 7 тестов ✅
+- `tests/conftest.py` — seed_data Slot + WorkDay (Slot → drop в 5.4 при переписи seed)
 - `donor-research/topics/booking-bot-architecture.md:158-166` — BB-007 (НЕ нарушается B)
 
 **Smoke-test на dev-копии prod базы перед deploy миграции 005** (PLANS.md:203, one-way door):
