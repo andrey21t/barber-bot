@@ -2,11 +2,14 @@
 
 Spec.md 251 (Вариант B): inline keyboard с 5 кнопками для мастера Екатерины.
 Каждая кнопка триггерит callback → FSM flow (multi-step для 3 из 5):
-- ➕ Открыть слоты → adding_slots (date → hours)
-- 🔒 Закрыть слот → closing_slot (date → hour)
+- 📅 Открыть день → opening_workday (date → start_time → end_time)
+- ➕ Изменить окно → adding_slots (date → start_time → end_time — MODIFY flow)
 - 📅 Сегодня → мгновенный список (no FSM)
 - 🗓 Неделя → мгновенный список (no FSM)
-- 💇 Добавить услугу → entering_service (name → duration → price)
+- 💇 Услуги → entering_service (name → duration → price)
+
+/closeslot SHRINK inline flow REMOVED (5.10 simplification) — «Изменить окно»
+умеет и расширить, и сузить, и сдвинуть (двухфазный picker start→end).
 
 Back-compat: admin_keyboard() (reply) оставлен как alias для тестов test_admin_handlers.py
 (54 теста на command handlers) и для Екатерины если она запомнила команды.
@@ -52,16 +55,13 @@ class AdminOpendayCallbackData(CallbackData, prefix="admin_openday"):
 
 
 class AdminAddslotsCallbackData(CallbackData, prefix="admin_addslots"):
-    """Trigger adding_slots flow — открыть слоты на дату (DEPRECATED after 5.1).
+    """Trigger adding_slots flow — «Изменить окно» (MODIFY) — Этап 5.10.
 
-    Kept in the inline menu until 5.10 (PLANS.md Plan of Work п.11) for
-    backwards compat with Екатерина's muscle memory; /addslots command alias
-    stays even after the button is removed.
+    /closeslot SHRINK inline flow REMOVED (5.10 simplification) — «Изменить
+    окно» handles both shrink+extend+shift via two-phase picker start→end.
+    /addslots command alias stays for muscle memory (cmd_addslots redirect
+    to calendar → inline picker).
     """
-
-
-class AdminCloseslotCallbackData(CallbackData, prefix="admin_closeslot"):
-    """Trigger closing_slot flow — закрыть слот."""
 
 
 class AdminTodayCallbackData(CallbackData, prefix="admin_today"):
@@ -122,25 +122,23 @@ class AdminMoveConfirmCallbackData(CallbackData, prefix="admin_move_confirm"):
 
 
 def admin_inline_menu() -> InlineKeyboardMarkup:
-    """Inline keyboard с 6 кнопками для мастера (spec.md 251, Вариант B + Этап 5.1).
+    """Inline keyboard с 5 кнопками для мастера (spec.md 251, Вариант B + Этап 5.1).
 
-    Layout: 2 + 2 + 2 (3 rows) — semantic shift 5.10: «Открыть слоты» →
-    «Изменить окно» (/addslots = MODIFY), «Закрыть слот» → «Сузить окно»
-    (/closeslot = SHRINK). Layout 2×3 (вместо 3+2+1) — кнопки шире, текст не
-    обрезается на мобильных экранах (предыдущий 3×3 ломал «Открыть слоты» →
-    «Открыть слот»). /openday (CREATE) без изменений.
+    Layout: 2 + 2 + 1 (3 rows) — semantic shift 5.10: «Открыть слоты» →
+    «Изменить окно» (/addslots = MODIFY). SHRINK button REMOVED (5.10
+    simplification) — «Изменить окно» handles both shrink+extend+shift via
+    two-phase picker start→end. /openday (CREATE) без изменений.
     Row 1: 📅 Открыть день (CREATE), ➕ Изменить окно (MODIFY, 5.10).
-    Row 2: ⬇️ Сузить окно (SHRINK, 5.10), 📅 Сегодня.
-    Row 3: 🗓 Неделя, 💇 Добавить услугу (entering_service flow).
+    Row 2: 📅 Сегодня, 🗓 Неделя.
+    Row 3: 💇 Услуги (entering_service flow).
     """
     builder = InlineKeyboardBuilder()
     builder.button(text="📅 Открыть день", callback_data=AdminOpendayCallbackData().pack())
     builder.button(text="➕ Изменить окно", callback_data=AdminAddslotsCallbackData().pack())
-    builder.button(text="⬇️ Сузить окно", callback_data=AdminCloseslotCallbackData().pack())
     builder.button(text="📅 Сегодня", callback_data=AdminTodayCallbackData().pack())
     builder.button(text="🗓 Неделя", callback_data=AdminWeekCallbackData().pack())
     builder.button(text="💇 Услуги", callback_data=AdminServicesCallbackData().pack())
-    builder.adjust(2, 2, 2)
+    builder.adjust(2, 2, 1)
     return builder.as_markup()
 
 
@@ -258,17 +256,15 @@ class AdminWindowSlot30CallbackData(CallbackData, prefix="admin_win30"):
     - workday_id: UUID — WorkDay row (resolved in calendar_cb via select_workday).
       NON-Optional (mirror AdminMoveSlot30CallbackData:109). For /addslots inline
       open_workday uses master_id+work_date (NOT workday_id) but workday_id is
-      kept in callback_data for state propagation symmetry with /closeslot
-      (where update_workday REQUIRES workday_id).
+      kept in callback_data for state propagation symmetry.
     - start_minute: int — minutes since midnight (0-1439), encodes slot time_local.
 
     Wire format size: "admin_win30:<uuid>:<int>" ≈ 10+1+32+1+4 = 47 bytes < 64 limit.
 
     NB: same CallbackData class used for both "start" pick (mode="start") and
-    "end" pick (mode="end") and "shrink end" pick (mode="shrink"). The mode is
-    determined by the StateFilter on the handler (picking_window_start vs
-    picking_window_end vs picking_shrink_end), NOT by a field in callback_data.
-    This keeps callback_data minimal and avoids mode-payload races.
+    "end" pick (mode="end"). The mode is determined by the StateFilter on the
+    handler (picking_window_start vs picking_window_end), NOT by a field in
+    callback_data. This keeps callback_data minimal and avoids mode-payload races.
     """
 
     workday_id: UUID
@@ -276,14 +272,13 @@ class AdminWindowSlot30CallbackData(CallbackData, prefix="admin_win30"):
 
 
 class AdminWindowConfirmCallbackData(CallbackData, prefix="admin_win_conf"):
-    """Confirm window modify/shrink — final step in AdminStates.confirming_window
-    and AdminStates.confirming_shrink (Этап 5.10).
+    """Confirm window modify — final step in AdminStates.confirming_window (Этап 5.10).
 
     No payload (mirror AdminMoveConfirmCallbackData:113). Handler reads
-    picked_start_minute + picked_end_minute (or new_end_minute for shrink) +
-    workday_id + selected_date from FSM state, NOT from callback payload —
-    keeps callback_data small and avoids race where user could change FSM state
-    mid-tap. Same pattern as AdminMoveConfirmCallbackData + admin_move_confirm_cb.
+    picked_start_minute + picked_end_minute + workday_id + selected_date from
+    FSM state, NOT from callback payload — keeps callback_data small and avoids
+    race where user could change FSM state mid-tap. Same pattern as
+    AdminMoveConfirmCallbackData + admin_move_confirm_cb.
     """
 
 
@@ -293,27 +288,22 @@ def admin_window_slot_picker_keyboard(
     mode: str,
     business_tz: str = "Europe/Moscow",
     picked_start_minute: int | None = None,
-    current_start_minute: int | None = None,
-    current_end_minute: int | None = None,
 ) -> InlineKeyboardMarkup:
-    """Inline 30-min slot picker for /addslots (window start/end) and
-    /closeslot (shrink end) — Этап 5.10 inline-часы.
+    """Inline 30-min slot picker for /addslots (window start/end) — Этап 5.10.
+
+    /closeslot SHRINK inline flow REMOVED (5.10 simplification) — «Изменить
+    окно» (mode="start" + mode="end") handles both shrink+extend+shift.
 
     Args:
         workday_id: UUID of the WorkDay being modified. Stored in callback_data
             payload so the next handler can resolve it without re-SELECT'ing.
-        mode: "start" | "end" | "shrink" — determines which slots to render.
-            The caller is responsible for setting the appropriate FSM state
-            BEFORE showing this keyboard (handler dispatch by StateFilter).
+        mode: "start" | "end" — determines which slots to render. The caller
+            is responsible for setting the appropriate FSM state BEFORE showing
+            this keyboard (handler dispatch by StateFilter).
         business_tz: IANA tz for slot labels (HH:MM in local time).
         picked_start_minute: required for mode="end" — start picked in previous
             step (admin_window_start_cb stored in FSM state, passed here to
             generate end slots starting from picked_start+30).
-        current_start_minute: required for mode="shrink" — current WorkDay
-            start_time in minutes (to enforce new_end > current_start).
-        current_end_minute: required for mode="shrink" — current WorkDay
-            end_time in minutes (to enforce only-shrink: new_end < current_end,
-            and to compute current_end-30 as max pickable end-slot).
 
     Slot ranges by mode (all slots are 30-min apart, label "HH:MM"):
         - mode="start": 0, 30, 60, ..., 1350 (22:30) — max start = 22:30 (NI1
@@ -324,12 +314,6 @@ def admin_window_slot_picker_keyboard(
           end-slot = 23:00 (end_time = 23:30, still < midnight). Caller MUST
           pass picked_start_minute. If picked_start_minute+30 > 1380 → empty
           list (caller should validate BEFORE calling, show appropriate UX).
-        - mode="shrink": current_start_minute+30, +60, ..., current_end_minute-30
-          (NI2 fix). Ensures: (a) new_end > current_start (prevents ValueError
-          in update_workday), (b) only shrink (new_end < current_end), (c) min
-          30-min window remains. If current_end-30 < current_start+30 → empty
-          (caller /closeslot_calendar_cb pre-checks window >= 60min and shows
-          "Окно слишком узкое, нельзя сузить" before reaching this keyboard).
 
     Empty list → single "Нет слотов" button (matches slot_picker_keyboard_30min
     UX in client.py:172). adjust(3) — 3 buttons per row.
@@ -346,16 +330,8 @@ def admin_window_slot_picker_keyboard(
             raise ValueError("mode='end' requires picked_start_minute")
         # picked_start+30, +60, ..., 1380 (23:00). max end-slot = 23:00 = 1380.
         candidates = list(range(picked_start_minute + 30, 1381, 30))
-    elif mode == "shrink":
-        if current_start_minute is None or current_end_minute is None:
-            raise ValueError("mode='shrink' requires current_start_minute + current_end_minute")
-        # current_start+30, +60, ..., current_end-30. Enforces only-shrink +
-        # new_end > current_start + min 30-min window remains.
-        # range end is exclusive, so current_end_minute (not -30) — we want
-        # last candidate = current_end-30 inclusive.
-        candidates = list(range(current_start_minute + 30, current_end_minute, 30))
     else:
-        raise ValueError(f"unknown mode={mode!r}, expected 'start'|'end'|'shrink'")
+        raise ValueError(f"unknown mode={mode!r}, expected 'start'|'end'")
 
     if not candidates:
         builder.button(text="Нет слотов", callback_data="noop")
@@ -380,13 +356,12 @@ def admin_window_slot_picker_keyboard(
 
 
 def admin_window_confirm_keyboard() -> InlineKeyboardMarkup:
-    """Build [✅ Подтвердить] / [❌ Отмена] keyboard for AdminStates.confirming_window
-    and AdminStates.confirming_shrink (Этап 5.10).
+    """Build [✅ Подтвердить] / [❌ Отмена] keyboard for AdminStates.confirming_window (Этап 5.10).
 
     Mirror admin_move_confirm_keyboard() but uses AdminWindowConfirmCallbackData
     (distinct prefix "admin_win_conf", no conflict with "admin_move_confirm").
     Cancel button uses string "admin_window_cancel" — caught by F.data filter
-    in admin_window_cancel_cb / admin_shrink_cancel_cb.
+    in admin_window_cancel_cb.
     """
     builder = InlineKeyboardBuilder()
     builder.button(
