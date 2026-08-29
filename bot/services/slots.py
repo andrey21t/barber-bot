@@ -162,22 +162,18 @@ async def get_available_slots_30(
         ordered by start_at_utc ascending. Empty if all slots are occupied OR
         workday window < 30 min.
     """
-    candidates = await get_30min_slots_from_workday(
-        workday, business_timezone, now_utc=now_utc
-    )
+    candidates = await get_30min_slots_from_workday(workday, business_timezone, now_utc=now_utc)
     if not candidates:
         return []
 
     workday_start_utc, workday_end_utc = _window_bounds_utc(
         workday.work_date, workday.start_time, workday.end_time, business_timezone
     )
-    bookings_stmt = (
-        select(Booking).where(
-            Booking.master_id == workday.master_id,
-            Booking.start_at < workday_end_utc,
-            Booking.end_at > workday_start_utc,
-            Booking.status.in_(("confirmed", "transferred")),
-        )
+    bookings_stmt = select(Booking).where(
+        Booking.master_id == workday.master_id,
+        Booking.start_at < workday_end_utc,
+        Booking.end_at > workday_start_utc,
+        Booking.status.in_(("confirmed", "transferred")),
     )
     bookings = (await session.execute(bookings_stmt)).scalars().all()
     # Normalize naive SQLite datetimes to aware UTC for Python-level comparison.
