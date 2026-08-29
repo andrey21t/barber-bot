@@ -2491,6 +2491,93 @@ async def test_cancel_msg_clears_state_and_answers(
     assert "/book" in text
 
 
+@pytest.mark.asyncio
+async def test_cancel_msg_slots_path_hint_directs_to_slots() -> None:
+    """Этап 5.8b W2 (code-review iter 2): cancel_msg при is_slots_path=True в
+    state → hint '/slots' (NOT '/book'). User был в /slots flow, нажал /cancel
+    из entering_name/entering_service — должен получить retry-cmd для своего flow.
+    """
+    msg = _make_message(user_id=111222333, text="/cancel")
+    state = _make_state()
+    await state.update_data(is_slots_path=True)
+
+    await client_handlers.cancel_msg(msg, state)
+
+    state.clear.assert_awaited_once()
+    text = _answer_text(msg)
+    assert "Ввод отменён" in text
+    assert "/slots" in text
+    assert "/book" not in text, "W2 fix: /slots user must NOT see /book hint"
+
+
+@pytest.mark.asyncio
+async def test_simple_calendar_cb_cancel_slots_path_hint_directs_to_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Этап 5.8b W1 (code-review iter 2): simple_calendar_cb act=cancel при
+    is_slots_path=True → 'Ввод отменён. /slots ...' (NOT '/book'). /slots user
+    нажал 'Отмена' в календаре → должен получить retry-cmd для своего flow.
+    """
+    _patch_process_selection(monkeypatch, selected=False, selected_date=None)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.cancel)
+
+    state = _make_state()
+    await state.update_data(is_slots_path=True)
+    await client_handlers.simple_calendar_cb(cb, callback_data, state)
+
+    state.clear.assert_awaited_once()
+    text = _answer_text(cb.message)
+    assert "Ввод отменён" in text
+    assert "/slots" in text
+    assert "/book" not in text, "W1 fix: /slots user must NOT see /book hint"
+
+
+@pytest.mark.asyncio
+async def test_confirm_cb_xor_abort_slots_path_hint_directs_to_slots(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Этап 5.8b W3 (code-review iter 2): confirm_cb XOR contract abort при
+    workday_id в state (но slot_id also set — corrupted FSM) → 'Данные потеряны.
+    ... /slots' (NOT '/book'). Согласованность с SlotAlreadyBooked/SlotInPast
+    retry-cmd branching в том же handler.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        wd = await _seed_workday(session, ctx, work_date=target_date)
+        workday_id = wd.id
+
+    cb, callback_data = _make_confirm_callback()
+    state = _make_state()
+    # Corrupted FSM: BOTH workday_id и slot_id set (XOR violation). has_workday_path
+    # True (workday_id + start_minute), has_slot_path True (slot_id) → XOR False → abort.
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=600,
+        slot_id=str(uuid4()),  # also set → XOR contract violation
+        client_name="Паша",
+        service_title="Стрижка",
+    )
+    scheduler = MagicMock(spec=AsyncIOScheduler)
+
+    await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
+
+    state.clear.assert_awaited_once()
+    text = _answer_text(cb.message)
+    assert "Данные потеряны" in text
+    assert "/slots" in text, "W3 fix: workday-path abort must direct to /slots"
+    assert "/book" not in text, "W3 fix: NOT /book for workday-path"
+    cb.answer.assert_awaited()
+
+
 # ============================================================
 # Tier 2 (T10) — client handler edge branches (NEXT_COVERAGE_GAPS.md)
 # Covers bot/handlers/client.py:
