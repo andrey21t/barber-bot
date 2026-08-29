@@ -498,6 +498,33 @@ async def test_get_available_slots_30_cancelled_excluded(
 
 
 @pytest.mark.asyncio
+async def test_get_available_slots_30_transferred_included(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Transferred booking DOES occupy the slot (mirror _check_multi_client_capacity:228).
+
+    Status filter IN ('confirmed', 'transferred') — 'transferred' must block
+    the slot the same way as 'confirmed'. Without this test, future regression
+    dropping 'transferred' from the filter (slots.py:179) would not be caught
+    (all other capacity tests use status='confirmed' default).
+    """
+    work_date = _future_workdate()
+    wd = await _make_workday(session, seed_data, work_date, 10, 13, capacity=1)
+    await _insert_booking(
+        session,
+        seed_data,
+        start_at=_local_to_utc(work_date, 11, 0),
+        end_at=_local_to_utc(work_date, 11, 30),
+        status="transferred",
+    )
+    available = await get_available_slots_30(session, wd, BUSINESS_TZ)
+    labels = [s.label for s in available]
+    assert "11:00" not in labels  # transferred blocks slot [11:00, 11:30]
+    assert len(available) == 5  # 6 grid cells - 1 occupied
+
+
+@pytest.mark.asyncio
 async def test_get_available_slots_30_touch_edge_no_overlap(
     session: AsyncSession,
     seed_data: dict[str, Any],
@@ -537,6 +564,29 @@ async def test_get_available_slots_30_past_slots_filtered(
     available = await get_available_slots_30(session, wd, BUSINESS_TZ, now_utc=far_future_now)
     # All 4 slots are "past" relative to far_future_now → 0 available
     assert available == []
+
+
+@pytest.mark.asyncio
+async def test_get_available_slots_30_partial_past_filter(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Partial past filter: now_utc mid-workday → past slots filtered, future survive.
+
+    now_utc = 10:45 LOCAL → slots [10:00, 10:30] are past (start_at_utc <= ref),
+    slots [11:00, 11:30] are future (start_at_utc > ref). Closes S1 from
+    code-review: the all-past test only exercised the early-return path
+    (slots.py:168 `if not candidates`), this test verifies past-filter survives
+    alongside future slots in the same call.
+    """
+    work_date = _future_workdate(3)
+    wd = await _make_workday(session, seed_data, work_date, 10, 12, capacity=1)
+    # now_utc = 10:45 LOCAL on work_date → 07:45 UTC (Moscow UTC+3)
+    mid_now = _local_to_utc(work_date, 10, 45)
+    available = await get_available_slots_30(session, wd, BUSINESS_TZ, now_utc=mid_now)
+    labels = [s.label for s in available]
+    # Past: [10:00, 10:30] filtered (start <= 10:45). Future: [11:00, 11:30] kept.
+    assert labels == ["11:00", "11:30"]
 
 
 @pytest.mark.asyncio
