@@ -32,12 +32,15 @@ class AdminStates(StatesGroup):
     """FSM states для admin inline-menu flow (Вариант B, spec.md 251).
 
     Multi-step flows для 4 из 5 кнопок админ-меню:
-    - adding_slots: date (SimpleCalendar) → hours (text input) → create
-      (deprecated after 5.10 inline-часы; /addslots alias оставлен до 5.10)
-    - closing_slot: date (SimpleCalendar) → hour (text input) → close
-      (deprecated after 5.10 inline-часы)
+    - adding_slots: date (SimpleCalendar) → pick window start (inline 30-min)
+      → pick window end (inline 30-min) → confirm → open_workday (Этап 5.10
+      inline-часы; replaces text input "11 12 13" with two-phase inline picker)
+    - closing_slot: date (SimpleCalendar) → pick shrink end (inline 30-min)
+      → confirm → update_workday shrink (Этап 5.10 inline-часы; replaces text
+      input "14" with inline shrink picker)
     - opening_workday: date (SimpleCalendar) → start_time (HH:MM text) →
-      end_time (HH:MM text) → open_workday (Этап 5.1, replaces /addslots)
+      end_time (HH:MM text) → open_workday (Этап 5.1, primary CREATE path —
+      /addslots inline = MODIFY only, redirects here if WorkDay missing)
     - entering_service: name → duration → create (price убран в Session 5.10,
       мастер озвучивает цену отдельно в чате; поле Service.price nullable)
 
@@ -45,9 +48,12 @@ class AdminStates(StatesGroup):
     """
 
     adding_slots_date = State()
-    adding_slots_hours = State()
+    picking_window_start = State()
+    picking_window_end = State()
+    confirming_window = State()
     closing_slot_date = State()
-    closing_slot_hour = State()
+    picking_shrink_end = State()
+    confirming_shrink = State()
     opening_workday_date = State()
     opening_workday_start = State()
     opening_workday_end = State()
