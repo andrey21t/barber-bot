@@ -1,19 +1,23 @@
 """Tests for bot.services.slots."""
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from datetime import time as dt_time
 from typing import Any
 from uuid import uuid4
 
 import pytest
-from bot.models import Business, Master, Slot
+from bot.models import Booking, Business, Client, Master, Slot, WorkDay
 from bot.services.slots import (
     SlotAlreadyExistsError,
     add_slots,
     close_slot,
     get_available_slots,
+    get_available_slots_30,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.selectable import Select
+
+BUSINESS_TZ = "Europe/Moscow"
 
 
 @pytest.mark.asyncio
@@ -270,3 +274,310 @@ async def test_add_slots_concurrent_race_raises_slot_exists(
         assert len(slots) == 1, f"expected 1 slot in DB, got {len(slots)}"
         assert slots[0].slot_hour == 14
         assert slots[0].status == "open"
+
+
+# ============================================================
+# Этап 5.6 — get_available_slots_30 occupancy tests
+# ============================================================
+
+
+def _local_to_utc(work_date: date, hour: int, minute: int = 0) -> datetime:
+    """Convert (work_date, HH:MM) LOCAL Moscow → aware UTC datetime.
+
+    Mirror of test_workday_service._local_to_utc — used by _insert_booking
+    to set start_at/end_at for seed bookings.
+    """
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(BUSINESS_TZ)
+    return datetime.combine(work_date, dt_time(hour, minute), tzinfo=tz).astimezone(UTC)
+
+
+async def _insert_booking(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+    *,
+    start_at: datetime,
+    end_at: datetime,
+    status: str = "confirmed",
+) -> Booking:
+    """Direct INSERT a Booking bypassing create_booking — for test setup only.
+
+    Mirror of test_workday_service._direct_insert_booking:41. Booking.slot_id
+    is nullable=False on the model — use seed_data["slot"] for convenience.
+    """
+    booking = Booking(
+        slot_id=seed_data["slot"].id,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        client_id=seed_data["client"].id,
+        service_id=None,
+        service_title_snapshot="test",
+        client_name_snapshot="test",
+        start_at=start_at,
+        end_at=end_at,
+        status=status,
+    )
+    session.add(booking)
+    await session.commit()
+    return booking
+
+
+def _future_workdate(days: int = 14) -> date:
+    """Work date N days ahead — far enough from 'today' to avoid past-slot filter."""
+    return (datetime.now(UTC) + timedelta(days=days)).date()
+
+
+async def _make_workday(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+    work_date: date,
+    start: int,
+    end: int,
+    capacity: int = 1,
+) -> WorkDay:
+    """Create WorkDay [start:00, end:00] LOCAL Moscow with given capacity."""
+    wd = WorkDay(
+        master_id=seed_data["master_id"],
+        work_date=work_date,
+        start_time=dt_time(start, 0),
+        end_time=dt_time(end, 0),
+        max_concurrent_clients=capacity,
+        is_active=True,
+    )
+    session.add(wd)
+    await session.commit()
+    return wd
+
+
+@pytest.mark.asyncio
+async def test_get_available_slots_30_empty_no_bookings(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Happy path: WorkDay [10:00, 12:00] cap=1, no bookings → 4 slots available."""
+    wd = await _make_workday(session, seed_data, _future_workdate(), 10, 12, capacity=1)
+    available = await get_available_slots_30(session, wd, BUSINESS_TZ)
+    # [10:00, 10:30, 11:00, 11:30] = 4 slots (last slot start = 11:30, end 12:00)
+    assert len(available) == 4
+    assert [s.label for s in available] == ["10:00", "10:30", "11:00", "11:30"]
+
+
+@pytest.mark.asyncio
+async def test_get_available_slots_30_capacity_1_one_booking_covers_slot(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """cap=1, booking [11:00, 11:30] → slot [11:00, 11:30] unavailable, others free."""
+    work_date = _future_workdate()
+    wd = await _make_workday(session, seed_data, work_date, 10, 13, capacity=1)
+    await _insert_booking(
+        session,
+        seed_data,
+        start_at=_local_to_utc(work_date, 11, 0),
+        end_at=_local_to_utc(work_date, 11, 30),
+    )
+    available = await get_available_slots_30(session, wd, BUSINESS_TZ)
+    labels = [s.label for s in available]
+    # WorkDay [10:00, 13:00] = 6 slots: 10:00, 10:30, 11:00, 11:30, 12:00, 12:30
+    # booking [11:00, 11:30] covers slot [11:00, 11:30] → 5 available
+    assert "11:00" not in labels
+    assert len(available) == 5
+    assert labels == ["10:00", "10:30", "11:30", "12:00", "12:30"]
+
+
+@pytest.mark.asyncio
+async def test_get_available_slots_30_capacity_1_booking_crosses_3_cells(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """cap=1, booking [11:00, 12:30] (90 min) → 3 grid cells unavailable."""
+    work_date = _future_workdate()
+    wd = await _make_workday(session, seed_data, work_date, 10, 13, capacity=1)
+    await _insert_booking(
+        session,
+        seed_data,
+        start_at=_local_to_utc(work_date, 11, 0),
+        end_at=_local_to_utc(work_date, 12, 30),
+    )
+    available = await get_available_slots_30(session, wd, BUSINESS_TZ)
+    labels = [s.label for s in available]
+    # WorkDay [10:00, 13:00] = 6 slots. Booking covers [11:00-11:30, 11:30-12:00, 12:00-12:30]
+    assert "11:00" not in labels
+    assert "11:30" not in labels
+    assert "12:00" not in labels
+    # 3 unavailable, 3 available
+    assert len(available) == 3
+    assert labels == ["10:00", "10:30", "12:30"]
+
+
+@pytest.mark.asyncio
+async def test_get_available_slots_30_capacity_2_one_booking(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """cap=2, one booking overlaps slot → slot still available (count=1 < 2)."""
+    work_date = _future_workdate()
+    wd = await _make_workday(session, seed_data, work_date, 10, 12, capacity=2)
+    await _insert_booking(
+        session,
+        seed_data,
+        start_at=_local_to_utc(work_date, 11, 0),
+        end_at=_local_to_utc(work_date, 11, 30),
+    )
+    available = await get_available_slots_30(session, wd, BUSINESS_TZ)
+    # All 4 slots available — capacity=2, overlap_count=1 on [11:00, 11:30]
+    assert len(available) == 4
+
+
+@pytest.mark.asyncio
+async def test_get_available_slots_30_capacity_2_two_bookings_overlap_slot(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """cap=2, two bookings overlap slot [11:00, 11:30] → slot unavailable (count=2)."""
+    work_date = _future_workdate()
+    wd = await _make_workday(session, seed_data, work_date, 10, 13, capacity=2)
+    # Two bookings both [11:00, 11:30] — need different slot_id (UNIQUE(slot_id))
+    # and different client_id.
+    client2 = Client(telegram_id=999999999, name="Second")
+    session.add(client2)
+    await session.flush()
+    slot2 = Slot(
+        master_id=seed_data["master_id"],
+        slot_date=work_date,
+        slot_hour=11,
+        status="open",
+    )
+    session.add(slot2)
+    await session.flush()
+    bookings_data = [
+        (seed_data["slot"].id, seed_data["client"].id),
+        (slot2.id, client2.id),
+    ]
+    for slot_id, client_id in bookings_data:
+        b = Booking(
+            slot_id=slot_id,
+            business_id=seed_data["business_id"],
+            master_id=seed_data["master_id"],
+            client_id=client_id,
+            service_id=None,
+            service_title_snapshot="test",
+            client_name_snapshot="test",
+            start_at=_local_to_utc(work_date, 11, 0),
+            end_at=_local_to_utc(work_date, 11, 30),
+            status="confirmed",
+        )
+        session.add(b)
+    await session.commit()
+    available = await get_available_slots_30(session, wd, BUSINESS_TZ)
+    labels = [s.label for s in available]
+    assert "11:00" not in labels  # count=2 >= capacity=2
+    assert len(available) == 5  # 6 grid cells - 1 occupied
+
+
+@pytest.mark.asyncio
+async def test_get_available_slots_30_cancelled_excluded(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Cancelled booking does not occupy the slot — slot still available."""
+    work_date = _future_workdate()
+    wd = await _make_workday(session, seed_data, work_date, 10, 12, capacity=1)
+    await _insert_booking(
+        session,
+        seed_data,
+        start_at=_local_to_utc(work_date, 11, 0),
+        end_at=_local_to_utc(work_date, 11, 30),
+        status="cancelled",
+    )
+    available = await get_available_slots_30(session, wd, BUSINESS_TZ)
+    # Cancelled booking excluded → all 4 slots available
+    assert len(available) == 4
+    assert "11:00" in [s.label for s in available]
+
+
+@pytest.mark.asyncio
+async def test_get_available_slots_30_touch_edge_no_overlap(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Touch edge: booking [11:00, 11:30] does NOT block slot [11:30, 12:00] (half-open)."""
+    work_date = _future_workdate()
+    wd = await _make_workday(session, seed_data, work_date, 10, 13, capacity=1)
+    await _insert_booking(
+        session,
+        seed_data,
+        start_at=_local_to_utc(work_date, 11, 0),
+        end_at=_local_to_utc(work_date, 11, 30),
+    )
+    available = await get_available_slots_30(session, wd, BUSINESS_TZ)
+    labels = [s.label for s in available]
+    # Booking covers [11:00, 11:30]. Touch slot [11:30, 12:00] — half-open, no overlap.
+    assert "11:00" not in labels  # booking covers this slot
+    assert "11:30" in labels  # touch — NOT overlap
+    assert "12:00" in labels
+
+
+@pytest.mark.asyncio
+async def test_get_available_slots_30_past_slots_filtered(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Past slots filtered out via now_utc injection (UX: hide past windows).
+
+    Strategy: inject now_utc at end-of-day for the work_date — all 4 grid slots
+    [10:00, 10:30, 11:00, 11:30] are strictly before 23:00 → all filtered as
+    'past' → 0 available. Deterministic regardless of test execution time.
+    """
+    work_date_future = _future_workdate(2)
+    wd = await _make_workday(session, seed_data, work_date_future, 10, 12, capacity=1)
+    # now_utc = 23:00 LOCAL on the work_date → all [10:00..11:30] slots are past
+    far_future_now = _local_to_utc(work_date_future, 23, 0)
+    available = await get_available_slots_30(session, wd, BUSINESS_TZ, now_utc=far_future_now)
+    # All 4 slots are "past" relative to far_future_now → 0 available
+    assert available == []
+
+
+@pytest.mark.asyncio
+async def test_get_available_slots_30_closed_workday_not_filtered(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Function does NOT filter is_active=False — handler 5.8 decides (separation of concerns)."""
+    work_date = _future_workdate()
+    wd = WorkDay(
+        master_id=seed_data["master_id"],
+        work_date=work_date,
+        start_time=dt_time(10, 0),
+        end_time=dt_time(12, 0),
+        max_concurrent_clients=1,
+        is_active=False,  # closed
+    )
+    session.add(wd)
+    await session.commit()
+    available = await get_available_slots_30(session, wd, BUSINESS_TZ)
+    # Function still returns slots — handler 5.8 is responsible for is_active filter
+    assert len(available) == 4
+
+
+@pytest.mark.asyncio
+async def test_get_available_slots_30_window_less_than_30min(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Defensive: WorkDay window < 30 min → empty result (no slot fits)."""
+    work_date = _future_workdate()
+    # 10:00 to 10:15 — 15 min window, < 30 min slot size
+    wd = WorkDay(
+        master_id=seed_data["master_id"],
+        work_date=work_date,
+        start_time=dt_time(10, 0),
+        end_time=dt_time(10, 15),
+        max_concurrent_clients=1,
+        is_active=True,
+    )
+    session.add(wd)
+    await session.commit()
+    available = await get_available_slots_30(session, wd, BUSINESS_TZ)
+    assert available == []

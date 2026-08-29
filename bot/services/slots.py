@@ -20,7 +20,8 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.models import Slot, WorkDay
+from bot.models import Booking, Slot, WorkDay
+from bot.services.workday import _window_bounds_utc
 
 # ============================================================
 # 30-мин slots from WorkDay (Этап 5.4 — for /slots UI in 5.8)
@@ -113,6 +114,90 @@ async def get_30min_slots_from_workday(
             )
         cursor += timedelta(minutes=30)
     return slots
+
+
+# ============================================================
+# Occupancy filter (Этап 5.6 «Мест нет» — capacity check on 30-min grid)
+# ============================================================
+
+
+async def get_available_slots_30(
+    session: AsyncSession,
+    workday: WorkDay,
+    business_timezone: str,
+    *,
+    now_utc: datetime | None = None,
+) -> list[TimeSlot30]:
+    """Filter 30-min slots from workday grid by occupancy (capacity check).
+
+    Этап 5.6 (PLANS.md:15): /slots UI (5.8) shows 30-min slots that have at
+    least one free capacity — count of overlapping active bookings (status IN
+    'confirmed'/'transferred', half-open overlap) < workday.max_concurrent_clients.
+
+    Half-open overlap (mirror booking.py:_check_multi_client_capacity:226-227):
+        booking.start_at < slot.end_utc AND booking.end_at > slot.start_at_utc
+    Booking range crosses multiple grid cells (service.duration_minutes > 30):
+    all cells overlapped become occupied — overlap measured against **full
+    booking range**, not the 30-min grid cell.
+
+    Status filter: only 'confirmed'/'transferred' (cancelled excluded, mirror
+    _check_multi_client_capacity:228).
+    Past slots: filtered in get_30min_slots_from_workday via now_utc injection.
+    Closed WorkDay (is_active=False): NOT filtered here — handler 5.8 decides
+    (separation of concerns; this function is read-only, no policy).
+
+    NB: SQLite stores Booking.start_at naive, Postgres aware. Normalize in
+    Python loop (b.start_at.replace(tzinfo=UTC) if b.start_at.tzinfo is None).
+    SQLAlchemy handles at SQL level, but Python-level comparison does not.
+
+    Args:
+        session: SQLAlchemy AsyncSession (read-only SELECT).
+        workday: WorkDay record — provides master_id, work_date, start_time,
+            end_time, max_concurrent_clients.
+        business_timezone: IANA tz name (e.g. "Europe/Moscow") for LOCAL → UTC.
+        now_utc: injected for tests (production uses datetime.now(UTC)).
+
+    Returns:
+        List of TimeSlot30 (subset of get_30min_slots_from_workday output)
+        ordered by start_at_utc ascending. Empty if all slots are occupied OR
+        workday window < 30 min.
+    """
+    candidates = await get_30min_slots_from_workday(
+        workday, business_timezone, now_utc=now_utc
+    )
+    if not candidates:
+        return []
+
+    workday_start_utc, workday_end_utc = _window_bounds_utc(
+        workday.work_date, workday.start_time, workday.end_time, business_timezone
+    )
+    bookings_stmt = (
+        select(Booking).where(
+            Booking.master_id == workday.master_id,
+            Booking.start_at < workday_end_utc,
+            Booking.end_at > workday_start_utc,
+            Booking.status.in_(("confirmed", "transferred")),
+        )
+    )
+    bookings = (await session.execute(bookings_stmt)).scalars().all()
+    # Normalize naive SQLite datetimes to aware UTC for Python-level comparison.
+    normalized = [
+        (
+            b.start_at if b.start_at.tzinfo else b.start_at.replace(tzinfo=UTC),
+            b.end_at if b.end_at.tzinfo else b.end_at.replace(tzinfo=UTC),
+        )
+        for b in bookings
+    ]
+
+    available: list[TimeSlot30] = []
+    for slot in candidates:
+        slot_end_utc = slot.start_at_utc + timedelta(minutes=30)
+        overlap_count = sum(
+            1 for bs, be in normalized if bs < slot_end_utc and be > slot.start_at_utc
+        )
+        if overlap_count < workday.max_concurrent_clients:
+            available.append(slot)
+    return available
 
 
 # ============================================================
