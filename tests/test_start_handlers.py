@@ -76,9 +76,7 @@ async def test_cmd_start_admin_shows_welcome_and_inline_menu() -> None:
 
     # Второй вызов — inline menu
     second_call = msg.answer.await_args_list[1]
-    text = str(second_call.args[0]) if second_call.args else str(
-        second_call.kwargs.get("text", "")
-    )
+    text = str(second_call.args[0]) if second_call.args else str(second_call.kwargs.get("text", ""))
     assert "Привет, Екатерина" in text
     # Этап 3: текст больше НЕ перечисляет команды (только welcome)
     assert "/addslots" not in text
@@ -86,6 +84,7 @@ async def test_cmd_start_admin_shows_welcome_and_inline_menu() -> None:
     reply_markup = second_call.kwargs.get("reply_markup")
     assert reply_markup is not None, "admin /start must include inline menu"
     from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardRemove
+
     assert isinstance(reply_markup, InlineKeyboardMarkup), "must be inline keyboard"
 
     # Первый вызов — cleanup reply keyboard

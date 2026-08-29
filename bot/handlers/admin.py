@@ -312,9 +312,7 @@ async def cmd_openday(message: Message, command: CommandObject) -> None:
         existing = await select_workday(session, master_id, work_date)
         was_closed = existing is not None and not existing.is_active
         try:
-            await open_workday(
-                session, master_id, work_date, start_time, end_time, business_tz=tz
-            )
+            await open_workday(session, master_id, work_date, start_time, end_time, business_tz=tz)
         except ValueError as exc:
             await message.answer(f"❌ {exc}")
             return
@@ -1042,9 +1040,7 @@ async def admin_openday_end_msg(message: Message, state: FSMContext) -> None:
         existing = await select_workday(session, master_id, work_date)
         was_closed = existing is not None and not existing.is_active
         try:
-            await open_workday(
-                session, master_id, work_date, start_time, end_time, business_tz=tz
-            )
+            await open_workday(session, master_id, work_date, start_time, end_time, business_tz=tz)
         except ValueError as exc:
             await message.answer(f"❌ {exc}")
             return  # state stays — admin can retry end_time

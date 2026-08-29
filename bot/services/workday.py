@@ -218,9 +218,7 @@ async def close_workday(
     return True
 
 
-async def select_workday(
-    session: AsyncSession, master_id: UUID, work_date: date
-) -> WorkDay | None:
+async def select_workday(session: AsyncSession, master_id: UUID, work_date: date) -> WorkDay | None:
     """Lookup WorkDay by (master_id, work_date). Mirrors _select_workday_for_slot
     in booking.py:117 but exposed here for /openday handler use (was_closed UX fix,
     Session 5.18 F1 — handler reads is_active BEFORE open_workday re-opens it).
