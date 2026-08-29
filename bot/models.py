@@ -176,7 +176,13 @@ class Booking(Base):
     __tablename__ = "bookings"
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    slot_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("slots.id"), nullable=False)
+    # Этап 5.8a (миграция 006): slot_id → nullable. WorkDay-only bookings (no
+    # Slot row — 30-min slot generated from WorkDay window on /slots UI) хранят
+    # slot_id = NULL. Legacy /book flow (Slot-based, до 5.8b/c) хранит slot_id
+    # = real Slot.id. UNIQUE(ux_bookings_slot) убран — guard shift на rowcount-
+    # check (booking.py:482-487) + multi-client capacity check (booking.py:451).
+    # FK остаётся (slots table жива до миграции 007 — legacy /book flow в 5.8b).
+    slot_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("slots.id"), nullable=True)
     business_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("businesses.id"), nullable=False
     )
@@ -202,7 +208,9 @@ class Booking(Base):
 
     __table_args__ = (
         CheckConstraint("end_at > start_at", name="ck_booking_duration_positive"),
-        Index("ux_bookings_slot", "slot_id", unique=True),  # UNIQUE(slot_id) — SQLite fallback
+        # Этап 5.8a (миграция 006): UNIQUE(ux_bookings_slot) убран — slot_id
+        # nullable для WorkDay-only bookings. Guard shift на rowcount-check
+        # (booking.py:482-487) + multi-client capacity (booking.py:451).
         Index(
             "idx_bookings_client",
             "client_id",

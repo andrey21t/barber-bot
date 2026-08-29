@@ -17,6 +17,7 @@ cancel_booking coverage (spec.md 41, 298, 317, 405-407):
 
 import html
 from datetime import UTC, datetime, timedelta
+from datetime import time as dt_time
 from typing import Any
 from unittest.mock import MagicMock
 from uuid import UUID, uuid4
@@ -34,8 +35,11 @@ from bot.services.booking import (
     SlotAlreadyBookedError,
     SlotClosedError,
     SlotInPastError,
+    WorkDayCapacityExceededError,
+    _build_start_at_from_workday,
     cancel_booking,
     create_booking,
+    transfer_booking,
 )
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -631,7 +635,6 @@ from bot.services.booking import (  # noqa: E402 — local import to keep transf
     BookingAlreadyTransferredError,
     SlotNotAvailableError,
     TransferResult,
-    transfer_booking,
 )
 
 
@@ -1603,26 +1606,34 @@ async def test_create_booking_concurrent_race_integrity_error(
     session: AsyncSession,
     seed_data: dict[str, Any],
 ) -> None:
-    """Covers bot/services/booking.py:180-182 — IntegrityError on booking flush
-    (UNIQUE slot_id violated by concurrent insert).
+    """Covers bot/services/booking.py:482-487 — rowcount-check race path
+    (UPDATE Slot WHERE status='open' returns 0 → SlotAlreadyBookedError).
 
-    Approach: pre-create a booking with same slot_id (commits to DB), then
-    patch execute so _select_open_slot's SELECT returns a STALE DETACHED slot
-    (status='open'). create_booking proceeds to INSERT booking → UNIQUE(slot_id)
-    violation at flush → IntegrityError → SlotAlreadyBookedError (line 182).
+    Этап 5.8a (миграция 006): UNIQUE(slot_id) dropped. Legacy slot path now
+    relies on the rowcount-check guard: after INSERT booking flush, UPDATE
+    Slot WHERE status='open' returns rowcount=0 if a concurrent booking
+    already changed slot.status to 'booked' between our SELECT (returns
+    stale_slot status='open') and UPDATE.
+
+    Approach: pre-create a booking with same slot_id (commits to DB,
+    slot.status='booked'), then patch execute so _select_open_slot's SELECT
+    returns a STALE DETACHED slot (status='open'). create_booking proceeds to
+    INSERT booking (flush succeeds — no UNIQUE guard post-006) → UPDATE Slot
+    WHERE status='open' → rowcount=0 → SlotAlreadyBookedError with the
+    "was taken/closed between SELECT and UPDATE" message (line 487).
 
     Why stale DETACHED slot (not real attached): the service's error message
-    at line 183 accesses `slot.id` AFTER `session.rollback()`. On an attached
-    instance, rollback expires all attributes → `slot.id` triggers lazy load
-    → MissingGreenlet (async SQLAlchemy). A detached instance (created via
-    `Slot(id=...)` constructor, never `session.add()`'d) has `id` as a plain
-    Python attribute — no lazy load, no MissingGreenlet. This is a production
-    latent bug (slot.id after rollback) — recorded in NEXT_COVERAGE_GAPS.md.
+    at line 487 references `slot_id` (the captured UUID local, not
+    `slot.id` attribute access) — safe even after session.rollback(). A
+    detached instance (created via `Slot(id=...)` constructor, never
+    `session.add()`'d) is required to avoid the patched_execute returning a
+    real attached slot from DB (which would show status='booked' and trigger
+    early SlotAlreadyBookedError at _select_open_slot).
 
-    Faithful: tests the actual flush IntegrityError path (line 180-182), NOT
-    the _select_open_slot early-exit (line 64) that the existing
-    test_create_booking_idempotency_unique_guard covers via sequential double-call
-    (where slot.status='booked' is visible on SELECT).
+    Faithful: tests the actual rowcount-check path (line 482-487), NOT the
+    _select_open_slot early-exit (line 64) that the existing
+    test_create_booking_idempotency_unique_guard covers via sequential
+    double-call (where slot.status='booked' is visible on SELECT).
     """
     # Create a fresh slot WITHOUT WorkDay on a separate date — capacity check
     # (Этап 5.5) is skipped when no WorkDay exists, so the UNIQUE(slot_id) guard
@@ -1689,7 +1700,14 @@ async def test_create_booking_concurrent_race_integrity_error(
 
     session.execute = patched_execute  # type: ignore[method-assign]
     try:
-        with pytest.raises(SlotAlreadyBookedError, match="UNIQUE constraint"):
+        # Этап 5.8a (миграция 006): UNIQUE(slot_id) dropped — IntegrityError at
+        # flush больше НЕ срабатывает на duplicate slot_id. Test now covers the
+        # rowcount-check path (booking.py:482-487): after flush, UPDATE Slot
+        # WHERE status='open' returns rowcount=0 (real slot is 'booked') →
+        # SlotAlreadyBookedError with the "was taken/closed" message.
+        with pytest.raises(
+            SlotAlreadyBookedError, match="was taken/closed between SELECT and UPDATE"
+        ):
             await create_booking(
                 session,
                 payload,
@@ -2072,3 +2090,232 @@ async def test_transfer_booking_concurrent_new_slot_taken_raises_slot_already_bo
     await session.rollback()
     stmt_b = select(Booking.status).where(Booking.id == booking_id)
     assert (await session.execute(stmt_b)).scalar_one() == "confirmed"
+
+
+# ============================================================
+# Этап 5.8a — WorkDay path tests (booking.py:432-504)
+#
+# Coverage (Acceptance Contract — 5.8a branch, slot_id XOR workday):
+# - happy path: payload(workday_id + start_time_local) → BookingCreatedData
+#   with slot_id=None, start_at via _build_start_at_from_workday
+# - capacity check on workday path: cap=1, 2nd overlapping booking raises
+#   WorkDayCapacityExceededError (half-open overlap, mirror 5.5 multi-client
+#   pattern but without slot_id)
+# - cancel workday-only booking: skip UPDATE Slot (booking.py:742-744 guard),
+#   booking.status='cancelled', no exception
+# - transfer workday-only booking: NotImplementedError guard (booking.py:919-923)
+#   — WorkDay transfer is 5.9 scope (admin_move_booking — separate service,
+#   no client_id pin, no 24h rule)
+# ============================================================
+
+
+async def _make_workday_payload(workday_id: UUID, *, start_time_local: dt_time) -> BookingCreate:
+    """Build BookingCreate payload for the WorkDay path — slot_id=None.
+
+    Mirror of _make_payload (slot path) but for the new 5.8a workday branch.
+    service_id=None triggers SERVICE_DEFAULT_DURATION_MIN (60 min) — overlap
+    window [start_time_local, start_time_local + 60min] in LOCAL.
+    """
+    return BookingCreate(
+        workday_id=workday_id,
+        start_time_local=start_time_local,
+        client_name="Паша",
+        service_title="Стрижка",
+        service_id=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_booking_workday_path(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Этап 5.8a — happy path: payload(workday_id + start_time_local) creates
+    booking with slot_id=None, BookingCreatedData.slot_id is None, start_at
+    matches _build_start_at_from_workday(workday, start_time_local, business_tz).
+    No Slot row created/updated (slot_id is None — workday-only flow).
+
+    Covers booking.py:432-504 (workday branch):
+      - Pydantic validator passed (workday_id + start_time_local set, slot_id None)
+      - SELECT WorkDay by id → resolved
+      - start_at = _build_start_at_from_workday(workday, start_time_local, business_tz)
+      - _validate_booking_within_workday MANDATORY (no skip case on workday path)
+      - INSERT Booking with slot_id=None (no UNIQUE guard — migration 006 dropped)
+      - SKIP UPDATE Slot (slot_id is None, booking.py:566 guard)
+    """
+    workday = seed_data["workday"]
+    payload = await _make_workday_payload(workday.id, start_time_local=dt_time(14, 30))
+
+    result = await create_booking(
+        session,
+        payload,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=seed_data["client_telegram_id"],
+    )
+
+    # BookingCreatedData carries slot_id=None for workday-only path (5.8a contract)
+    assert result.slot_id is None
+    assert result.booking_id is not None
+
+    # start_at = _build_start_at_from_workday(workday, start_time_local, business_tz)
+    # seed_data fixture: business.timezone = "Europe/Moscow" (conftest.py:103).
+    expected_start_at = _build_start_at_from_workday(workday, dt_time(14, 30), "Europe/Moscow")
+    assert result.start_at == expected_start_at
+
+    # DB state: Booking exists with slot_id=None, status='confirmed'
+    stmt = select(Booking).where(Booking.id == result.booking_id)
+    booking = (await session.execute(stmt)).scalar_one()
+    assert booking.slot_id is None
+    assert booking.status == "confirmed"
+    assert booking.master_id == seed_data["master_id"]
+    assert booking.business_id == seed_data["business_id"]
+
+
+@pytest.mark.asyncio
+async def test_create_booking_workday_capacity_blocks_2nd(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Этап 5.8a — capacity check on workday path: WorkDay.max_concurrent_clients=1
+    (seed_data fixture conftest.py:132). 1st booking [14:00, 15:00] succeeds,
+    2nd booking [14:30, 15:30] overlaps (half-open: start < other_end AND
+    end > other_start) → capacity exceeded (1 overlapping >= cap 1) →
+    WorkDayCapacityExceededError.
+
+    Pattern mirror test_multi_client.py:160-200 test_create_booking_capacity_1_blocks_2nd_overlap
+    but for workday path (no slot_id — slot_id=None contract from 5.8a).
+    Overlap check at booking.py:225-244 (_check_multi_client_capacity, half-open
+    Booking.start_at < end_at AND Booking.end_at > start_at).
+    """
+    workday = seed_data["workday"]
+    assert workday.max_concurrent_clients == 1
+
+    # 1st booking: 14:00 LOCAL → [14:00, 15:00] (default 60min duration)
+    payload1 = await _make_workday_payload(workday.id, start_time_local=dt_time(14, 0))
+    result1 = await create_booking(
+        session,
+        payload1,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=seed_data["client_telegram_id"],
+    )
+    assert result1.slot_id is None
+
+    # 2nd booking: 14:30 LOCAL → [14:30, 15:30] overlaps with [14:00, 15:00]
+    # Half-open overlap: 14:00 < 15:30 (yes) AND 15:00 > 14:30 (yes) → overlap
+    payload2 = await _make_workday_payload(workday.id, start_time_local=dt_time(14, 30))
+    with pytest.raises(WorkDayCapacityExceededError, match="capacity 1 exceeded"):
+        await create_booking(
+            session,
+            payload2,
+            business_id=seed_data["business_id"],
+            master_id=seed_data["master_id"],
+            telegram_id=seed_data["client_telegram_id"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancel_booking_workday_no_slot_update(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Этап 5.8a — cancel workday-only booking (slot_id=None): UPDATE Slot skipped
+    (booking.py:742-744 guard `if booking.slot_id is not None: UPDATE Slot`),
+    booking.status='cancelled', no exception. Verifies the skip-UPDATE-Slot branch
+    — workday-only bookings have no Slot row to release (30-min slot generated
+    from WorkDay window on /slots UI, not a row in slots table).
+
+    Coverage of booking.py:742-744:
+      - WorkDay-only booking: booking.slot_id is None → skip UPDATE Slot block
+      - UPDATE Booking SET status='cancelled' proceeds (step 5)
+      - NotificationLog(master_cancel) INSERTed (step 7, SAVEPOINT idempotency)
+      - CancelResult.slot_id carries None (booking.py:776)
+    """
+    workday = seed_data["workday"]
+    payload = await _make_workday_payload(workday.id, start_time_local=dt_time(14, 30))
+    result = await create_booking(
+        session,
+        payload,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=seed_data["client_telegram_id"],
+    )
+    assert result.slot_id is None
+    booking_id = result.booking_id
+
+    # Cancel — should not raise (slot_id is None → skip UPDATE Slot block)
+    # now_utc 10 days ago → passes CANCEL_MIN_HOURS (24h) check.
+    cancel_result = await cancel_booking(
+        session,
+        booking_id=booking_id,
+        client_id=seed_data["client"].id,
+        scheduler=_mock_scheduler(),
+        now_utc=datetime.now(UTC) - timedelta(days=10),
+    )
+
+    # CancelResult carries slot_id=None (mirror of BookingCreatedData contract)
+    assert cancel_result.slot_id is None
+    assert cancel_result.booking_id == booking_id
+
+    # DB state: booking.status == 'cancelled' after cancel
+    await session.rollback()
+    stmt = select(Booking.status, Booking.slot_id).where(Booking.id == booking_id)
+    row = (await session.execute(stmt)).one()
+    assert row.status == "cancelled"
+    assert row.slot_id is None
+
+
+@pytest.mark.asyncio
+async def test_transfer_booking_workday_raises_not_implemented(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Этап 5.8a — transfer workday-only booking (slot_id=None) raises
+    NotImplementedError (booking.py:919-923 guard). WorkDay transfer = 5.9 scope
+    (admin_move_booking — separate service, no client_id pin, no 24h rule).
+
+    Guard fires BEFORE step 4 (24h rule), step 5 (SELECT new_slot) — so any
+    new_slot_id is fine (it's never reached). Pattern mirror test_transfer_booking_*
+    setup but slot_id=None booking (workday path).
+
+    Coverage of booking.py:919-923:
+      - SELECT booking (step 1-3) returns workday-only booking (slot_id=None)
+      - status != 'cancelled' → falls through
+      - Guard `if booking.slot_id is None: raise NotImplementedError(...)`
+      - 5.9 scope (admin_move_booking) — separate service without client_id pin
+    """
+    workday = seed_data["workday"]
+    payload = await _make_workday_payload(workday.id, start_time_local=dt_time(14, 30))
+    result = await create_booking(
+        session,
+        payload,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=seed_data["client_telegram_id"],
+    )
+    assert result.slot_id is None
+    booking_id = result.booking_id
+
+    # transfer_booking requires new_slot_id — guard fires BEFORE _select_open_slot
+    # (step 5), so any UUID is fine (never reached). Use seed_data["slot"].id for
+    # semantic clarity (would-be destination in 5.9 admin_move_booking).
+    new_slot_id = seed_data["slot"].id
+
+    with pytest.raises(NotImplementedError, match="WorkDay transfer is 5.9 scope"):
+        await transfer_booking(
+            session,
+            booking_id=booking_id,
+            new_slot_id=new_slot_id,
+            client_id=seed_data["client"].id,
+            scheduler=_mock_scheduler(),
+            now_utc=datetime.now(UTC) - timedelta(days=10),
+        )
+
+    # Booking unchanged — guard fired before any UPDATE (status='confirmed',
+    # slot_id=None preserved, not overwritten with new_slot_id).
+    await session.rollback()
+    stmt_b = select(Booking.status, Booking.slot_id).where(Booking.id == booking_id)
+    row = (await session.execute(stmt_b)).one()
+    assert row.status == "confirmed"
+    assert row.slot_id is None
