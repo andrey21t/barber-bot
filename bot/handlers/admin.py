@@ -753,10 +753,15 @@ async def admin_addslots_calendar_cb(
         await state.set_state(AdminStates.picking_window_start)
 
         # INL-001: edit_message_text — чат не засоряется (calendar → slot picker).
+        # UX: показать текущее окно — иначе пользователь не понимает что picker
+        # меняет (semantic shift 5.10: /addslots = MODIFY, не "открыть слоты").
         if isinstance(callback.message, Message):
+            current_start = workday.start_time.strftime("%H:%M")
+            current_end = workday.end_time.strftime("%H:%M")
             picker_text = (
                 f"📅 Дата: <b>{slot_date.strftime('%d %B %Y')}</b>\n"
-                "⏰ Выберите время начала окна:"
+                f"🕒 Текущее окно: <b>{current_start}–{current_end}</b>\n"
+                "⏰ Выберите новое время начала окна:"
             )
             picker_kb = admin_window_slot_picker_keyboard(
                 workday_id=workday.id,

@@ -124,20 +124,23 @@ class AdminMoveConfirmCallbackData(CallbackData, prefix="admin_move_confirm"):
 def admin_inline_menu() -> InlineKeyboardMarkup:
     """Inline keyboard с 6 кнопками для мастера (spec.md 251, Вариант B + Этап 5.1).
 
-    Layout: 3 + 2 + 1 (3 rows). Каждая кнопка = отдельный callback_data.
-    Row 1 (открытие/закрытие): 📅 Открыть день (5.1, primary), ➕ Открыть слоты
-        (deprecated alias до 5.10), 🔒 Закрыть слот (deprecated до 5.10).
-    Row 2 (просмотр): 📅 Сегодня, 🗓 Неделя — мгновенные callbacks, no FSM.
-    Row 3 (услуги): 💇 Добавить услугу — entering_service flow.
+    Layout: 2 + 2 + 2 (3 rows) — semantic shift 5.10: «Открыть слоты» →
+    «Изменить окно» (/addslots = MODIFY), «Закрыть слот» → «Сузить окно»
+    (/closeslot = SHRINK). Layout 2×3 (вместо 3+2+1) — кнопки шире, текст не
+    обрезается на мобильных экранах (предыдущий 3×3 ломал «Открыть слоты» →
+    «Открыть слот»). /openday (CREATE) без изменений.
+    Row 1: 📅 Открыть день (CREATE), ➕ Изменить окно (MODIFY, 5.10).
+    Row 2: ⬇️ Сузить окно (SHRINK, 5.10), 📅 Сегодня.
+    Row 3: 🗓 Неделя, 💇 Добавить услугу (entering_service flow).
     """
     builder = InlineKeyboardBuilder()
     builder.button(text="📅 Открыть день", callback_data=AdminOpendayCallbackData().pack())
-    builder.button(text="➕ Открыть слоты", callback_data=AdminAddslotsCallbackData().pack())
-    builder.button(text="🔒 Закрыть слот", callback_data=AdminCloseslotCallbackData().pack())
+    builder.button(text="➕ Изменить окно", callback_data=AdminAddslotsCallbackData().pack())
+    builder.button(text="⬇️ Сузить окно", callback_data=AdminCloseslotCallbackData().pack())
     builder.button(text="📅 Сегодня", callback_data=AdminTodayCallbackData().pack())
     builder.button(text="🗓 Неделя", callback_data=AdminWeekCallbackData().pack())
-    builder.button(text="💇 Добавить услугу", callback_data=AdminServicesCallbackData().pack())
-    builder.adjust(3, 2, 1)
+    builder.button(text="💇 Услуги", callback_data=AdminServicesCallbackData().pack())
+    builder.adjust(2, 2, 2)
     return builder.as_markup()
 
 
