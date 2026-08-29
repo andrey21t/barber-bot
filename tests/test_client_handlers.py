@@ -31,10 +31,10 @@ that records set_state/update_data calls for assertion).
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
-from uuid import UUID
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -50,7 +50,7 @@ from bot.keyboards.client import (
     MyBookingsTransferCallbackData,
     mybookings_keyboard,
 )
-from bot.models import Booking, Business, Client, Master, Slot
+from bot.models import Booking, Business, Client, Master, Slot, WorkDay
 from bot.states import BookingStates, TransferStates
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -2771,3 +2771,613 @@ def test_no_op_button_helper_returns_noop_inline_button() -> None:
 
     assert button.text == "Нет свободных слотов"
     assert button.callback_data == "noop"
+
+
+# ============================================================
+# Этап 5.8b — /slots + BookSlot30CallbackData + workday-path
+# handlers (cmd_slots, simple_calendar_cb slots branch, slot_30_cb,
+# service_msg workday branch, confirm_cb workday branch + new
+# exceptions BookingOutsideWorkDayError / WorkDayCapacityExceededError).
+# P0 critic iter 2: confirm_cb must catch workday-path race errors.
+# ============================================================
+
+
+async def _seed_workday(
+    session: AsyncSession,
+    ctx: dict[str, Any],
+    *,
+    work_date: date,
+    is_active: bool = True,
+    start_time: time = time(10, 0),
+    end_time: time = time(18, 0),
+    max_concurrent_clients: int = 1,
+) -> WorkDay:
+    """Insert a WorkDay row for the seeded master. Returns the WorkDay instance.
+
+    Mirrors the WorkDay schema (5.1 /openday) — max_concurrent_clients defaults
+    to 1 to surface overlaps via WorkDayCapacityExceededError.
+    """
+    wd = WorkDay(
+        master_id=ctx["master_id"],
+        work_date=work_date,
+        start_time=start_time,
+        end_time=end_time,
+        is_active=is_active,
+        max_concurrent_clients=max_concurrent_clients,
+    )
+    session.add(wd)
+    await session.commit()
+    return wd
+
+
+def _make_slot_30_callback(
+    workday_id: UUID,
+    start_minute: int,
+    *,
+    user_id: int = 111222333,
+) -> tuple[MagicMock, Any]:
+    """Mock CallbackQuery for slot_30_cb (BookSlot30CallbackData filter).
+
+    Builds a real BookSlot30CallbackData so .filter() matches on dispatch.
+    """
+    from bot.keyboards.client import BookSlot30CallbackData
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(user_id)
+    cb.message = _make_message(user_id, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = BookSlot30CallbackData(
+        workday_id=workday_id, start_minute=start_minute
+    )
+    return cb, callback_data
+
+
+@pytest.mark.asyncio
+async def test_cmd_slots_sets_state_and_shows_date_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Этап 5.8b: cmd_slots — /slots sets FSM selecting_date + is_slots_path=True.
+
+    Same calendar picker as /book; the slots-branch flag is read by
+    _handle_simple_calendar to dispatch to WorkDay lookup + 30-min slot picker.
+    """
+    msg = _make_message(user_id=111222333, text="/slots")
+    state = _make_state()
+
+    await client_handlers.cmd_slots(msg, state)
+
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.selecting_date
+
+    # state.update_data called with is_slots_path=True (the slots-branch flag)
+    update_kwargs = state.update_data.call_args.kwargs
+    assert update_kwargs.get("is_slots_path") is True
+
+    msg.answer.assert_awaited_once()
+    assert "Выберите дату" in _answer_text(msg)
+    assert isinstance(_answer_reply_markup(msg), InlineKeyboardMarkup)
+
+
+@pytest.mark.asyncio
+async def test_simple_calendar_cb_slots_path_shows_30min_slot_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Этап 5.8b: /slots path — calendar day-select with active WorkDay →
+    get_available_slots_30 returns TimeSlot30 list → slot_picker_keyboard_30min
+    with BookSlot30CallbackData callback_data (NOT legacy slot picker).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        await _seed_workday(
+            session, ctx, work_date=target_date, start_time=time(10, 0), end_time=time(12, 0)
+        )
+
+    target_dt = datetime.combine(target_date, time(11, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
+
+    state = _make_state()
+    # cmd_slots sets is_slots_path=True before calendar is opened
+    await state.update_data(is_slots_path=True)
+    await client_handlers.simple_calendar_cb(cb, callback_data, state)
+
+    state.update_data.assert_awaited()
+    assert state.update_data.call_args.kwargs.get("selected_date") == target_date.isoformat()
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.selecting_slot
+
+    text = _answer_text(cb.message)
+    assert "Выберите время" in text
+    reply_markup = _answer_reply_markup(cb.message)
+    assert isinstance(reply_markup, InlineKeyboardMarkup)
+    # 30-min picker has BookSlot30CallbackData on buttons (prefix book_slot_30),
+    # NOT legacy BookSlotCallbackData (prefix book_slot).
+    rows = reply_markup.inline_keyboard
+    assert rows, "30-min picker must have buttons"
+    first_cb = rows[0][0].callback_data
+    assert first_cb is not None, "callback_data must be set on slot buttons"
+    assert first_cb.startswith("book_slot_30:"), (
+        f"workday-path callback must use BookSlot30CallbackData, got {first_cb!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_simple_calendar_cb_slots_path_no_workday_shows_hint(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Этап 5.8b: /slots path, no WorkDay for date → 'Мастер не работает в этот
+    день. /book для записи по часам.' (NOT generic 'нет свободных слотов').
+    FSM stays in selecting_date (no slot picker shown).
+    """
+    async with session_factory() as session:
+        await _seed_full_stack(session)  # master exists, no WorkDay seeded
+
+    target_date = (datetime.now(UTC) + timedelta(days=30)).date()
+    target_dt = datetime.combine(target_date, time(12, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = AsyncMock()
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
+
+    state = _make_state()
+    await state.update_data(is_slots_path=True)
+    await client_handlers.simple_calendar_cb(cb, callback_data, state)
+
+    text = _answer_text(cb.message)
+    assert "не работает в этот день" in text
+    state.set_state.assert_not_awaited()
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_simple_calendar_cb_slots_path_inactive_workday_shows_hint(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Этап 5.8b: /slots path, WorkDay exists but is_active=False (master
+    closed the day via /closeday) → 'День закрыт мастером.' + calendar retry.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=2)).date()
+        await _seed_workday(
+            session, ctx, work_date=target_date, is_active=False
+        )
+
+    target_dt = datetime.combine(target_date, time(12, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = AsyncMock()
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
+
+    state = _make_state()
+    await state.update_data(is_slots_path=True)
+    await client_handlers.simple_calendar_cb(cb, callback_data, state)
+
+    text = _answer_text(cb.message)
+    assert "День закрыт мастером" in text
+    state.set_state.assert_not_awaited()
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_slot_30_cb_saves_workday_id_start_minute() -> None:
+    """Этап 5.8b: slot_30_cb — valid BookSlot30CallbackData → state.update_data
+    (workday_id, start_minute) + set_state(entering_name) + ask name message.
+    """
+    workday_id = uuid4()
+    cb, callback_data = _make_slot_30_callback(
+        workday_id=workday_id, start_minute=630  # 10:30
+    )
+
+    state = _make_state()
+    await client_handlers.slot_30_cb(cb, callback_data, state)
+
+    update_kwargs = state.update_data.call_args.kwargs
+    assert update_kwargs["workday_id"] == str(workday_id)
+    assert update_kwargs["start_minute"] == 630
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.entering_name
+    assert "На чьё имя" in _answer_text(cb.message)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_slot_30_cb_out_of_range_clears_state() -> None:
+    """Этап 5.8b: slot_30_cb, start_minute outside 0-1439 → state.clear +
+    '❌ Ошибка выбора времени' + callback.answer. Defensive against tampered
+    callback_data (slot_30_cb:range_check).
+    """
+    workday_id = uuid4()
+    # start_minute=1500 is out-of-range (max valid 1439 = 23:59).
+    cb, callback_data = _make_slot_30_callback(
+        workday_id=workday_id, start_minute=1500
+    )
+
+    state = _make_state()
+    await client_handlers.slot_30_cb(cb, callback_data, state)
+
+    state.clear.assert_awaited_once()
+    assert "Ошибка выбора времени" in _answer_text(cb.message)
+    state.set_state.assert_not_awaited()
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_cb_workday_path_happy_creates_booking(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Этап 5.8b: confirm_cb workday path — workday_id + start_minute in state
+    → BookingCreate(workday_id, start_time_local) → create_booking succeeds →
+    master notification + schedule_for_booking + 'Вы записаны'.
+
+    Mirrors test_confirm_cb_happy_creates_booking_and_schedules but for the
+    workday path (no slot_id in state).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        wd = await _seed_workday(
+            session, ctx, work_date=target_date, start_time=time(10, 0), end_time=time(12, 0)
+        )
+        workday_id = wd.id
+
+    fake_result = MagicMock()
+    fake_result.booking_id = UUID("00000000-0000-0000-0000-000000000003")
+    fake_result.start_at = datetime.now(UTC) + timedelta(days=1)
+    fake_result.master_notification_text = "Новая запись: Паша, Стрижка"
+
+    async def _fake_create(*args: Any, **kwargs: Any) -> Any:
+        # Verify the payload is workday-path (XOR contract).
+        payload = args[1]
+        assert payload.workday_id == workday_id
+        assert payload.slot_id is None
+        # start_minute=630 → 10:30 LOCAL
+        assert payload.start_time_local == time(10, 30)
+        return fake_result
+
+    monkeypatch.setattr(client_handlers, "create_booking", _fake_create)
+    schedule_mock = MagicMock()
+    monkeypatch.setattr(client_handlers, "schedule_for_booking", schedule_mock)
+
+    cb, callback_data = _make_confirm_callback()
+    state = _make_state()
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=630,
+        client_name="Паша",
+        service_title="Стрижка",
+    )
+    scheduler = MagicMock(spec=AsyncIOScheduler)
+
+    await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
+
+    cb.bot.send_message.assert_awaited_once()
+    schedule_mock.assert_called_once()
+    state.clear.assert_awaited_once()
+    assert "Вы записаны" in _answer_text(cb.message)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_service_msg_workday_path_workday_not_found_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Этап 5.8b W1: service_msg workday-path — workday_id in state but WorkDay
+    row deleted (race: master deleted day between service_msg call and user
+    typed service) → state.clear + 'Рабочий день не найден. ... /slots'.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        wd = await _seed_workday(session, ctx, work_date=target_date)
+        workday_id = wd.id
+        # Now delete the WorkDay (simulating race with /closeday cascade or manual
+        # cleanup). Service_msg's SELECT will return None.
+        from sqlalchemy import delete as sa_delete
+
+        await session.execute(sa_delete(WorkDay).where(WorkDay.id == workday_id))
+        await session.commit()
+
+    msg = _make_message(user_id=111222333, text="Стрижка")
+    state = _make_state()
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=600,
+        client_name="Паша",
+    )
+
+    await client_handlers.service_msg(msg, state)
+
+    state.clear.assert_awaited_once()
+    assert "Рабочий день не найден" in _answer_text(msg)
+    assert "/slots" in _answer_text(msg)
+
+
+@pytest.mark.asyncio
+async def test_service_msg_workday_path_happy_shows_summary(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Этап 5.8b W1: service_msg workday-path happy — workday_id + start_minute
+    in state → fetch WorkDay → _build_start_at_from_workday → summary via
+    _format_booking_summary_from_start_at → 'Подтвердите запись' + confirm_kb.
+    Verifies the summary contains LOCAL-formatted date/time + client_name +
+    service_title (no Slot entity involved).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        wd = await _seed_workday(
+            session,
+            ctx,
+            work_date=target_date,
+            start_time=time(10, 0),
+            end_time=time(12, 0),
+        )
+        workday_id = wd.id
+
+    msg = _make_message(user_id=111222333, text="Стрижка")
+    state = _make_state()
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=600,  # 10:00 LOCAL
+        client_name="Паша",
+    )
+
+    await client_handlers.service_msg(msg, state)
+
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.confirming
+    text = _answer_text(msg)
+    assert "Подтвердите запись" in text
+    # Summary rendered via _format_booking_summary_from_start_at — uses LOCAL
+    # strftime "%d %B %Y, %H:%M" → "10:00" appears in summary.
+    assert "10:00" in text
+    assert "Паша" in text
+    assert "Стрижка" in text
+    assert isinstance(_answer_reply_markup(msg), InlineKeyboardMarkup)
+
+
+@pytest.mark.asyncio
+async def test_confirm_cb_workday_path_slot_in_past_directs_to_slots(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Этап 5.8b W3: confirm_cb workday path — user waited >30 min before ✅,
+    start_at is now in the past. create_booking raises SlotInPastError →
+    handler catches, message directs to /slots (NOT /book — workday-path users
+    must retry via /slots, legacy /book would not find workday slots).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        wd = await _seed_workday(session, ctx, work_date=target_date)
+        workday_id = wd.id
+
+    async def _raise_past(*args: Any, **kwargs: Any) -> Any:
+        from bot.services.booking import SlotInPastError
+
+        raise SlotInPastError(f"WorkDay {workday_id} start_at in past")
+
+    monkeypatch.setattr(client_handlers, "create_booking", _raise_past)
+
+    cb, callback_data = _make_confirm_callback()
+    state = _make_state()
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=600,
+        client_name="Паша",
+        service_title="Стрижка",
+    )
+    scheduler = MagicMock(spec=AsyncIOScheduler)
+
+    await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
+
+    state.clear.assert_awaited_once()
+    text = _answer_text(cb.message)
+    assert "время уже прошло" in text
+    # W3 fix: retry hint must be /slots for workday-path (NOT /book).
+    assert "/slots" in text
+    assert "/book" not in text, "workday-path must NOT direct user to /book"
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_cb_workday_path_booking_outside_workday_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Этап 5.8b P0 (critic iter 2): confirm_cb workday path — race: between
+    service_msg summary and confirm_cb ✅, master closed the day via /closeday
+    (is_active=False). create_booking raises BookingOutsideWorkDayError →
+    handler catches, state.clear + 'День закрыт мастером. ... /slots'.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        wd = await _seed_workday(session, ctx, work_date=target_date)
+        workday_id = wd.id
+
+    async def _raise_outside(*args: Any, **kwargs: Any) -> Any:
+        from bot.services.booking import BookingOutsideWorkDayError
+
+        raise BookingOutsideWorkDayError(f"WorkDay {workday_id} closed")
+
+    monkeypatch.setattr(client_handlers, "create_booking", _raise_outside)
+
+    cb, callback_data = _make_confirm_callback()
+    state = _make_state()
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=600,  # 10:00 LOCAL
+        client_name="Паша",
+        service_title="Стрижка",
+    )
+    scheduler = MagicMock(spec=AsyncIOScheduler)
+
+    await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
+
+    state.clear.assert_awaited_once()
+    assert "День закрыт мастером" in _answer_text(cb.message)
+    assert "/slots" in _answer_text(cb.message)
+    cb.answer.assert_awaited()
+    cb.bot.send_message.assert_not_awaited()  # no master notification on error
+
+
+@pytest.mark.asyncio
+async def test_confirm_cb_workday_path_capacity_exceeded_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Этап 5.8b P0 (critic iter 2): confirm_cb workday path — race: another
+    booking grabbed the same 30-min window between service_msg and confirm_cb.
+    create_booking raises WorkDayCapacityExceededError → handler catches,
+    state.clear + 'Это время только что заняли. ... /slots'.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        wd = await _seed_workday(session, ctx, work_date=target_date, max_concurrent_clients=1)
+        workday_id = wd.id
+
+    async def _raise_capacity(*args: Any, **kwargs: Any) -> Any:
+        from bot.services.booking import WorkDayCapacityExceededError
+
+        raise WorkDayCapacityExceededError("WorkDay capacity exceeded")
+
+    monkeypatch.setattr(client_handlers, "create_booking", _raise_capacity)
+
+    cb, callback_data = _make_confirm_callback()
+    state = _make_state()
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=600,
+        client_name="Паша",
+        service_title="Стрижка",
+    )
+    scheduler = MagicMock(spec=AsyncIOScheduler)
+
+    await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
+
+    state.clear.assert_awaited_once()
+    assert "только что заняли" in _answer_text(cb.message)
+    assert "/slots" in _answer_text(cb.message)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mybookings_keyboard_hides_transfer_for_workday_only_booking(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Этап 5.8b Gap 5: mybookings_keyboard — booking with slot_id=None
+    (workday-only, post-migration 006) must NOT show [🔄 Перенести] button.
+    Transfer flow expects slot_id (legacy /book path) and would fail with
+    AttributeError on a workday-only booking. Keyboard hides the button instead.
+
+    Booking with slot_id SET (legacy /book path) keeps [🔄 Перенести] as before.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=2)).date()
+
+        # Workday-only booking (slot_id=None) — workday path post-006.
+        booking_workday = Booking(
+            slot_id=None,
+            business_id=ctx["business_id"],
+            master_id=ctx["master_id"],
+            client_id=ctx["client_id"],
+            service_id=None,
+            service_title_snapshot="Стрижка",
+            service_price_snapshot=None,
+            client_name_snapshot="Паша",
+            start_at=datetime.now(UTC) + timedelta(days=2, hours=2),
+            end_at=datetime.now(UTC) + timedelta(days=2, hours=2, minutes=60),
+            status="confirmed",
+        )
+        # Legacy slot-based booking (slot_id SET) — pre-006 path.
+        slot = Slot(
+            master_id=ctx["master_id"],
+            slot_date=target_date,
+            slot_hour=14,
+            status="booked",
+        )
+        session.add(slot)
+        session.add(booking_workday)
+        await session.flush()
+        booking_legacy = Booking(
+            slot_id=slot.id,
+            business_id=ctx["business_id"],
+            master_id=ctx["master_id"],
+            client_id=ctx["client_id"],
+            service_id=None,
+            service_title_snapshot="Стрижка",
+            service_price_snapshot=None,
+            client_name_snapshot="Паша",
+            start_at=datetime.now(UTC) + timedelta(days=3, hours=2),
+            end_at=datetime.now(UTC) + timedelta(days=3, hours=2, minutes=60),
+            status="confirmed",
+        )
+        session.add(booking_legacy)
+        await session.commit()
+
+        # Re-fetch with fresh session to detach from identity map.
+        booking_workday_id = booking_workday.id
+        booking_legacy_id = booking_legacy.id
+
+    async with session_factory() as session:
+        wd_stmt = select(Booking).where(Booking.id == booking_workday_id)
+        legacy_stmt = select(Booking).where(Booking.id == booking_legacy_id)
+        booking_wd = (await session.execute(wd_stmt)).scalar_one()
+        booking_lg = (await session.execute(legacy_stmt)).scalar_one()
+
+        # Workday-only booking: slot_id is None → transfer hidden.
+        kb_wd = mybookings_keyboard([booking_wd])
+        rows_wd = kb_wd.inline_keyboard
+        flat_texts_wd = [btn.text for row in rows_wd for btn in row]
+        assert not any("Перенести" in t for t in flat_texts_wd), (
+            "workday-only booking (slot_id=None) must hide transfer button"
+        )
+        # Cancel still offered (cancel_booking supports slot_id=None).
+        assert any("Отменить" in t for t in flat_texts_wd), (
+            "cancel button must remain for workday-only booking"
+        )
+
+        # Legacy slot-based booking: slot_id SET → transfer shown.
+        kb_lg = mybookings_keyboard([booking_lg])
+        rows_lg = kb_lg.inline_keyboard
+        flat_texts_lg = [btn.text for row in rows_lg for btn in row]
+        assert any("Перенести" in t for t in flat_texts_lg), (
+            "legacy slot-based booking must keep transfer button"
+        )

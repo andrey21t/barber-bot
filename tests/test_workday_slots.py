@@ -148,11 +148,19 @@ async def test_get_30min_slots_filters_past() -> None:
 def test_slot_picker_30min_keyboard() -> None:
     """Keyboard layout — 3 buttons per row, HH:MM labels, empty-state fallback.
 
+    Этап 5.8b: signature takes `workday_id` (UUID), callback_data is now
+    BookSlot30CallbackData(workday_id, start_minute).pack() (NOT "noop").
     Verifies:
     - Non-empty input → adjust(3), buttons with pre-formatted labels.
+    - Each button's callback_data round-trips via BookSlot30CallbackData.unpack()
+      → preserves workday_id + start_minute = HH*60+MM.
     - Empty input → single "Нет свободных слотов" button.
-    - callback_data placeholder "noop" (TODO 5.8: BookSlot30CallbackData).
     """
+    from uuid import UUID, uuid4
+
+    from bot.keyboards.client import BookSlot30CallbackData
+
+    workday_id = uuid4()
     # Non-empty: 4 slots → 4 buttons, adjust(3) → 2 rows (3 + 1).
     slots = [
         TimeSlot30(
@@ -176,7 +184,7 @@ def test_slot_picker_30min_keyboard() -> None:
             label="11:30",
         ),
     ]
-    kb = slot_picker_keyboard_30min(slots)
+    kb = slot_picker_keyboard_30min(slots, workday_id)
     assert isinstance(kb, InlineKeyboardMarkup)
     # aiogram InlineKeyboardMarkup exposes .inline_keyboard as list of rows.
     rows = kb.inline_keyboard
@@ -189,11 +197,22 @@ def test_slot_picker_30min_keyboard() -> None:
     labels_row1 = [btn.text for btn in rows[1]]
     assert labels_row0 == ["10:00", "10:30", "11:00"]
     assert labels_row1 == ["11:30"]
-    # callback_data placeholder (TODO 5.8: real BookSlot30CallbackData).
-    assert rows[0][0].callback_data == "noop"
+    # callback_data is BookSlot30CallbackData.pack() — round-trip via unpack().
+    # First slot "10:00" → start_minute = 10*60 + 0 = 600.
+    cb0_raw = rows[0][0].callback_data
+    assert cb0_raw is not None, "callback_data must be set on slot buttons"
+    cb0 = BookSlot30CallbackData.unpack(cb0_raw)
+    assert cb0.workday_id == workday_id
+    assert cb0.start_minute == 600
+    # Slot 4 "11:30" → start_minute = 11*60 + 30 = 690.
+    cb_last_raw = rows[1][0].callback_data
+    assert cb_last_raw is not None, "callback_data must be set on slot buttons"
+    cb_last = BookSlot30CallbackData.unpack(cb_last_raw)
+    assert cb_last.workday_id == workday_id
+    assert cb_last.start_minute == 690
 
     # Empty input → single "Нет свободных слотов" button.
-    kb_empty = slot_picker_keyboard_30min([])
+    kb_empty = slot_picker_keyboard_30min([], UUID(int=1))
     rows_empty = kb_empty.inline_keyboard
     assert len(rows_empty) == 1
     assert len(rows_empty[0]) == 1
