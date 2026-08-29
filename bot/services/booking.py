@@ -78,10 +78,14 @@ class WorkDayCapacityExceededError(Exception):
 
 @dataclass(frozen=True)
 class BookingCreatedData:
-    """Result of create_booking — passed to handler for Telegram I/O."""
+    """Result of create_booking — passed to handler for Telegram I/O.
+
+    Этап 5.8a: slot_id теперь Optional — None для WorkDay-only bookings
+    (30-min slot generated from WorkDay window, no Slot row in DB).
+    """
 
     booking_id: UUID
-    slot_id: UUID
+    slot_id: UUID | None
     master_id: UUID
     business_id: UUID
     client_id: UUID
@@ -372,70 +376,132 @@ async def create_booking(
 ) -> BookingCreatedData:
     """Create booking in a transaction.
 
-    Steps (spec.md 192-198):
-      1. SELECT slot WHERE id=slot_id AND status='open'
-      2. If slot.status != 'open' → raise SlotClosedError / SlotAlreadyBookedError
-      3. Build start_at (UTC) from slot.slot_hour (LOCAL in business.timezone)
-      4. If start_at <= now() → raise SlotInPastError
+    Этап 5.8a branching (миграция 006 — Booking.slot_id nullable):
+      - **Legacy slot path** (`payload.slot_id` set): existing flow from /book
+        — Slot row in DB, _select_open_slot, _build_start_at(slot, business_tz),
+        UPDATE slot.status='booked' (rowcount check for SQLite race).
+      - **WorkDay path** (`payload.workday_id` + `payload.start_time_local` set,
+        `payload.slot_id` None): new flow from /slots (5.8b — BookSlot30CallbackData).
+        Slot row НЕ создаётся — 30-min slot generated from WorkDay window on
+        /slots UI. start_at via _build_start_at_from_workday(workday,
+        start_time_local: time, business_tz). Booking.slot_id = NULL.
+
+    Pydantic validator (BookingCreate._validate_slot_xor_workday) guarantees
+    exactly one path is set — XOR contract enforced on schema side, not here.
+
+    Steps (spec.md 192-198, both paths share):
+      1. Resolve path → slot (legacy SELECT) OR workday (WorkDay get)
+      2. If legacy: slot.status != 'open' → SlotClosedError / SlotAlreadyBookedError
+         If workday: WorkDay None or inactive → BookingOutsideWorkDayError
+      3. Build start_at (UTC):
+         - Legacy: slot.slot_hour (LOCAL) → UTC via business_tz
+         - WorkDay: workday.work_date + start_time_local (LOCAL HH:MM) → UTC
+      4. If start_at <= now() → SlotInPastError
       5. Build end_at = start_at + service.duration_minutes (or default)
-      6. WorkDay invariant (Этап 5.3, PLANS.md Gap 6):
-         - SELECT WorkDay WHERE master_id=slot.master_id AND work_date=slot.slot_date
-         - If found: validate [start_at, end_at] ∈ [workday.start_time, end_time]
+      6. WorkDay invariant (PLANS.md Gap 6):
+         - Legacy path: SELECT WorkDay for (slot.master_id, slot.slot_date);
+           if found: validate [start_at, end_at] ∈ [workday.start_time, end_time]
            (compared in UTC via business_tz). Outside → BookingOutsideWorkDayError.
-         - If not found: skip (backwards compat, slot-only data via legacy /addslots).
+           If not found: skip (backwards compat, slot-only data via legacy /addslots).
+         - WorkDay path: WorkDay already resolved — validate directly. MANDATORY
+           (workday path is the new contract, no skip case).
       7. html.escape(client_name, service_title) BEFORE INSERT
-      8. INSERT booking (UNIQUE slot_id guard catches double-click)
-      9. UPDATE slot.status='booked' WHERE id=? AND status='open' — rowcount check (SQLite race)
+      8. INSERT booking — legacy path: UNIQUE(slot_id) dropped (миграция 006),
+         guard shift на rowcount-check (booking.py:482-487) + multi-client
+         capacity check (booking.py:451). WorkDay path: no UNIQUE guard.
+      9. UPDATE slot.status='booked' WHERE id=? AND status='open' — LEGACY PATH
+         ONLY (skip for workday-only bookings, slot_id is None).
      10. INSERT notifications_log(master_new) — UNIQUE guard
      11. Return BookingCreatedData with master_notification_text
     """
     settings = get_settings()
 
-    slot = await _select_open_slot(session, payload.slot_id)
-    # Capture slot_id BEFORE any rollback-prone call (B1 fix).
-    # `_select_or_create_client` (line 167) may call `session.rollback()` on
-    # concurrent client INSERT race (line 116) → SQLAlchemy expires all
-    # attached instances → subsequent `slot.id` access triggers lazy load
-    # → MissingGreenlet (sync access to async session). UUID is immutable and
-    # already loaded from SELECT → safe to capture here.
-    slot_id = slot.id
-    business_tz = await _select_business_timezone(session, business_id)
-    start_at = _build_start_at(slot, business_tz)
-
-    if start_at <= datetime.now(UTC):
-        raise SlotInPastError(f"Slot {payload.slot_id} start_at={start_at} is in the past")
-
-    service = await _select_service(session, payload.service_id)
-    end_at = _build_end_at(start_at, service, settings.SERVICE_DEFAULT_DURATION_MIN)
-
-    # WorkDay invariants (Этап 5.3, PLANS.md Gap 6): capture master_id + slot_date
-    # BEFORE _select_or_create_client (rollback-prone — B1 pattern). Lookup is
-    # OPTIONAL: if WorkDay exists for (master_id, slot_date), validate [start_at,
-    # end_at] ∈ [workday.start_time, end_time]. If WorkDay not found (legacy slot-
-    # only data created via /addslots before /openday rollout in 5.1) → skip check.
-    #
-    # Transitional artifact (5.2 → 5.4): if master opens slot via /addslots (no
-    # WorkDay), then later adds a WorkDay with a narrower window via /openday,
-    # new bookings on the old slot will raise BookingOutsideWorkDayError. Existing
-    # bookings are NOT retroactively validated (per-call invariant, not retroactive).
-    # Expected during migration — /addslots deprecated in 5.4, master sees the
-    # conflict and either widens the WorkDay window or cancels the stale slot.
-    slot_master_id = slot.master_id
-    slot_date = slot.slot_date
-    workday = await _select_workday_for_slot(session, slot_master_id, slot_date)
+    # === Path branching — capture common state ===
+    slot_id: UUID | None
+    slot_master_id: UUID
+    slot_date: date
     workday_id: UUID | None = None
     workday_capacity = 0  # sentinel — capacity check skipped when workday is None
-    if workday is not None:
-        _validate_booking_within_workday(workday, start_at, end_at, business_tz)
-        # B1 pattern (Этап 5.5): capture workday.id + max_concurrent_clients BEFORE
-        # _select_or_create_client (line 443 below) — that call may invoke
-        # session.rollback() on concurrent client INSERT race (line 254), which
-        # expires ALL attached instances (including workday). Accessing
-        # workday.max_concurrent_clients after that rollback would trigger
-        # MissingGreenlet (sync lazy load on async session). UUID/int are immutable
+    start_at: datetime
+    end_at: datetime
+    business_tz: str
+
+    if payload.slot_id is not None:
+        # === Legacy slot path (existing flow from /book, mirror) ===
+        slot = await _select_open_slot(session, payload.slot_id)
+        # Capture slot_id BEFORE any rollback-prone call (B1 fix).
+        # `_select_or_create_client` (line ~430) may call `session.rollback()` on
+        # concurrent client INSERT race → SQLAlchemy expires all attached
+        # instances → subsequent `slot.id` access triggers lazy load
+        # → MissingGreenlet (sync access to async session). UUID is immutable
         # and already loaded from SELECT → safe to capture here.
+        slot_id = slot.id
+        business_tz = await _select_business_timezone(session, business_id)
+        start_at = _build_start_at(slot, business_tz)
+
+        if start_at <= datetime.now(UTC):
+            raise SlotInPastError(f"Slot {payload.slot_id} start_at={start_at} is in the past")
+
+        service = await _select_service(session, payload.service_id)
+        end_at = _build_end_at(start_at, service, settings.SERVICE_DEFAULT_DURATION_MIN)
+
+        # WorkDay invariants (Этап 5.3, PLANS.md Gap 6): capture master_id + slot_date
+        # BEFORE _select_or_create_client (rollback-prone — B1 pattern). Lookup is
+        # OPTIONAL: if WorkDay exists for (master_id, slot_date), validate [start_at,
+        # end_at] ∈ [workday.start_time, end_time]. If WorkDay not found (legacy slot-
+        # only data created via /addslots before /openday rollout in 5.1) → skip check.
+        slot_master_id = slot.master_id
+        slot_date = slot.slot_date
+        workday = await _select_workday_for_slot(session, slot_master_id, slot_date)
+        if workday is not None:
+            _validate_booking_within_workday(workday, start_at, end_at, business_tz)
+            # B1 pattern (Этап 5.5): capture workday.id + max_concurrent_clients BEFORE
+            # _select_or_create_client (line ~430) — that call may invoke
+            # session.rollback() on concurrent client INSERT race, which expires ALL
+            # attached instances (including workday). Accessing workday attributes
+            # after rollback would trigger MissingGreenlet. UUID/int are immutable
+            # and already loaded from SELECT → safe to capture here.
+            workday_id = workday.id
+            workday_capacity = workday.max_concurrent_clients
+    else:
+        # === WorkDay path (Этап 5.8a — new flow from /slots 5.8b) ===
+        # Pydantic validator guarantees workday_id AND start_time_local both set
+        # when slot_id is None (XOR contract). Defensive guard for mypy narrowing.
+        workday_id_payload = payload.workday_id
+        start_time_local = payload.start_time_local
+        if workday_id_payload is None or start_time_local is None:
+            raise RuntimeError(
+                "BookingCreate validator bypassed — workday path requires "
+                "both workday_id and start_time_local"
+            )
+
+        workday = await session.get(WorkDay, workday_id_payload)
+        if workday is None:
+            raise BookingOutsideWorkDayError(f"WorkDay {workday_id_payload} not found")
+        if not workday.is_active:
+            raise BookingOutsideWorkDayError(
+                f"WorkDay {workday_id_payload} is closed (is_active=False) — "
+                f"day was closed by master via /closeday"
+            )
+        business_tz = await _select_business_timezone(session, business_id)
+        start_at = _build_start_at_from_workday(workday, start_time_local, business_tz)
+
+        if start_at <= datetime.now(UTC):
+            raise SlotInPastError(
+                f"WorkDay {workday_id_payload} slot start_at={start_at} is in the past"
+            )
+
+        service = await _select_service(session, payload.service_id)
+        end_at = _build_end_at(start_at, service, settings.SERVICE_DEFAULT_DURATION_MIN)
+
+        # WorkDay invariants — MANDATORY on workday path (WorkDay already resolved).
+        # Compare [start_at, end_at] ∈ [workday.start_time, end_time] in UTC.
+        _validate_booking_within_workday(workday, start_at, end_at, business_tz)
+        slot_master_id = workday.master_id
+        slot_date = workday.work_date
         workday_id = workday.id
         workday_capacity = workday.max_concurrent_clients
+        slot_id = None
 
     # HTML escape BEFORE INSERT — stored escaped, rendered without double-escape
     escaped_name = html.escape(payload.client_name, quote=False)
@@ -445,7 +511,7 @@ async def create_booking(
 
     # Multi-client capacity check (Этап 5.5, B1 fix): acquire advisory lock + count
     # overlapping active bookings AFTER _select_or_create_client (rollback-prone
-    # above) but BEFORE Booking INSERT (line 447). workday_id/capacity captured
+    # above) but BEFORE Booking INSERT (line below). workday_id/capacity captured
     # before the rollback-prone call (B1 pattern). Skipped when WorkDay is None
     # (backwards compat — legacy slot-only data has no capacity constraint).
     if workday_id is not None:
@@ -476,20 +542,41 @@ async def create_booking(
         await session.flush()
     except IntegrityError as exc:
         await session.rollback()
-        raise SlotAlreadyBookedError(f"Slot {slot_id} already booked (UNIQUE constraint)") from exc
+        if slot_id is not None:
+            # Legacy path: UNIQUE(slot_id) was the guard (pre-миграция 006);
+            # post-006 it's dropped, but IntegrityError here can still happen
+            # for other constraints. Preserve legacy error message for tests.
+            raise SlotAlreadyBookedError(
+                f"Slot {slot_id} already booked (UNIQUE constraint)"
+            ) from exc
+        # WorkDay path: UNIQUE guard dropped (миграция 006) — IntegrityError here
+        # is unexpected (CheckConstraint end_at > start_at enforced by service,
+        # FK violations shouldn't happen since workday_id is resolved above).
+        # Map to SlotAlreadyBookedError for user-facing consistency ("слот занят").
+        raise SlotAlreadyBookedError(
+            f"WorkDay {workday_id} booking flush failed (IntegrityError)"
+        ) from exc
 
     # SQLite race protection: UPDATE ... WHERE status='open' + rowcount check
-    upd = update(Slot).where(Slot.id == slot_id, Slot.status == "open").values(status="booked")
-    res = await session.execute(upd)
-    if cast("CursorResult[Any]", res).rowcount == 0:
-        # Lost race: slot was closed/booked between SELECT and UPDATE
-        await session.rollback()
-        raise SlotAlreadyBookedError(f"Slot {slot_id} was taken/closed between SELECT and UPDATE")
+    # Этап 5.8a: LEGACY PATH ONLY — workday-only bookings (slot_id is None)
+    # have no Slot row to UPDATE (slot generated on-the-fly from WorkDay window).
+    # Race protection for workday path: multi-client capacity check above
+    # (acquire_advisory_lock + count overlapping active bookings) handles
+    # concurrent workday bookings — no Slot.status transition needed.
+    if slot_id is not None:
+        upd = update(Slot).where(Slot.id == slot_id, Slot.status == "open").values(status="booked")
+        res = await session.execute(upd)
+        if cast("CursorResult[Any]", res).rowcount == 0:
+            # Lost race: slot was closed/booked between SELECT and UPDATE
+            await session.rollback()
+            raise SlotAlreadyBookedError(
+                f"Slot {slot_id} was taken/closed between SELECT and UPDATE"
+            )
 
     # notifications_log idempotency — UNIQUE(booking_id, kind)
     # SAVEPOINT isolates log_entry INSERT from main transaction (booking + slot):
-    # if IntegrityError (already logged — idempotent path), only savepoint rolls back,
-    # main transaction (booking + slot) survives and commits below.
+    # if IntegrityError (already logged — idempotent path), only savepoint rolls
+    # back, main transaction (booking + slot) survives and commits below.
     # NOTE: session.add(log_entry) MUST go INSIDE begin_nested() — otherwise
     # log_entry remains in session.new after savepoint rollback and outer commit
     # attempts re-INSERT → IntegrityError unhandled → whole outer tx rolls back.
@@ -550,10 +637,14 @@ class CancelResult:
 
     Mirrors BookingCreatedData: snapshots are already html.escape()'d in DB
     (no re-escape needed when rendering master notification in HTML parse mode).
+
+    Этап 5.8a: slot_id теперь Optional — None для WorkDay-only bookings
+    (cancel path skips Slot UPDATE when slot_id is None — booking.py:646).
+    Critic iter 2 finding A.
     """
 
     booking_id: UUID
-    slot_id: UUID
+    slot_id: UUID | None
     master_id: UUID
     business_id: UUID
     client_name_snapshot: str
@@ -643,8 +734,14 @@ async def cancel_booking(
     # Step 6: UPDATE slot SET status='open' — slot was 'booked' (close_slot refuses
     # to close a booked slot, so during the lifetime of a booking slot.status is
     # always 'booked'). Releasing to 'open' makes the slot available for new bookings.
-    upd_s = update(Slot).where(Slot.id == booking.slot_id).values(status="open")
-    await session.execute(upd_s)
+    #
+    # Этап 5.8a: skip UPDATE Slot для workday-only bookings (slot_id is None) —
+    # booking не имеет Slot row (30-min slot generated from WorkDay window на
+    # /slots UI), releasing slot is no-op. WorkDay не имеет "open/closed"
+    # status per slot — capacity check на /slots UI re-computes на каждый SELECT.
+    if booking.slot_id is not None:
+        upd_s = update(Slot).where(Slot.id == booking.slot_id).values(status="open")
+        await session.execute(upd_s)
 
     # Step 7: NotificationLog master_cancel — SAVEPOINT idempotency (booking.py:198-212
     # pattern). If IntegrityError (already logged — duplicate retry), only the
@@ -723,10 +820,14 @@ class TransferResult:
     Mirrors CancelResult: snapshots already escaped in DB (no re-escape needed).
     Carries both old and new start_at so the handler can render "X → Y" in
     master and client messages (spec.md 318: "Перенос: ... → ...").
+
+    Этап 5.8a: old_slot_id Optional — workday-only bookings (slot_id=None)
+    поднимают NotImplementedError на transfer (booking.py:817 guard, до build
+    TransferResult). Тип defensive — happy path всегда non-None.
     """
 
     booking_id: UUID
-    old_slot_id: UUID
+    old_slot_id: UUID | None
     new_slot_id: UUID
     master_id: UUID
     business_id: UUID
@@ -807,6 +908,19 @@ async def transfer_booking(
         raise BookingNotFoundError(f"Booking {booking_id} not found for client {client_id}")
     if booking.status == "cancelled":
         raise BookingAlreadyCancelledError(f"Booking {booking_id} is cancelled, cannot transfer")
+
+    # Этап 5.8a guard: workday-only bookings (slot_id is None) не могут
+    # переноситься через transfer_booking — это slot-based API (требует
+    # new_slot_id, _select_open_slot, UPDATE Slot.status). WorkDay transfer
+    # = 5.9 scope (admin_move_booking — отдельный сервис без 24h rule и без
+    # client_id pin). User-facing behavior: handler ловит NotImplementedError
+    # (5.8b — добавим в transfer_slot_cb except list) ИЛИ mybookings_keyboard
+    # hide-transfer-button для workday-only bookings (5.8b — Gap 5).
+    if booking.slot_id is None:
+        raise NotImplementedError(
+            f"WorkDay transfer is 5.9 scope — admin_move_booking. "
+            f"Booking {booking_id} has slot_id=None (WorkDay-only)"
+        )
 
     # Step 4: 24h rule (same as cancel_booking). Cross-DB aware-aware comparison:
     # old_start_at is naive on SQLite / aware UTC on Postgres. Inject tzinfo=UTC
