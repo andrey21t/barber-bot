@@ -24,6 +24,7 @@ Invariants (spec.md + MY-VIBE-RULES.md):
 
 import logging
 from datetime import UTC, datetime, timedelta
+from datetime import time as dt_time
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -41,20 +42,24 @@ from bot.config import Settings, get_settings
 from bot.db import async_session_factory
 from bot.keyboards.client import (
     BookConfirmCallbackData,
+    BookSlot30CallbackData,
     BookSlotCallbackData,
     MyBookingsCancelCallbackData,
     MyBookingsTransferCallbackData,
+    _format_booking_summary_from_start_at,
     calendar_keyboard,
     confirm_keyboard,
     mybookings_keyboard,
     slot_picker_keyboard,
+    slot_picker_keyboard_30min,
 )
-from bot.models import Booking, Slot
+from bot.models import Booking, Slot, WorkDay
 from bot.schemas import BookingCreate
 from bot.services.booking import (
     BookingAlreadyCancelledError,
     BookingAlreadyTransferredError,
     BookingNotFoundError,
+    BookingOutsideWorkDayError,
     CancelResult,
     CancelTooLateError,
     SlotAlreadyBookedError,
@@ -62,11 +67,14 @@ from bot.services.booking import (
     SlotInPastError,
     SlotNotAvailableError,
     TransferResult,
+    WorkDayCapacityExceededError,
+    _build_start_at_from_workday,
+    _select_workday_for_slot,
     cancel_booking,
     create_booking,
     transfer_booking,
 )
-from bot.services.slots import get_available_slots
+from bot.services.slots import get_available_slots, get_available_slots_30
 from bot.states import BookingStates, TransferStates
 
 logger = logging.getLogger(__name__)
@@ -99,9 +107,45 @@ def _calendar_range(settings: Settings) -> tuple[datetime, datetime]:
 # ============================================================
 @router.message(Command("book"), StateFilter(None))
 async def cmd_book(message: Message, state: FSMContext) -> None:
-    """Show SimpleCalendar (month navigation) for date selection."""
+    """Show SimpleCalendar (month navigation) for date selection.
+
+    Этап 5.8b: explicitly set is_slots_path=False in FSM data to prevent
+    state pollution — if user was in /slots flow (is_slots_path=True) and
+    started /book without completing it, the flag would otherwise linger
+    (state.set_state does NOT clear data). Default dict.get returns None
+    for missing key, but explicit False is defensive against future FSM
+    changes. /book → legacy slot path (BookSlotCallbackData + slot_picker_keyboard).
+    """
     settings = get_settings()
     await state.set_state(BookingStates.selecting_date)
+    await state.update_data(is_slots_path=False)
+    await message.answer(
+        "📅 Выберите дату записи:",
+        reply_markup=await calendar_keyboard(*_calendar_range(settings)),
+    )
+
+
+# ============================================================
+# 1b. cmd_slots — entry point (/slots, Этап 5.8b — WorkDay path)
+# ============================================================
+@router.message(Command("slots"), StateFilter(None))
+async def cmd_slots(message: Message, state: FSMContext) -> None:
+    """Entry point for /slots — same SimpleCalendar date picker as /book,
+    but sets `is_slots_path=True` flag in FSM data. _handle_simple_calendar
+    branches on this flag: True → fetch WorkDay for date + 30-min slots →
+    slot_picker_keyboard_30min (BookSlot30CallbackData). False → existing
+    /book path (slot_picker_keyboard + BookSlotCallbackData).
+
+    The flag is needed because BookingStates.selecting_date is shared between
+    /book and /slots — single-master MVP doesn't warrant a separate
+    SlotsBookingStates group (state pollution handled by explicit flag reset
+    in cmd_book + state.clear() in cancel paths). See Pass 3 state-pollution
+    tradeoff in deep-analysis-protocol Session 5.23 (critic iter 2 — pragmatic
+    for 2 flows; if a 3rd client flow is added, refactor to SlotsBookingStates).
+    """
+    settings = get_settings()
+    await state.set_state(BookingStates.selecting_date)
+    await state.update_data(is_slots_path=True)
     await message.answer(
         "📅 Выберите дату записи:",
         reply_markup=await calendar_keyboard(*_calendar_range(settings)),
@@ -159,6 +203,14 @@ async def _handle_simple_calendar(
         if not selected:
             return  # F7 fix: out-of-range, lib answered alert, do nothing
         slot_date = selected_date.date()
+
+        # Этап 5.8b: read is_slots_path flag from FSM data BEFORE session.
+        # Defaults None for /transfer (TransferStates — flag never set) → falsy →
+        # legacy slot branch. Defaults None for /book pre-5.8b sessions (cmd_book
+        # now explicitly sets False, but defensive for in-flight pre-upgrade flows).
+        fsm_data = await state.get_data()
+        is_slots_path: bool | None = fsm_data.get("is_slots_path")
+
         async with async_session_factory() as session:
             from sqlalchemy import select
 
@@ -174,24 +226,72 @@ async def _handle_simple_calendar(
                     )
                 await callback.answer()
                 return
+
+            if is_slots_path:
+                # === /slots workday branch (Этап 5.8b) ===
+                # Fetch WorkDay for (master_id, slot_date). If None → master doesn't
+                # work that day (no /openday). If is_active=False → closed via
+                # /closeday. Both → user-facing hint, no slot picker shown.
+                workday = await _select_workday_for_slot(session, master.id, slot_date)
+                if workday is None:
+                    if callback.message is not None:
+                        await callback.message.answer(
+                            "Мастер не работает в этот день. /book для записи по часам.",
+                            reply_markup=await calendar_keyboard(*_calendar_range(settings)),
+                        )
+                    await callback.answer()
+                    return
+                if not workday.is_active:
+                    if callback.message is not None:
+                        await callback.message.answer(
+                            "День закрыт мастером. Выберите другую дату:",
+                            reply_markup=await calendar_keyboard(*_calendar_range(settings)),
+                        )
+                    await callback.answer()
+                    return
+                # WorkDay active — fetch 30-min slots with capacity check.
+                # get_available_slots_30 filters past slots via now_utc injection
+                # (default datetime.now(UTC) inside — caller doesn't need to pass).
+                slots_30 = await get_available_slots_30(
+                    session, workday, settings.TIMEZONE
+                )
+                if not slots_30:
+                    if callback.message is not None:
+                        await callback.message.answer(
+                            "На эту дату нет свободного времени. Выберите другую дату:",
+                            reply_markup=await calendar_keyboard(*_calendar_range(settings)),
+                        )
+                    await callback.answer()
+                    return
+                await state.update_data(selected_date=slot_date.isoformat())
+                await state.set_state(selecting_slot_state)
+                if callback.message is not None:
+                    await callback.message.answer(
+                        "Выберите новое время:" if is_transfer else "Выберите время:",
+                        reply_markup=slot_picker_keyboard_30min(slots_30, workday.id),
+                    )
+                await callback.answer()
+                return
+
+            # === /book legacy slot branch (existing) ===
             slots = await get_available_slots(session, master.id, slot_date)
-        if not slots:
+            if not slots:
+                if callback.message is not None:
+                    await callback.message.answer(
+                        "На эту дату нет свободных слотов. Выберите другую дату:",
+                        reply_markup=await calendar_keyboard(*_calendar_range(settings)),
+                    )
+                await callback.answer()
+                return
+            await state.update_data(selected_date=slot_date.isoformat())
+            await state.set_state(selecting_slot_state)
             if callback.message is not None:
                 await callback.message.answer(
-                    "На эту дату нет свободных слотов. Выберите другую дату:",
-                    reply_markup=await calendar_keyboard(*_calendar_range(settings)),
+                    "Выберите новое время:" if is_transfer else "Выберите время:",
+                    reply_markup=slot_picker_keyboard(slots),
                 )
             await callback.answer()
             return
-        await state.update_data(selected_date=slot_date.isoformat())
-        await state.set_state(selecting_slot_state)
-        if callback.message is not None:
-            await callback.message.answer(
-                "Выберите новое время:" if is_transfer else "Выберите время:",
-                reply_markup=slot_picker_keyboard(slots),
-            )
-        await callback.answer()
-        return
 
     if callback_data.act == SimpleCalAct.cancel:
         # state.clear() BEFORE callback.answer (race condition, MY-VIBE-RULES.md:23)
@@ -244,6 +344,46 @@ async def slot_cb(
 
 
 # ============================================================
+# 3b. slot_30_cb — user picked a 30-min WorkDay slot → ask for name (Этап 5.8b)
+# ============================================================
+@router.callback_query(BookSlot30CallbackData.filter(), StateFilter(BookingStates.selecting_slot))
+async def slot_30_cb(
+    callback: CallbackQuery,
+    callback_data: BookSlot30CallbackData,
+    state: FSMContext,
+) -> None:
+    """User selected a 30-min WorkDay slot (via /slots) — save workday_id and
+    start_minute, ask for client name.
+
+    Defensive range check: aiogram CallbackData validates types at pack/unpack,
+    but a malicious/tampered callback could carry out-of-range start_minute.
+    Range 0-1439 (00:00 - 23:59). Reject → state.clear() + hint, no crash.
+
+    Registration BEFORE no_state_callback_fallback (router order — registered
+    top-down, callback dispatch first-match). Same StateFilter(selecting_slot)
+    as slot_cb but distinct CallbackData prefix (book_slot_30 vs book_slot) —
+    aiogram dispatch is exact-prefix match (callback_data.py:117-125).
+    """
+    start_minute = callback_data.start_minute
+    if not (0 <= start_minute <= 1439):
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer(
+                "❌ Ошибка выбора времени. Начните заново через /slots"
+            )
+        await callback.answer()
+        return
+    await state.update_data(
+        workday_id=str(callback_data.workday_id),
+        start_minute=start_minute,
+    )
+    await state.set_state(BookingStates.entering_name)
+    if callback.message is not None:
+        await callback.message.answer("На чьё имя записываем? (например: Паша, я сам, сын 5 лет)")
+    await callback.answer()
+
+
+# ============================================================
 # 4. name_msg — user typed name → ask for service
 # ============================================================
 @router.message(StateFilter(BookingStates.entering_name))
@@ -279,37 +419,80 @@ async def service_msg(message: Message, state: FSMContext) -> None:
     await state.update_data(service_title=service)
     await state.set_state(BookingStates.confirming)
 
-    # Render summary
+    # Render summary — branch on /slots (workday_id) vs /book (slot_id).
+    # Этап 5.8b: two paths share confirming state; slot_30_cb writes workday_id
+    # + start_minute, slot_cb writes slot_id. XOR by construction — only one
+    # of the two flows reaches confirming state.
     data = await state.get_data()
-    slot_id_str = data.get("slot_id")
-    if not slot_id_str:
-        await message.answer("❌ Ошибка: слот не выбран. Начните заново через /book")
-        await state.clear()
-        return
-
     settings = get_settings()
     async with async_session_factory() as session:
         from sqlalchemy import select
 
-        # Slot.id is Uuid column — convert str to UUID to avoid AttributeError
-        # on SQLite (Uuid.bind_processor calls value.hex, str.hex doesn't exist)
-        # and TypeError on Postgres.
-        stmt = select(Slot).where(Slot.id == UUID(slot_id_str))
-        result = await session.execute(stmt)
-        slot = result.scalar_one_or_none()
-        if slot is None:
-            await message.answer("❌ Слот не найден. Начните заново через /book")
-            await state.clear()
-            return
+        workday_id_str = data.get("workday_id")
+        slot_id_str = data.get("slot_id")
 
-        from bot.keyboards.client import _format_booking_summary
+        if workday_id_str is not None:
+            # === /slots workday path (Этап 5.8b) ===
+            start_minute = data.get("start_minute")
+            if start_minute is None:
+                await state.clear()
+                await message.answer(
+                    "❌ Ошибка: время не выбрано. Начните заново через /slots"
+                )
+                return
+            stmt = select(WorkDay).where(WorkDay.id == UUID(workday_id_str))
+            workday = (await session.execute(stmt)).scalar_one_or_none()
+            if workday is None:
+                await state.clear()
+                await message.answer(
+                    "❌ Рабочий день не найден. Начните заново через /slots"
+                )
+                return
+            # Range 0-1439 guaranteed by slot_30_cb, but defensive against
+            # corrupted FSM storage (e.g. persisted across upgrade).
+            if not isinstance(start_minute, int) or not (0 <= start_minute <= 1439):
+                await state.clear()
+                await message.answer(
+                    "❌ Ошибка времени. Начните заново через /slots"
+                )
+                return
+            start_time_local = dt_time(start_minute // 60, start_minute % 60)
+            start_at = _build_start_at_from_workday(
+                workday, start_time_local, settings.TIMEZONE
+            )
+            summary = _format_booking_summary_from_start_at(
+                start_at=start_at,
+                client_name=data["client_name"],
+                service_title=service,
+                business_timezone=settings.TIMEZONE,
+            )
+        else:
+            # === /book legacy slot path ===
+            if not slot_id_str:
+                await state.clear()
+                await message.answer(
+                    "❌ Ошибка: слот не выбран. Начните заново через /book"
+                )
+                return
 
-        summary = _format_booking_summary(
-            slot=slot,
-            client_name=data["client_name"],
-            service_title=service,
-            business_timezone=settings.TIMEZONE,
-        )
+            # Slot.id is Uuid column — convert str to UUID to avoid AttributeError
+            # on SQLite (Uuid.bind_processor calls value.hex, str.hex doesn't exist)
+            # and TypeError on Postgres.
+            slot_stmt = select(Slot).where(Slot.id == UUID(slot_id_str))
+            slot = (await session.execute(slot_stmt)).scalar_one_or_none()
+            if slot is None:
+                await state.clear()
+                await message.answer("❌ Слот не найден. Начните заново через /book")
+                return
+
+            from bot.keyboards.client import _format_booking_summary
+
+            summary = _format_booking_summary(
+                slot=slot,
+                client_name=data["client_name"],
+                service_title=service,
+                business_timezone=settings.TIMEZONE,
+            )
 
     await message.answer(
         f"Подтвердите запись:\n\n{summary}",
@@ -333,10 +516,17 @@ async def confirm_cb(
     """
     data = await state.get_data()
     slot_id_str = data.get("slot_id")
+    workday_id_str = data.get("workday_id")
+    start_minute = data.get("start_minute")
     client_name = data.get("client_name")
     service_title = data.get("service_title")
 
-    if not all([slot_id_str, client_name, service_title]):
+    # XOR contract with service_msg: slot_id (legacy /book) XOR
+    # (workday_id + start_minute) (workday /slots). Both branches require
+    # client_name + service_title to be set by name_msg + service_msg.
+    has_slot_path = slot_id_str is not None
+    has_workday_path = workday_id_str is not None and start_minute is not None
+    if not client_name or not service_title or not (has_slot_path ^ has_workday_path):
         # state.clear() BEFORE answer (race condition, MY-VIBE-RULES.md 24)
         await state.clear()
         if callback.message is not None:
@@ -371,19 +561,41 @@ async def confirm_cb(
 
         from uuid import UUID
 
-        # Type narrowing: slot_id_str, client_name, service_title are guaranteed by earlier check
-        assert slot_id_str is not None
+        # Type narrowing: guaranteed by earlier XOR + presence check
         assert client_name is not None
         assert service_title is not None
 
         # Note: client_id intentionally NOT in BookingCreate — service resolves
         # client by telegram_id via _select_or_create_client(telegram_id).
-        payload = BookingCreate(
-            slot_id=UUID(slot_id_str),
-            client_name=client_name,
-            service_title=service_title,
-            service_id=None,
-        )
+        if has_workday_path:
+            # === /slots workday path (Этап 5.8b) ===
+            # start_minute range 0-1439 guaranteed by slot_30_cb, but defensively
+            # re-check here too — same rationale as service_msg: corrupted FSM
+            # storage across upgrade would otherwise yield a wrong BookingCreate.
+            if not isinstance(start_minute, int) or not (0 <= start_minute <= 1439):
+                await state.clear()
+                if callback.message is not None:
+                    await callback.message.answer(
+                        "❌ Ошибка времени. Начните заново через /slots"
+                    )
+                await callback.answer()
+                return
+            payload = BookingCreate(
+                workday_id=UUID(workday_id_str),
+                start_time_local=dt_time(start_minute // 60, start_minute % 60),
+                client_name=client_name,
+                service_title=service_title,
+                service_id=None,
+            )
+        else:
+            # === /book legacy slot path ===
+            assert slot_id_str is not None  # type narrowing for mypy
+            payload = BookingCreate(
+                slot_id=UUID(slot_id_str),
+                client_name=client_name,
+                service_title=service_title,
+                service_id=None,
+            )
 
         try:
             result = await create_booking(
@@ -397,24 +609,58 @@ async def confirm_cb(
             # state.clear() BEFORE answer (race condition)
             await state.clear()
             if callback.message is not None:
+                # Этап 5.8b W3: SlotAlreadyBookedError is now reachable on
+                # workday-path too (booking.py IntegrityError remap). Direct
+                # /slots users to /slots, /book users to /book.
+                retry_cmd = "/slots" if has_workday_path else "/book"
                 await callback.message.answer(
-                    "😔 Слот только что заняли. Начните заново через /book"
+                    f"😔 Слот только что заняли. Начните заново через {retry_cmd}"
                 )
             await callback.answer()
             return
         except SlotInPastError:
             await state.clear()
             if callback.message is not None:
+                # Этап 5.8b W3: SlotInPastError reachable on workday-path
+                # (booking.py:489-492 raise if start_at <= now). User waited
+                # >30 min before ✅ on a workday slot — direct to /slots.
+                retry_cmd = "/slots" if has_workday_path else "/book"
                 await callback.message.answer(
-                    "❌ Это время уже прошло. Выберите другое через /book"
+                    f"❌ Это время уже прошло. Выберите другое через {retry_cmd}"
                 )
             await callback.answer()
             return
         except SlotClosedError:
             await state.clear()
             if callback.message is not None:
+                # SlotClosedError is slot-only (workday-path uses is_active
+                # → BookingOutsideWorkDayError). Message stays /book.
                 await callback.message.answer(
                     "❌ Слот закрыт мастером. Выберите другой через /book"
+                )
+            await callback.answer()
+            return
+        except BookingOutsideWorkDayError:
+            # Этап 5.8b: workday-path race — between service_msg (summary shown)
+            # and confirm_cb (✅ tapped) the master either closed the day via
+            # /closeday (is_active=False) or the WorkDay record was deleted.
+            # Critic iter 2 P0: confirm_cb previously did NOT catch this —
+            # the race leaked through as a 500 to the user.
+            await state.clear()
+            if callback.message is not None:
+                await callback.message.answer(
+                    "❌ День закрыт мастером. Выберите другую дату через /slots"
+                )
+            await callback.answer()
+            return
+        except WorkDayCapacityExceededError:
+            # Этап 5.8b: another booking grabbed the same 30-min window
+            # between service_msg and confirm_cb. Service-side capacity check
+            # (overlapping active bookings >= capacity) raised.
+            await state.clear()
+            if callback.message is not None:
+                await callback.message.answer(
+                    "😔 Это время только что заняли. Начните заново через /slots"
                 )
             await callback.answer()
             return

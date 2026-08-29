@@ -77,6 +77,28 @@ class MyBookingsTransferCallbackData(CallbackData, prefix="mybook_transfer"):
     booking_id: UUID
 
 
+class BookSlot30CallbackData(CallbackData, prefix="book_slot_30"):
+    """30-min WorkDay slot callback (Этап 5.8b — /slots UI workday path).
+
+    Payload:
+    - workday_id: UUID — WorkDay row in DB (resolved by simple_calendar_cb slots branch).
+    - start_minute: int — minutes since midnight (0-1439), encodes start_time_local.
+      Stored as int (NOT "HH:MM" str) — aiogram CallbackData.pack() raises ValueError
+      if separator ':' appears inside a value (verified aiogram 3.x source:
+      filters/callback_data.py:93-98, `__separator__ = ":"` default). int has no
+      `:` → pack() safe. Range check in slot_30_cb handler (defensive, 0 <= x <= 1439).
+
+    Conversion in slot_30_cb: `dt_time(start_minute // 60, start_minute % 60)`.
+    Wire format size: "book_slot_30:<uuid>:<int>" ≈ 12+1+32+1+4 = 50 bytes < 64 limit.
+
+    Distinct prefix from BookSlotCallbackData ("book_slot") — aiogram dispatch is
+    exact-prefix match (callback_data.py:117-125), no substring conflict.
+    """
+
+    workday_id: UUID
+    start_minute: int
+
+
 async def calendar_keyboard(min_date: datetime, max_date: datetime) -> InlineKeyboardMarkup:
     """Build SimpleCalendar markup with date range.
 
@@ -123,8 +145,11 @@ def slot_picker_keyboard(slots: list[Slot]) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def slot_picker_keyboard_30min(slots: list[TimeSlot30]) -> InlineKeyboardMarkup:
-    """Build inline keyboard from 30-мин WorkDay slots (Этап 5.4).
+def slot_picker_keyboard_30min(
+    slots: list[TimeSlot30],
+    workday_id: UUID,
+) -> InlineKeyboardMarkup:
+    """Build inline keyboard from 30-мин WorkDay slots (Этап 5.4 → 5.8b wired).
 
     Each TimeSlot30 carries a pre-formatted `label` ("HH:MM" in business tz),
     so this helper does not need to know the timezone — generation logic lives
@@ -134,12 +159,13 @@ def slot_picker_keyboard_30min(slots: list[TimeSlot30]) -> InlineKeyboardMarkup:
     Empty list → single "Нет свободных слотов" button (matches legacy
     slot_picker_keyboard UX). Adjust(3) — 3 buttons per row.
 
-    NB: callback_data for 30-мин slots is NOT YET implemented — /slots command
-    (5.8) will introduce a BookSlot30CallbackData carrying workday_id +
-    start_time_local (or encode them). This helper is released in 5.4 as
-    infrastructure for 5.8; until 5.8 wires up the handler, the callback_data
-    field uses a placeholder "noop" string (so the keyboard renders but taps
-    are no-ops — 5.8 will replace with real BookSlot30CallbackData).
+    Этап 5.8b (was: "noop" placeholder in 5.4 — 5.8b wires up real callback):
+    callback_data carries BookSlot30CallbackData(workday_id, start_minute).
+    `start_minute` = `slot.start_time_local.hour * 60 + slot.start_time_local.minute`
+    (int 0-1439, no `:` — aiogram pack() safe per aiogram 3.x source).
+
+    Caller MUST pass `workday_id` (resolved in simple_calendar_cb slots branch
+    via `_select_workday_for_slot` or equivalent — single source of truth).
     """
     builder = InlineKeyboardBuilder()
     if not slots:
@@ -147,9 +173,12 @@ def slot_picker_keyboard_30min(slots: list[TimeSlot30]) -> InlineKeyboardMarkup:
         return builder.as_markup()
 
     for slot in slots:
-        # TODO 5.8: replace "noop" with BookSlot30CallbackData(workday_id=...,
-        # start_time_local=slot.start_time_local.isoformat()).pack()
-        builder.button(text=slot.label, callback_data="noop")
+        start_minute = slot.start_time_local.hour * 60 + slot.start_time_local.minute
+        cb = BookSlot30CallbackData(
+            workday_id=workday_id,
+            start_minute=start_minute,
+        )
+        builder.button(text=slot.label, callback_data=cb.pack())
     builder.adjust(3)
     return builder.as_markup()
 
@@ -182,6 +211,13 @@ def mybookings_keyboard(
     (handler computes deadline, only passes cancelable bookings here). Both cancel
     and transfer share the same 24h window (spec.md 41 — "отмена (>24ч) или перенос
     (>24ч)"), so one cancelable list drives both buttons.
+
+    Этап 5.8b — Gap 5 fix (PLANS.md:263, :245): workday-only bookings
+    (b.slot_id is None, created via /slots workday path) НЕ показывают [🔄 Перенести]
+    кнопку — `transfer_booking` raises NotImplementedError (booking.py:920, 5.9 scope
+    admin_move_booking). Hide-transfer prevents silent failure: user видит только
+    [Отменить], не получает unhandled NotImplementedError при тапе.
+    adjust(2) → uneven rows для workday-only (1 кнопка в ряду) — aiogram handles.
     """
     tz = ZoneInfo(business_timezone)
     builder = InlineKeyboardBuilder()
@@ -195,10 +231,13 @@ def mybookings_keyboard(
             text=f"❌ Отменить {when}",
             callback_data=MyBookingsCancelCallbackData(booking_id=b.id).pack(),
         )
-        builder.button(
-            text=f"🔄 Перенести {when}",
-            callback_data=MyBookingsTransferCallbackData(booking_id=b.id).pack(),
-        )
+        # Gap 5 fix: skip [🔄 Перенести] для workday-only bookings (slot_id is None).
+        # transfer_booking raises NotImplementedError (booking.py:920, 5.9 scope).
+        if b.slot_id is not None:
+            builder.button(
+                text=f"🔄 Перенести {when}",
+                callback_data=MyBookingsTransferCallbackData(booking_id=b.id).pack(),
+            )
     builder.adjust(2)  # 2 buttons per row: [Отменить] [Перенести] for each booking
     return builder.as_markup()
 
