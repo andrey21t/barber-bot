@@ -32,6 +32,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback
 from aiogram_calendar.schemas import SimpleCalAct
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy.exc import SQLAlchemyError
 
 from bot.config import get_settings
@@ -40,30 +41,51 @@ from bot.keyboards.admin import (
     AdminAddslotsCallbackData,
     AdminCloseslotCallbackData,
     AdminMenuCallbackData,
+    AdminMoveCallbackData,
+    AdminMoveConfirmCallbackData,
+    AdminMoveSlot30CallbackData,
     AdminOpendayCallbackData,
     AdminServicesCallbackData,
     AdminTodayCallbackData,
     AdminWeekCallbackData,
     admin_calendar_keyboard,
     admin_inline_menu,
+    admin_move_confirm_keyboard,
+    admin_today_keyboard,
 )
-from bot.models import Booking
+from bot.models import Booking, WorkDay
 from bot.services.admin import (
     create_service,
     get_today_bookings,
     get_week_bookings,
 )
+from bot.services.admin_move import (
+    AdminMoveResult,
+    WorkDayInactiveError,
+    WorkDayNotFoundError,
+    admin_move_booking,
+)
+from bot.services.booking import (
+    BookingAlreadyCancelledError,
+    BookingAlreadyTransferredError,
+    BookingNotFoundError,
+    BookingOutsideWorkDayError,
+    SlotAlreadyBookedError,
+    SlotInPastError,
+    WorkDayCapacityExceededError,
+)
 from bot.services.slots import (
     SlotAlreadyExistsError,
     add_slots,
     close_slot,
+    get_available_slots_30,
 )
 from bot.services.workday import (
     WorkDayShrinkError,
     open_workday,
     select_workday,
 )
-from bot.states import AdminStates
+from bot.states import AdminMoveStates, AdminStates
 
 logger = logging.getLogger(__name__)
 
@@ -446,7 +468,10 @@ async def cmd_today(message: Message) -> None:
         await message.answer("На сегодня записей нет.")
         return
 
-    await message.answer(_render_bookings("📅 Записи на сегодня:", bookings, tz))
+    await message.answer(
+        _render_bookings("📅 Записи на сегодня:", bookings, tz),
+        reply_markup=admin_today_keyboard(bookings, tz),
+    )
 
 
 # ============================================================
@@ -1308,7 +1333,10 @@ async def admin_today_cb(callback: CallbackQuery) -> None:
         if not bookings:
             await callback.message.answer("На сегодня записей нет.")
         else:
-            await callback.message.answer(_render_bookings("📅 Записи на сегодня:", bookings, tz))
+            await callback.message.answer(
+                _render_bookings("📅 Записи на сегодня:", bookings, tz),
+                reply_markup=admin_today_keyboard(bookings, tz),
+            )
     await callback.answer()
 
 
@@ -1500,6 +1528,435 @@ async def admin_service_duration_msg(message: Message, state: FSMContext) -> Non
         f"💇 <b>{html.escape(service.name, quote=False)}</b>\n"
         f"⏱ {service.duration_minutes} мин"
     )
+
+
+# ============================================================
+# Этап 5.9 — admin_move flow (/today → [🔄 Перенести] → calendar → 30-min slot → confirm)
+# ============================================================
+# 5 handlers for admin-initiated booking move (mirrors transfer flow in
+# client.py:904-1130 but with AdminMoveStates + admin_move_booking service):
+#   1. admin_move_select_cb    — [🔄 Перенести] tap → set_state(selecting_date)
+#   2. admin_move_simple_calendar_cb — SimpleCalendar nav + day select → fetch
+#      30-min slots from WorkDay → set_state(selecting_slot)
+#   3. admin_move_slot_30_cb   — slot tap → save workday_id + start_minute →
+#      set_state(confirming) + show summary
+#   4. admin_move_confirm_cb   — [✅ Перенести] → call admin_move_booking,
+#      notify client, clear state
+#   5. admin_move_cancel_cb    — [❌ Отмена] string callback → clear state
+#
+# Distinct from TransferStates via StateFilter (handler dispatch by state,
+# NOT by is_admin_move flag — avoids flag pollution, see states.py:74-76).
+# Distinct from BookingStates.selecting_date via same StateFilter mechanism.
+# ============================================================
+
+
+@router.callback_query(AdminMoveCallbackData.filter(), StateFilter("*"))
+async def admin_move_select_cb(
+    callback: CallbackQuery,
+    callback_data: AdminMoveCallbackData,
+    state: FSMContext,
+) -> None:
+    """[🔄 Перенести] tap in /today list — start admin_move FSM.
+
+    Saves booking_id in FSM (state.set_state AFTER save — order is safe because
+    state.update_data doesn't trigger handlers, set_state does).
+
+    StateFilter("*") + state.clear() — admin can start move mid-FSM. clear()
+    mirrors admin_addslots_cb:644 (prevents state pollution from prior flow,
+    e.g. addslots `selected_date` leaking into admin_move FSM data dict).
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+
+    # Resolve tz here for calendar range (same pattern as admin_addslots_cb).
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    _master_id, _business_id, tz = resolved
+
+    await state.clear()
+    await state.update_data(admin_move_booking_id=str(callback_data.booking_id))
+    await state.set_state(AdminMoveStates.selecting_date)
+    if callback.message is not None:
+        await callback.message.answer(
+            "📅 Выберите новую дату для переноса:",
+            reply_markup=await admin_calendar_keyboard(*_admin_calendar_range(tz)),
+        )
+    await callback.answer()
+
+
+@router.callback_query(
+    SimpleCalendarCallback.filter(), StateFilter(AdminMoveStates.selecting_date)
+)
+async def admin_move_simple_calendar_cb(
+    callback: CallbackQuery,
+    callback_data: SimpleCalendarCallback,
+    state: FSMContext,
+) -> None:
+    """SimpleCalendar navigation + day select for admin_move flow.
+
+    Distinct from admin_addslots_calendar_cb (StateFilter(AdminStates.adding_slots_date))
+    and from client._handle_simple_calendar (which branches on is_slots_path flag
+    — admin_move is ALWAYS workday path, no flag needed).
+
+    On day select: fetch WorkDay for (master_id, slot_date). If None → "не работает
+    в этот день" hint. If is_active=False → "день закрыт" hint. Both → re-show
+    calendar (user can pick another date). If workday found → fetch 30-min
+    slots via get_available_slots_30 → render slot_picker_keyboard_30min with
+    AdminMoveSlot30CallbackData → set_state(selecting_slot).
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await state.clear()
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    master_id, _business_id, tz = resolved
+
+    # act=ignore/today+same-month: lib не вызывается (early return), handler answers
+    # cache_time=60 — contract с aiogram_calendar 0.6.0 (mirror admin_addslots_calendar_cb).
+    if callback_data.act == SimpleCalAct.ignore:
+        await callback.answer(cache_time=60)
+        return
+    if callback_data.act == SimpleCalAct.today:
+        today_sys = datetime.now().replace(tzinfo=None)
+        if today_sys.year == callback_data.year and today_sys.month == callback_data.month:
+            await callback.answer(cache_time=60)
+            return  # same-month: lib answer cache_time=60, handler вместо
+
+    cal = SimpleCalendar(locale="ru_RU.UTF-8", cancel_btn="Отмена", today_btn="Сегодня")
+    cal.set_dates_range(*_admin_calendar_range(tz))
+    selected, selected_date = await cal.process_selection(callback, callback_data)
+
+    if callback_data.act == SimpleCalAct.day:
+        if not selected:
+            return  # out-of-range — lib answered alert, do nothing
+        slot_date = selected_date.date()
+
+        # Fetch WorkDay for (master_id, slot_date). No workday → master не работает.
+        # Inactive workday → closed via /closeday. Both → hint + re-show calendar.
+        async with async_session_factory() as session:
+            workday = await select_workday(session, master_id, slot_date)
+
+        if workday is None:
+            if callback.message is not None:
+                await callback.message.answer(
+                    "❌ Мастер не работает в этот день. Выберите другую дату.",
+                    reply_markup=await admin_calendar_keyboard(*_admin_calendar_range(tz)),
+                )
+            await callback.answer()
+            return
+        if not workday.is_active:
+            if callback.message is not None:
+                await callback.message.answer(
+                    "❌ Этот день закрыт. Выберите другую дату.",
+                    reply_markup=await admin_calendar_keyboard(*_admin_calendar_range(tz)),
+                )
+            await callback.answer()
+            return
+
+        # Workday found + active → fetch 30-min available slots.
+        async with async_session_factory() as session:
+            slots = await get_available_slots_30(session, workday, tz)
+
+        # Save new_workday_id for slot_30_cb + confirm_cb.
+        await state.update_data(admin_move_new_workday_id=str(workday.id))
+        await state.set_state(AdminMoveStates.selecting_slot)
+
+        if callback.message is not None:
+            # Build keyboard inline with AdminMoveSlot30CallbackData (distinct
+            # prefix from BookSlot30CallbackData — no dispatch conflict).
+            from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+            builder_kb = InlineKeyboardBuilder()
+            if not slots:
+                builder_kb.button(text="Нет свободных слотов", callback_data="noop")
+                await callback.message.answer(
+                    "На эту дату нет свободных слотов. Выберите другую дату.",
+                    reply_markup=builder_kb.as_markup(),
+                )
+                await callback.answer()
+                return
+            for slot in slots:
+                start_minute = slot.start_time_local.hour * 60 + slot.start_time_local.minute
+                cb = AdminMoveSlot30CallbackData(
+                    workday_id=workday.id,
+                    start_minute=start_minute,
+                )
+                builder_kb.button(text=slot.label, callback_data=cb.pack())
+            builder_kb.adjust(3)
+            await callback.message.answer(
+                "⏰ Выберите новое время:",
+                reply_markup=builder_kb.as_markup(),
+            )
+    elif callback_data.act == SimpleCalAct.cancel:
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer("❌ Перенос отменён.")
+    # navigation (prev_y/next_y/prev_m/next_m/today-diff-month): lib did
+    # edit_reply_markup, handler answers.
+    await callback.answer()
+
+
+@router.callback_query(
+    AdminMoveSlot30CallbackData.filter(), StateFilter(AdminMoveStates.selecting_slot)
+)
+async def admin_move_slot_30_cb(
+    callback: CallbackQuery,
+    callback_data: AdminMoveSlot30CallbackData,
+    state: FSMContext,
+) -> None:
+    """Slot tap → save workday_id + start_minute → set_state(confirming) + show summary.
+
+    Summary fetches booking.start_at + WorkDay.work_date from DB for old/new time
+    display. booking_id comes from FSM data (saved in admin_move_select_cb).
+    workday_id + start_minute come from callback_data (admin_move_simple_calendar_cb
+    saved workday_id in FSM too, but callback_data is the source of truth —
+    avoids stale FSM state race).
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+
+    data = await state.get_data()
+    booking_id_str = data.get("admin_move_booking_id")
+    if not booking_id_str:
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer("❌ Данные потеряны. /today чтобы начать")
+        await callback.answer()
+        return
+
+    # Save new_workday_id + new_start_minute for confirm_cb.
+    await state.update_data(
+        admin_move_new_workday_id=str(callback_data.workday_id),
+        admin_move_new_start_minute=callback_data.start_minute,
+    )
+    await state.set_state(AdminMoveStates.confirming)
+
+    # Build summary: fetch booking + workday for old/new times.
+    new_start_minute = callback_data.start_minute
+    new_time_local = dt_time(new_start_minute // 60, new_start_minute % 60)
+
+    async with async_session_factory() as session:
+        from sqlalchemy import select as sa_select
+
+        booking = (
+            await session.execute(
+                sa_select(Booking).where(Booking.id == UUID(booking_id_str))
+            )
+        ).scalar_one_or_none()
+        if booking is None:
+            await state.clear()
+            if callback.message is not None:
+                await callback.message.answer("❌ Запись не найдена. /today чтобы начать")
+            await callback.answer()
+            return
+        workday = (
+            await session.execute(
+                sa_select(WorkDay).where(WorkDay.id == callback_data.workday_id)
+            )
+        ).scalar_one_or_none()
+        if workday is None:
+            await state.clear()
+            if callback.message is not None:
+                await callback.message.answer("❌ Рабочий день не найден. /today чтобы начать")
+            await callback.answer()
+            return
+
+    # Render old + new LOCAL times for summary (mirror transfer_booking:1077-1086).
+    settings = get_settings()
+    tz_obj = ZoneInfo(settings.TIMEZONE)
+    old_local = booking.start_at.replace(tzinfo=UTC).astimezone(tz_obj)
+    old_formatted = old_local.strftime("%d %b %Y, %H:%M")
+    # new date = workday.work_date + new_time_local (LOCAL) → formatted.
+    new_local_dt = datetime.combine(workday.work_date, new_time_local, tzinfo=tz_obj)
+    new_formatted = new_local_dt.strftime("%d %b %Y, %H:%M")
+
+    if callback.message is not None:
+        await callback.message.answer(
+            f"Подтвердите перенос:\n\n"
+            f"📅 Было: {old_formatted}\n"
+            f"📅 Станет: {new_formatted}\n"
+            f"👤 {booking.client_name_snapshot}\n"
+            f"💇 {booking.service_title_snapshot}",
+            reply_markup=admin_move_confirm_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.callback_query(
+    AdminMoveConfirmCallbackData.filter(), StateFilter(AdminMoveStates.confirming)
+)
+async def admin_move_confirm_cb(
+    callback: CallbackQuery,
+    state: FSMContext,
+    scheduler: AsyncIOScheduler,
+) -> None:
+    """[✅ Перенести] → call admin_move_booking service, notify client, clear state.
+
+    state.clear() BEFORE service call (race condition, mirror transfer_slot_cb:1062).
+    admin_move_booking is idempotent on race (start_at pin), but if user taps twice
+    in quick succession, the second tap should NOT reuse stale state.
+
+    `scheduler` injected from dp["scheduler"] workflow_data (same as transfer_slot_cb).
+
+    Error mapping (mirror transfer_slot_cb:1071-1111, minus CancelTooLateError
+    and SlotClosedError/SlotNotAvailableError — admin_move has no 24h rule and no
+    legacy slot lookup):
+      BookingNotFoundError             → "Запись не найдена"
+      BookingAlreadyCancelledError      → "Запись уже отменена"  (defensive — service
+                                          doesn't raise this for admin_move, but keep
+                                          for safety if service changes)
+      BookingAlreadyTransferredError    → "❌ Запись уже перенесена (конкурентный запрос)"
+      SlotAlreadyBookedError            → "😔 Слот только что заняли"
+      SlotInPastError                   → "❌ Это время уже прошло"
+      WorkDayNotFoundError               → "❌ Рабочий день не найден"
+      WorkDayInactiveError               → "❌ День закрыт"
+      BookingOutsideWorkDayError         → "❌ Время вне рабочего окна"
+      WorkDayCapacityExceededError       → "❌ Нет мест (все слоты заняты)"
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+
+    data = await state.get_data()
+    booking_id_str = data.get("admin_move_booking_id")
+    new_workday_id_str = data.get("admin_move_new_workday_id")
+    new_start_minute = data.get("admin_move_new_start_minute")
+    if not (booking_id_str and new_workday_id_str and new_start_minute is not None):
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer("❌ Данные потеряны. /today чтобы начать")
+        await callback.answer()
+        return
+
+    # Build new_start_at_local time from int minute (0-1439).
+    new_time_local = dt_time(int(new_start_minute) // 60, int(new_start_minute) % 60)
+
+    # state.clear() BEFORE service call (race condition, mirror transfer_slot_cb:1062).
+    await state.clear()
+    async with async_session_factory() as session:
+        try:
+            result: AdminMoveResult = await admin_move_booking(
+                session,
+                UUID(booking_id_str),
+                UUID(new_workday_id_str),
+                new_time_local,
+                scheduler,
+            )
+        except BookingNotFoundError:
+            await callback.answer("Запись не найдена")
+            return
+        except BookingAlreadyCancelledError:
+            await callback.answer("Запись уже отменена")
+            return
+        except BookingAlreadyTransferredError:
+            if callback.message is not None:
+                await callback.message.answer(
+                    "❌ Запись уже перенесена (конкурентный запрос). "
+                    "/today чтобы увидеть актуальный список"
+                )
+            await callback.answer()
+            return
+        except SlotAlreadyBookedError:
+            if callback.message is not None:
+                await callback.message.answer(
+                    "😔 Слот только что заняли. /today чтобы выбрать другой"
+                )
+            await callback.answer()
+            return
+        except SlotInPastError:
+            if callback.message is not None:
+                await callback.message.answer("❌ Это время уже прошло.")
+            await callback.answer()
+            return
+        except WorkDayNotFoundError:
+            if callback.message is not None:
+                await callback.message.answer("❌ Рабочий день не найден. /today чтобы начать")
+            await callback.answer()
+            return
+        except WorkDayInactiveError:
+            if callback.message is not None:
+                await callback.message.answer("❌ Этот день закрыт. /today чтобы начать")
+            await callback.answer()
+            return
+        except BookingOutsideWorkDayError:
+            if callback.message is not None:
+                await callback.message.answer("❌ Время вне рабочего окна.")
+            await callback.answer()
+            return
+        except WorkDayCapacityExceededError:
+            if callback.message is not None:
+                await callback.message.answer("❌ Нет мест — все слоты заняты.")
+            await callback.answer()
+            return
+
+        # Send CLIENT notification (NOT master — admin already knows, client needs to know).
+        # Mirror transfer_slot_cb:1115-1119 but chat_id = client_telegram_id (not ADMIN_ID).
+        if result.client_telegram_id is not None and callback.bot is not None:
+            tz_obj = ZoneInfo(result.business_timezone)
+            old_local = result.old_start_at.astimezone(tz_obj)
+            new_local = result.new_start_at.astimezone(tz_obj)
+            old_formatted = old_local.strftime("%d %b %Y, %H:%M")
+            new_formatted = new_local.strftime("%d %b %Y, %H:%M")
+            client_text = (
+                f"📢 Ваша запись перенесена мастером:\n\n"
+                f"📅 Было: {old_formatted}\n"
+                f"📅 Станет: {new_formatted}\n"
+                f"👤 {result.client_name_snapshot}\n"
+                f"💇 {result.service_title_snapshot}"
+            )
+            try:
+                await callback.bot.send_message(
+                    chat_id=result.client_telegram_id,
+                    text=client_text,
+                )
+            except TelegramBadRequest:
+                # Client blocked the bot — log and skip (booking is still moved).
+                logger.warning(
+                    "admin_move: client %s blocked the bot — notification skipped "
+                    "(booking %s moved)",
+                    result.client_telegram_id,
+                    result.booking_id,
+                )
+
+    if callback.message is not None:
+        settings = get_settings()
+        tz_obj = ZoneInfo(settings.TIMEZONE)
+        new_local = result.new_start_at.astimezone(tz_obj)
+        new_formatted = new_local.strftime("%d %b %Y, %H:%M")
+        await callback.message.answer(
+            f"✅ Запись перенесена на {new_formatted}. Клиент уведомлён."
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_move_cancel", StateFilter(AdminMoveStates))
+async def admin_move_cancel_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """[❌ Отмена] string callback in confirming state — clear FSM, answer.
+
+    Uses F.data == "admin_move_cancel" (string callback_data from
+    admin_move_confirm_keyboard, keyboards/admin.py:233) — no CallbackData class
+    needed for plain string. StateFilter(AdminMoveStates) ensures this only
+    catches cancel within admin_move flow (not other admin states).
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    await state.clear()
+    if callback.message is not None:
+        await callback.message.answer("❌ Перенос отменён.")
+    await callback.answer()
 
 
 # ============================================================

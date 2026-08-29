@@ -9,14 +9,14 @@ created: 2026-08-29
 а использует `Booking.slot_id = NULL` + WorkDay invariant enforcement on
 service layer (`_validate_booking_within_workday` + `_check_multi_client_capacity`).
 
-Split с 006 на 007 (Session 5.20 finding E — PLANS.md drift line 89 vs 181/407):
+Split с 006 на 008 (Session 5.20 finding E — PLANS.md drift line 89 vs 181/407):
 - 006 (этот файл): nullable + drop UNIQUE + drop FK
-- 007 (future, после smoke-test 006 на prod ~1 неделя): drop table slots
+- 008 (future, после smoke-test 006 на prod ~1 неделя): drop table slots
 
 Что делает upgrade:
 1. DROP FK bookings.slot_id → slots.id (Postgres: DROP CONSTRAINT;
    SQLite batch_alter_table drop_constraint). Без drop FK миграция 006 была бы
-   заблокирована на 007 (DROP TABLE slots requires FK drop first).
+   заблокирована на 008 (DROP TABLE slots requires FK drop first).
 2. DROP UNIQUE INDEX ux_bookings_slot — legacy no-WorkDay path теряет UNIQUE
    guard, остаётся rowcount-check (booking.py:482-487). Достаточно (Postgres
    row-level lock + SQLite DB-lock сериализуют). Critic iter 2 finding 7.
@@ -24,10 +24,10 @@ Split с 006 на 007 (Session 5.20 finding E — PLANS.md drift line 89 vs 181/
    (workday-only bookings).
 
 Что НЕ делает upgrade:
-- НЕ drop table slots (миграция 007, после smoke-test на prod ~1 неделя)
+- НЕ drop table slots (миграция 008, после smoke-test на prod ~1 неделя)
 - НЕ drop column slot_id (оставляем для backwards compat с legacy /book flow
   до 5.8b/c impl, который переключит /slots UI на BookSlot30CallbackData →
-  workday path. После 5.8b/c → миграция 008 drop column slot_id, потом 007 drop table)
+  workday path. После 5.8b/c → миграция 009 drop column slot_id, потом 008 drop table)
 
 Cross-DB:
 - Postgres: DROP CONSTRAINT IF EXISTS bookings_slot_id_fkey (FK name from
@@ -72,7 +72,7 @@ def upgrade() -> None:
     # без explicit name → FK auto-named `bookings_slot_id_fkey` на Postgres).
     # `IF EXISTS` молча skip'ает если имя не совпадает → было F1 (code-reviewer
     # [REDACTED-SESSION-ID], 2026-08-29): wrong name `fk_bookings_slot_id`
-    # silently skip'ал drop → FK оставался → блокировал 007 `DROP TABLE slots`.
+    # silently skip'ал drop → FK оставался → блокировал 008 `DROP TABLE slots`.
     if dialect == "postgresql":
         op.execute("ALTER TABLE bookings DROP CONSTRAINT IF EXISTS bookings_slot_id_fkey")
 
