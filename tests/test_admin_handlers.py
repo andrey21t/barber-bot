@@ -1280,11 +1280,15 @@ def _make_callback(
 
     message.answer is AsyncMock; callback.bot.send_message is AsyncMock
     (for confirm_cb test where handler sends client notification).
+    message has spec=Message so isinstance(callback.message, Message) in
+    handler code passes True (mirror INL-001 edit_text path); edit_text is
+    AsyncMock so `await edit_text(...)` works in calendar_cb tests.
     """
     cb = MagicMock(spec=["from_user", "message", "bot", "answer", "data"])
     cb.from_user = _make_user(user_id)
-    cb.message = MagicMock()
+    cb.message = MagicMock(spec=Message)
     cb.message.answer = AsyncMock()
+    cb.message.edit_text = AsyncMock()
     cb.bot = MagicMock()
     cb.bot.send_message = AsyncMock()
     cb.answer = AsyncMock()
@@ -1624,3 +1628,938 @@ async def test_admin_move_confirm_cb_calls_service_and_notifies_client(
     text = callback_answer_text(callback)
     assert "✅ Запись перенесена" in text
     assert "Клиент уведомлён" in text
+
+
+# ============================================================
+# Этап 5.10 inline-часы: /addslots + /closeslot inline window/shrink flow
+#
+# Coverage (mirror admin_move tests 1359-1626 pattern):
+#   /addslots calendar_cb: no workday redirect + workday shows start picker
+#   admin_window_start_cb: pick start → end picker + state loss
+#   admin_window_end_cb: pick end → summary + state loss
+#   admin_window_confirm_cb: open_workday success + WorkDayShrinkError +
+#     SQLAlchemyError + state loss
+#   /closeslot calendar_cb: no workday + window too narrow + shows shrink picker
+#   admin_shrink_end_cb: pick new end → summary
+#   admin_shrink_confirm_cb: update_workday success + ValueError (deleted) +
+#     WorkDayShrinkError + state loss
+#   admin_window_cancel_cb: clears state
+# ============================================================
+
+
+async def _seed_workday(
+    session: AsyncSession,
+    *,
+    ctx: dict[str, Any],
+    work_date: date,
+    start_time_str: str = "10:00",
+    end_time_str: str = "20:00",
+    is_active: bool = True,
+) -> Any:
+    """Insert WorkDay for (master, date) — shared helper for inline-часы tests.
+
+    start_time_str / end_time_str: "HH:MM" → datetime.time. is_active controls
+    closed-workday branch testing.
+    """
+    from datetime import time as dt_time
+
+    from bot.models import WorkDay
+
+    sh, sm = (int(x) for x in start_time_str.split(":"))
+    eh, em = (int(x) for x in end_time_str.split(":"))
+    workday = WorkDay(
+        master_id=ctx["master_id"],
+        work_date=work_date,
+        start_time=dt_time(sh, sm),
+        end_time=dt_time(eh, em),
+        max_concurrent_clients=1,
+        is_active=is_active,
+    )
+    session.add(workday)
+    await session.commit()
+    return workday
+
+
+def _picker_reply_markup(callback: MagicMock) -> Any:
+    """Extract reply_markup from callback.message.answer call (mirror admin_move
+    tests pattern 1386-1388, 1548-1553).
+    """
+    args, kwargs = callback.message.answer.call_args
+    return kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
+
+
+def _state_data_passed(state: MagicMock) -> dict[str, Any]:
+    """Extract dict passed to state.update_data (mirror admin_move tests 1543-1546)."""
+    update_args, update_kwargs = state.update_data.call_args
+    result: dict[str, Any] = update_args[0] if update_args else update_kwargs
+    return result
+
+
+# --- /addslots calendar_cb -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_admin_addslots_calendar_cb_no_workday_redirects_to_openday(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Day select with no WorkDay → 'не открыт' redirect hint to /openday."""
+    from unittest.mock import patch
+
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    future_date = datetime.now(UTC) + timedelta(days=30)
+    cal_cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=future_date.year,
+        month=future_date.month,
+        day=future_date.day,
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(True, future_date),
+    ):
+        await admin_handlers.admin_addslots_calendar_cb(callback, cal_cb_data, state)
+
+    # No workday → message edit_text (or answer fallback) with redirect hint.
+    text: str
+    if callback.message.edit_text.called:
+        text = str(callback.message.edit_text.call_args.args[0])
+    else:
+        text = callback_answer_text(callback)
+    assert "не открыт" in text
+    assert "/openday" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_addslots_calendar_cb_workday_exists_shows_start_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Day select with active WorkDay → set_state(picking_window_start),
+    reply_markup=admin_window_slot_picker_keyboard (start picker).
+    """
+    from unittest.mock import patch
+
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+    from bot.states import AdminStates
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        await _seed_workday(session, ctx=ctx, work_date=tomorrow)
+
+    future_date = datetime.combine(tomorrow, datetime.min.time())
+    cal_cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=future_date.year,
+        month=future_date.month,
+        day=future_date.day,
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(True, future_date),
+    ):
+        await admin_handlers.admin_addslots_calendar_cb(callback, cal_cb_data, state)
+
+    state.set_state.assert_called_once_with(AdminStates.picking_window_start)
+    # update_data called with selected_date + workday_id.
+    data_passed = _state_data_passed(state)
+    assert data_passed["selected_date"] == tomorrow.isoformat()
+    assert "workday_id" in data_passed
+
+    # Edit text with start picker reply_markup (since isinstance Message).
+    assert callback.message.edit_text.called
+    edit_args, edit_kwargs = callback.message.edit_text.call_args
+    reply_markup = edit_kwargs.get("reply_markup") or (edit_args[1] if len(edit_args) > 1 else None)
+    assert reply_markup is not None, "Expected start picker reply_markup"
+
+
+# --- admin_window_start_cb ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_admin_window_start_cb_picks_start_shows_end_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[start slot tap] → state.update_data(picked_start_minute),
+    state.set_state(picking_window_end), answer with end-picker keyboard.
+    """
+    from bot.keyboards.admin import AdminWindowSlot30CallbackData
+    from bot.states import AdminStates
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        workday = await _seed_workday(session, ctx=ctx, work_date=tomorrow)
+
+    picked_start_minute = 11 * 60  # 11:00
+    cb_data = AdminWindowSlot30CallbackData(
+        workday_id=workday.id, start_minute=picked_start_minute
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state(
+        data={
+            "selected_date": tomorrow.isoformat(),
+            "workday_id": str(workday.id),
+        }
+    )
+
+    await admin_handlers.admin_window_start_cb(callback, cb_data, state)
+
+    data_passed = _state_data_passed(state)
+    assert data_passed["picked_start_minute"] == picked_start_minute
+    state.set_state.assert_called_once_with(AdminStates.picking_window_end)
+
+    reply_markup = _picker_reply_markup(callback)
+    assert reply_markup is not None, "Expected end-picker reply_markup"
+    args, _ = callback.message.answer.call_args
+    text = str(args[0])
+    assert "окончания" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_window_start_cb_state_loss_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[start slot tap] with no workday_id in state → state.clear + 'Данные
+    сессии потеряны' hint (state loss defensive check, mirror admin_move_confirm_cb).
+    """
+    from bot.keyboards.admin import AdminWindowSlot30CallbackData
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        workday = await _seed_workday(session, ctx=ctx, work_date=tomorrow)
+
+    cb_data = AdminWindowSlot30CallbackData(
+        workday_id=workday.id, start_minute=11 * 60
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state(data={})  # empty state — simulate state loss
+
+    await admin_handlers.admin_window_start_cb(callback, cb_data, state)
+
+    state.clear.assert_called_once()
+    state.set_state.assert_not_called()
+    text = callback_answer_text(callback)
+    assert "Данные сессии потеряны" in text
+
+
+# --- admin_window_end_cb --------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_admin_window_end_cb_picks_end_shows_summary(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[end slot tap] → state.update_data(picked_end_minute),
+    state.set_state(confirming_window), answer with summary + confirm keyboard.
+    """
+    from bot.keyboards.admin import AdminWindowSlot30CallbackData
+    from bot.states import AdminStates
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        workday = await _seed_workday(session, ctx=ctx, work_date=tomorrow)
+
+    picked_start_minute = 11 * 60  # 11:00
+    picked_end_minute = 18 * 60  # 18:00
+    cb_data = AdminWindowSlot30CallbackData(
+        workday_id=workday.id, start_minute=picked_end_minute
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state(
+        data={
+            "selected_date": tomorrow.isoformat(),
+            "workday_id": str(workday.id),
+            "picked_start_minute": picked_start_minute,
+        }
+    )
+
+    await admin_handlers.admin_window_end_cb(callback, cb_data, state)
+
+    data_passed = _state_data_passed(state)
+    assert data_passed["picked_end_minute"] == picked_end_minute
+    state.set_state.assert_called_once_with(AdminStates.confirming_window)
+
+    reply_markup = _picker_reply_markup(callback)
+    assert reply_markup is not None, "Expected admin_window_confirm_keyboard"
+    text = callback_answer_text(callback)
+    assert "Изменить окно" in text
+    assert "11:00" in text
+    assert "18:00" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_window_end_cb_state_loss_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[end slot tap] with picked_start_minute missing in state → state.clear
+    + 'Данные сессии потеряны' hint.
+    """
+    from bot.keyboards.admin import AdminWindowSlot30CallbackData
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        workday = await _seed_workday(session, ctx=ctx, work_date=tomorrow)
+
+    cb_data = AdminWindowSlot30CallbackData(
+        workday_id=workday.id, start_minute=18 * 60
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    # picked_start_minute missing → state loss
+    state = _make_mock_state(
+        data={
+            "selected_date": tomorrow.isoformat(),
+            "workday_id": str(workday.id),
+        }
+    )
+
+    await admin_handlers.admin_window_end_cb(callback, cb_data, state)
+
+    state.clear.assert_called_once()
+    state.set_state.assert_not_called()
+    text = callback_answer_text(callback)
+    assert "Данные сессии потеряны" in text
+
+
+# --- admin_window_confirm_cb ---------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_admin_window_confirm_cb_calls_open_workday_success(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[✅ Подтвердить] → open_workday called with extracted args, state.clear,
+    answer with success message (✅ Окно изменено).
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    work_date = (datetime.now(UTC) + timedelta(days=1)).date()
+    picked_start_minute = 11 * 60  # 11:00
+    picked_end_minute = 18 * 60  # 18:00
+    state = _make_mock_state(
+        data={
+            "selected_date": work_date.isoformat(),
+            "picked_start_minute": picked_start_minute,
+            "picked_end_minute": picked_end_minute,
+        }
+    )
+    callback = _make_callback(ADMIN_TG_ID)
+
+    from unittest.mock import AsyncMock, patch
+
+    mock_workday = MagicMock()
+    mock_workday.work_date = work_date
+    with patch(
+        "bot.handlers.admin.open_workday",
+        new_callable=AsyncMock,
+        return_value=mock_workday,
+    ) as mock_service:
+        await admin_handlers.admin_window_confirm_cb(callback, state)
+
+    mock_service.assert_called_once()
+    call_args = mock_service.call_args
+    # args[1]=master_id (skip session), args[2]=work_date, args[3]=start_time,
+    # args[4]=end_time, kwargs business_tz.
+    assert call_args.args[2] == work_date
+    assert call_args.args[3].hour == 11
+    assert call_args.args[3].minute == 0
+    assert call_args.args[4].hour == 18
+    assert call_args.args[4].minute == 0
+    assert call_args.kwargs.get("business_tz") == TZ
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "✅ Окно изменено" in text
+    assert "11:00" in text and "18:00" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_window_confirm_cb_value_error(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """open_workday raises ValueError (business validation) → message renders
+    f'❌ {exc}\\n/addslots чтобы начать' (mirror shrink confirm ValueError pattern).
+    W1 fix from code-reviewer iter 2 — test-coverage parity with shrink flow.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    work_date = (datetime.now(UTC) + timedelta(days=1)).date()
+    state = _make_mock_state(
+        data={
+            "selected_date": work_date.isoformat(),
+            "picked_start_minute": 11 * 60,
+            "picked_end_minute": 18 * 60,
+        }
+    )
+    callback = _make_callback(ADMIN_TG_ID)
+
+    from unittest.mock import AsyncMock, patch
+
+    with patch(
+        "bot.handlers.admin.open_workday",
+        new_callable=AsyncMock,
+        side_effect=ValueError("invalid time range"),
+    ):
+        await admin_handlers.admin_window_confirm_cb(callback, state)
+
+    state.clear.assert_called_once()  # state.clear() BEFORE service call
+    text = callback_answer_text(callback)
+    assert "invalid time range" in text
+    assert "/addslots" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_window_confirm_cb_workday_shrink_error(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """open_workday raises WorkDayShrinkError → 'Нельзя сократить окно' hint
+    (race: concurrent create_booking between pick and confirm).
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    work_date = (datetime.now(UTC) + timedelta(days=1)).date()
+    state = _make_mock_state(
+        data={
+            "selected_date": work_date.isoformat(),
+            "picked_start_minute": 11 * 60,
+            "picked_end_minute": 12 * 60,  # narrow window shrinks
+        }
+    )
+    callback = _make_callback(ADMIN_TG_ID)
+
+    from unittest.mock import AsyncMock, patch
+
+    from bot.services.workday import WorkDayShrinkError
+
+    with patch(
+        "bot.handlers.admin.open_workday",
+        new_callable=AsyncMock,
+        side_effect=WorkDayShrinkError("conflict"),
+    ):
+        await admin_handlers.admin_window_confirm_cb(callback, state)
+
+    state.clear.assert_called_once()  # state.clear() BEFORE service call
+    text = callback_answer_text(callback)
+    assert "Нельзя сократить окно" in text
+    assert "conflict" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_window_confirm_cb_sqlalchemy_error(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """open_workday raises SQLAlchemyError → 'Ошибка БД' message."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    work_date = (datetime.now(UTC) + timedelta(days=1)).date()
+    state = _make_mock_state(
+        data={
+            "selected_date": work_date.isoformat(),
+            "picked_start_minute": 11 * 60,
+            "picked_end_minute": 18 * 60,
+        }
+    )
+    callback = _make_callback(ADMIN_TG_ID)
+
+    from unittest.mock import AsyncMock, patch
+
+    from sqlalchemy.exc import SQLAlchemyError
+
+    with patch(
+        "bot.handlers.admin.open_workday",
+        new_callable=AsyncMock,
+        side_effect=SQLAlchemyError("db down"),
+    ):
+        await admin_handlers.admin_window_confirm_cb(callback, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "Ошибка БД" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_window_confirm_cb_state_loss_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[✅ Подтвердить] with picked_end_minute missing in state → state.clear
+    + 'Данные сессии потеряны' hint.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    work_date = (datetime.now(UTC) + timedelta(days=1)).date()
+    state = _make_mock_state(
+        data={
+            "selected_date": work_date.isoformat(),
+            "picked_start_minute": 11 * 60,
+            # picked_end_minute missing → state loss
+        }
+    )
+    callback = _make_callback(ADMIN_TG_ID)
+
+    await admin_handlers.admin_window_confirm_cb(callback, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "Данные сессии потеряны" in text
+
+
+# --- /closeslot calendar_cb ----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_admin_closeslot_calendar_cb_no_workday_message(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Day select with no WorkDay → 'не открыт — нечего закрывать' hint."""
+    from unittest.mock import patch
+
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    future_date = datetime.now(UTC) + timedelta(days=30)
+    cal_cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=future_date.year,
+        month=future_date.month,
+        day=future_date.day,
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(True, future_date),
+    ):
+        await admin_handlers.admin_closeslot_calendar_cb(callback, cal_cb_data, state)
+
+    text: str
+    if callback.message.edit_text.called:
+        text = str(callback.message.edit_text.call_args.args[0])
+    else:
+        text = callback_answer_text(callback)
+    assert "не открыт" in text
+    assert "нечего закрывать" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_closeslot_calendar_cb_window_too_narrow_message(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Day select with WorkDay window < 60min → 'слишком узкое, нельзя сузить'."""
+    from unittest.mock import patch
+
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        # 30-min window — too narrow to shrink
+        await _seed_workday(session, ctx=ctx, work_date=tomorrow, start_time_str="10:00",
+                            end_time_str="10:30")
+
+    future_date = datetime.combine(tomorrow, datetime.min.time())
+    cal_cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=future_date.year,
+        month=future_date.month,
+        day=future_date.day,
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(True, future_date),
+    ):
+        await admin_handlers.admin_closeslot_calendar_cb(callback, cal_cb_data, state)
+
+    text: str
+    if callback.message.edit_text.called:
+        text = str(callback.message.edit_text.call_args.args[0])
+    else:
+        text = callback_answer_text(callback)
+    assert "слишком узкое" in text
+    assert "нельзя сузить" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_closeslot_calendar_cb_shows_shrink_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Day select with WorkDay window >= 60min → set_state(picking_shrink_end),
+    reply_markup=admin_window_slot_picker_keyboard (shrink picker).
+    """
+    from unittest.mock import patch
+
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+    from bot.states import AdminStates
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        await _seed_workday(session, ctx=ctx, work_date=tomorrow,
+                            start_time_str="10:00", end_time_str="20:00")
+
+    future_date = datetime.combine(tomorrow, datetime.min.time())
+    cal_cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=future_date.year,
+        month=future_date.month,
+        day=future_date.day,
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(True, future_date),
+    ):
+        await admin_handlers.admin_closeslot_calendar_cb(callback, cal_cb_data, state)
+
+    state.set_state.assert_called_once_with(AdminStates.picking_shrink_end)
+    data_passed = _state_data_passed(state)
+    assert data_passed["selected_date"] == tomorrow.isoformat()
+    assert "workday_id" in data_passed
+    assert "current_start_minute" in data_passed
+    assert "current_end_minute" in data_passed
+
+    assert callback.message.edit_text.called
+    edit_args, edit_kwargs = callback.message.edit_text.call_args
+    reply_markup = edit_kwargs.get("reply_markup") or (edit_args[1] if len(edit_args) > 1 else None)
+    assert reply_markup is not None, "Expected shrink picker reply_markup"
+
+
+# --- admin_shrink_end_cb --------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_admin_shrink_end_cb_picks_new_end_shows_summary(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[shrink end slot tap] → state.update_data(new_end_minute),
+    state.set_state(confirming_shrink), answer with summary + confirm keyboard.
+    """
+    from bot.keyboards.admin import AdminWindowSlot30CallbackData
+    from bot.states import AdminStates
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        workday = await _seed_workday(session, ctx=ctx, work_date=tomorrow,
+                                       start_time_str="10:00", end_time_str="20:00")
+
+    current_start_minute = 10 * 60  # 10:00
+    new_end_minute = 16 * 60  # 16:00
+    cb_data = AdminWindowSlot30CallbackData(
+        workday_id=workday.id, start_minute=new_end_minute
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state(
+        data={
+            "workday_id": str(workday.id),
+            "current_start_minute": current_start_minute,
+        }
+    )
+
+    await admin_handlers.admin_shrink_end_cb(callback, cb_data, state)
+
+    data_passed = _state_data_passed(state)
+    assert data_passed["new_end_minute"] == new_end_minute
+    state.set_state.assert_called_once_with(AdminStates.confirming_shrink)
+
+    reply_markup = _picker_reply_markup(callback)
+    assert reply_markup is not None, "Expected admin_window_confirm_keyboard"
+    text = callback_answer_text(callback)
+    assert "Сузить окно" in text
+    assert "10:00" in text and "16:00" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_shrink_end_cb_state_loss_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[shrink end slot tap] with no workday_id in state → state.clear +
+    'Данные сессии потеряны' hint (state loss defensive check).
+    Mirror test_admin_window_start_cb_state_loss pattern (S3 gap from code-reviewer).
+    """
+    from bot.keyboards.admin import AdminWindowSlot30CallbackData
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        workday = await _seed_workday(session, ctx=ctx, work_date=tomorrow)
+
+    cb_data = AdminWindowSlot30CallbackData(
+        workday_id=workday.id, start_minute=16 * 60
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state(data={})  # empty state — simulate state loss
+
+    await admin_handlers.admin_shrink_end_cb(callback, cb_data, state)
+
+    state.clear.assert_called_once()
+    state.set_state.assert_not_called()
+    text = callback_answer_text(callback)
+    assert "Данные сессии потеряны" in text
+
+
+# --- admin_shrink_confirm_cb ----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_admin_shrink_confirm_cb_calls_update_workday_success(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[✅ Подтвердить] → update_workday called with workday_id + start + new_end,
+    state.clear, answer with success (✅ Окно сужено).
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    workday_id = UUID("33333333-3333-3333-3333-333333333333")
+    work_date = (datetime.now(UTC) + timedelta(days=1)).date()
+    state = _make_mock_state(
+        data={
+            "workday_id": str(workday_id),
+            "current_start_minute": 10 * 60,  # 10:00
+            "new_end_minute": 16 * 60,  # 16:00
+        }
+    )
+    callback = _make_callback(ADMIN_TG_ID)
+
+    mock_updated = MagicMock()
+    mock_updated.work_date = work_date
+    from datetime import time as dt_time
+    mock_updated.start_time = dt_time(10, 0)
+    mock_updated.end_time = dt_time(16, 0)
+
+    from unittest.mock import AsyncMock, patch
+
+    with patch(
+        "bot.handlers.admin.update_workday",
+        new_callable=AsyncMock,
+        return_value=mock_updated,
+    ) as mock_service:
+        await admin_handlers.admin_shrink_confirm_cb(callback, state)
+
+    mock_service.assert_called_once()
+    call_args = mock_service.call_args
+    assert call_args.args[1] == workday_id
+    assert call_args.args[2].hour == 10
+    assert call_args.args[2].minute == 0
+    assert call_args.args[3].hour == 16
+    assert call_args.args[3].minute == 0
+    assert call_args.kwargs.get("business_tz") == TZ
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "✅ Окно сужено" in text
+    assert "10:00" in text and "16:00" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_shrink_confirm_cb_value_error_workday_deleted(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """update_workday raises ValueError (WorkDay deleted race) → message renders
+    f'❌ {exc}\\n/closeslot чтобы начать' (exc='WorkDay not found' from workday.py).
+    Mirror admin_window_confirm_cb ValueError pattern (S1 fix from code-reviewer).
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    state = _make_mock_state(
+        data={
+            "workday_id": str(UUID("44444444-4444-4444-4444-444444444444")),
+            "current_start_minute": 10 * 60,
+            "new_end_minute": 16 * 60,
+        }
+    )
+    callback = _make_callback(ADMIN_TG_ID)
+
+    from unittest.mock import AsyncMock, patch
+
+    with patch(
+        "bot.handlers.admin.update_workday",
+        new_callable=AsyncMock,
+        side_effect=ValueError("WorkDay not found"),
+    ):
+        await admin_handlers.admin_shrink_confirm_cb(callback, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "WorkDay not found" in text
+    assert "/closeslot" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_shrink_confirm_cb_sqlalchemy_error(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """update_workday raises SQLAlchemyError → 'Ошибка БД' message.
+
+    Mirror test_admin_window_confirm_cb_sqlalchemy_error pattern (S2 gap from
+    code-reviewer). Confirms shrink flow error-mapping parity with window flow.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    state = _make_mock_state(
+        data={
+            "workday_id": str(UUID("55555555-5555-5555-5555-555555555555")),
+            "current_start_minute": 10 * 60,
+            "new_end_minute": 16 * 60,
+        }
+    )
+    callback = _make_callback(ADMIN_TG_ID)
+
+    from unittest.mock import AsyncMock, patch
+
+    from sqlalchemy.exc import SQLAlchemyError
+
+    with patch(
+        "bot.handlers.admin.update_workday",
+        new_callable=AsyncMock,
+        side_effect=SQLAlchemyError("db down"),
+    ):
+        await admin_handlers.admin_shrink_confirm_cb(callback, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "Ошибка БД" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_shrink_confirm_cb_workday_shrink_error(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """update_workday raises WorkDayShrinkError (race with concurrent booking) →
+    'Только что записался клиент' hint.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    state = _make_mock_state(
+        data={
+            "workday_id": str(UUID("55555555-5555-5555-5555-555555555555")),
+            "current_start_minute": 10 * 60,
+            "new_end_minute": 16 * 60,
+        }
+    )
+    callback = _make_callback(ADMIN_TG_ID)
+
+    from unittest.mock import AsyncMock, patch
+
+    from bot.services.workday import WorkDayShrinkError
+
+    with patch(
+        "bot.handlers.admin.update_workday",
+        new_callable=AsyncMock,
+        side_effect=WorkDayShrinkError("conflict"),
+    ):
+        await admin_handlers.admin_shrink_confirm_cb(callback, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "Только что записался клиент" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_shrink_confirm_cb_state_loss_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[✅ Подтвердить] with new_end_minute missing in state → state.clear +
+    'Данные сессии потеряны' hint.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    state = _make_mock_state(
+        data={
+            "workday_id": str(UUID("66666666-6666-6666-6666-666666666666")),
+            "current_start_minute": 10 * 60,
+            # new_end_minute missing → state loss
+        }
+    )
+    callback = _make_callback(ADMIN_TG_ID)
+
+    await admin_handlers.admin_shrink_confirm_cb(callback, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "Данные сессии потеряны" in text
+
+
+# --- admin_window_cancel_cb -----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_admin_window_cancel_cb_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[❌ Отмена] (string F.data == 'admin_window_cancel') → state.clear + answer
+    with 'Действие отменено' message.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_window_cancel"
+    state = _make_mock_state()
+
+    await admin_handlers.admin_window_cancel_cb(callback, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "Действие отменено" in text
