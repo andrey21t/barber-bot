@@ -358,7 +358,8 @@ async def cmd_openday(message: Message, command: CommandObject) -> None:
     await message.answer(
         f"✅ День открыт на {work_date.strftime('%d %B %Y')}:\n"
         f"<b>{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}</b>"
-        + ("\n(день был закрыт — открыт заново)" if was_closed else "")
+        + ("\n(день был закрыт — открыт заново)" if was_closed else ""),
+        reply_markup=admin_inline_menu(),
     )
 
 
@@ -563,7 +564,8 @@ async def cmd_services(message: Message, command: CommandObject) -> None:
     await message.answer(
         f"✅ Услуга добавлена:\n"
         f"💇 <b>{html.escape(service.name, quote=False)}</b>\n"
-        f"⏱ {service.duration_minutes} мин"
+        f"⏱ {service.duration_minutes} мин",
+        reply_markup=admin_inline_menu(),
     )
 
 
@@ -1040,7 +1042,8 @@ async def admin_openday_end_msg(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"✅ День открыт на {work_date.strftime('%d %B %Y')}:\n"
         f"<b>{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}</b>"
-        + ("\n(день был закрыт — открыт заново)" if was_closed else "")
+        + ("\n(день был закрыт — открыт заново)" if was_closed else ""),
+        reply_markup=admin_inline_menu(),
     )
 
 
@@ -1285,7 +1288,8 @@ async def admin_window_confirm_cb(
     if callback.message is not None:
         await callback.message.answer(
             f"✅ Окно изменено на {work_date.strftime('%d %B %Y')}:\n"
-            f"<b>{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}</b>"
+            f"<b>{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}</b>",
+            reply_markup=admin_inline_menu(),
         )
     await callback.answer()
 
@@ -1316,7 +1320,8 @@ async def admin_window_cancel_cb(callback: CallbackQuery, state: FSMContext) -> 
     await state.clear()
     if callback.message is not None:
         await callback.message.answer(
-            "❌ Действие отменено. /addslots чтобы начать заново."
+            "❌ Действие отменено. /addslots чтобы начать заново.",
+            reply_markup=admin_inline_menu(),
         )
     await callback.answer()
 
@@ -1539,7 +1544,8 @@ async def admin_service_duration_msg(message: Message, state: FSMContext) -> Non
     await message.answer(
         f"✅ Услуга добавлена:\n"
         f"💇 <b>{html.escape(service.name, quote=False)}</b>\n"
-        f"⏱ {service.duration_minutes} мин"
+        f"⏱ {service.duration_minutes} мин",
+        reply_markup=admin_inline_menu(),
     )
 
 
@@ -1949,7 +1955,8 @@ async def admin_move_confirm_cb(
         new_local = result.new_start_at.astimezone(tz_obj)
         new_formatted = new_local.strftime("%d %b %Y, %H:%M")
         await callback.message.answer(
-            f"✅ Запись перенесена на {new_formatted}. Клиент уведомлён."
+            f"✅ Запись перенесена на {new_formatted}. Клиент уведомлён.",
+            reply_markup=admin_inline_menu(),
         )
     await callback.answer()
 
@@ -1968,7 +1975,10 @@ async def admin_move_cancel_cb(callback: CallbackQuery, state: FSMContext) -> No
         return
     await state.clear()
     if callback.message is not None:
-        await callback.message.answer("❌ Перенос отменён.")
+        await callback.message.answer(
+            "❌ Перенос отменён.",
+            reply_markup=admin_inline_menu(),
+        )
     await callback.answer()
 
 

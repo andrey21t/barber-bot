@@ -306,14 +306,18 @@ def admin_window_slot_picker_keyboard(
             generate end slots starting from picked_start+30).
 
     Slot ranges by mode (all slots are 30-min apart, label "HH:MM"):
-        - mode="start": 0, 30, 60, ..., 1350 (22:30) — max start = 22:30 (NI1
-          fix: end-picker at start=22:30 shows single slot 23:00, non-empty).
-          Prevents midnight overflow (23:30 end-slot → 00:00 end_time →
-          ValueError in open_workday).
-        - mode="end": picked_start_minute+30, +60, ..., 1380 (23:00) — max
-          end-slot = 23:00 (end_time = 23:30, still < midnight). Caller MUST
-          pass picked_start_minute. If picked_start_minute+30 > 1380 → empty
-          list (caller should validate BEFORE calling, show appropriate UX).
+        Business hours 09:00–20:00 (default work range for Екатерина):
+        - mode="start": 540 (09:00), 570, ..., 1170 (19:30) — 22 start slots.
+          Max start = 19:30 → end-picker shows single slot 20:00, non-empty.
+        - mode="end": picked_start_minute+30, +60, ..., 1200 (20:00) — max
+          end-slot = 20:00 (end_time = 20:30). Caller MUST pass picked_start_minute.
+          If picked_start_minute >= 1200 → empty (shouldn't happen — start
+          picker caps at 19:30 = 1170, so end always >= 1200 = 20:00).
+
+    Edge case for rare early/late hours: /openday text command supports
+    arbitrary HH:MM outside 09:00–20:00 (e.g. 08:00). Inline picker is
+    optimised for the common 09:00–20:00 workday; full-range fallback via
+    /openday.
 
     Empty list → single "Нет слотов" button (matches slot_picker_keyboard_30min
     UX in client.py:172). adjust(3) — 3 buttons per row.
@@ -322,14 +326,15 @@ def admin_window_slot_picker_keyboard(
     tz = ZoneInfo(business_tz)
 
     # Compute candidate minutes by mode.
+    # Business hours 09:00–20:00 (540–1200 min) — Екатерина's typical workday.
     if mode == "start":
-        # 0, 30, 60, ..., 1350 (22:30). max start = 22:30 = 1350 min.
-        candidates = list(range(0, 1380, 30))  # 0..1350 inclusive
+        # 540, 570, ..., 1170 (09:00 → 19:30). max start = 19:30 = 1170 min.
+        candidates = list(range(540, 1171, 30))  # 09:00..19:30 inclusive
     elif mode == "end":
         if picked_start_minute is None:
             raise ValueError("mode='end' requires picked_start_minute")
-        # picked_start+30, +60, ..., 1380 (23:00). max end-slot = 23:00 = 1380.
-        candidates = list(range(picked_start_minute + 30, 1381, 30))
+        # picked_start+30, +60, ..., 1200 (20:00). max end-slot = 20:00 = 1200.
+        candidates = list(range(picked_start_minute + 30, 1201, 30))
     else:
         raise ValueError(f"unknown mode={mode!r}, expected 'start'|'end'")
 
