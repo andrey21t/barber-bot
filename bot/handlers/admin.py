@@ -39,7 +39,6 @@ from bot.config import get_settings
 from bot.db import async_session_factory
 from bot.keyboards.admin import (
     AdminAddslotsCallbackData,
-    AdminCloseslotCallbackData,
     AdminMenuCallbackData,
     AdminMoveCallbackData,
     AdminMoveConfirmCallbackData,
@@ -88,7 +87,6 @@ from bot.services.workday import (
     WorkDayShrinkError,
     open_workday,
     select_workday,
-    update_workday,
 )
 from bot.states import AdminMoveStates, AdminStates
 
@@ -1046,207 +1044,22 @@ async def admin_openday_end_msg(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.callback_query(AdminCloseslotCallbackData.filter(), StateFilter("*"))
-async def admin_closeslot_cb(callback: CallbackQuery, state: FSMContext) -> None:
-    """Menu tap: закрыть слот — start closeslot flow.
-
-    UX-edge: tap mid-FSM → state.clear() + set_state(closing_slot_date).
-    Show SimpleCalendar for date selection (next handler — 1.3c).
-    """
-    if not _is_admin_callback(callback):
-        await callback.answer()
-        return
-
-    # _is_admin_callback guarantees callback.from_user is not None (type narrowing).
-    assert callback.from_user is not None
-    resolved = await _resolve_master_and_business(callback.from_user.id)
-    if resolved is None:
-        await callback.answer("❌ Мастер не найден", show_alert=True)
-        return
-    _master_id, _business_id, tz = resolved
-
-    await state.clear()
-    await state.set_state(AdminStates.closing_slot_date)
-
-    if callback.message is not None:
-        await callback.message.answer(
-            "📅 Выберите дату слота для закрытия:",
-            reply_markup=await admin_calendar_keyboard(*_admin_calendar_range(tz)),
-        )
-    await callback.answer()
-
-
-# ============================================================
-# FSM closeslot (Вариант B, spec.md 251) — Этап 1.3c
-#
-# Адаптация паттерна 1.3b (addslots), отличия:
-# - state: closing_slot_date → closing_slot_hour (НЕ adding_slots_*)
-# - hour input: SINGLE час (не список через пробел)
-# - service: close_slot (НЕ add_slots) — нужен find slot по (master, date, hour)
-# - render: "✅ Слот {date} {hour}:00 закрыт" (НЕ список часов)
-# - past-date re-check ОТСУТСТВУЕТ (отличие от 1.3b) — закрыть slot в прошлом
-#   валидно (отменить невыполненную запись). cmd_closeslot тоже не проверяет.
-#   Calendar min=today всё равно не даёт выбрать прошлое.
-# - INL-001: edit_message_text при calendar → ask hour (fallback на answer).
-# - W1 analog: ~F.text.startswith("/") в фильтре hour_msg → /cancel проваливается
-#   в client_router (escape hatch).
-# - W2 analog: state.clear() в branch "Мастер не найден" в hour_msg.
-# ============================================================
-
-
-@router.callback_query(SimpleCalendarCallback.filter(), StateFilter(AdminStates.closing_slot_date))
-async def admin_closeslot_calendar_cb(
-    callback: CallbackQuery,
-    callback_data: SimpleCalendarCallback,
-    state: FSMContext,
-) -> None:
-    """SimpleCalendar для closeslot — навигация + выбор даты (Этап 5.10 inline-часы).
-
-    Branch by callback_data.act (копия admin_addslots_calendar_cb, отличия:
-    state closing_slot_* вместо adding_slots_*, render shrink picker вместо
-    start picker, "Закрытие слота отменено" вместо "Открытие слотов отменено").
-    На day select: SELECT WorkDay for (master_id, slot_date). If None →
-    "нечего закрывать" hint (no WorkDay to shrink). If window < 60min →
-    "Окно слишком узкое" hint (shrink range [current_start+30, current_end-30]
-    is empty). Else → set_state(picking_shrink_end) + store workday_id +
-    current_start/end_minute in state + show admin_window_slot_picker_keyboard
-    (mode="shrink").
-    """
-    if not _is_admin_callback(callback):
-        await callback.answer()
-        return
-
-    # _is_admin_callback guarantees callback.from_user is not None (type narrowing).
-    assert callback.from_user is not None
-    resolved = await _resolve_master_and_business(callback.from_user.id)
-    if resolved is None:
-        await state.clear()
-        await callback.answer("❌ Мастер не найден", show_alert=True)
-        return
-    master_id, _business_id, tz = resolved
-
-    # act=ignore/today+same-month: lib не вызывается (early return), handler answers
-    if callback_data.act == SimpleCalAct.ignore:
-        await callback.answer(cache_time=60)
-        return
-    if callback_data.act == SimpleCalAct.today:
-        today_sys = datetime.now().replace(tzinfo=None)
-        if today_sys.year == callback_data.year and today_sys.month == callback_data.month:
-            await callback.answer(cache_time=60)
-            return
-
-    cal = SimpleCalendar(locale="ru_RU.UTF-8", cancel_btn="Отмена", today_btn="Сегодня")
-    cal.set_dates_range(*_admin_calendar_range(tz))
-    selected, selected_date = await cal.process_selection(callback, callback_data)
-
-    if callback_data.act == SimpleCalAct.day:
-        if not selected:
-            return  # out-of-range — lib answered alert
-        slot_date = selected_date.date()
-
-        # SELECT WorkDay for (master_id, slot_date). /closeslot inline = SHRINK
-        # existing window end (5.10 semantic shift). No WorkDay → nothing to shrink.
-        async with async_session_factory() as session:
-            workday = await select_workday(session, master_id, slot_date)
-
-        if workday is None:
-            if isinstance(callback.message, Message):
-                hint_text = (
-                    f"❌ На {slot_date.strftime('%d %B %Y')} рабочий день не открыт — "
-                    "нечего закрывать."
-                )
-                try:
-                    await callback.message.edit_text(hint_text, reply_markup=None)
-                except TelegramBadRequest:
-                    await callback.message.answer(hint_text)
-            await callback.answer()
-            return
-
-        # Compute current window in minutes for shrink keyboard + state.
-        current_start_minute = workday.start_time.hour * 60 + workday.start_time.minute
-        current_end_minute = workday.end_time.hour * 60 + workday.end_time.minute
-        # NI2 pre-check: shrink range [current_start+30, current_end-30] must be
-        # non-empty → window must be >= 60min. < 60min → "Окно слишком узкое".
-        if current_end_minute - current_start_minute < 60:
-            if isinstance(callback.message, Message):
-                narrow_text = (
-                    f"❌ Окно на {slot_date.strftime('%d %B %Y')} слишком узкое "
-                    f"({workday.start_time.strftime('%H:%M')}–"
-                    f"{workday.end_time.strftime('%H:%M')}), нельзя сузить."
-                )
-                try:
-                    await callback.message.edit_text(narrow_text, reply_markup=None)
-                except TelegramBadRequest:
-                    await callback.message.answer(narrow_text)
-            await callback.answer()
-            return
-
-        # Window wide enough → start inline shrink picker (mode="shrink").
-        await state.update_data(
-            selected_date=slot_date.isoformat(),
-            workday_id=str(workday.id),
-            current_start_minute=current_start_minute,
-            current_end_minute=current_end_minute,
-        )
-        await state.set_state(AdminStates.picking_shrink_end)
-
-        if isinstance(callback.message, Message):
-            picker_text = (
-                f"📅 Дата: <b>{slot_date.strftime('%d %B %Y')}</b>\n"
-                f"Текущее окно: <b>"
-                f"{workday.start_time.strftime('%H:%M')}–"
-                f"{workday.end_time.strftime('%H:%M')}</b>\n"
-                "⏰ Выберите новое время окончания (окно сузится до этого времени):"
-            )
-            picker_kb = admin_window_slot_picker_keyboard(
-                workday_id=workday.id,
-                mode="shrink",
-                business_tz=tz,
-                current_start_minute=current_start_minute,
-                current_end_minute=current_end_minute,
-            )
-            try:
-                await callback.message.edit_text(picker_text, reply_markup=picker_kb)
-            except TelegramBadRequest:
-                await callback.message.answer(picker_text, reply_markup=picker_kb)
-        await callback.answer()
-        return
-
-    if callback_data.act == SimpleCalAct.cancel:
-        await state.clear()
-        if isinstance(callback.message, Message):
-            try:
-                await callback.message.edit_text(
-                    "❌ Закрытие слота отменено. /menu — заново",
-                    reply_markup=None,
-                )
-            except TelegramBadRequest:
-                await callback.message.answer("❌ Закрытие слота отменено. /menu — заново")
-        await callback.answer()
-        return
-
-    # Navigation (prev_y/next_y/prev_m/next_m/today-diff-month):
-    # lib сделал edit_reply_markup, handler answers.
-    await callback.answer()
-
-
 # ============================================================
 # Этап 5.10 inline-часы: AdminWindow* pick / confirm / cancel handlers
 #
 # Replaces text-input hours_msg/hour_msg (deleted above) with inline 30-min
-# slot picker. Two flows share AdminWindowSlot30CallbackData (prefix "admin_win30")
-# + AdminWindowConfirmCallbackData (prefix "admin_win_conf") — distinguished by
-# StateFilter (picking_window_start/end vs picking_shrink_end vs
-# confirming_window vs confirming_shrink).
+# slot picker. Window flow uses AdminWindowSlot30CallbackData (prefix
+# "admin_win30") + AdminWindowConfirmCallbackData (prefix "admin_win_conf").
 #
 # /addslots inline flow (4 steps):
 #   calendar_cb (above) → admin_window_start_cb (picking_window_start) →
 #   admin_window_end_cb (picking_window_end) → admin_window_confirm_cb
 #   (confirming_window) → open_workday (handles create+update idempotently).
 #
-# /closeslot inline flow (3 steps):
-#   calendar_cb (above) → admin_shrink_end_cb (picking_shrink_end) →
-#   admin_shrink_confirm_cb (confirming_shrink) → update_workday shrink.
+# /closeslot SHRINK inline flow — REMOVED (5.10 simplification, user feedback:
+# «Изменить окно» уже умеет сузить, расширить, сдвинуть — отдельная кнопка
+# «Сузить» избыточна). cmd_closeslot (text command, slot-based) — deprecated
+# alias, не трогаем.
 #
 # Mirror patterns (no line numbers — prone to drift; use symbol name for grep):
 #   admin_move_slot_30_cb — slot tap + state save + summary
@@ -1477,181 +1290,25 @@ async def admin_window_confirm_cb(
     await callback.answer()
 
 
-@router.callback_query(
-    AdminWindowSlot30CallbackData.filter(),
-    StateFilter(AdminStates.picking_shrink_end),
-)
-async def admin_shrink_end_cb(
-    callback: CallbackQuery,
-    callback_data: AdminWindowSlot30CallbackData,
-    state: FSMContext,
-) -> None:
-    """[shrink end slot tap] → save new_end_minute, set_state(confirming_shrink),
-    show summary "Сузить окно до [start, new_end]?" + admin_window_confirm_keyboard().
-    """
-    if not _is_admin_callback(callback):
-        await callback.answer()
-        return
-    assert callback.from_user is not None
-
-    resolved = await _resolve_master_and_business(callback.from_user.id)
-    if resolved is None:
-        await state.clear()
-        await callback.answer("❌ Мастер не найден", show_alert=True)
-        return
-    _master_id, _business_id, _tz = resolved
-
-    data = await state.get_data()
-    workday_id_str = data.get("workday_id")
-    current_start_minute = data.get("current_start_minute")
-    if not workday_id_str or current_start_minute is None:
-        await state.clear()
-        if callback.message is not None:
-            await callback.message.answer(
-                "❌ Данные сессии потеряны. /closeslot чтобы начать заново"
-            )
-        await callback.answer()
-        return
-
-    new_end_minute = callback_data.start_minute
-    await state.update_data(new_end_minute=new_end_minute)
-    await state.set_state(AdminStates.confirming_shrink)
-
-    start_time = dt_time(int(current_start_minute) // 60, int(current_start_minute) % 60)
-    new_end_time = dt_time(new_end_minute // 60, new_end_minute % 60)
-
-    if callback.message is not None:
-        await callback.message.answer(
-            f"Сузить окно до <b>{start_time.strftime('%H:%M')}–"
-            f"{new_end_time.strftime('%H:%M')}</b>?",
-            reply_markup=admin_window_confirm_keyboard(),
-        )
-    await callback.answer()
-
-
-@router.callback_query(
-    AdminWindowConfirmCallbackData.filter(),
-    StateFilter(AdminStates.confirming_shrink),
-)
-async def admin_shrink_confirm_cb(
-    callback: CallbackQuery,
-    state: FSMContext,
-) -> None:
-    """[✅ Подтвердить] → capture state → state.clear() → update_workday shrink → render result.
-
-    Mirror admin_window_confirm_cb pattern: state.clear() BEFORE service call.
-
-    update_workday REQUIRES workday_id (NOT (master_id, work_date) like open_workday).
-    current_start_time preserved from state (shrink = change end only, start fixed).
-
-    Error mapping (NI3 fix, mirror admin_openday_end_msg error mapping):
-      ValueError → f"❌ {exc}\n/closeslot чтобы начать" (exc =
-        "WorkDay {workday_id} not found" — admin deleted workday between pick
-        and confirm, OR workday_id corrupted in state)
-      WorkDayShrinkError → "Только что записался клиент на это время. /closeslot
-        чтобы выбрать другое время" (race with concurrent create_booking)
-      SQLAlchemyError → "❌ Ошибка БД..."
-
-    State loss defensive check (mirror admin_move_confirm_cb state_loss check).
-    """
-    if not _is_admin_callback(callback):
-        await callback.answer()
-        return
-    assert callback.from_user is not None
-
-    resolved = await _resolve_master_and_business(callback.from_user.id)
-    if resolved is None:
-        await state.clear()
-        await callback.answer("❌ Мастер не найден", show_alert=True)
-        return
-    _master_id, _business_id, tz = resolved
-
-    data = await state.get_data()
-    workday_id_str = data.get("workday_id")
-    current_start_minute = data.get("current_start_minute")
-    new_end_minute = data.get("new_end_minute")
-    if not workday_id_str or current_start_minute is None or new_end_minute is None:
-        await state.clear()
-        if callback.message is not None:
-            await callback.message.answer(
-                "❌ Данные сессии потеряны. /closeslot чтобы начать заново"
-            )
-        await callback.answer()
-        return
-
-    try:
-        workday_id = UUID(workday_id_str)
-        current_start_time = dt_time(
-            int(current_start_minute) // 60, int(current_start_minute) % 60
-        )
-        new_end_time = dt_time(int(new_end_minute) // 60, int(new_end_minute) % 60)
-    except (ValueError, TypeError):
-        await state.clear()
-        if callback.message is not None:
-            await callback.message.answer(
-                "❌ Ошибка данных в сессии. /closeslot чтобы начать заново"
-            )
-        await callback.answer()
-        return
-
-    # state.clear() BEFORE service call (race condition).
-    await state.clear()
-    async with async_session_factory() as session:
-        try:
-            updated = await update_workday(
-                session, workday_id, current_start_time, new_end_time, business_tz=tz
-            )
-        except ValueError as exc:
-            # WorkDay deleted between pick and confirm (race) — update_workday
-            # raises ValueError("WorkDay {id} not found"). Also covers the
-            # "end_time must be > start_time" path (workday.py:136) — unreachable
-            # under normal flow (shrink picker constrains new_end >= current_start+30)
-            # but if state corrupted → render the actual error text (mirror
-            # admin_window_confirm_cb ValueError pattern).
-            if callback.message is not None:
-                await callback.message.answer(f"❌ {exc}\n/closeslot чтобы начать")
-            await callback.answer()
-            return
-        except WorkDayShrinkError as exc:
-            # Race: concurrent create_booking between pick and confirm added a
-            # booking outside the new (narrower) window.
-            if callback.message is not None:
-                await callback.message.answer(
-                    f"❌ Только что записался клиент на это время.\n{exc}\n"
-                    "/closeslot чтобы выбрать другое время"
-                )
-            await callback.answer()
-            return
-        except SQLAlchemyError:
-            if callback.message is not None:
-                await callback.message.answer("❌ Ошибка БД. Начните заново через /menu")
-            await callback.answer()
-            return
-
-    if callback.message is not None:
-        await callback.message.answer(
-            f"✅ Окно сужено на {updated.work_date.strftime('%d %B %Y')}:\n"
-            f"<b>{updated.start_time.strftime('%H:%M')}–"
-            f"{updated.end_time.strftime('%H:%M')}</b>"
-        )
-    await callback.answer()
-
-
 @router.callback_query(F.data == "admin_window_cancel", StateFilter(AdminStates))
 async def admin_window_cancel_cb(callback: CallbackQuery, state: FSMContext) -> None:
-    """[❌ Отмена] string callback in window/shrink FSM states — clear FSM, answer.
+    """[❌ Отмена] string callback in window FSM states — clear FSM, answer.
 
     Uses F.data == "admin_window_cancel" (string callback_data from
-    admin_window_confirm_keyboard, keyboards/admin.py:393). StateFilter(AdminStates)
-    catches ONLY in AdminStates group (window/shrink/openday/service) — admin_window_cancel
-    originates from our confirm keyboard which is only shown inside AdminStates. BookingStates
-    / TransferStates / AdminMoveStates NOT touched (admin_move_cancel uses
-    StateFilter(AdminMoveStates), BookingStates has its own /cancel).
+    admin_window_confirm_keyboard, keyboards/admin.py). StateFilter(AdminStates)
+    catches ONLY in AdminStates group (window/openday/service) — admin_window_cancel
+    originates from our confirm keyboard which is only shown in
+    picking_window_end/confirming_window. BookingStates / TransferStates /
+    AdminMoveStates NOT touched (admin_move_cancel uses StateFilter(AdminMoveStates),
+    BookingStates has its own /cancel).
 
     Mirror admin_move_cancel_cb pattern — same F.data string
     filter approach; StateFilter(AdminStates) is wider than StateFilter(AdminMoveStates)
-    because window/shrink/openday/service live in 6 distinct AdminStates groups,
-    while admin_move flow is contained in AdminMoveStates.
+    because window/openday/service live in distinct AdminStates groups, while
+    admin_move flow is contained in AdminMoveStates.
+
+    /closeslot shrink flow REMOVED (5.10 simplification) — no shrink_state
+    to catch, no impact on this handler.
     """
     if not _is_admin_callback(callback):
         await callback.answer()
@@ -1659,7 +1316,7 @@ async def admin_window_cancel_cb(callback: CallbackQuery, state: FSMContext) -> 
     await state.clear()
     if callback.message is not None:
         await callback.message.answer(
-            "❌ Действие отменено. /addslots или /closeslot чтобы начать."
+            "❌ Действие отменено. /addslots чтобы начать заново."
         )
     await callback.answer()
 
