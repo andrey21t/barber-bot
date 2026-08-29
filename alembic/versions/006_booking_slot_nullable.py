@@ -74,10 +74,7 @@ def upgrade() -> None:
     # [REDACTED-SESSION-ID], 2026-08-29): wrong name `fk_bookings_slot_id`
     # silently skip'ал drop → FK оставался → блокировал 007 `DROP TABLE slots`.
     if dialect == "postgresql":
-        op.execute(
-            "ALTER TABLE bookings "
-            "DROP CONSTRAINT IF EXISTS bookings_slot_id_fkey"
-        )
+        op.execute("ALTER TABLE bookings DROP CONSTRAINT IF EXISTS bookings_slot_id_fkey")
 
     # 2. Drop UNIQUE index ux_bookings_slot — legacy no-WorkDay path теряет
     # UNIQUE guard, остаётся rowcount-check (booking.py:482-487).
