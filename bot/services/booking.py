@@ -262,7 +262,10 @@ async def _acquire_advisory_lock(session: AsyncSession, master_id: UUID, work_da
     engine = session.bind
     if engine is None or engine.dialect.name != "postgresql":
         return
-    stmt = text("SELECT pg_advisory_xact_lock(hashtext(:master_id::text), :work_date_ordinal)")
+    # NB: не использовать `::text` cast после :param — asyncpg парсер ломается
+    # на `:master_id::text` (PostgresSyntaxError "syntax error at or near :",
+    # verified prod VPS 2026-08-29). str(master_id) и так text — cast избыточен.
+    stmt = text("SELECT pg_advisory_xact_lock(hashtext(:master_id), :work_date_ordinal)")
     await session.execute(
         stmt,
         {
