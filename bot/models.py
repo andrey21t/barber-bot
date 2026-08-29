@@ -233,7 +233,7 @@ class NotificationLog(Base):
         Uuid, ForeignKey("bookings.id", ondelete="CASCADE"), nullable=False
     )
     kind: Mapped[str] = mapped_column(String(30))
-    # remind_24h | remind_1h | master_new | master_cancel | master_transfer
+    # remind_24h | remind_1h | master_new | master_cancel | master_transfer | client_moved
     sent_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True).with_variant(TIMESTAMP(timezone=True), "postgresql"),
         server_default=func.now(),
@@ -241,7 +241,10 @@ class NotificationLog(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "kind IN ('remind_24h','remind_1h','master_new','master_cancel','master_transfer')",
+            "kind IN ("
+            "'remind_24h','remind_1h','master_new','master_cancel','master_transfer',"
+            "'client_moved'"
+            ")",
             name="ck_notifications_kind",
         ),
         Index("ux_notifications_booking_kind", "booking_id", "kind", unique=True),

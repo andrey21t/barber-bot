@@ -1252,3 +1252,375 @@ async def test_resolve_master_and_business_returns_none_when_business_fk_broken(
 
     result = await admin_handlers._resolve_master_and_business(ADMIN_TG_ID)
     assert result is None
+
+
+# ============================================================
+# Этап 5.9 — admin_move flow handler tests (6 tests)
+# ============================================================
+# Coverage:
+# - cmd_today renders move button (reply_markup non-None)
+# - admin_move_select_cb sets state + shows calendar
+# - admin_move_simple_calendar_cb: no_workday hint + inactive_workday hint
+# - admin_move_slot_30_cb saves state + shows summary
+# - admin_move_confirm_cb calls service + notifies client + clears state
+#
+# Pattern: direct handler invocation with mock CallbackQuery + MagicMock state
+# (FSMContext is hard to instantiate without Dispatcher; MagicMock suffices
+# for set_state/update_data/get_data/clear assertions). scheduler patched via
+# patch on admin_move_booking for confirm_cb test (avoids real DB writes).
+# ============================================================
+
+
+def _make_callback(
+    user_id: int,
+    *,
+    callback_data: Any = None,
+) -> MagicMock:
+    """Mock aiogram.CallbackQuery with spec — answer is AsyncMock for assertions.
+
+    message.answer is AsyncMock; callback.bot.send_message is AsyncMock
+    (for confirm_cb test where handler sends client notification).
+    """
+    cb = MagicMock(spec=["from_user", "message", "bot", "answer", "data"])
+    cb.from_user = _make_user(user_id)
+    cb.message = MagicMock()
+    cb.message.answer = AsyncMock()
+    cb.bot = MagicMock()
+    cb.bot.send_message = AsyncMock()
+    cb.answer = AsyncMock()
+    cb.data = callback_data if callback_data is not None else "noop"
+    return cb
+
+
+def _make_mock_state(data: dict[str, Any] | None = None) -> MagicMock:
+    """Mock FSMContext — AsyncMock for set_state/update_data/get_data/clear.
+
+    `get_data` returns the passed dict (or empty dict) — for tests that
+    need state pre-populated (e.g. confirm_cb expects booking_id + workday_id +
+    start_minute in FSM data).
+    """
+    state = MagicMock()
+    state.set_state = AsyncMock()
+    state.update_data = AsyncMock()
+    state.clear = AsyncMock()
+    stored = dict(data) if data else {}
+
+    async def _get_data() -> dict[str, Any]:
+        return stored
+
+    state.get_data = _get_data
+    return state
+
+
+def callback_answer_text(callback: MagicMock) -> str:
+    """Extract text from callback.message.answer (first positional arg)."""
+    args, _ = callback.message.answer.call_args
+    return str(args[0])
+
+
+@pytest.mark.asyncio
+async def test_cmd_today_renders_move_button_for_bookings(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """/today with bookings → answer includes reply_markup (admin_today_keyboard
+    with [🔄 Перенести] button per booking)."""
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        now_local = datetime.now(ZoneInfo(TZ))
+        today_local_at_14 = now_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        slot = await _seed_slot(
+            session,
+            master_id=ctx["master_id"],
+            slot_date=today_local_at_14.date(),
+            hour=14,
+            status="open",
+        )
+        await _seed_booking(
+            session,
+            ctx=ctx,
+            slot=slot,
+            start_at_utc_naive=_local_to_utc_naive(today_local_at_14),
+            status="confirmed",
+        )
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/today")
+    await admin_handlers.cmd_today(msg)
+
+    # msg.answer called with reply_markup — second positional arg or kwarg.
+    args, kwargs = msg.answer.call_args
+    reply_markup = kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
+    assert reply_markup is not None, "Expected reply_markup with [🔄 Перенести] button"
+    # InlineKeyboardMarkup has .inline_keyboard list — at least one button.
+    assert len(reply_markup.inline_keyboard) >= 1
+
+
+@pytest.mark.asyncio
+async def test_admin_move_select_cb_sets_state_and_shows_calendar(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[🔄 Перенести] tap → state.set_state(AdminMoveStates.selecting_date),
+    state.update_data(admin_move_booking_id), answer with calendar keyboard.
+    """
+    from bot.keyboards.admin import AdminMoveCallbackData
+    from bot.states import AdminMoveStates
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    booking_id = UUID("12345678-1234-5678-1234-567812345678")
+    cb_data = AdminMoveCallbackData(booking_id=booking_id)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state()
+
+    await admin_handlers.admin_move_select_cb(callback, cb_data, state)
+
+    state.update_data.assert_called_once()
+    update_args, update_kwargs = state.update_data.call_args
+    data_passed = update_args[0] if update_args else update_kwargs
+    assert data_passed["admin_move_booking_id"] == str(booking_id)
+
+    state.set_state.assert_called_once_with(AdminMoveStates.selecting_date)
+
+    args, kwargs = callback.message.answer.call_args
+    reply_markup = kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
+    assert reply_markup is not None, "Expected calendar reply_markup"
+
+
+@pytest.mark.asyncio
+async def test_admin_move_simple_calendar_no_workday_hint(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Day select with no WorkDay → 'Мастер не работает в этот день' + re-show
+    calendar (no slot picker).
+    """
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cb = MagicMock(spec=["from_user", "message", "bot", "answer"])
+    cb.from_user = _make_user(ADMIN_TG_ID)
+    cb.message = MagicMock()
+    cb.message.answer = AsyncMock()
+    cb.answer = AsyncMock()
+
+    future_date = datetime.now(UTC) + timedelta(days=30)
+    cal_cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=future_date.year,
+        month=future_date.month,
+        day=future_date.day,
+    )
+
+    state = _make_mock_state()
+
+    from unittest.mock import patch
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(True, future_date),
+    ):
+        await admin_handlers.admin_move_simple_calendar_cb(cb, cal_cb_data, state)
+
+    text = callback_answer_text(cb)
+    assert "не работает в этот день" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_move_simple_calendar_inactive_workday_hint(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Day select with is_active=False WorkDay → 'Этот день закрыт' + re-show
+    calendar.
+    """
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        from datetime import time as dt_time
+
+        from bot.models import WorkDay
+
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        workday = WorkDay(
+            master_id=ctx["master_id"],
+            work_date=tomorrow,
+            start_time=dt_time(10, 0),
+            end_time=dt_time(20, 0),
+            max_concurrent_clients=1,
+            is_active=False,  # closed via /closeday
+        )
+        session.add(workday)
+        await session.commit()
+
+    cb = MagicMock(spec=["from_user", "message", "bot", "answer"])
+    cb.from_user = _make_user(ADMIN_TG_ID)
+    cb.message = MagicMock()
+    cb.message.answer = AsyncMock()
+    cb.answer = AsyncMock()
+
+    future_date = datetime.combine(tomorrow, datetime.min.time())
+    cal_cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=future_date.year,
+        month=future_date.month,
+        day=future_date.day,
+    )
+
+    state = _make_mock_state()
+
+    from unittest.mock import patch
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(True, future_date),
+    ):
+        await admin_handlers.admin_move_simple_calendar_cb(cb, cal_cb_data, state)
+
+    text = callback_answer_text(cb)
+    assert "закрыт" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_move_slot_30_cb_saves_state_and_shows_summary(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Slot tap → state.update_data(workday_id+start_minute),
+    state.set_state(confirming), answer with summary + confirm_keyboard.
+    """
+    from bot.keyboards.admin import AdminMoveSlot30CallbackData
+    from bot.states import AdminMoveStates
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        from datetime import time as dt_time
+
+        from bot.models import WorkDay
+
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        workday = WorkDay(
+            master_id=ctx["master_id"],
+            work_date=tomorrow,
+            start_time=dt_time(10, 0),
+            end_time=dt_time(20, 0),
+            max_concurrent_clients=1,
+            is_active=True,
+        )
+        session.add(workday)
+        now_local = datetime.now(ZoneInfo(TZ))
+        today_at_14 = now_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        slot = await _seed_slot(
+            session,
+            master_id=ctx["master_id"],
+            slot_date=today_at_14.date(),
+            hour=14,
+            status="open",
+        )
+        booking = await _seed_booking(
+            session,
+            ctx=ctx,
+            slot=slot,
+            start_at_utc_naive=_local_to_utc_naive(today_at_14),
+            status="confirmed",
+        )
+        await session.commit()
+
+    workday_id = workday.id
+    booking_id = booking.id
+    cb_data = AdminMoveSlot30CallbackData(workday_id=workday_id, start_minute=15 * 60)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state(data={"admin_move_booking_id": str(booking_id)})
+
+    await admin_handlers.admin_move_slot_30_cb(callback, cb_data, state)
+
+    state.update_data.assert_called_once()
+    update_args, update_kwargs = state.update_data.call_args
+    data_passed = update_args[0] if update_args else update_kwargs
+    assert data_passed["admin_move_new_workday_id"] == str(workday_id)
+    assert data_passed["admin_move_new_start_minute"] == 15 * 60
+    state.set_state.assert_called_once_with(AdminMoveStates.confirming)
+
+    text = callback_answer_text(callback)
+    assert "Подтвердите перенос" in text
+    assert "Было:" in text
+    assert "Станет:" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_move_confirm_cb_calls_service_and_notifies_client(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[✅ Перенести] → admin_move_booking called with extracted args,
+    bot.send_message to client_telegram_id, state.clear, answer with success.
+
+    Patches admin_move_booking to return a stub AdminMoveResult — avoids real
+    DB writes (already covered by service tests in test_admin_move.py).
+    """
+    from bot.services.admin_move import AdminMoveResult
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+
+    booking_id = UUID("11111111-1111-1111-1111-111111111111")
+    workday_id = UUID("22222222-2222-2222-2222-222222222222")
+    state = _make_mock_state(
+        data={
+            "admin_move_booking_id": str(booking_id),
+            "admin_move_new_workday_id": str(workday_id),
+            "admin_move_new_start_minute": 15 * 60,  # 15:00
+        }
+    )
+
+    callback = _make_callback(ADMIN_TG_ID)
+    mock_scheduler = MagicMock()
+
+    stub_result = AdminMoveResult(
+        booking_id=booking_id,
+        old_start_at=datetime.now(UTC) - timedelta(hours=1),
+        new_start_at=datetime.now(UTC) + timedelta(days=2),
+        client_telegram_id=111222333,
+        client_name_snapshot="Паша",
+        service_title_snapshot="Стрижка",
+        master_id=ctx["master_id"],
+        business_id=ctx["business_id"],
+        business_timezone=TZ,
+        old_slot_id=None,
+        notification_logged=True,
+    )
+
+    from unittest.mock import patch
+
+    with patch(
+        "bot.handlers.admin.admin_move_booking",
+        return_value=stub_result,
+    ) as mock_service:
+        await admin_handlers.admin_move_confirm_cb(callback, state, mock_scheduler)
+
+    mock_service.assert_called_once()
+    call_args = mock_service.call_args
+    assert call_args.args[1] == booking_id
+    assert call_args.args[2] == workday_id
+    assert call_args.args[3].hour == 15
+    assert call_args.args[3].minute == 0
+    assert call_args.args[4] == mock_scheduler
+
+    state.clear.assert_called_once()
+
+    callback.bot.send_message.assert_called_once()
+    send_args, send_kwargs = callback.bot.send_message.call_args
+    chat_id = send_args[0] if send_args else send_kwargs.get("chat_id")
+    text_sent = send_args[1] if len(send_args) > 1 else send_kwargs.get("text")
+    assert chat_id == 111222333
+    assert "перенесена мастером" in text_sent
+
+    text = callback_answer_text(callback)
+    assert "✅ Запись перенесена" in text
+    assert "Клиент уведомлён" in text

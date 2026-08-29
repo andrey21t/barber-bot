@@ -21,7 +21,7 @@ created: 2026-08-28
    Замена: app-level check + retry + pg_advisory_xact_lock (BB-008, в 5.5).
 
 Что НЕ делает upgrade:
-- НЕ drop table slots (миграция 006, после smoke-test на prod ~1 неделя)
+- НЕ drop table slots (миграция 008, после smoke-test 006 на prod ~1 неделя)
 - НЕ drop Booking.slot_id FK (миграция 006)
 - НЕ drop UNIQUE(slot_id) на bookings (миграция 006)
 

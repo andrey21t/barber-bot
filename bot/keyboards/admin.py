@@ -10,10 +10,15 @@ Spec.md 251 (Вариант B): inline keyboard с 5 кнопками для м�
 
 Back-compat: admin_keyboard() (reply) оставлен как alias для тестов test_admin_handlers.py
 (54 теста на command handlers) и для Екатерины если она запомнила команды.
+
+Этап 5.9: admin_move keyboard + 3 callbacks (AdminMoveCallbackData,
+AdminMoveSlot30CallbackData, AdminMoveConfirmCallbackData).
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import cast
+from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import (
@@ -23,6 +28,8 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram_calendar import SimpleCalendar
+
+from bot.models import Booking
 
 
 class AdminMenuCallbackData(CallbackData, prefix="admin_menu"):
@@ -66,6 +73,51 @@ class AdminWeekCallbackData(CallbackData, prefix="admin_week"):
 
 class AdminServicesCallbackData(CallbackData, prefix="admin_services"):
     """Trigger entering_service flow — добавить услугу."""
+
+
+class AdminMoveCallbackData(CallbackData, prefix="admin_move"):
+    """Trigger admin_move flow — открыть calendar для переноса booking (Этап 5.9).
+
+    Payload:
+    - booking_id: UUID — booking to move (resolved from /today inline button).
+
+    Distinct prefix from MyBookingsTransferCallbackData ("mybook_transfer") —
+    that's client-initiated transfer with 24h rule + client_id pin. This is
+    admin-initiated move without 24h rule, without client_id pin, with
+    notification to CLIENT (not master). Different semantics, different prefix.
+    """
+
+    booking_id: UUID
+
+
+class AdminMoveSlot30CallbackData(CallbackData, prefix="admin_move_slot_30"):
+    """30-min WorkDay slot for admin_move flow (Этап 5.9).
+
+    Mirror BookSlot30CallbackData (keyboards/client.py:80) but distinct prefix
+    "admin_move_slot_30" — aiogram dispatch is exact-prefix match (callback_data.py:
+    117-125), no conflict with "book_slot_30".
+
+    Payload:
+    - workday_id: UUID — WorkDay row (resolved by admin_move_simple_calendar_cb).
+    - start_minute: int — minutes since midnight (0-1439), encodes start_time_local.
+      int has no `:` → aiogram pack() safe (verified aiogram 3.x source).
+
+    Conversion in admin_move_slot_30_cb: `dt_time(start_minute // 60, start_minute % 60)`.
+    Wire format size: "admin_move_slot_30:<uuid>:<int>" ≈ 19+1+32+1+4 = 57 bytes < 64 limit.
+    """
+
+    workday_id: UUID
+    start_minute: int
+
+
+class AdminMoveConfirmCallbackData(CallbackData, prefix="admin_move_confirm"):
+    """Confirm admin_move booking — final step in AdminMoveStates.confirming (Этап 5.9).
+
+    No payload (mirror BookConfirmCallbackData pattern, keyboards/client.py:50).
+    Handler reads booking_id + new_workday_id + new_start_minute from FSM state
+    (stored in selecting_slot transition), NOT from callback payload — keeps
+    callback_data small and avoids race where user could change FSM state mid-tap.
+    """
 
 
 def admin_inline_menu() -> InlineKeyboardMarkup:
@@ -123,3 +175,64 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         is_persistent=False,
     )
+
+
+def admin_today_keyboard(
+    bookings: list[Booking],
+    business_timezone: str = "Europe/Moscow",
+) -> InlineKeyboardMarkup:
+    """Inline keyboard with [🔄 Перенести] button for each today booking (Этап 5.9).
+
+    One button per booking, labeled with local time + service title (matches
+    /today text line). admin taps → admin_move flow (calendar → 30-min slot
+    picker → admin_move_booking service).
+
+    adjust(1) — one button per row (avoid horizontal clutter; Екатерина sees a
+    list, not a grid). Telegram inline keyboard limit 100 buttons/row × N rows
+    — pet-project single-tenant (Екатерина < 10 bookings/day), no pagination
+    needed. If > 30 bookings — would need pagination (defer until pain).
+
+    NB: workday-only bookings (slot_id is None) AND legacy slot-based bookings
+    BOTH get [🔄 Перенести] button — admin_move_booking handles both paths
+    (slot_id → NULL for legacy, no slot release for workday-only source).
+    """
+    tz = ZoneInfo(business_timezone)
+    builder = InlineKeyboardBuilder()
+    for b in bookings:
+        # b.start_at: naive on SQLite, aware UTC on Postgres. Inject tzinfo=UTC
+        # (no-op on Postgres) before .astimezone — Python interprets naive as
+        # system-local TZ otherwise.
+        local_time = b.start_at.replace(tzinfo=UTC).astimezone(tz)
+        when = local_time.strftime("%H:%M")
+        # Strip newlines from already-escaped snapshots to preserve button label
+        # layout (mirror _render_bookings:564 in admin.py).
+        name = b.client_name_snapshot.replace("\n", " ")
+        service = b.service_title_snapshot.replace("\n", " ")
+        builder.button(
+            text=f"🔄 {when} — {name}, {service}",
+            callback_data=AdminMoveCallbackData(booking_id=b.id).pack(),
+        )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_move_confirm_keyboard() -> InlineKeyboardMarkup:
+    """Build [✅ Перенести] / [❌ Отмена] keyboard for AdminMoveStates.confirming (Этап 5.9).
+
+    Mirror confirm_keyboard() in keyboards/client.py:186 but uses
+    AdminMoveConfirmCallbackData (distinct prefix, no conflict with
+    BookConfirmCallbackData "book_confirm").
+    """
+    from aiogram.types import InlineKeyboardButton
+
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="✅ Перенести",
+        callback_data=AdminMoveConfirmCallbackData().pack(),
+    )
+    builder.button(text="❌ Отмена", callback_data="admin_move_cancel")
+    builder.adjust(2)
+    # Suppress unused import warning (InlineKeyboardButton kept for clarity
+    # if someone wants to extend with custom rows later).
+    _ = InlineKeyboardButton
+    return builder.as_markup()

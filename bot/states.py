@@ -53,3 +53,29 @@ class AdminStates(StatesGroup):
     opening_workday_end = State()
     entering_service_name = State()
     entering_service_duration = State()
+
+
+class AdminMoveStates(StatesGroup):
+    """FSM states для admin_move flow (Этап 5.9, spec.md PLANS.md Gap 5).
+
+    Admin (мастер) переносит ЛЮБОЙ booking через /today → [🔄 Перенести]
+    кнопка. Distinct от TransferStates (client transfer) — admin skips 24h
+    rule, skips client_id pin, уведомление КЛИЕНТУ (не мастеру).
+
+    Flow:
+    - selecting_date: admin navigates SimpleCalendar to pick destination date.
+      Store: booking_id (str), is_admin_move=True flag implicit via StateFilter.
+    - selecting_slot: admin picks 30-min slot from workday window.
+      Store: booking_id, new_workday_id (str), new_start_minute (int).
+    - confirming: admin sees summary, taps [✅ Перенести] → admin_move_booking.
+
+    Reuses get_30min_slots_from_workday + get_available_slots_30 (slots.py:56,124)
+    + select_workday (workday.py:221) + slot_picker_keyboard_30min (keyboards).
+    Distinct from BookingStates/TransferStates via StateFilter — handler
+    dispatch by state, NOT by is_admin_move flag (avoids flag pollution in
+    _handle_simple_calendar, see client.py:168 is_transfer precedent).
+    """
+
+    selecting_date = State()
+    selecting_slot = State()
+    confirming = State()
