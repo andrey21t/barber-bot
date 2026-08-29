@@ -1,6 +1,6 @@
 """Add 'client_moved' to notifications_log.ck_notifications_kind
 
-Revision ID: 007_notifications_log_client_moved
+Revision ID: 007_notif_log_client_moved
 Revises: 006_booking_slot_nullable
 Create Date: 2026-08-29
 
@@ -22,6 +22,11 @@ Session 5.20 finding E). Renamed to 008 (drop table slots, after smoke-test 007
 on prod ~1 неделя). 007 = NotificationLog CHECK now — data-preserving, safe to
 deploy independent of 008. PLANS.md docstrings updated in this commit.
 
+NB2 (fix 2026-08-29): revision_id укорочен с "007_notifications_log_client_moved"
+(34 chars, не влезал в alembic_version.version_num VARCHAR(32) —
+StringDataRightTruncation на prod deploy) до "007_notif_log_client_moved"
+(26 chars). Конвенция: все revision_ids ≤32 chars (mirror 001-006).
+
 Downgrade is one-way door (mirror migration 006:97):
 - DELETE FROM notifications_log WHERE kind='client_moved' — removes audit logs
   of admin_move actions (pet-project single-tenant, data loss acceptable для
@@ -32,7 +37,7 @@ Downgrade is one-way door (mirror migration 006:97):
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision = "007_notifications_log_client_moved"
+revision = "007_notif_log_client_moved"
 down_revision = "006_booking_slot_nullable"
 branch_labels = None
 depends_on = None
