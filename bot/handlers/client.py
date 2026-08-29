@@ -294,14 +294,24 @@ async def _handle_simple_calendar(
             return
 
     if callback_data.act == SimpleCalAct.cancel:
+        # Этап 5.8b W1 (code-review iter 2): /slots vs /book hint branching.
+        # Read is_slots_path ДО state.clear() — после clear флаг потерян.
+        # is_transfer branch уже отличает transfer flow — добавляем /slots
+        # различие внутри not-transfer (booking flow) для согласованности с
+        # SlotAlreadyBooked/SlotInPast retry-cmd branching в confirm_cb.
+        if not is_transfer:
+            fsm_data_cancel = await state.get_data()
+            is_slots_path_cancel: bool | None = fsm_data_cancel.get("is_slots_path")
         # state.clear() BEFORE callback.answer (race condition, MY-VIBE-RULES.md:23)
         await state.clear()
         if callback.message is not None:
-            await callback.message.answer(
-                "Перенос отменён. /mybookings чтобы начать заново"
-                if is_transfer
-                else "Ввод отменён. /book чтобы начать заново"
-            )
+            if is_transfer:
+                hint = "Перенос отменён. /mybookings чтобы начать заново"
+            elif is_slots_path_cancel:
+                hint = "Ввод отменён. /slots чтобы начать заново"
+            else:
+                hint = "Ввод отменён. /book чтобы начать заново"
+            await callback.message.answer(hint)
         await callback.answer()
         return
 
@@ -528,9 +538,14 @@ async def confirm_cb(
     has_workday_path = workday_id_str is not None and start_minute is not None
     if not client_name or not service_title or not (has_slot_path ^ has_workday_path):
         # state.clear() BEFORE answer (race condition, MY-VIBE-RULES.md 24)
+        # Этап 5.8b W3 (code-review iter 2): retry-cmd branching для согласованности
+        # с SlotAlreadyBooked/SlotInPast except'ами ниже (lines 615, 627). Если
+        # state corrupted с workday_id set (FSM from Redis after upgrade) —
+        # user был в /slots flow, hint должен быть /slots.
+        retry_cmd = "/slots" if has_workday_path else "/book"
         await state.clear()
         if callback.message is not None:
-            await callback.message.answer("❌ Данные потеряны. Начните заново через /book")
+            await callback.message.answer(f"❌ Данные потеряны. Начните заново через {retry_cmd}")
         await callback.answer()
         return
 
@@ -692,10 +707,21 @@ async def cancel_msg(message: Message, state: FSMContext) -> None:
 
     Registered BEFORE /mybookings handler (spec.md 491) — /cancel from /mybookings
     will be added in Урок 2.5 with StateFilter(None).
+
+    Этап 5.8b W2 (code-review iter 2): /slots vs /book hint branching. Read
+    is_slots_path ДО state.clear() — после clear флаг потерян. StateFilter("*")
+    ловит cancel из любого state, включая /slots entering_name/entering_service.
     """
+    # Read is_slots_path ДО state.clear() (race-condition pattern preserves).
+    fsm_data_cancel = await state.get_data()
+    is_slots_path_cancel: bool | None = fsm_data_cancel.get("is_slots_path")
     # state.clear() BEFORE answer (race condition, MY-VIBE-RULES.md 24)
     await state.clear()
-    await message.answer("Ввод отменён. /book чтобы начать заново")
+    if is_slots_path_cancel:
+        hint = "Ввод отменён. /slots чтобы начать заново"
+    else:
+        hint = "Ввод отменён. /book чтобы начать заново"
+    await message.answer(hint)
 
 
 # ============================================================
