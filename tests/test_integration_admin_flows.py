@@ -82,6 +82,7 @@ async def integration_dispatcher(
     before re-attaching (works across tests within same session).
     """
     monkeypatch.setattr("bot.handlers.admin.async_session_factory", session_factory)
+    monkeypatch.setattr("bot.handlers.client.async_session_factory", session_factory)
 
     for r in (start_router, admin_router, client_router):
         if r._parent_router is not None:  # noqa: SLF001 — aiogram internal
@@ -159,6 +160,22 @@ class RecordingBot:
 
     def reset(self) -> None:
         self.calls.clear()
+
+    async def send_message(self, *args: Any, **kwargs: Any) -> Any:
+        """Stub for callback.bot.send_message (used by confirm_cb to notify
+        master). Returns a stub Message — handler doesn't await on it.
+        """
+        from aiogram.types import Chat
+        from aiogram.types import Message as AioMessage
+
+        chat_id = kwargs.get("chat_id") or (args[0] if args else 1)
+        text = kwargs.get("text", "")
+        return AioMessage(
+            message_id=1,
+            date=datetime.now(UTC),
+            chat=Chat(id=chat_id, type="private"),
+            text=text,
+        )
 
 
 async def _seed_admin(
@@ -448,3 +465,307 @@ async def test_openweek_cancel_clears_state(
     bot.reset()
     await dp.feed_update(bot, _make_text_update("/openweek"))
     assert "Шаг 1" in _extract_send_text(bot)
+
+
+# ============================================================
+# Session 5.27 FEAT — booking flow E2E with service picker
+# Coverage: /slots → calendar → slot → name → service picker → ✅ → booking
+# ============================================================
+
+
+async def _seed_workday_tomorrow(
+    session_factory: Any,
+    *,
+    start_time_str: str = "10:00",
+    end_time_str: str = "12:00",
+) -> dict[str, Any]:
+    """Seed admin + business + master + workday (tomorrow, 10-12 LOCAL).
+
+    Returns dict with master_id, business_id, workday_id, client_telegram_id.
+    Client is NOT seeded here — created via /slots booking flow by telegram_id.
+    """
+    from datetime import time as dt_time
+
+    from bot.models import Service
+
+    async with session_factory() as session:
+        biz = Business(name="Test", telegram_owner_id=ADMIN_TG_ID, timezone=TZ)
+        session.add(biz)
+        await session.flush()
+        master = Master(business_id=biz.id, name="T", telegram_id=ADMIN_TG_ID, role="owner")
+        session.add(master)
+        await session.flush()
+
+        tomorrow = (datetime.now(ZoneInfo(TZ)) + timedelta(days=1)).date()
+        wd = WorkDay(
+            master_id=master.id,
+            work_date=tomorrow,
+            start_time=dt_time.fromisoformat(start_time_str),
+            end_time=dt_time.fromisoformat(end_time_str),
+            is_active=True,
+            max_concurrent_clients=1,
+        )
+        session.add(wd)
+        await session.flush()
+
+        # Two active services — picker should show both
+        svc1 = Service(business_id=biz.id, name="Стрижка", duration_minutes=60)
+        svc2 = Service(business_id=biz.id, name="Окрашивание", duration_minutes=120)
+        session.add_all([svc1, svc2])
+        await session.commit()
+
+        return {
+            "business_id": biz.id,
+            "master_id": master.id,
+            "workday_id": wd.id,
+            "service1_id": svc1.id,
+            "service2_id": svc2.id,
+        }
+
+
+def _make_calendar_day_update(
+    target_date: Any,
+    *,
+    user_id: int = ADMIN_TG_ID,
+    chat_id: int = ADMIN_TG_ID,
+) -> Update:
+    """Build Update for SimpleCalendar day-tap (act=DAY, year/month/day set).
+
+    Uses client telegram_id (999_888_777 — same as _seed_admin), not admin.
+    """
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=target_date.year,
+        month=target_date.month,
+        day=target_date.day,
+    ).pack()
+    return Update(
+        update_id=1,
+        callback_query=CallbackQuery(
+            id="1",
+            chat_instance=str(chat_id),
+            data=cb_data,
+            from_user=User(id=user_id, is_bot=False, first_name="T"),
+            message=Message(
+                message_id=1,
+                date=datetime.now(UTC),
+                chat=Chat(id=chat_id, type="private"),
+                text="calendar",
+            ),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_booking_flow_with_service_picker_creates_booking(
+    integration_dispatcher: tuple[Dispatcher, MagicMock],
+    session_factory: Any,
+) -> None:
+    """Session 5.27 FEAT E2E: /slots → calendar → slot → name → service
+    picker (tap service) → ✅ → booking created with service_id set.
+
+    Verifies:
+    - All handlers dispatch correctly (cmd_slots → simple_calendar_cb →
+      slot_30_cb → name_msg → service_picker_cb → confirm_cb)
+    - service_picker_keyboard shown with both seeded services + 'Своя услуга'
+    - Tap service → summary with service name → ✅ → BookingCreate.service_id
+      is the UUID (not None) — _build_end_at uses service.duration_minutes
+    - Booking persisted to DB with correct service_id, service_title_snapshot,
+      end_at = start_at + service.duration_minutes
+    """
+    from freezegun import freeze_time
+
+    # Freeze on a date where tomorrow is in the future (calendar always
+    # allows today + MAX_BOOKING_DAYS_AHEAD). Use a fixed date for determinism.
+    with freeze_time("2026-08-25 14:00:00", tz_offset=0):
+        dp, bot = integration_dispatcher
+        ctx = await _seed_workday_tomorrow(session_factory)  # workday for 2026-08-26
+
+        # Use a distinct client telegram_id (not admin).
+        client_tg = 999_888_777
+
+        # Step 1: /slots → SimpleCalendar shown (selecting_date state).
+        await dp.feed_update(bot, _make_text_update("/slots", user_id=client_tg))
+        step1 = _extract_send_text(bot)
+        assert "Выберите дату" in step1, f"Expected date picker, got: {step1!r}"
+
+        # Step 2: tap tomorrow (2026-08-26) in calendar → slot picker.
+        tomorrow = (datetime.now(ZoneInfo(TZ)) + timedelta(days=1)).date()
+        bot.reset()
+        await dp.feed_update(
+            bot, _make_calendar_day_update(tomorrow, user_id=client_tg)
+        )
+        step2 = _extract_send_text(bot)
+        # Either slot picker shown ('10:00' button) OR 'нет слотов' if workday
+        # window is empty. We seeded 10:00-12:00, so picker should appear.
+        slot_btn = await _find_button_by_label(bot, "10:00")
+        assert slot_btn is not None, (
+            f"Expected 10:00 slot button after calendar tap. Got text: {step2!r}"
+        )
+
+        # Step 3: tap 10:00 slot → 'На чьё имя?' prompt (entering_name).
+        bot.reset()
+        await dp.feed_update(
+            bot, _make_callback_update_from_button(slot_btn, user_id=client_tg)
+        )
+        step3 = _extract_send_text(bot)
+        assert "На чьё имя" in step3, f"Expected name prompt, got: {step3!r}"
+
+        # Step 4: type name → service picker shown (entering_service).
+        bot.reset()
+        await dp.feed_update(
+            bot, _make_text_update("Паша", user_id=client_tg)
+        )
+        step4 = _extract_send_text(bot)
+        assert "Выберите услугу тапом" in step4, (
+            f"5.27 FEAT: with services in DB, must show inline picker. "
+            f"Got: {step4!r}"
+        )
+        # Both services present + 'Своя услуга' fallback.
+        svc_btn = await _find_button_by_label(bot, "Стрижка")
+        assert svc_btn is not None, "Стрижка button in picker"
+        svc2_btn = await _find_button_by_label(bot, "Окрашивание")
+        assert svc2_btn is not None, "Окрашивание button in picker"
+        custom_btn = await _find_button_by_label(bot, "Своя услуга")
+        assert custom_btn is not None, "✏️ Своя услуга fallback button"
+
+        # Step 5: tap 'Окрашивание' → summary with service name (confirming).
+        bot.reset()
+        await dp.feed_update(
+            bot, _make_callback_update_from_button(svc2_btn, user_id=client_tg)
+        )
+        step5 = _extract_send_text(bot)
+        assert "Подтвердите запись" in step5, f"Expected summary, got: {step5!r}"
+        assert "Окрашивание" in step5, f"Service name in summary, got: {step5!r}"
+        assert "Паша" in step5, f"Client name in summary, got: {step5!r}"
+
+        # Step 6: tap ✅ → booking created ('Вы записаны').
+        confirm_btn = await _find_button_by_label(bot, "Подтвердить")
+        assert confirm_btn is not None, "✅ Подтвердить button on summary"
+        bot.reset()
+        await dp.feed_update(
+            bot, _make_callback_update_from_button(confirm_btn, user_id=client_tg)
+        )
+        step6 = _extract_send_text(bot)
+        assert "Вы записаны" in step6, f"Expected success, got: {step6!r}"
+
+        # Verify Booking persisted with correct service_id + duration.
+        from bot.models import Booking
+
+        async with session_factory() as session:
+            booking = await session.scalar(
+                select(Booking).where(Booking.master_id == ctx["master_id"])
+            )
+        assert booking is not None, "Booking must be persisted"
+        assert booking.service_id == ctx["service2_id"], (
+            "service_id in DB must match 'Окрашивание' (120 min) — "
+            "_build_end_at uses service.duration_minutes"
+        )
+        assert booking.service_title_snapshot == "Окрашивание"
+        assert booking.client_name_snapshot == "Паша"
+        # end_at - start_at should equal 120 min (service duration).
+        duration = (booking.end_at - booking.start_at).total_seconds() / 60
+        assert duration == 120, (
+            f"end_at - start_at must be 120 min (Окрашивание duration), "
+            f"got {duration} min — service_id not propagated to _build_end_at?"
+        )
+
+
+@pytest.mark.asyncio
+async def test_booking_flow_custom_service_text_uses_default_duration(
+    integration_dispatcher: tuple[Dispatcher, MagicMock],
+    session_factory: Any,
+) -> None:
+    """5.27 FEAT E2E: /slots → calendar → slot → name → '✏️ Своя услуга' →
+    typed text → ✅ → booking with service_id=None + default duration
+    (SERVICE_DEFAULT_DURATION_MIN).
+
+    Verifies the legacy fallback path: 'Своя услуга' button keeps state in
+    entering_service, service_msg catches the next text message, service_id
+    stays None (or reset to None — F1 fix), _build_end_at uses default.
+
+    F1 regression (stale service_id leaking from previous picker tap) is
+    covered by unit tests in test_client_handlers.py
+    (test_service_msg_clears_stale_service_id_from_state). This integration
+    test focuses on the happy path of the custom-service fallback.
+    """
+    from freezegun import freeze_time
+
+    with freeze_time("2026-08-25 14:00:00", tz_offset=0):
+        dp, bot = integration_dispatcher
+        ctx = await _seed_workday_tomorrow(session_factory)
+
+        client_tg = 999_888_777
+
+        # Full flow: /slots → calendar → slot → name.
+        await dp.feed_update(bot, _make_text_update("/slots", user_id=client_tg))
+        assert "Выберите дату" in _extract_send_text(bot)
+
+        tomorrow = (datetime.now(ZoneInfo(TZ)) + timedelta(days=1)).date()
+        bot.reset()
+        await dp.feed_update(
+            bot, _make_calendar_day_update(tomorrow, user_id=client_tg)
+        )
+        slot_btn = await _find_button_by_label(bot, "10:00")
+        assert slot_btn is not None
+
+        bot.reset()
+        await dp.feed_update(
+            bot, _make_callback_update_from_button(slot_btn, user_id=client_tg)
+        )
+        assert "На чьё имя" in _extract_send_text(bot)
+
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("Паша", user_id=client_tg))
+        assert "Выберите услугу тапом" in _extract_send_text(bot)
+
+        # Tap '✏️ Своя услуга' → ask for text.
+        custom_btn = await _find_button_by_label(bot, "Своя услуга")
+        assert custom_btn is not None
+        bot.reset()
+        await dp.feed_update(
+            bot, _make_callback_update_from_button(custom_btn, user_id=client_tg)
+        )
+        assert "Напишите услугу" in _extract_send_text(bot)
+
+        # Type custom service text.
+        bot.reset()
+        await dp.feed_update(
+            bot, _make_text_update("Борода + стрижка", user_id=client_tg)
+        )
+        summary = _extract_send_text(bot)
+        assert "Подтвердите запись" in summary
+        assert "Борода + стрижка" in summary
+
+        # Tap ✅.
+        confirm_btn = await _find_button_by_label(bot, "Подтвердить")
+        assert confirm_btn is not None
+        bot.reset()
+        await dp.feed_update(
+            bot, _make_callback_update_from_button(confirm_btn, user_id=client_tg)
+        )
+        assert "Вы записаны" in _extract_send_text(bot)
+
+        # Verify booking: service_id is None, end_at = start + default duration.
+        from bot.config import get_settings
+        from bot.models import Booking
+
+        async with session_factory() as session:
+            booking = await session.scalar(
+                select(Booking).where(Booking.master_id == ctx["master_id"])
+            )
+        assert booking is not None
+        assert booking.service_id is None, (
+            "Custom text path must NOT set service_id — _build_end_at uses "
+            "SERVICE_DEFAULT_DURATION_MIN"
+        )
+        assert booking.service_title_snapshot == "Борода + стрижка"
+        default_min = get_settings().SERVICE_DEFAULT_DURATION_MIN
+        duration = (booking.end_at - booking.start_at).total_seconds() / 60
+        assert duration == default_min, (
+            f"end_at - start_at must be {default_min} min (default), "
+            f"got {duration}"
+        )
