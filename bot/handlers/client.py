@@ -42,6 +42,7 @@ from bot.config import Settings, get_settings
 from bot.db import async_session_factory
 from bot.keyboards.client import (
     BookConfirmCallbackData,
+    BookServiceCallbackData,
     BookSlot30CallbackData,
     BookSlotCallbackData,
     MyBookingsCancelCallbackData,
@@ -50,6 +51,7 @@ from bot.keyboards.client import (
     calendar_keyboard,
     confirm_keyboard,
     mybookings_keyboard,
+    service_picker_keyboard,
     slot_picker_keyboard,
     slot_picker_keyboard_30min,
 )
@@ -434,7 +436,14 @@ async def slot_30_cb(
 # ============================================================
 @router.message(StateFilter(BookingStates.entering_name))
 async def name_msg(message: Message, state: FSMContext) -> None:
-    """User typed client name — save, ask for service."""
+    """User typed client name — save, ask for service.
+
+    Session 5.27 FEAT: if active services exist in DB → show inline picker
+    (tap-to-select). Otherwise → fall back to free-text prompt (legacy).
+    Service list is scoped to the master's business (single-master MVP:
+    ADMIN_ID → Master → Business.id), filtered by is_active=True, sorted
+    by name (predictable order for the user).
+    """
     name = message.text.strip() if message.text else ""
     if not name:
         await message.answer("Имя не может быть пустым. Введите имя:")
@@ -445,7 +454,190 @@ async def name_msg(message: Message, state: FSMContext) -> None:
 
     await state.update_data(client_name=name)
     await state.set_state(BookingStates.entering_service)
-    await message.answer("Какая услуга? (например: стрижка, окрашивание+стрижка)")
+
+    settings = get_settings()
+    async with async_session_factory() as session:
+        from sqlalchemy import select
+
+        from bot.models import Business, Master, Service
+
+        stmt_m = select(Master).where(Master.telegram_id == settings.ADMIN_ID).limit(1)
+        master = (await session.execute(stmt_m)).scalar_one_or_none()
+        if master is None:
+            # No master row yet (single-master MVP, but admin hasn't run /start
+            # or DB was wiped) → no business → no services → legacy text path.
+            await message.answer("Какая услуга? (например: стрижка, окрашивание+стрижка)")
+            return
+
+        stmt_b = select(Business).where(Business.id == master.business_id).limit(1)
+        business = (await session.execute(stmt_b)).scalar_one_or_none()
+        if business is None:
+            await message.answer("Какая услуга? (например: стрижка, окрашивание+стрижка)")
+            return
+
+        stmt_s = (
+            select(Service)
+            .where(Service.business_id == business.id, Service.is_active == True)  # noqa: E712
+            .order_by(Service.name)
+        )
+        services = list((await session.execute(stmt_s)).scalars().all())
+
+    if not services:
+        await message.answer("Какая услуга? (например: стрижка, окрашивание+стрижка)")
+        return
+
+    await message.answer(
+        "Выберите услугу тапом или напишите свою:",
+        reply_markup=service_picker_keyboard(services),
+    )
+
+
+# ============================================================
+# 4b. service_picker_cb — user tapped a service button (Session 5.27 FEAT)
+# ============================================================
+@router.callback_query(
+    BookServiceCallbackData.filter(),
+    StateFilter(BookingStates.entering_service),
+)
+async def service_picker_cb(
+    callback: CallbackQuery,
+    callback_data: BookServiceCallbackData,
+    state: FSMContext,
+) -> None:
+    """User tapped a service from the inline picker — save service_id +
+    service_title (= Service.name from DB), jump to confirming, render summary.
+
+    Reuses the same summary rendering logic as service_msg (workday_id path
+    OR slot_id path, XOR contract). The only difference vs service_msg:
+    service_id is set (string of UUID) in FSM data, which confirm_cb later
+    passes to BookingCreate.service_id → _build_end_at uses
+    service.duration_minutes instead of SERVICE_DEFAULT_DURATION_MIN.
+
+    Defensive: re-SELECT Service by id (callback_data could be stale/tampered
+    — the inline keyboard was built from a DB snapshot at name_msg time, but
+    master could have archived the service between name_msg and tap). If
+    service deleted or archived → fall back to text input (legacy path):
+    keep state in entering_service, ask for service manually. This avoids
+    a dead-end (user tapped a button that no longer resolves).
+    """
+    settings = get_settings()
+    async with async_session_factory() as session:
+        from sqlalchemy import select
+
+        from bot.models import Service
+
+        stmt = select(Service).where(Service.id == callback_data.service_id)
+        service = (await session.execute(stmt)).scalar_one_or_none()
+        if service is None or not service.is_active:
+            # Service was archived/deleted between name_msg and tap.
+            # Stay in entering_service, ask for free-text input.
+            if callback.message is not None:
+                await callback.message.answer(
+                    "Эта услуга больше недоступна. Напишите услугу текстом "
+                    "(например: стрижка, окрашивание+стрижка):"
+                )
+            await callback.answer()
+            return
+
+        await state.update_data(
+            service_id=str(service.id),
+            service_title=service.name,
+        )
+        await state.set_state(BookingStates.confirming)
+
+        data = await state.get_data()
+        workday_id_str = data.get("workday_id")
+        slot_id_str = data.get("slot_id")
+
+        # Branch on workday vs slot path (XOR — same as service_msg).
+        if workday_id_str is not None:
+            start_minute = data.get("start_minute")
+            if start_minute is None:
+                await state.clear()
+                if callback.message is not None:
+                    await callback.message.answer(
+                        "❌ Ошибка: время не выбрано. Начните заново через /slots"
+                    )
+                await callback.answer()
+                return
+            if not isinstance(start_minute, int) or not (0 <= start_minute <= 1439):
+                await state.clear()
+                if callback.message is not None:
+                    await callback.message.answer(
+                        "❌ Ошибка времени. Начните заново через /slots"
+                    )
+                await callback.answer()
+                return
+            start_time_local = dt_time(start_minute // 60, start_minute % 60)
+            wd_stmt = select(WorkDay).where(WorkDay.id == UUID(workday_id_str))
+            workday = (await session.execute(wd_stmt)).scalar_one_or_none()
+            if workday is None:
+                await state.clear()
+                if callback.message is not None:
+                    await callback.message.answer(
+                        "❌ Рабочий день не найден. Начните заново через /slots"
+                    )
+                await callback.answer()
+                return
+            start_at = _build_start_at_from_workday(workday, start_time_local, settings.TIMEZONE)
+            summary = _format_booking_summary_from_start_at(
+                start_at=start_at,
+                client_name=data["client_name"],
+                service_title=service.name,
+                business_timezone=settings.TIMEZONE,
+            )
+        else:
+            # Legacy /book slot path
+            if not slot_id_str:
+                await state.clear()
+                if callback.message is not None:
+                    await callback.message.answer(
+                        "❌ Ошибка: слот не выбран. Начните заново через /book"
+                    )
+                await callback.answer()
+                return
+            slot_stmt = select(Slot).where(Slot.id == UUID(slot_id_str))
+            slot = (await session.execute(slot_stmt)).scalar_one_or_none()
+            if slot is None:
+                await state.clear()
+                if callback.message is not None:
+                    await callback.message.answer("❌ Слот не найден. Начните заново через /book")
+                await callback.answer()
+                return
+            from bot.keyboards.client import _format_booking_summary
+
+            summary = _format_booking_summary(
+                slot=slot,
+                client_name=data["client_name"],
+                service_title=service.name,
+                business_timezone=settings.TIMEZONE,
+            )
+
+    if callback.message is not None:
+        await callback.message.answer(
+            f"Подтвердите запись:\n\n{summary}",
+            reply_markup=confirm_keyboard(),
+        )
+    await callback.answer()
+
+
+# ============================================================
+# 4c. service_custom_cb — user tapped "✏️ Своя услуга" (Session 5.27 FEAT)
+# ============================================================
+@router.callback_query(F.data == "book_service_custom", StateFilter(BookingStates.entering_service))
+async def service_custom_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """User tapped "Своя услуга" — keep state in entering_service, ask for text.
+
+    Existing service_msg catches the next text message and proceeds to
+    confirming (legacy path, no service_id set → _build_end_at uses default
+    duration). callback.answer() closes the loading spinner on the inline
+    button (Telegram UX contract).
+    """
+    if callback.message is not None:
+        await callback.message.answer(
+            "Напишите услугу текстом (например: стрижка, окрашивание+стрижка):"
+        )
+    await callback.answer()
 
 
 # ============================================================
@@ -462,7 +654,7 @@ async def service_msg(message: Message, state: FSMContext) -> None:
         await message.answer("Услуга слишком длинная (макс. 255 символов). Введите короче:")
         return
 
-    await state.update_data(service_title=service)
+    await state.update_data(service_title=service, service_id=None)
     await state.set_state(BookingStates.confirming)
 
     # Render summary — branch on /slots (workday_id) vs /book (slot_id).
@@ -479,19 +671,14 @@ async def service_msg(message: Message, state: FSMContext) -> None:
 
         if workday_id_str is not None:
             # === /slots workday path (Этап 5.8b) ===
+            # W2 (5.27 code-review iter): range check ДО DB SELECT — не тратим
+            # DB-вызов на заведомо невалидный start_minute. Унифицировано с
+            # service_picker_cb (client.py:554-571).
             start_minute = data.get("start_minute")
             if start_minute is None:
                 await state.clear()
                 await message.answer(
                     "❌ Ошибка: время не выбрано. Начните заново через /slots"
-                )
-                return
-            stmt = select(WorkDay).where(WorkDay.id == UUID(workday_id_str))
-            workday = (await session.execute(stmt)).scalar_one_or_none()
-            if workday is None:
-                await state.clear()
-                await message.answer(
-                    "❌ Рабочий день не найден. Начните заново через /slots"
                 )
                 return
             # Range 0-1439 guaranteed by slot_30_cb, but defensive against
@@ -500,6 +687,14 @@ async def service_msg(message: Message, state: FSMContext) -> None:
                 await state.clear()
                 await message.answer(
                     "❌ Ошибка времени. Начните заново через /slots"
+                )
+                return
+            stmt = select(WorkDay).where(WorkDay.id == UUID(workday_id_str))
+            workday = (await session.execute(stmt)).scalar_one_or_none()
+            if workday is None:
+                await state.clear()
+                await message.answer(
+                    "❌ Рабочий день не найден. Начните заново через /slots"
                 )
                 return
             start_time_local = dt_time(start_minute // 60, start_minute % 60)
@@ -566,6 +761,7 @@ async def confirm_cb(
     start_minute = data.get("start_minute")
     client_name = data.get("client_name")
     service_title = data.get("service_title")
+    service_id_str = data.get("service_id")  # Session 5.27: tap-to-select path
 
     # XOR contract with service_msg: slot_id (legacy /book) XOR
     # (workday_id + start_minute) (workday /slots). Both branches require
@@ -636,7 +832,7 @@ async def confirm_cb(
                 start_time_local=dt_time(start_minute // 60, start_minute % 60),
                 client_name=client_name,
                 service_title=service_title,
-                service_id=None,
+                service_id=UUID(service_id_str) if service_id_str else None,
             )
         else:
             # === /book legacy slot path ===
@@ -645,7 +841,7 @@ async def confirm_cb(
                 slot_id=UUID(slot_id_str),
                 client_name=client_name,
                 service_title=service_title,
-                service_id=None,
+                service_id=UUID(service_id_str) if service_id_str else None,
             )
 
         try:
