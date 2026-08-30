@@ -2088,7 +2088,6 @@ async def admin_move_cancel_cb(callback: CallbackQuery, state: FSMContext) -> No
 
 @router.message(Command("openweek"), StateFilter(None))
 async def cmd_openweek(message: Message, state: FSMContext) -> None:
-    logger.info("DEBUG /openweek cmd_openweek called")
     if not _is_admin(message):
         return
 
@@ -2121,7 +2120,6 @@ async def cmd_openweek(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(AdminOpenWeekEntryCallbackData.filter(), StateFilter("*"))
 async def admin_openweek_entry_cb(callback: CallbackQuery, state: FSMContext) -> None:
-    logger.info("DEBUG admin_openweek_entry_cb called")
     if not _is_admin_callback(callback):
         await callback.answer()
         return
@@ -2170,7 +2168,6 @@ async def admin_openweek_start_cb(
     callback_data: AdminWindowSlot30CallbackData,
     state: FSMContext,
 ) -> None:
-    logger.info("DEBUG admin_openweek_start_cb called, start_minute=%s", callback_data.start_minute)
     if not _is_admin_callback(callback):
         await callback.answer()
         return
@@ -2215,7 +2212,6 @@ async def admin_openweek_end_cb(
     callback_data: AdminWindowSlot30CallbackData,
     state: FSMContext,
 ) -> None:
-    logger.info("DEBUG admin_openweek_end_cb called, end_minute=%s", callback_data.start_minute)
     if not _is_admin_callback(callback):
         await callback.answer()
         return
