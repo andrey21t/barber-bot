@@ -2387,6 +2387,12 @@ async def admin_openweek_confirm_cb(
     for weekday in sorted(selected):
         work_date = monday + timedelta(days=weekday)
         day_label = _WEEKDAY_LABELS_HANDLER[weekday]
+        # Skip past days — mirror /addslots past-date guard (admin.py:291).
+        # On weekend (Sat/Sun) the current week's Mon-Fri are already past;
+        # user running /openweek on weekend wants upcoming days, not past.
+        if work_date < today_local:
+            fail_lines.append(f"❌ {day_label}: прошедшая дата")
+            continue
         try:
             async with async_session_factory() as session:
                 await open_workday(
@@ -2543,6 +2549,7 @@ async def admin_closeday_calendar_cb(
 
     if callback_data.act == SimpleCalAct.day:
         if not selected:
+            await callback.answer(cache_time=60)
             return  # out-of-range
         work_date = selected_date.date()
 

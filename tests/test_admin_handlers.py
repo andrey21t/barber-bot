@@ -2458,14 +2458,59 @@ async def test_admin_openweek_confirm_cb_state_loss_clears_state(
 
 
 @pytest.mark.asyncio
-@freeze_time("2026-08-30 14:00:00", tz_offset=0)  # Sunday UTC 14:00
+@freeze_time("2026-08-30 14:00:00", tz_offset=0)  # Sunday UTC 14:00 → Moscow 17:00
+async def test_admin_openweek_confirm_cb_skips_past_days(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[✅ Открыть] on Sunday with [Mon, Tue, Wed] selected — all 3 are past
+    (Mon 24, Tue 25, Wed 26 Aug). All get ❌ 'прошедшая дата', no WorkDay created.
+    Mirror /addslots past-date guard (admin.py:291).
+    """
+    from bot.models import WorkDay
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_openweek_confirm"
+    state = _make_mock_state({
+        "picked_start_minute": 600,
+        "picked_end_minute": 1200,
+        "selected_weekdays": [0, 1, 2],  # Mon, Tue, Wed (all past)
+        "business_tz": TZ,
+    })
+
+    await admin_handlers.admin_openweek_confirm_cb(callback, state)
+
+    text = callback_answer_text(callback)
+    assert "прошедшая дата" in text
+    assert "Пн" in text and "Вт" in text and "Ср" in text
+    # Verify no WorkDay created (all skipped).
+    today_local = datetime.now(ZoneInfo(TZ)).date()
+    monday = today_local - timedelta(days=today_local.weekday())
+    async with session_factory() as session:
+        count = 0
+        for weekday in [0, 1, 2]:
+            wd_date = monday + timedelta(days=weekday)
+            wd = await session.scalar(
+                select(WorkDay).where(
+                    WorkDay.master_id == ctx["master_id"], WorkDay.work_date == wd_date
+                )
+            )
+            count += 1 if wd is not None else 0
+    assert count == 0, "No WorkDay should be created for past days"
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-08-25 14:00:00", tz_offset=0)  # Tuesday UTC 14:00 → Moscow 17:00
 async def test_admin_openweek_confirm_cb_opens_days(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """[✅ Открыть] with 2 selected weekdays (Mon, Wed) → open_workday called
-    for Monday and Wednesday of current week. Monday = today_local - weekday()
-    where today_local uses business_tz (Moscow = UTC+3, so 17:00 Sunday 30 Aug).
+    """[✅ Открыть] with 2 selected weekdays (Wed, Fri) → open_workday called
+    for Wednesday and Friday of current week (Wed=27, Fri=29 Aug, both future).
+    Tuesday Moscow 17:00 → Mon(24)/Tue(25) past, Wed(27)/Fri(29) future.
     """
     from bot.models import WorkDay
 
@@ -2477,7 +2522,7 @@ async def test_admin_openweek_confirm_cb_opens_days(
     state = _make_mock_state({
         "picked_start_minute": 600,  # 10:00
         "picked_end_minute": 1200,  # 20:00
-        "selected_weekdays": [0, 2],  # Mon, Wed
+        "selected_weekdays": [2, 4],  # Wed, Fri (both future on Tuesday)
         "business_tz": TZ,
     })
 
@@ -2486,33 +2531,31 @@ async def test_admin_openweek_confirm_cb_opens_days(
     state.clear.assert_called_once()
     text = callback_answer_text(callback)
     assert "✅" in text
-    # Compute expected Monday/Wednesday from frozen time (mirror handler logic).
-    # UTC 14:00 2026-08-30 → Moscow 17:00 2026-08-30 (Sunday, weekday=6).
-    # Monday = 30 - 6 = 2026-08-24.
+    # Compute expected Wed/Fri of frozen week.
     today_local = datetime.now(ZoneInfo(TZ)).date()
     monday = today_local - timedelta(days=today_local.weekday())
-    mon_date = monday + timedelta(days=0)
     wed_date = monday + timedelta(days=2)
+    fri_date = monday + timedelta(days=4)
 
     async with session_factory() as session:
-        mon = await session.scalar(
-            select(WorkDay).where(
-                WorkDay.master_id == ctx["master_id"],
-                WorkDay.work_date == mon_date,
-            )
-        )
         wed = await session.scalar(
             select(WorkDay).where(
                 WorkDay.master_id == ctx["master_id"],
                 WorkDay.work_date == wed_date,
             )
         )
-    assert mon is not None and mon.is_active
+        fri = await session.scalar(
+            select(WorkDay).where(
+                WorkDay.master_id == ctx["master_id"],
+                WorkDay.work_date == fri_date,
+            )
+        )
     assert wed is not None and wed.is_active
+    assert fri is not None and fri.is_active
 
 
 @pytest.mark.asyncio
-@freeze_time("2026-08-30 14:00:00", tz_offset=0)
+@freeze_time("2026-08-25 14:00:00", tz_offset=0)  # Tuesday UTC 14:00
 async def test_admin_openweek_confirm_cb_partial_failure_shrinks_lines(
     session_factory: Any,
     patched_session_factory: Any,
@@ -2533,7 +2576,7 @@ async def test_admin_openweek_confirm_cb_partial_failure_shrinks_lines(
     state = _make_mock_state({
         "picked_start_minute": 600,   # 10:00
         "picked_end_minute": 720,     # 12:00
-        "selected_weekdays": [0, 2],  # Mon(0), Wed(2)
+        "selected_weekdays": [2, 4],  # Wed(2), Fri(4) — both future on Tuesday
         "business_tz": TZ,
     })
 
@@ -2543,7 +2586,10 @@ async def test_admin_openweek_confirm_cb_partial_failure_shrinks_lines(
         # Compute Monday of frozen week (mirror handler logic).
         today_local = datetime.now(ZoneInfo(business_tz)).date()
         monday = today_local - timedelta(days=today_local.weekday())
-        if work_date == monday:
+        # Fail on Wednesday (weekday=2) of frozen week — Wed selected, raise
+        # WorkDayShrinkError to simulate "есть бронь"; Fri passes through.
+        wed_fail = monday + timedelta(days=2)
+        if work_date == wed_fail:
             raise WorkDayShrinkError("active")
         return await real_open(
             session, master_id, work_date, start_time, end_time, business_tz=business_tz
@@ -2553,7 +2599,7 @@ async def test_admin_openweek_confirm_cb_partial_failure_shrinks_lines(
         await admin_handlers.admin_openweek_confirm_cb(callback, state)
 
     text = callback_answer_text(callback)
-    assert "Пн" in text and "Ср" in text
+    assert "Ср" in text and "Пт" in text
     assert "❌" in text and "✅" in text
 
 
