@@ -1,136 +1,142 @@
-# NEXT_SESSION_PROMPT — Session 5.26: 5.10 inline-часы toggle — финализация (commit + smoke-test)
+# NEXT_SESSION_PROMPT.md — Session 5.26 handoff
 
-> Дата: 2026-08-29 · **Session 5.25/5.25b завершены** (5.10 inline-часы toggle impl + post-compact recovery + code-reviewer S1-S4 fixup, НЕ закоммичено). Session 5.26 — финальный commit + smoke-test.
+> Pet-project git free (AGENTS.md § git-repo-categories): commit + push без переспроса.
+> VPS deploy через ssh root@188.225.82.248 (password rotated 27 авг, нет в .env).
 
-## ⚡ TL;DR для Session 5.26
+## Контекст сессии
 
-**Цель 5.26:** Закоммитить готовую работу 5.10 (inline-часы toggle) + smoke-test через Telegram (вручную, не автоматизировано).
+Сессия 5.25 (a-f) завершена: inline-picker для /addslots + remove shrink flow +
+picker range 09:00-20:00 + auto-show menu + picker показывает только свободные
+слоты с header «🔒 Занято» (donor-standard, winnerxxx13 Phase 2 deep dive).
+Push `e22fe2c` на GitHub.
 
-**Контекст:** Этап 5.10 — переделать `/addslots` и `/closeslot` FSM UI с text-input на inline 30-min slot picker, переключиться на workday-based path (`open_workday`/`update_workday` вместо deprecated `add_slots`/`close_slot`). Risk-class: HIGH-STAKES. Полностью имплементировано в Session 5.25 + 5.25b (post-compact recovery).
+Сделан Phase 2 donor research (winnerxxx13/barbershop-telegram-bot) — 15
+паттернов BB-100..BB-114, детально в `donor-research/donors/` + INSIGHT в
+`donor-research/topics/booking-bot-architecture.md`.
 
-## Что сделано (готово к коммиту)
+Решено: продолжать /openweek (наш подход ЛУЧШЕ для плавающего графика
+Екатерины — donor weekly schedule хуже для нестабильного графика). После
+/openweek — 4 статуса booking (BB-107) как разблокировка для reviews/CSV.
 
-### Git status (M = modified, НЕ staged):
+## Цель Session 5.26
+
+Реализовать 2 фичи:
+
+### A. /openweek — batch открыть неделю (главная задача)
+
+**Flow:**
+1. `/openweek` → picker start (09:00-19:30) — reuses
+   `admin_window_slot_picker_keyboard(mode="start")` (С bookmarker для
+   picked_start_minute, но БЕЗ booked_slots — новый день, не modify).
+   ИЛИ если хотим reuse с booked_slots: SELECT bookings для каждого дня
+   недели (7 queries) — too much. Решение: picker start БЕЗ booked_slots
+   (свободный выбор, protection на apply — WorkDayShrinkError по дню).
+2. → picker end (start+30 → 20:00) — reuses
+   `admin_window_slot_picker_keyboard(mode="end", picked_start_minute=...)`.
+3. → 7 toggle-кнопок дней (Пн/Вт/Ср/Чт/Пт/Сб/Вс) + «✅ Открыть» + «❌ Отмена».
+   Кнопка `AdminOpenWeekCallbackData` (prefix `admin_openweek_days`,
+   `weekday: int 0-6`). Toggle UX: тап → ✅ Пн, повторный тап → Пн. State
+   хранит set выбранных weekdays.
+4. → «✅ Открыть» → применить `open_workday(start, end)` к каждому выбранному
+   дню текущей недели. Пн = начало недели (`date - timedelta(days=weekday)`).
+   WorkDayShrinkError → ❌ для этого дня, продолжаем остальные. Итог:
+   `✅ Открыто: Пн 11-18, Ср 11-18, Пт 11-18\n❌ Вт: нельзя сузить, есть бронь`.
+
+**FSM (bot/states.py):**
+```python
+class AdminStates(StatesGroup):
+    # ... existing ...
+    opening_week_start = State()  # NEW (after picking_window_end)
+    opening_week_end = State()    # NEW
+    opening_week_days = State()   # NEW (toggle days)
 ```
-M bot/handlers/admin.py       (+701 / -308 = +393 net, 6 NEW handlers + 2 modified calendar_cb + 2 deleted text handlers)
-M bot/keyboards/admin.py       (+168 lines, NEW 2 CallbackData + 2 keyboard functions + helper)
-M bot/states.py                (+20 / -10, AdminStates renamed/added)
-M tests/test_admin_handlers.py (+835 lines, 16 NEW тестов + 3 helper functions)
-M PLANS.md                     (Decision Log Session 5.25 + 5.25b)
-M NEXT_SESSION_PROMPT.md       (этот файл)
+
+**Handlers (bot/handlers/admin.py):**
+- `cmd_openweek` (Command("openweek"), StateFilter(None)) — entry point
+- `admin_openweek_start_cb` (AdminWindowSlot30CallbackData, opening_week_start)
+- `admin_openweek_end_cb` (AdminWindowSlot30CallbackData, opening_week_end)
+- `admin_openweek_days_cb` (AdminOpenWeekCallbackData, opening_week_days) —
+  toggle weekday in state
+- `admin_openweek_confirm_cb` (F.data == "admin_openweek_confirm",
+  opening_week_days) — apply to all selected days
+
+**Keyboards (bot/keyboards/admin.py):**
+- `AdminOpenWeekCallbackData(CallbackData, prefix="admin_openweek_days")` с
+  `weekday: int` payload
+- `admin_week_days_keyboard(selected: set[int]) -> InlineKeyboardMarkup` — 7
+  toggle-кнопок + «✅ Открыть» (callback "admin_openweek_confirm") + «❌ Отмена»
+  (callback "admin_openweek_cancel"). Selected weekdays помечены ✅.
+
+**admin_inline_menu:** добавить кнопку «🗓 Открыть неделю»
+(`AdminOpenWeekCallbackData` или новый `AdminOpenWeekEntryCallbackData` для
+menu tap → picker start). 6 кнопок всего, adjust(2,2,1,1) или подобный layout.
+
+**Tests (tests/test_admin_handlers.py):**
+- `test_cmd_openweek_entry_shows_start_picker`
+- `test_admin_openweek_start_cb_picks_start_shows_end_picker`
+- `test_admin_openweek_end_cb_shows_days_toggle`
+- `test_admin_openweek_days_cb_toggles_weekday` (state save)
+- `test_admin_openweek_confirm_cb_applies_to_all_selected` (success case)
+- `test_admin_openweek_confirm_cb_partial_failure` (1 day WorkDayShrinkError)
+- `test_admin_openweek_confirm_cb_no_days_selected` (hint «выберите день»)
+- `test_admin_openweek_cancel_cb_clears_state` (✅ меню после cancel)
+
+### B. /closeday — закрыть конкретный день (маленькая, ~30 мин)
+
+**Flow:**
+1. `/closeday` (или кнопка «📅 Закрыть день» в admin_inline_menu) → SimpleCalendar.
+2. → выбрать дату → если WorkDay is_active=False → «уже закрыт» hint.
+3. → если есть active bookings → показать список + «Отменить все N записей?»
+   confirm. Если bookings нет → сразу закрыть.
+4. → confirm → `close_workday(workday_id)` (services/workday.py, УЖЕ ЕСТЬ) →
+   `is_active=False` + отменить все bookings (status='cancelled') + уведомить
+   клиентов через notifications.py (scheduler, skeleton уже есть).
+5. → «✅ День закрыт, N записей отменено» + admin_inline_menu.
+
+**Handlers:** `cmd_closeday` + `admin_closeday_calendar_cb` +
+`admin_closeday_confirm_cb`.
+
+**Tests:** 3-5 тестов (no workday, already closed, active bookings → confirm,
+confirm → bookings cancelled + clients notified).
+
+## Verify before commit
+
+`.venv/bin/ruff check bot/ tests/` ✅ + `.venv/bin/mypy bot/ tests/` ✅ +
+`.venv/bin/python -m pytest tests/` ✅ (expect ~390+ passed after new tests).
+
+## Deploy
+
+Push origin main → VPS deploy command:
+```bash
+ssh root@188.225.82.248 "cd /opt/barber-bot && git pull && docker compose up -d --build && docker compose restart bot && docker compose logs bot --tail 20"
 ```
 
-### Финальная верификация (Session 5.25b):
-- **ruff:** ✅ All checks passed!
-- **mypy:** ✅ Success: no issues found in 3 source files
-- **pytest:** ✅ 79 passed, 2 skipped (race tests require Postgres)
+## Smoke-test в Telegram
 
-### Что нового в коде:
+### /openweek:
+1. `/menu` → кнопка «🗓 Открыть неделю»
+2. → picker start (09:00-19:30, без booked_slots) → выбрать 11:00
+3. → picker end → выбрать 18:00
+4. → 7 toggle дней (Пн-Вс) → тапнуть Пн, Ср, Пт → ✅ все три подсвечены
+5. → «✅ Открыть» → «✅ Открыто: Пн 11-18, Ср 11-18, Пт 11-18» + меню
+6. Проверить через /today что записи на Пн/Ср/Пт появились (или через /addslots)
 
-**bot/states.py** — AdminStates переименован:
-- `adding_slots_hours` → `picking_window_start` + добавлены `picking_window_end`, `confirming_window`
-- `closing_slot_hour` → `picking_shrink_end` + добавлен `confirming_shrink`
-
-**bot/keyboards/admin.py** — NEW 2 CallbackData + 2 keyboard functions + 1 helper:
-- `AdminWindowSlot30CallbackData(prefix="admin_win30", workday_id: UUID, start_minute: int)` — NON-Optional UUID (mirror AdminMoveSlot30CallbackData)
-- `AdminWindowConfirmCallbackData(prefix="admin_win_conf")` — без payload
-- `admin_window_slot_picker_keyboard(workday_id, *, mode, business_tz, picked_start_minute=None, current_start_minute=None, current_end_minute=None)` — 3 mode:
-  - "start" (0..1350=22:30 max start — NI1 fix)
-  - "end" (picked_start+30..1380=23:00 max end-slot — midnight overflow protection)
-  - "shrink" (current_start+30..current_end-30 — NI2 fix: only shrink, new_end > start, min 30-min window remains)
-- `admin_window_confirm_keyboard()` — ✅ + ❌ (string "admin_window_cancel" for F.data filter)
-- `_minute_to_time(minute)` — helper
-
-**bot/handlers/admin.py** — 6 NEW handlers + 2 modified calendar_cb + 2 deleted text handlers:
-- DELETED `admin_addslots_hours_msg` + `admin_closeslot_hour_msg` (text handlers, использовали переименованные state'ы)
-- MODIFIED `admin_addslots_calendar_cb` — SELECT WorkDay → if None → redirect `/openday` hint. If exists → `state.set_state(picking_window_start)` + store `workday_id` + show start-picker
-- MODIFIED `admin_closeslot_calendar_cb` — SELECT WorkDay → if None → message. If window < 60min → "слишком узкое, нельзя сузить" pre-check. Else → `state.set_state(picking_shrink_end)` + show shrink-picker
-- NEW `admin_window_start_cb` — slot tap → store `start_minute` → set_state(picking_window_end) → show end-picker. State loss defensive check.
-- NEW `admin_window_end_cb` — slot tap → store `end_minute` → set_state(confirming_window) → show summary "Изменить окно на [start, end]?" + confirm keyboard. State loss defensive check.
-- NEW `admin_window_confirm_cb` — `[✅ Подтвердить]` → state.clear() BEFORE service call (race condition fix) → `open_workday(session, master_id, work_date, start_time, end_time, business_tz)` (handles create+update idempotently). Error mapping: ValueError, WorkDayShrinkError, SQLAlchemyError. State loss defensive check.
-- NEW `admin_shrink_end_cb` — slot tap → store `new_end_minute` → set_state(confirming_shrink) → show summary "Сузить окно до [start, new_end]?" + confirm keyboard. State loss defensive check.
-- NEW `admin_shrink_confirm_cb` — `[✅ Подтвердить]` → state.clear() → `update_workday(session, workday_id, current_start_time, new_end_time, business_tz)` (shrink end_time). Error mapping (NI3 fix):
-  - ValueError → `f"❌ {exc}\n/closeslot чтобы начать"` (exc="WorkDay not found" race — admin deleted workday between pick and confirm)
-  - WorkDayShrinkError → "Только что записался клиент на это время. /closeslot чтобы выбрать другое время" (race with concurrent create_booking)
-  - SQLAlchemyError → "❌ Ошибка БД..."
-  - State loss defensive check.
-- NEW `admin_window_cancel_cb` — `[❌ Отмена]` → state.clear() + "Действие отменено. /addslots или /closeslot чтобы начать." StateFilter(AdminStates) — catches ONLY in AdminStates group (window/shrink/openday/service).
-
-**tests/test_admin_handlers.py** — 16 NEW тестов + 3 helper functions:
-- 3 helper: `_seed_workday`, `_picker_reply_markup`, `_state_data_passed` (`_make_callback` patched для `isinstance(callback.message, Message)` check в handler)
-- 8 на window flow: `test_admin_window_start_cb_picks_start_shows_end_picker`, `_state_loss_clears_state`, `test_admin_window_end_cb_picks_end_shows_summary`, `_state_loss_clears_state`, `test_admin_window_confirm_cb_calls_open_workday_success`, `_workday_shrink_error`, `_sqlalchemy_error`, `_state_loss_clears_state`
-- 7 на shrink flow: `test_admin_shrink_end_cb_picks_new_end_shows_summary`, `_state_loss_clears_state` (S3), `test_admin_shrink_confirm_cb_calls_update_workday_success`, `_value_error_workday_deleted`, `_sqlalchemy_error` (S2), `_workday_shrink_error`, `_state_loss_clears_state`
-- 1 на cancel: `test_admin_window_cancel_cb_clears_state`
-
-**Keep 22 existing тестов на `cmd_addslots`/`cmd_closeslot`** (text commands, deprecated alias — НЕ зависят от FSM state names).
-
-## Semantic design (подтверждён пользователем + critic iter 3)
-
-- `/addslots` inline = **MODIFY** существующее окно WorkDay. Если WorkDay нет → redirect на `/openday`.
-- `/openday` = **CREATE** нового WorkDay (text HH:MM UI, без изменений). Primary create path.
-- `/closeslot` inline = **SHRINK** end существующего окна. Полное закрытие (is_active=False) — OUT of scope, отдельная задача 5.10b (integrate `close_workday`).
-- cmd_addslots / cmd_closeslot (text commands) — KEEP для muscle memory Екатерины (deprecated alias, но не удаляются).
-
-## Гейты 5.10 (status)
-
-- **deep-analysis-protocol:** ✅ Pass 1-4 + critic iter 1-3 DEEP_ENOUGH (3 итерации critic, max 2 LBTM — OK, все архитектурные пробелы закрыты)
-- **qa-verify-and-fix:** ✅ ruff All checks passed! + mypy Success + pytest 79 passed, 2 skipped
-- **qa-code-review:** ✅ code-reviewer iter 1 LGTM с 4 suggestions (S1-S4 применены в Session 5.25b post-compact recovery)
-- **Pre-push:** skip (pet-project git free per AGENTS.md § git-repo-categories)
-
-## Critical reference patterns (mirror targets — без line numbers, prone to drift)
-
-- `admin_move_confirm_cb` — state capture + state.clear() BEFORE service call pattern
-- `admin_move_simple_calendar_cb` — calendar + inactive workday handling pattern
-- `admin_openday_end_msg` — error mapping pattern (ValueError, WorkDayShrinkError, SQLAlchemyError)
-- `admin_move_slot_30_cb` — slot tap + state save + summary
-- `open_workday` (workday.py) — `session, master_id, work_date, start_time, end_time, business_tz → WorkDay` (NO workday_id, resolves via UNIQUE)
-- `update_workday` (workday.py) — `session, workday_id, new_start_time, new_end_time, business_tz → WorkDay` (REQUIRES workday_id)
-- `select_workday` (workday.py) — `session, master_id, work_date → WorkDay | None`
-- `WorkDayShrinkError` (workday.py) — conflict list in message
-
-## Порядок работы в следующей сессии (Session 5.26)
-
-1. Прочитать этот файл (NEXT_SESSION_PROMPT.md) — полностью.
-2. Прочитать `PLANS.md` Decision Log Session 5.25 + 5.25b (lines 390-450).
-3. **Commit + push:**
-   ```bash
-   git add bot/handlers/admin.py bot/keyboards/admin.py bot/states.py tests/test_admin_handlers.py PLANS.md NEXT_SESSION_PROMPT.md
-   git status  # проверить что staged — только эти 6 файлов
-   git diff --cached --stat  # sanity check объёма
-   git commit -m "feat(admin): inline 30-min slot picker for /addslots & /closeslot (Этап 5.10, Session 5.25+5.25b)"
-   git push origin main
-   ```
-4. **Smoke-test через Telegram** (вручную, не автоматизировано — Telegram-зависимый):
-   - Запустить бота: `.venv/bin/python -m bot` (или uv run)
-   - В Telegram под админ-аккаунтом (Екатерина):
-     - `/openday` → выбрать завтра → текст "10:00-20:00" → окно создано
-     - `/addslots` → выбрать завтра → inline-picker [start] → тап 11:00 → inline-picker [end] → тап 18:00 → summary → [✅] → окно изменилось на 11:00-18:00
-     - `/addslots` на пустой день → "WorkDay не открыт. Используйте /openday." + redirect
-     - `/closeslot` → выбрать завтра → inline-picker [shrink] (только end-slots с 11:30 до 17:30) → тап 14:00 → summary "Сузить окно до 11:00-14:00?" → [✅] → окно сузилось
-     - `/closeslot` на окно < 60min → "слишком узкое, нельзя сузить"
-     - [❌ Отмена] в любой точке flow → state.clear + "Действие отменено"
-5. Если smoke-test прошёл — обновить PLANS.md Decision Log Session 5.26 (smoke-test passed).
-6. Если smoke-test нашёл баг — фикс в новой сессии + re-verify + amend commit (или новый fixup commit, на выбор).
-
-## Артефакты
-
-- Этот файл (NEXT_SESSION_PROMPT.md) — handoff для Session 5.26
-- `PLANS.md` — Decision Log: Session 5.25 (lines 390-423) + Session 5.25b (post-compact recovery, lines 425-454) — оба раздела добавлены
-- Все остальные файлы — M, готовы к commit
-
-## Risk-class
-
-HIGH-STAKES — admin UX rewrite + persistence layer switch + semantic shift (/addslots modify-only). Deep-analysis 3 итерации critic — все архитектурные пробелы закрыты. Code-reviewer LGTM с 4 suggestions (S1-S4 применены).
+### /closeday:
+1. Создать бронь на завтра (через /book как клиент со второго аккаунта)
+2. `/closeday` → календарь → выбрать завтра
+3. → «В этот день 1 запись: Иван, 14:00. Отменить?» → «✅ Да»
+4. → «✅ День закрыт, 1 запись отменена» + меню
+5. Проверить с клиента: уведомление «запись отменена мастером»
+6. `/book` на эту дату → «мастер не работает в этот день»
 
 ## "Продолжи с прошлого места" — что сказать в начале следующей сессии
 
 ```
-Продолжи Session 5.26 — 5.10 inline-часы toggle финализация. Прочитай NEXT_SESSION_PROMPT.md,
-затем сделай commit (pet-project git free): git add 6 файлов (bot/handlers/admin.py,
-bot/keyboards/admin.py, bot/states.py, tests/test_admin_handlers.py, PLANS.md,
-NEXT_SESSION_PROMPT.md) + commit message "feat(admin): inline 30-min slot picker for
-/addslots & /closeslot (Этап 5.10, Session 5.25+5.25b)" + git push origin main.
-Затем smoke-test через Telegram: /openday → /addslots (modify) → /closeslot (shrink) →
-[❌ Отмена]. Если нашёл баг — фикс + re-verify + amend.
+Продолжи Session 5.26 — реализуй /openweek + /closeday. Прочитай
+NEXT_SESSION_PROMPT.md для деталей. Pet-project git free — commit + push без
+переспроса. Начни с /openweek (главная задача): FSM states (opening_week_*),
+handlers (cmd_openweek + 4 cb), keyboards (AdminOpenWeekCallbackData +
+admin_week_days_keyboard), admin_inline_menu + кнопка «🗓 Открыть неделю»,
+tests. После /openweek → /closeday (reuse close_workday, cancel bookings +
+notify). Verify: ruff + mypy + pytest. Push + VPS deploy + smoke-test.
 ```
