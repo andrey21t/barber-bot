@@ -127,6 +127,7 @@ async def get_available_slots_30(
     business_timezone: str,
     *,
     now_utc: datetime | None = None,
+    min_duration_min: int = 0,
 ) -> list[TimeSlot30]:
     """Filter 30-min slots from workday grid by occupancy (capacity check).
 
@@ -146,6 +147,14 @@ async def get_available_slots_30(
     Closed WorkDay (is_active=False): NOT filtered here — handler 5.8 decides
     (separation of concerns; this function is read-only, no policy).
 
+    Session 5.27 (BUG2 fix): slots where slot.start + min_duration_min > end_time
+    are filtered OUT when min_duration_min > 0. Without this, /slots and /book
+    fallback would show e.g. 15:30 slot in workday 13:30–16:00, but create_booking
+    with SERVICE_DEFAULT_DURATION_MIN=60 raises BookingOutsideWorkDayError
+    (15:30+60=16:30 > 16:00), surfaced as "День закрыт мастером" — misleading.
+    Default 0 = no filter (preserves old behaviour for occupancy-only tests);
+    handlers pass SERVICE_DEFAULT_DURATION_MIN explicitly.
+
     NB: SQLite stores Booking.start_at naive, Postgres aware. Normalize in
     Python loop (b.start_at.replace(tzinfo=UTC) if b.start_at.tzinfo is None).
     SQLAlchemy handles at SQL level, but Python-level comparison does not.
@@ -156,11 +165,15 @@ async def get_available_slots_30(
             end_time, max_concurrent_clients.
         business_timezone: IANA tz name (e.g. "Europe/Moscow") for LOCAL → UTC.
         now_utc: injected for tests (production uses datetime.now(UTC)).
+        min_duration_min: when > 0, slots where start + min_duration_min >
+            workday.end_time are filtered out. Handlers that know the actual
+            service duration should pass it (default 0 = no filter, preserves
+            backward-compat for occupancy-only callers).
 
     Returns:
         List of TimeSlot30 (subset of get_30min_slots_from_workday output)
         ordered by start_at_utc ascending. Empty if all slots are occupied OR
-        workday window < 30 min.
+        workday window < 30 min OR no slot fits the min_duration.
     """
     candidates = await get_30min_slots_from_workday(workday, business_timezone, now_utc=now_utc)
     if not candidates:
@@ -169,6 +182,21 @@ async def get_available_slots_30(
     workday_start_utc, workday_end_utc = _window_bounds_utc(
         workday.work_date, workday.start_time, workday.end_time, business_timezone
     )
+
+    # Session 5.27 BUG2: drop slots where start + min_duration_min crosses end_time.
+    # create_booking with SERVICE_DEFAULT_DURATION_MIN=60 enforces [start_at, end_at]
+    # ⊆ [workday.start_time, end_time] via _validate_booking_within_workday — a
+    # slot visible in picker but rejected at confirm causes misleading error.
+    # Default min_duration_min=0 means no filter (preserves old behaviour for
+    # occupancy-only callers/tests); handlers pass SERVICE_DEFAULT_DURATION_MIN.
+    if min_duration_min > 0:
+        candidates = [
+            s for s in candidates
+            if s.start_at_utc + timedelta(minutes=min_duration_min) <= workday_end_utc
+        ]
+        if not candidates:
+            return []
+
     bookings_stmt = select(Booking).where(
         Booking.master_id == workday.master_id,
         Booking.start_at < workday_end_utc,

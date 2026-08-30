@@ -252,8 +252,12 @@ async def _handle_simple_calendar(
                 # WorkDay active — fetch 30-min slots with capacity check.
                 # get_available_slots_30 filters past slots via now_utc injection
                 # (default datetime.now(UTC) inside — caller doesn't need to pass).
+                # Session 5.27 BUG2: pass min_duration_min=SERVICE_DEFAULT_DURATION_MIN
+                # so slots that don't fit a default 60-min booking are hidden —
+                # prevents misleading BookingOutsideWorkDayError at confirm.
                 slots_30 = await get_available_slots_30(
-                    session, workday, settings.TIMEZONE
+                    session, workday, settings.TIMEZONE,
+                    min_duration_min=settings.SERVICE_DEFAULT_DURATION_MIN,
                 )
                 if not slots_30:
                     if callback.message is not None:
@@ -285,7 +289,8 @@ async def _handle_simple_calendar(
                 workday = await _select_workday_for_slot(session, master.id, slot_date)
                 if workday is not None and workday.is_active:
                     slots_30 = await get_available_slots_30(
-                        session, workday, settings.TIMEZONE
+                        session, workday, settings.TIMEZONE,
+                        min_duration_min=settings.SERVICE_DEFAULT_DURATION_MIN,
                     )
                     if slots_30:
                         await state.update_data(selected_date=slot_date.isoformat())

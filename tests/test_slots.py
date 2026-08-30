@@ -631,3 +631,65 @@ async def test_get_available_slots_30_window_less_than_30min(
     await session.commit()
     available = await get_available_slots_30(session, wd, BUSINESS_TZ)
     assert available == []
+
+
+@pytest.mark.asyncio
+async def test_get_available_slots_30_min_duration_filter(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Session 5.27 BUG2: min_duration_min > 0 filters slots whose
+    start + min_duration_min crosses workday.end_time. Without this filter,
+    /slots and /book fallback showed e.g. 15:30 in workday 13:30–16:00, but
+    create_booking with SERVICE_DEFAULT_DURATION_MIN=60 raised
+    BookingOutsideWorkDayError → surfaced as misleading 'День закрыт мастером'.
+
+    workday 13:30–16:00 → grid cells: 13:30, 14:00, 14:30, 15:00, 15:30.
+    With min_duration_min=60: 15:30+60=16:30 > 16:00 → dropped.
+    Remaining: 13:30, 14:00, 14:30, 15:00 (4 slots).
+    """
+    work_date = _future_workdate()
+    wd = WorkDay(
+        master_id=seed_data["master_id"],
+        work_date=work_date,
+        start_time=dt_time(13, 30),
+        end_time=dt_time(16, 0),
+        max_concurrent_clients=1,
+        is_active=True,
+    )
+    session.add(wd)
+    await session.commit()
+
+    # Default (no filter) — all 5 grid cells shown.
+    available_no_filter = await get_available_slots_30(session, wd, BUSINESS_TZ)
+    assert len(available_no_filter) == 5
+    assert [s.label for s in available_no_filter] == ["13:30", "14:00", "14:30", "15:00", "15:30"]
+
+    # With min_duration_min=60 — last slot dropped (15:30+60 > 16:00).
+    available = await get_available_slots_30(
+        session, wd, BUSINESS_TZ, min_duration_min=60
+    )
+    assert len(available) == 4
+    assert [s.label for s in available] == ["13:30", "14:00", "14:30", "15:00"]
+
+    # Edge: min_duration_min exactly equal to remaining window — slot kept.
+    # workday 13:30-16:00 + start 15:00 + duration 60 = 16:00 == end → kept.
+    # Half-open interval: end_at <= end_time accepted.
+    assert "15:00" in [s.label for s in available]
+
+    # Workday too narrow for min_duration → all slots dropped.
+    wd_narrow = WorkDay(
+        master_id=seed_data["master_id"],
+        work_date=_future_workdate(days=21),
+        start_time=dt_time(15, 30),
+        end_time=dt_time(16, 0),
+        max_concurrent_clients=1,
+        is_active=True,
+    )
+    session.add(wd_narrow)
+    await session.commit()
+    # 15:30 is the only grid cell, 15:30+60=16:30 > 16:00 → dropped.
+    available_narrow = await get_available_slots_30(
+        session, wd_narrow, BUSINESS_TZ, min_duration_min=60
+    )
+    assert available_narrow == []
