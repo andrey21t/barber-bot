@@ -208,16 +208,19 @@ def _require_admin_or_silent(message: Message) -> int | None:
 # ============================================================
 
 
-@router.message(Command("menu"), StateFilter(None))
-async def cmd_menu(message: Message) -> None:
-    """Show admin inline menu (re-show after actions).
+@router.message(Command("menu"), StateFilter("*"))
+async def cmd_menu(message: Message, state: FSMContext) -> None:
+    """Show admin inline menu — escape hatch from any FSM state.
 
-    13 сообщений в admin.py ссылаются на '/menu — заново' (grep) — без
-    этой команды dead-end UX. StateFilter(None) — НЕ ловит mid-FSM (там
-    /cancel сначала, потом /menu). _is_admin check — non-admin silent.
+    Works mid-FSM: clears state first, then shows menu. So admin stuck in
+    /openweek or /closeday flow can always /menu out (no need to know /cancel).
+
+    StateFilter("*") matches any state including None — single handler covers
+    both 'fresh /menu' and 'escape from stuck FSM'. _is_admin: non-admin silent.
     """
     if not _is_admin(message):
         return
+    await state.clear()
     await message.answer("📋 Меню:", reply_markup=admin_inline_menu())
 
 
