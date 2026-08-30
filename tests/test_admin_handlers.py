@@ -1870,9 +1870,7 @@ async def test_admin_window_start_cb_picks_start_shows_end_picker(
         workday = await _seed_workday(session, ctx=ctx, work_date=tomorrow)
 
     picked_start_minute = 11 * 60  # 11:00
-    cb_data = AdminWindowSlot30CallbackData(
-        workday_id=workday.id, start_minute=picked_start_minute
-    )
+    cb_data = AdminWindowSlot30CallbackData(workday_id=workday.id, start_minute=picked_start_minute)
     callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
     state = _make_mock_state(
         data={
@@ -1909,9 +1907,7 @@ async def test_admin_window_start_cb_state_loss_clears_state(
         tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
         workday = await _seed_workday(session, ctx=ctx, work_date=tomorrow)
 
-    cb_data = AdminWindowSlot30CallbackData(
-        workday_id=workday.id, start_minute=11 * 60
-    )
+    cb_data = AdminWindowSlot30CallbackData(workday_id=workday.id, start_minute=11 * 60)
     callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
     state = _make_mock_state(data={})  # empty state — simulate state loss
 
@@ -1944,9 +1940,7 @@ async def test_admin_window_end_cb_picks_end_shows_summary(
 
     picked_start_minute = 11 * 60  # 11:00
     picked_end_minute = 18 * 60  # 18:00
-    cb_data = AdminWindowSlot30CallbackData(
-        workday_id=workday.id, start_minute=picked_end_minute
-    )
+    cb_data = AdminWindowSlot30CallbackData(workday_id=workday.id, start_minute=picked_end_minute)
     callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
     state = _make_mock_state(
         data={
@@ -1985,9 +1979,7 @@ async def test_admin_window_end_cb_state_loss_clears_state(
         tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
         workday = await _seed_workday(session, ctx=ctx, work_date=tomorrow)
 
-    cb_data = AdminWindowSlot30CallbackData(
-        workday_id=workday.id, start_minute=18 * 60
-    )
+    cb_data = AdminWindowSlot30CallbackData(workday_id=workday.id, start_minute=18 * 60)
     callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
     # picked_start_minute missing → state loss
     state = _make_mock_state(
@@ -2435,8 +2427,7 @@ async def test_admin_openweek_days_cb_deselect_existing_weekday(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """[weekday tap] on already-selected weekday → remove from list, re-render.
-    """
+    """[weekday tap] on already-selected weekday → remove from list, re-render."""
     from bot.keyboards.admin import AdminOpenWeekCallbackData
 
     async with session_factory() as session:
@@ -2466,12 +2457,14 @@ async def test_admin_openweek_confirm_cb_no_days_keeps_state(
 
     callback = _make_callback(ADMIN_TG_ID)
     callback.data = "admin_openweek_confirm"
-    state = _make_mock_state({
-        "picked_start_minute": 600,
-        "picked_end_minute": 1080,
-        "selected_weekdays": [],
-        "business_tz": TZ,
-    })
+    state = _make_mock_state(
+        {
+            "picked_start_minute": 600,
+            "picked_end_minute": 1080,
+            "selected_weekdays": [],
+            "business_tz": TZ,
+        }
+    )
 
     await admin_handlers.admin_openweek_confirm_cb(callback, state)
 
@@ -2495,11 +2488,13 @@ async def test_admin_openweek_confirm_cb_state_loss_clears_state(
 
     callback = _make_callback(ADMIN_TG_ID)
     callback.data = "admin_openweek_confirm"
-    state = _make_mock_state({
-        "picked_end_minute": 1080,
-        "selected_weekdays": [0],
-        "business_tz": TZ,
-    })  # missing picked_start_minute
+    state = _make_mock_state(
+        {
+            "picked_end_minute": 1080,
+            "selected_weekdays": [0],
+            "business_tz": TZ,
+        }
+    )  # missing picked_start_minute
 
     await admin_handlers.admin_openweek_confirm_cb(callback, state)
 
@@ -2525,12 +2520,14 @@ async def test_admin_openweek_confirm_cb_skips_past_days(
 
     callback = _make_callback(ADMIN_TG_ID)
     callback.data = "admin_openweek_confirm"
-    state = _make_mock_state({
-        "picked_start_minute": 600,
-        "picked_end_minute": 1200,
-        "selected_weekdays": [0, 1, 2],  # Mon, Tue, Wed (all past)
-        "business_tz": TZ,
-    })
+    state = _make_mock_state(
+        {
+            "picked_start_minute": 600,
+            "picked_end_minute": 1200,
+            "selected_weekdays": [0, 1, 2],  # Mon, Tue, Wed (all past)
+            "business_tz": TZ,
+        }
+    )
 
     await admin_handlers.admin_openweek_confirm_cb(callback, state)
 
@@ -2570,12 +2567,14 @@ async def test_admin_openweek_confirm_cb_opens_days(
 
     callback = _make_callback(ADMIN_TG_ID)
     callback.data = "admin_openweek_confirm"
-    state = _make_mock_state({
-        "picked_start_minute": 600,  # 10:00
-        "picked_end_minute": 1200,  # 20:00
-        "selected_weekdays": [2, 4],  # Wed, Fri (both future on Tuesday)
-        "business_tz": TZ,
-    })
+    state = _make_mock_state(
+        {
+            "picked_start_minute": 600,  # 10:00
+            "picked_end_minute": 1200,  # 20:00
+            "selected_weekdays": [2, 4],  # Wed, Fri (both future on Tuesday)
+            "business_tz": TZ,
+        }
+    )
 
     await admin_handlers.admin_openweek_confirm_cb(callback, state)
 
@@ -2624,12 +2623,14 @@ async def test_admin_openweek_confirm_cb_partial_failure_shrinks_lines(
 
     callback = _make_callback(ADMIN_TG_ID)
     callback.data = "admin_openweek_confirm"
-    state = _make_mock_state({
-        "picked_start_minute": 600,   # 10:00
-        "picked_end_minute": 720,     # 12:00
-        "selected_weekdays": [2, 4],  # Wed(2), Fri(4) — both future on Tuesday
-        "business_tz": TZ,
-    })
+    state = _make_mock_state(
+        {
+            "picked_start_minute": 600,  # 10:00
+            "picked_end_minute": 720,  # 12:00
+            "selected_weekdays": [2, 4],  # Wed(2), Fri(4) — both future on Tuesday
+            "business_tz": TZ,
+        }
+    )
 
     real_open = admin_handlers.open_workday
 
@@ -2775,7 +2776,9 @@ async def test_admin_closeday_calendar_cb_no_workday_redirects(
     future_date = datetime.now(UTC) + timedelta(days=30)
     cal_cb_data = SimpleCalendarCallback(
         act=SimpleCalAct.day,
-        year=future_date.year, month=future_date.month, day=future_date.day,
+        year=future_date.year,
+        month=future_date.month,
+        day=future_date.day,
     )
     callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
     callback.message.edit_text = AsyncMock()
@@ -2814,7 +2817,9 @@ async def test_admin_closeday_calendar_cb_already_closed(
     future_date = datetime.combine(future, datetime.min.time())
     cal_cb_data = SimpleCalendarCallback(
         act=SimpleCalAct.day,
-        year=future_date.year, month=future_date.month, day=future_date.day,
+        year=future_date.year,
+        month=future_date.month,
+        day=future_date.day,
     )
     callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
     callback.message.edit_text = AsyncMock()
@@ -2853,7 +2858,9 @@ async def test_admin_closeday_calendar_cb_no_bookings_closes_immediately(
     future_date = datetime.combine(future, datetime.min.time())
     cal_cb_data = SimpleCalendarCallback(
         act=SimpleCalAct.day,
-        year=future_date.year, month=future_date.month, day=future_date.day,
+        year=future_date.year,
+        month=future_date.month,
+        day=future_date.day,
     )
     callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
     callback.message.answer = AsyncMock()
@@ -2874,9 +2881,7 @@ async def test_admin_closeday_calendar_cb_no_bookings_closes_immediately(
         from bot.models import WorkDay as _WD
 
         wd = await session.scalar(
-            select(_WD).where(
-                _WD.master_id == ctx["master_id"], _WD.work_date == future
-            )
+            select(_WD).where(_WD.master_id == ctx["master_id"], _WD.work_date == future)
         )
     assert wd is not None and wd.is_active is False
 
@@ -2904,7 +2909,9 @@ async def test_admin_closeday_calendar_cb_with_bookings_shows_confirm(
         )
         future_local = datetime.combine(future, datetime.min.time(), ZoneInfo(TZ))
         await _seed_booking(
-            session, ctx=ctx, slot=slot,
+            session,
+            ctx=ctx,
+            slot=slot,
             start_at_utc_naive=future_local.replace(hour=14).astimezone(UTC).replace(tzinfo=None),
             status="confirmed",
         )
@@ -2912,7 +2919,9 @@ async def test_admin_closeday_calendar_cb_with_bookings_shows_confirm(
     future_date = datetime.combine(future, datetime.min.time())
     cal_cb_data = SimpleCalendarCallback(
         act=SimpleCalAct.day,
-        year=future_date.year, month=future_date.month, day=future_date.day,
+        year=future_date.year,
+        month=future_date.month,
+        day=future_date.day,
     )
     callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
     callback.message.edit_text = AsyncMock()
@@ -2987,7 +2996,9 @@ async def test_admin_closeday_confirm_cb_closes_and_notifies(
         )
         future_local = datetime.combine(future, datetime.min.time(), ZoneInfo(TZ))
         booking = await _seed_booking(
-            session, ctx=ctx, slot=slot,
+            session,
+            ctx=ctx,
+            slot=slot,
             start_at_utc_naive=future_local.replace(hour=14).astimezone(UTC).replace(tzinfo=None),
             status="confirmed",
         )
@@ -2995,10 +3006,12 @@ async def test_admin_closeday_confirm_cb_closes_and_notifies(
     callback = _make_callback(ADMIN_TG_ID)
     callback.data = "admin_closeday_confirm"
     callback.bot.send_message = _AsyncMock()
-    state = _make_mock_state({
-        "business_tz": TZ,
-        "closing_day_workday_id": str(workday.id),
-    })
+    state = _make_mock_state(
+        {
+            "business_tz": TZ,
+            "closing_day_workday_id": str(workday.id),
+        }
+    )
 
     scheduler = MagicMock()
     with patch("bot.handlers.admin.remove_jobs_for_booking") as rm_jobs:
@@ -3021,9 +3034,7 @@ async def test_admin_closeday_confirm_cb_closes_and_notifies(
         from bot.models import WorkDay as _WD
 
         wd = await session.scalar(
-            select(_WD).where(
-                _WD.master_id == ctx["master_id"], _WD.work_date == future
-            )
+            select(_WD).where(_WD.master_id == ctx["master_id"], _WD.work_date == future)
         )
     assert wd is not None and wd.is_active is False
 

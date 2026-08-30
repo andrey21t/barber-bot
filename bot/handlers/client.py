@@ -258,7 +258,9 @@ async def _handle_simple_calendar(
                 # so slots that don't fit a default 60-min booking are hidden —
                 # prevents misleading BookingOutsideWorkDayError at confirm.
                 slots_30 = await get_available_slots_30(
-                    session, workday, settings.TIMEZONE,
+                    session,
+                    workday,
+                    settings.TIMEZONE,
                     min_duration_min=settings.SERVICE_DEFAULT_DURATION_MIN,
                 )
                 if not slots_30:
@@ -291,7 +293,9 @@ async def _handle_simple_calendar(
                 workday = await _select_workday_for_slot(session, master.id, slot_date)
                 if workday is not None and workday.is_active:
                     slots_30 = await get_available_slots_30(
-                        session, workday, settings.TIMEZONE,
+                        session,
+                        workday,
+                        settings.TIMEZONE,
                         min_duration_min=settings.SERVICE_DEFAULT_DURATION_MIN,
                     )
                     if slots_30:
@@ -416,9 +420,7 @@ async def slot_30_cb(
     if not (0 <= start_minute <= 1439):
         await state.clear()
         if callback.message is not None:
-            await callback.message.answer(
-                "❌ Ошибка выбора времени. Начните заново через /slots"
-            )
+            await callback.message.answer("❌ Ошибка выбора времени. Начните заново через /slots")
         await callback.answer()
         return
     await state.update_data(
@@ -563,9 +565,7 @@ async def service_picker_cb(
             if not isinstance(start_minute, int) or not (0 <= start_minute <= 1439):
                 await state.clear()
                 if callback.message is not None:
-                    await callback.message.answer(
-                        "❌ Ошибка времени. Начните заново через /slots"
-                    )
+                    await callback.message.answer("❌ Ошибка времени. Начните заново через /slots")
                 await callback.answer()
                 return
             start_time_local = dt_time(start_minute // 60, start_minute % 60)
@@ -677,30 +677,22 @@ async def service_msg(message: Message, state: FSMContext) -> None:
             start_minute = data.get("start_minute")
             if start_minute is None:
                 await state.clear()
-                await message.answer(
-                    "❌ Ошибка: время не выбрано. Начните заново через /slots"
-                )
+                await message.answer("❌ Ошибка: время не выбрано. Начните заново через /slots")
                 return
             # Range 0-1439 guaranteed by slot_30_cb, but defensive against
             # corrupted FSM storage (e.g. persisted across upgrade).
             if not isinstance(start_minute, int) or not (0 <= start_minute <= 1439):
                 await state.clear()
-                await message.answer(
-                    "❌ Ошибка времени. Начните заново через /slots"
-                )
+                await message.answer("❌ Ошибка времени. Начните заново через /slots")
                 return
             stmt = select(WorkDay).where(WorkDay.id == UUID(workday_id_str))
             workday = (await session.execute(stmt)).scalar_one_or_none()
             if workday is None:
                 await state.clear()
-                await message.answer(
-                    "❌ Рабочий день не найден. Начните заново через /slots"
-                )
+                await message.answer("❌ Рабочий день не найден. Начните заново через /slots")
                 return
             start_time_local = dt_time(start_minute // 60, start_minute % 60)
-            start_at = _build_start_at_from_workday(
-                workday, start_time_local, settings.TIMEZONE
-            )
+            start_at = _build_start_at_from_workday(workday, start_time_local, settings.TIMEZONE)
             summary = _format_booking_summary_from_start_at(
                 start_at=start_at,
                 client_name=data["client_name"],
@@ -711,9 +703,7 @@ async def service_msg(message: Message, state: FSMContext) -> None:
             # === /book legacy slot path ===
             if not slot_id_str:
                 await state.clear()
-                await message.answer(
-                    "❌ Ошибка: слот не выбран. Начните заново через /book"
-                )
+                await message.answer("❌ Ошибка: слот не выбран. Начните заново через /book")
                 return
 
             # Slot.id is Uuid column — convert str to UUID to avoid AttributeError
@@ -822,9 +812,7 @@ async def confirm_cb(
             if not isinstance(start_minute, int) or not (0 <= start_minute <= 1439):
                 await state.clear()
                 if callback.message is not None:
-                    await callback.message.answer(
-                        "❌ Ошибка времени. Начните заново через /slots"
-                    )
+                    await callback.message.answer("❌ Ошибка времени. Начните заново через /slots")
                 await callback.answer()
                 return
             payload = BookingCreate(

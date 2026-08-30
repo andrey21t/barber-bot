@@ -191,7 +191,8 @@ async def get_available_slots_30(
     # occupancy-only callers/tests); handlers pass SERVICE_DEFAULT_DURATION_MIN.
     if min_duration_min > 0:
         candidates = [
-            s for s in candidates
+            s
+            for s in candidates
             if s.start_at_utc + timedelta(minutes=min_duration_min) <= workday_end_utc
         ]
         if not candidates:

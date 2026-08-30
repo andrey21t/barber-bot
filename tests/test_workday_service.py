@@ -589,9 +589,7 @@ async def test_close_with_cancellations_no_workday_returns_none(
     that was never opened via /openweek or /openday).
     """
     fake_id = uuid4()
-    result = await close_workday_with_cancellations(
-        session, fake_id, business_tz=BUSINESS_TZ
-    )
+    result = await close_workday_with_cancellations(session, fake_id, business_tz=BUSINESS_TZ)
     assert result is None
 
 
@@ -626,9 +624,7 @@ async def test_close_with_cancellations_already_closed_idempotent(
         end_at=_local_to_utc(new_date, 15, 0),
     )
 
-    result = await close_workday_with_cancellations(
-        session, workday.id, business_tz=BUSINESS_TZ
-    )
+    result = await close_workday_with_cancellations(session, workday.id, business_tz=BUSINESS_TZ)
     assert result is not None
     assert result.was_already_closed is True
     assert result.cancelled_bookings == []
@@ -659,9 +655,7 @@ async def test_close_with_cancellations_no_active_bookings(
         business_tz=BUSINESS_TZ,
     )
 
-    result = await close_workday_with_cancellations(
-        session, workday.id, business_tz=BUSINESS_TZ
-    )
+    result = await close_workday_with_cancellations(session, workday.id, business_tz=BUSINESS_TZ)
     assert result is not None
     assert result.was_already_closed is False
     assert result.cancelled_bookings == []
@@ -704,9 +698,7 @@ async def test_close_with_cancellations_cancels_active_bookings(
         status="transferred",
     )
 
-    result = await close_workday_with_cancellations(
-        session, workday.id, business_tz=BUSINESS_TZ
-    )
+    result = await close_workday_with_cancellations(session, workday.id, business_tz=BUSINESS_TZ)
     assert result is not None
     assert result.was_already_closed is False
     assert result.work_date == new_date
@@ -765,9 +757,7 @@ async def test_close_with_cancellations_skips_cancelled_bookings(
         status="cancelled",
     )
 
-    result = await close_workday_with_cancellations(
-        session, workday.id, business_tz=BUSINESS_TZ
-    )
+    result = await close_workday_with_cancellations(session, workday.id, business_tz=BUSINESS_TZ)
     assert result is not None
     cancelled_ids = {b.id for b in result.cancelled_bookings}
     assert cancelled_ids == {booking_active.id}

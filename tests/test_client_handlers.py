@@ -2915,9 +2915,7 @@ def _make_slot_30_callback(
     cb.message = _make_message(user_id, text="<unused>")
     cb.answer = AsyncMock()
     cb.bot = bot
-    callback_data = BookSlot30CallbackData(
-        workday_id=workday_id, start_minute=start_minute
-    )
+    callback_data = BookSlot30CallbackData(workday_id=workday_id, start_minute=start_minute)
     return cb, callback_data
 
 
@@ -3047,9 +3045,7 @@ async def test_simple_calendar_cb_slots_path_inactive_workday_shows_hint(
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
         target_date = (datetime.now(UTC) + timedelta(days=2)).date()
-        await _seed_workday(
-            session, ctx, work_date=target_date, is_active=False
-        )
+        await _seed_workday(session, ctx, work_date=target_date, is_active=False)
 
     target_dt = datetime.combine(target_date, time(12, 0))
     _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
@@ -3087,8 +3083,11 @@ async def test_simple_calendar_cb_book_path_fallback_to_workday(
         target_date = (datetime.now(UTC) + timedelta(days=1)).date()
         # Active workday — simulates /openweek / /openday. NO Slot rows.
         await _seed_workday(
-            session, ctx, work_date=target_date,
-            start_time=time(10, 0), end_time=time(12, 0),
+            session,
+            ctx,
+            work_date=target_date,
+            start_time=time(10, 0),
+            end_time=time(12, 0),
         )
 
     target_dt = datetime.combine(target_date, time(11, 0))
@@ -3139,9 +3138,7 @@ async def test_simple_calendar_cb_book_path_fallback_closed_workday_shows_hint(
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
         target_date = (datetime.now(UTC) + timedelta(days=2)).date()
-        await _seed_workday(
-            session, ctx, work_date=target_date, is_active=False
-        )
+        await _seed_workday(session, ctx, work_date=target_date, is_active=False)
 
     target_dt = datetime.combine(target_date, time(12, 0))
     _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
@@ -3161,12 +3158,23 @@ async def test_simple_calendar_cb_book_path_fallback_closed_workday_shows_hint(
     assert "День закрыт мастером" in text
     state.set_state.assert_not_awaited()
     cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_slot_30_cb_saves_workday_id_start_minute() -> None:
     """Этап 5.8b: slot_30_cb — valid BookSlot30CallbackData → state.update_data
     (workday_id, start_minute) + set_state(entering_name) + ask name message.
+
+    Pre-existing regression: 5.27 commit 9101112 (BUG1 /book fallback) added
+    test_simple_calendar_cb_book_path_fallback_closed_workday_shows_hint which
+    ate the `def` line of this test (3dcb633). Body continued as dead code
+    inside the previous test — pytest never saw it. Restored 2026-08-30 by
+    code-review iter 2 finding F1.
     """
     workday_id = uuid4()
     cb, callback_data = _make_slot_30_callback(
-        workday_id=workday_id, start_minute=630  # 10:30
+        workday_id=workday_id,
+        start_minute=630,  # 10:30
     )
 
     state = _make_state()
@@ -3189,9 +3197,7 @@ async def test_slot_30_cb_out_of_range_clears_state() -> None:
     """
     workday_id = uuid4()
     # start_minute=1500 is out-of-range (max valid 1439 = 23:59).
-    cb, callback_data = _make_slot_30_callback(
-        workday_id=workday_id, start_minute=1500
-    )
+    cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=1500)
 
     state = _make_state()
     await client_handlers.slot_30_cb(cb, callback_data, state)
@@ -3720,9 +3726,7 @@ async def test_name_msg_archived_services_excluded_from_picker(
     assert isinstance(reply_markup, InlineKeyboardMarkup)
     flat_texts = [btn.text for row in reply_markup.inline_keyboard for btn in row]
     assert "Стрижка активная" in flat_texts
-    assert "Стрижка архив" not in flat_texts, (
-        "archived services must NOT appear in the picker"
-    )
+    assert "Стрижка архив" not in flat_texts, "archived services must NOT appear in the picker"
 
 
 @pytest.mark.asyncio
@@ -3739,9 +3743,7 @@ async def test_service_picker_cb_happy_saves_and_jumps_to_confirming(
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
-        svc = await _seed_service(
-            session, ctx, name="Окрашивание", duration_minutes=120
-        )
+        svc = await _seed_service(session, ctx, name="Окрашивание", duration_minutes=120)
         target_date = (datetime.now(UTC) + timedelta(days=1)).date()
         slot = Slot(
             master_id=ctx["master_id"],
@@ -3786,13 +3788,14 @@ async def test_service_picker_cb_workday_path_happy_shows_summary(
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
-        svc = await _seed_service(
-            session, ctx, name="Окрашивание", duration_minutes=120
-        )
+        svc = await _seed_service(session, ctx, name="Окрашивание", duration_minutes=120)
         target_date = (datetime.now(UTC) + timedelta(days=1)).date()
         wd = await _seed_workday(
-            session, ctx, work_date=target_date,
-            start_time=time(10, 0), end_time=time(12, 0),
+            session,
+            ctx,
+            work_date=target_date,
+            start_time=time(10, 0),
+            end_time=time(12, 0),
         )
         service_id = svc.id
         workday_id = wd.id
@@ -3913,13 +3916,14 @@ async def test_confirm_cb_workday_path_passes_service_id_to_booking_create(
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
-        svc = await _seed_service(
-            session, ctx, name="Окрашивание", duration_minutes=120
-        )
+        svc = await _seed_service(session, ctx, name="Окрашивание", duration_minutes=120)
         target_date = (datetime.now(UTC) + timedelta(days=1)).date()
         wd = await _seed_workday(
-            session, ctx, work_date=target_date,
-            start_time=time(10, 0), end_time=time(12, 0),
+            session,
+            ctx,
+            work_date=target_date,
+            start_time=time(10, 0),
+            end_time=time(12, 0),
         )
         service_id = svc.id
         workday_id = wd.id
@@ -3969,9 +3973,7 @@ async def test_confirm_cb_slot_path_passes_service_id_to_booking_create(
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
-        svc = await _seed_service(
-            session, ctx, name="Стрижка", duration_minutes=30
-        )
+        svc = await _seed_service(session, ctx, name="Стрижка", duration_minutes=30)
         target_date = (datetime.now(UTC) + timedelta(days=1)).date()
         slot = Slot(
             master_id=ctx["master_id"],
@@ -4077,6 +4079,16 @@ async def test_service_msg_clears_stale_service_id_from_state(
     state.set_state.assert_awaited()
     assert state.set_state.call_args.args[0] == BookingStates.confirming
 
+    # F2 fix (code-review iter 2): verify final FSM state (not just kwargs).
+    # Without F1 fix, service_msg called update_data(service_title=...) only,
+    # and stale service_id from pre-state would SURVIVE in state.get_data().
+    # With F1 fix, service_id=None in update_data overwrites stale UUID.
+    final_data = await state.get_data()
+    assert final_data.get("service_id") is None, (
+        "stale service_id from previous picker tap must be cleared in final "
+        "FSM state — without F1 fix, this would still be the stale UUID"
+    )
+
 
 @pytest.mark.asyncio
 async def test_confirm_cb_workday_path_with_stale_service_id_after_text_input(
@@ -4092,13 +4104,21 @@ async def test_confirm_cb_workday_path_with_stale_service_id_after_text_input(
     - Simulate: service_msg ran first (sets service_title, resets service_id=None)
     - Confirm_cb reads service_id from state → must be None → BookingCreate.service_id=None
     - create_booking → _select_service(None) → None → _build_end_at uses default duration
+
+    F3 fix (code-review iter 2): test now invokes service_msg first (which
+    clears stale service_id with F1 fix, leaves it stale without). Previous
+    version pre-set service_id=None in setup, which made the test pass
+    regardless of F1 fix (false positive).
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
         target_date = (datetime.now(UTC) + timedelta(days=1)).date()
         wd = await _seed_workday(
-            session, ctx, work_date=target_date,
-            start_time=time(10, 0), end_time=time(12, 0),
+            session,
+            ctx,
+            work_date=target_date,
+            start_time=time(10, 0),
+            end_time=time(12, 0),
         )
         workday_id = wd.id
 
@@ -4116,22 +4136,28 @@ async def test_confirm_cb_workday_path_with_stale_service_id_after_text_input(
     monkeypatch.setattr(client_handlers, "create_booking", _fake_create)
     monkeypatch.setattr(client_handlers, "schedule_for_booking", MagicMock())
 
-    cb, callback_data = _make_confirm_callback()
+    # Step 1: pre-state with STALE service_id (simulates abandoned picker tap)
+    stale_service_id = UUID("00000000-0000-0000-0000-000000000099")
     state = _make_state()
-    # Simulate post-service_msg state: service_id=None (F1 fix applied)
     await state.update_data(
         workday_id=str(workday_id),
         start_minute=600,
         client_name="Паша",
-        service_title="Стрижка",
-        service_id=None,  # F1 fix: service_msg reset this
+        service_id=str(stale_service_id),  # STALE — must be cleared by service_msg
     )
-    scheduler = MagicMock(spec=AsyncIOScheduler)
 
+    # Step 2: invoke service_msg (F1 fix: clears service_id via atomic merge)
+    msg = _make_message(user_id=111222333, text="Стрижка")
+    await client_handlers.service_msg(msg, state)
+
+    # Step 3: invoke confirm_cb (reads service_id from state)
+    cb, callback_data = _make_confirm_callback()
+    scheduler = MagicMock(spec=AsyncIOScheduler)
     await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
 
     assert captured.get("service_id") is None, (
         "confirm_cb must pass service_id=None when service_msg cleared stale "
-        "service_id from previous picker tap (F1 fix end-to-end)"
+        "service_id from previous picker tap (F1 fix end-to-end). Without F1 "
+        "fix, this would be the stale UUID — wrong end_at duration."
     )
     state.clear.assert_awaited_once()

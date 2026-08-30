@@ -339,9 +339,7 @@ async def close_workday_with_cancellations(
             except IntegrityError:
                 pass  # already logged — idempotent
 
-    await session.execute(
-        update(WorkDay).where(WorkDay.id == workday_id).values(is_active=False)
-    )
+    await session.execute(update(WorkDay).where(WorkDay.id == workday_id).values(is_active=False))
     await session.commit()
 
     return ClosedDayResult(

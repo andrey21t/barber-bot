@@ -653,9 +653,7 @@ async def test_admin_move_concurrent_race_runtime(
         )
         s_seed.add(biz)
         await s_seed.flush()
-        master = Master(
-            business_id=biz.id, name="Тестер", telegram_id=461355056, role="owner"
-        )
+        master = Master(business_id=biz.id, name="Тестер", telegram_id=461355056, role="owner")
         s_seed.add(master)
         await s_seed.flush()
         client = Client(telegram_id=111222333, name="Паша")
@@ -809,9 +807,9 @@ async def test_admin_move_concurrent_race_runtime(
 
         expected_b_start = _build_start_at_from_workday(
             # We don't have workday_b object here — re-fetch.
-            (await s_verify.execute(
-                select(WorkDay).where(WorkDay.id == new_workday_b_id)
-            )).scalar_one(),
+            (
+                await s_verify.execute(select(WorkDay).where(WorkDay.id == new_workday_b_id))
+            ).scalar_one(),
             dt_time(15, 0),
             "Europe/Moscow",
         )

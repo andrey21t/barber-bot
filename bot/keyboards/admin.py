@@ -333,8 +333,8 @@ class BookedSlot:
     """
 
     start_minute: int  # booking.start_at LOCAL in minutes since midnight
-    end_minute: int    # booking.end_at LOCAL in minutes since midnight
-    client_name: str   # snapshot, already html.escape()'d in booking.py
+    end_minute: int  # booking.end_at LOCAL in minutes since midnight
+    client_name: str  # snapshot, already html.escape()'d in booking.py
     service_title: str  # snapshot
 
 
@@ -500,7 +500,13 @@ def _minute_to_time(minute: int) -> dt_time:
 # ============================================================
 
 _WEEKDAY_LABELS: tuple[str, ...] = (
-    "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс",
+    "Пн",
+    "Вт",
+    "Ср",
+    "Чт",
+    "Пт",
+    "Сб",
+    "Вс",
 )
 
 
