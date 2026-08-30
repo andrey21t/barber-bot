@@ -296,6 +296,14 @@ async def close_workday_with_cancellations(
             was_already_closed=True,
         )
 
+    # Advisory lock BEFORE conflict SELECT — serialize with concurrent
+    # create_booking (mirror open_workday:93, booking.py:521). Without it:
+    # close SELECTs conflicts → close UPDATEs bookings → close sets
+    # is_active=False + commit; concurrent create_booking checked
+    # is_active=True (before lock), INSERTs, commits → zombie active booking
+    # on a closed day. Race invisible in SQLite tests (no-op lock).
+    await _acquire_advisory_lock(session, workday.master_id, workday.work_date)
+
     new_start_utc, new_end_utc = _window_bounds_utc(
         workday.work_date, workday.start_time, workday.end_time, business_tz
     )
