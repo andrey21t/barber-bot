@@ -276,6 +276,37 @@ async def _handle_simple_calendar(
             # === /book legacy slot branch (existing) ===
             slots = await get_available_slots(session, master.id, slot_date)
             if not slots:
+                # Session 5.27 fallback: legacy slots empty → try WorkDay.
+                # /openweek (Session 5.26) writes to work_days, not slots.
+                # Without this fallback, /book users can't book days opened
+                # via /openweek — only /slots could. Maintain backward compat
+                # by transparently switching /book to 30-min WorkDay picker
+                # when no legacy slots exist for the date.
+                workday = await _select_workday_for_slot(session, master.id, slot_date)
+                if workday is not None and workday.is_active:
+                    slots_30 = await get_available_slots_30(
+                        session, workday, settings.TIMEZONE
+                    )
+                    if slots_30:
+                        await state.update_data(selected_date=slot_date.isoformat())
+                        await state.set_state(selecting_slot_state)
+                        if callback.message is not None:
+                            await callback.message.answer(
+                                "Выберите новое время:" if is_transfer else "Выберите время:",
+                                reply_markup=slot_picker_keyboard_30min(slots_30, workday.id),
+                            )
+                        await callback.answer()
+                        return
+                    # workday active but no free slots — fall through to message below.
+                elif workday is not None and not workday.is_active:
+                    # workday exists but closed via /closeday — show closed hint.
+                    if callback.message is not None:
+                        await callback.message.answer(
+                            "День закрыт мастером. Выберите другую дату:",
+                            reply_markup=await calendar_keyboard(*_calendar_range(settings)),
+                        )
+                    await callback.answer()
+                    return
                 if callback.message is not None:
                     await callback.message.answer(
                         "На эту дату нет свободных слотов. Выберите другую дату:",
