@@ -28,7 +28,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram_calendar import SimpleCalendar
 
-from bot.models import Booking, Slot
+from bot.models import Booking, Service, Slot
 from bot.services.slots import TimeSlot30
 
 
@@ -97,6 +97,26 @@ class BookSlot30CallbackData(CallbackData, prefix="book_slot_30"):
 
     workday_id: UUID
     start_minute: int
+
+
+class BookServiceCallbackData(CallbackData, prefix="book_service"):
+    """Service picker callback (Session 5.27 FEAT — tap-to-select services).
+
+    Payload: service_id UUID — Service row selected from inline picker.
+    Handler resolves service.name + service.duration_minutes for summary +
+    create_booking (BookingCreate.service_id set → _build_end_at uses
+    service.duration_minutes, not SERVICE_DEFAULT_DURATION_MIN).
+
+    Distinct prefix "book_service" — no conflict with booking flow callbacks
+    (BookSlotCallbackData prefix="book_slot", BookSlot30CallbackData prefix="book_slot_30").
+
+    Fallback "Своя услуга" uses plain string "book_service_custom" (no payload)
+    caught by F.data == "book_service_custom" filter — handler keeps FSM in
+    entering_service and asks for text; existing service_msg catches the
+    free-text answer (legacy path, no service_id set → default duration).
+    """
+
+    service_id: UUID
 
 
 async def calendar_keyboard(min_date: datetime, max_date: datetime) -> InlineKeyboardMarkup:
@@ -188,6 +208,33 @@ def confirm_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Подтвердить", callback_data=BookConfirmCallbackData().pack())
     builder.button(text="❌ Отмена", callback_data=BookCancelCallbackData().pack())
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+def service_picker_keyboard(services: list[Service]) -> InlineKeyboardMarkup:
+    """Build inline keyboard with services for tap-to-select (Session 5.27 FEAT).
+
+    Each button shows service.name (up to 255 chars — Telegram truncates display
+    if too long). callback_data carries BookServiceCallbackData(service_id).
+    Last row adds "✏️ Своя услуга" (callback_data="book_service_custom") as a
+    fallback to the legacy free-text input — covers unusual requests that
+    don't match the predefined service list.
+
+    Empty services list is handled by the caller (name_msg shows text prompt
+    instead when no services in DB — single-master MVP, rare case).
+
+    Args:
+        services: list of bot.models.Service (active, business-scoped).
+
+    Returns:
+        InlineKeyboardMarkup — buttons in 2 columns, custom row last.
+    """
+    builder = InlineKeyboardBuilder()
+    for svc in services:
+        cb = BookServiceCallbackData(service_id=svc.id)
+        builder.button(text=svc.name, callback_data=cb.pack())
+    builder.button(text="✏️ Своя услуга", callback_data="book_service_custom")
     builder.adjust(2)
     return builder.as_markup()
 

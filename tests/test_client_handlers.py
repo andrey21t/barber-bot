@@ -50,7 +50,7 @@ from bot.keyboards.client import (
     MyBookingsTransferCallbackData,
     mybookings_keyboard,
 )
-from bot.models import Booking, Business, Client, Master, Slot, WorkDay
+from bot.models import Booking, Business, Client, Master, Service, Slot, WorkDay
 from bot.states import BookingStates, TransferStates
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -3556,3 +3556,582 @@ async def test_mybookings_keyboard_hides_transfer_for_workday_only_booking(
         assert any("Перенести" in t for t in flat_texts_lg), (
             "legacy slot-based booking must keep transfer button"
         )
+
+
+# ============================================================
+# Session 5.27 FEAT — service_picker_cb + service_custom_cb
+# Coverage: client.py name_msg (services in DB → picker),
+#           service_picker_cb (tap → confirming),
+#           service_custom_cb (tap "Своя услуга" → text input),
+#           confirm_cb with service_id in FSM (BookingCreate.service_id set).
+# ============================================================
+
+
+async def _seed_service(
+    session: AsyncSession,
+    ctx: dict[str, Any],
+    *,
+    name: str = "Стрижка",
+    duration_minutes: int = 60,
+    is_active: bool = True,
+) -> Service:
+    """Insert a Service row for the seeded business. Returns the Service."""
+    svc = Service(
+        business_id=ctx["business_id"],
+        name=name,
+        duration_minutes=duration_minutes,
+        is_active=is_active,
+    )
+    session.add(svc)
+    await session.commit()
+    return svc
+
+
+def _make_service_callback(
+    service_id: UUID,
+    *,
+    user_id: int = 111222333,
+) -> tuple[MagicMock, Any]:
+    """Mock CallbackQuery for service_picker_cb (BookServiceCallbackData filter)."""
+    from bot.keyboards.client import BookServiceCallbackData
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(user_id)
+    cb.message = _make_message(user_id, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = BookServiceCallbackData(service_id=service_id)
+    return cb, callback_data
+
+
+def _make_string_callback(
+    data: str,
+    *,
+    user_id: int = 111222333,
+) -> MagicMock:
+    """Mock CallbackQuery with raw callback_data string (for 'book_service_custom').
+
+    service_custom_cb uses F.data == "book_service_custom" (NOT CallbackData
+    factory), so we set cb.data directly and skip factory parsing.
+    """
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(user_id)
+    cb.message = _make_message(user_id, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    cb.data = data
+    return cb
+
+
+@pytest.mark.asyncio
+async def test_name_msg_with_services_shows_inline_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.27 FEAT: name_msg with active services in DB → 'Выберите услугу тапом'
+    + inline keyboard with service buttons (service_picker_keyboard).
+
+    Verifies:
+    - state.set_state(entering_service) — FSM advances correctly
+    - message.answer called with reply_markup (InlineKeyboardMarkup)
+    - reply_markup contains the seeded service name AND 'Своя услуга' button
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        await _seed_service(session, ctx, name="Стрижка", duration_minutes=60)
+        await _seed_service(session, ctx, name="Окрашивание", duration_minutes=120)
+
+    msg = _make_message(user_id=111222333, text="Паша")
+    state = _make_state()
+
+    await client_handlers.name_msg(msg, state)
+
+    state.update_data.assert_awaited()
+    assert state.update_data.call_args.kwargs.get("client_name") == "Паша"
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.entering_service
+
+    text = _answer_text(msg)
+    assert "Выберите услугу тапом" in text
+    reply_markup = _answer_reply_markup(msg)
+    assert isinstance(reply_markup, InlineKeyboardMarkup), (
+        "with services in DB, name_msg must show inline keyboard"
+    )
+    flat_texts = [btn.text for row in reply_markup.inline_keyboard for btn in row]
+    assert "Стрижка" in flat_texts
+    assert "Окрашивание" in flat_texts
+    assert any("Своя услуга" in t for t in flat_texts), (
+        "'Своя услуга' fallback button must always be present"
+    )
+
+
+@pytest.mark.asyncio
+async def test_name_msg_no_services_falls_back_to_text_prompt(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.27 FEAT: name_msg with no active services in DB → legacy text prompt
+    'Какая услуга?' (no inline keyboard).
+
+    Single-master MVP edge case: master hasn't created any services yet →
+    user types service name as before (legacy path preserved).
+    """
+    async with session_factory() as session:
+        await _seed_full_stack(session)  # master + business, NO services
+
+    msg = _make_message(user_id=111222333, text="Паша")
+    state = _make_state()
+
+    await client_handlers.name_msg(msg, state)
+
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.entering_service
+    text = _answer_text(msg)
+    assert "Какая услуга" in text
+    assert _answer_reply_markup(msg) is None, (
+        "no services in DB → no inline keyboard, legacy text prompt"
+    )
+
+
+@pytest.mark.asyncio
+async def test_name_msg_archived_services_excluded_from_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.27 FEAT: name_msg filters is_active=True — archived services excluded.
+
+    Service with is_active=False is in DB but picker shows only active ones.
+    If all services archived → fallback to text prompt (no inline keyboard).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        # Two services: one active, one archived.
+        await _seed_service(session, ctx, name="Стрижка активная", is_active=True)
+        await _seed_service(session, ctx, name="Стрижка архив", is_active=False)
+
+    msg = _make_message(user_id=111222333, text="Паша")
+    state = _make_state()
+
+    await client_handlers.name_msg(msg, state)
+
+    reply_markup = _answer_reply_markup(msg)
+    assert isinstance(reply_markup, InlineKeyboardMarkup)
+    flat_texts = [btn.text for row in reply_markup.inline_keyboard for btn in row]
+    assert "Стрижка активная" in flat_texts
+    assert "Стрижка архив" not in flat_texts, (
+        "archived services must NOT appear in the picker"
+    )
+
+
+@pytest.mark.asyncio
+async def test_service_picker_cb_happy_saves_and_jumps_to_confirming(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.27 FEAT: service_picker_cb happy — tap a service button →
+    state.update_data(service_id, service_title) + set_state(confirming) +
+    'Подтвердите запись' summary with service.name.
+
+    Uses the /book legacy slot path (slot_id set in FSM) — workday path is
+    covered by a separate test below.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        svc = await _seed_service(
+            session, ctx, name="Окрашивание", duration_minutes=120
+        )
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = Slot(
+            master_id=ctx["master_id"],
+            slot_date=target_date,
+            slot_hour=14,
+            status="open",
+        )
+        session.add(slot)
+        await session.commit()
+        service_id = svc.id
+        slot_id = slot.id
+
+    cb, callback_data = _make_service_callback(service_id)
+    state = _make_state()
+    await state.update_data(client_name="Паша", slot_id=str(slot_id))
+
+    await client_handlers.service_picker_cb(cb, callback_data, state)
+
+    state.update_data.assert_awaited()
+    # service_id and service_title saved (single update_data call with both)
+    saved_kwargs = state.update_data.call_args.kwargs
+    assert saved_kwargs.get("service_id") == str(service_id)
+    assert saved_kwargs.get("service_title") == "Окрашивание"
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.confirming
+
+    text = _answer_text(cb.message)
+    assert "Подтвердите запись" in text
+    assert "Окрашивание" in text
+    assert "Паша" in text
+    assert isinstance(_answer_reply_markup(cb.message), InlineKeyboardMarkup)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_service_picker_cb_workday_path_happy_shows_summary(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.27 FEAT: service_picker_cb on /slots workday path — workday_id +
+    start_minute in state → summary via _format_booking_summary_from_start_at.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        svc = await _seed_service(
+            session, ctx, name="Окрашивание", duration_minutes=120
+        )
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        wd = await _seed_workday(
+            session, ctx, work_date=target_date,
+            start_time=time(10, 0), end_time=time(12, 0),
+        )
+        service_id = svc.id
+        workday_id = wd.id
+
+    cb, callback_data = _make_service_callback(service_id)
+    state = _make_state()
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=600,  # 10:00 LOCAL
+        client_name="Паша",
+    )
+
+    await client_handlers.service_picker_cb(cb, callback_data, state)
+
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.confirming
+    text = _answer_text(cb.message)
+    assert "Подтвердите запись" in text
+    assert "Окрашивание" in text
+    assert "10:00" in text  # summary formatted via _format_booking_summary_from_start_at
+    assert "Паша" in text
+
+
+@pytest.mark.asyncio
+async def test_service_picker_cb_service_archived_falls_back_to_text(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.27 FEAT: service_picker_cb defensive — service archived/deleted between
+    name_msg and tap → stay in entering_service + ask text (no dead-end for user).
+
+    Race scenario: master archived the service while user was looking at the
+    inline keyboard. service_picker_cb re-SELECTs Service by id and checks
+    is_active — archived → fallback to text input (legacy path).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        svc = await _seed_service(
+            session, ctx, name="Окрашивание", duration_minutes=120, is_active=True
+        )
+        # Now archive it (simulate race with master's /closeservice or similar)
+        svc.is_active = False
+        await session.commit()
+        service_id = svc.id
+
+    cb, callback_data = _make_service_callback(service_id)
+    state = _make_state()
+    await state.update_data(client_name="Паша", slot_id=str(UUID(int=1)))
+
+    await client_handlers.service_picker_cb(cb, callback_data, state)
+
+    # State stays in entering_service (NOT advanced to confirming)
+    state.set_state.assert_not_awaited()
+    # update_data called ONCE only — in our test setup (pre-call). Handler
+    # itself did NOT call update_data (no service saved on race fallback).
+    state.update_data.assert_awaited_once()
+    text = _answer_text(cb.message)
+    assert "недоступна" in text or "Напишите услугу" in text
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_service_picker_cb_service_deleted_falls_back_to_text(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.27 FEAT: service_picker_cb defensive — service deleted between name_msg
+    and tap (callback_data has stale service_id) → Service row not found →
+    stay in entering_service + ask text.
+    """
+    cb, callback_data = _make_service_callback(UUID(int=42))
+    # No DB seed at all — Service SELECT returns None
+    state = _make_state()
+    await state.update_data(client_name="Паша", slot_id=str(UUID(int=1)))
+
+    await client_handlers.service_picker_cb(cb, callback_data, state)
+
+    state.set_state.assert_not_awaited()
+    state.update_data.assert_awaited_once()  # only pre-call, no handler calls
+    text = _answer_text(cb.message)
+    assert "недоступна" in text or "Напишите услугу" in text
+
+
+@pytest.mark.asyncio
+async def test_service_custom_cb_keeps_state_and_asks_text(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.27 FEAT: service_custom_cb — tap 'Своя услуга' → state stays in
+    entering_service + 'Напишите услугу текстом'. Existing service_msg catches
+    the next text message (legacy path, no service_id in FSM).
+    """
+    cb = _make_string_callback("book_service_custom")
+    state = _make_state()
+    await state.update_data(client_name="Паша", slot_id=str(UUID(int=1)))
+
+    await client_handlers.service_custom_cb(cb, state)
+
+    # State stays in entering_service — no set_state call (legacy text path)
+    state.set_state.assert_not_awaited()
+    state.update_data.assert_awaited_once()  # only pre-call, no handler calls
+    text = _answer_text(cb.message)
+    assert "Напишите услугу" in text
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_cb_workday_path_passes_service_id_to_booking_create(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """5.27 FEAT: confirm_cb with service_id in FSM → BookingCreate.service_id
+    is the UUID (not None) → _build_end_at uses service.duration_minutes.
+
+    Verifies the FEAT end-to-end: service_picker_cb saves service_id in FSM,
+    confirm_cb reads it and passes to create_booking via BookingCreate.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        svc = await _seed_service(
+            session, ctx, name="Окрашивание", duration_minutes=120
+        )
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        wd = await _seed_workday(
+            session, ctx, work_date=target_date,
+            start_time=time(10, 0), end_time=time(12, 0),
+        )
+        service_id = svc.id
+        workday_id = wd.id
+
+    captured_payload: dict[str, Any] = {}
+    fake_result = MagicMock()
+    fake_result.booking_id = UUID("00000000-0000-0000-0000-000000000007")
+    fake_result.start_at = datetime.now(UTC) + timedelta(days=1)
+    fake_result.master_notification_text = "Новая запись"
+
+    async def _fake_create(*args: Any, **kwargs: Any) -> Any:
+        payload = args[1]
+        captured_payload["service_id"] = payload.service_id
+        captured_payload["workday_id"] = payload.workday_id
+        return fake_result
+
+    monkeypatch.setattr(client_handlers, "create_booking", _fake_create)
+    monkeypatch.setattr(client_handlers, "schedule_for_booking", MagicMock())
+
+    cb, callback_data = _make_confirm_callback()
+    state = _make_state()
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=600,
+        client_name="Паша",
+        service_title="Окрашивание",
+        service_id=str(service_id),
+    )
+    scheduler = MagicMock(spec=AsyncIOScheduler)
+
+    await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
+
+    assert captured_payload.get("service_id") == service_id, (
+        "confirm_cb must pass service_id from FSM to BookingCreate"
+    )
+    state.clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_confirm_cb_slot_path_passes_service_id_to_booking_create(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """5.27 FEAT: confirm_cb on legacy /book slot path with service_id in FSM →
+    BookingCreate.service_id is the UUID.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        svc = await _seed_service(
+            session, ctx, name="Стрижка", duration_minutes=30
+        )
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = Slot(
+            master_id=ctx["master_id"],
+            slot_date=target_date,
+            slot_hour=14,
+            status="open",
+        )
+        session.add(slot)
+        await session.commit()
+        service_id = svc.id
+        slot_id = slot.id
+
+    captured_payload: dict[str, Any] = {}
+    fake_result = MagicMock()
+    fake_result.booking_id = UUID("00000000-0000-0000-0000-000000000008")
+    fake_result.start_at = datetime.now(UTC) + timedelta(days=1)
+    fake_result.master_notification_text = "Новая запись"
+
+    async def _fake_create(*args: Any, **kwargs: Any) -> Any:
+        payload = args[1]
+        captured_payload["service_id"] = payload.service_id
+        captured_payload["slot_id"] = payload.slot_id
+        return fake_result
+
+    monkeypatch.setattr(client_handlers, "create_booking", _fake_create)
+    monkeypatch.setattr(client_handlers, "schedule_for_booking", MagicMock())
+
+    cb, callback_data = _make_confirm_callback()
+    state = _make_state()
+    await state.update_data(
+        slot_id=str(slot_id),
+        client_name="Паша",
+        service_title="Стрижка",
+        service_id=str(service_id),
+    )
+    scheduler = MagicMock(spec=AsyncIOScheduler)
+
+    await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
+
+    assert captured_payload.get("service_id") == service_id
+    assert captured_payload.get("slot_id") == slot_id
+    state.clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_service_msg_clears_stale_service_id_from_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """5.27 code-review F1: stale service_id in FSM (from previous picker tap
+    in abandoned flow) → service_msg must reset it to None.
+
+    Scenario (regression test for F1 bug):
+    1. User /book → date → slot → name → tap picker (service_id=X set in state,
+       state=confirming)
+    2. User abandons (no ✅, closes bot) — state persists in Postgres storage
+    3. User returns → /book → date → slot → types new name (name_msg overwrites
+       client_name)
+    4. User types "Стрижка" (custom text, NOT picker) → service_msg must
+       OVERWRITE service_id=None (atomic merge in update_data), so confirm_cb
+       doesn't pass stale service_id to BookingCreate.
+
+    Without the fix: service_msg only sets service_title (dict.update merges),
+    stale service_id=X survives → create_booking computes end_at from
+    stale Service (e.g. "Окрашивание" duration=120 instead of "Стрижка" 60).
+    Silent data correctness bug — user sees correct title but wrong end_at.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        # Seed two services — one we'll "tap" (stale), one is unrelated
+        await _seed_service(session, ctx, name="Окрашивание", duration_minutes=120)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = Slot(
+            master_id=ctx["master_id"],
+            slot_date=target_date,
+            slot_hour=14,
+            status="open",
+        )
+        session.add(slot)
+        await session.commit()
+        slot_id = slot.id
+
+    msg = _make_message(user_id=111222333, text="Стрижка")
+    state = _make_state()
+    # Pre-populate STALE service_id (simulates abandoned picker tap from prior flow)
+    stale_service_id = UUID("00000000-0000-0000-0000-000000000099")
+    await state.update_data(
+        client_name="Паша",
+        slot_id=str(slot_id),
+        service_id=str(stale_service_id),  # STALE — must be cleared
+    )
+
+    await client_handlers.service_msg(msg, state)
+
+    # Verify update_data called with service_id=None (reset)
+    saved_kwargs = state.update_data.call_args.kwargs
+    assert saved_kwargs.get("service_id") is None, (
+        "service_msg must reset service_id=None to prevent stale service_id "
+        "from previous picker tap leaking into BookingCreate (F1 bug)"
+    )
+    assert saved_kwargs.get("service_title") == "Стрижка"
+    state.set_state.assert_awaited()
+    assert state.set_state.call_args.args[0] == BookingStates.confirming
+
+
+@pytest.mark.asyncio
+async def test_confirm_cb_workday_path_with_stale_service_id_after_text_input(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """5.27 code-review F1 end-to-end: user typed custom service text after
+    abandoning picker tap → BookingCreate.service_id must be None (not stale).
+
+    Verifies the F1 fix end-to-end through confirm_cb:
+    - Pre-state: workday_id + start_minute + service_id (STALE) + client_name
+    - Simulate: service_msg ran first (sets service_title, resets service_id=None)
+    - Confirm_cb reads service_id from state → must be None → BookingCreate.service_id=None
+    - create_booking → _select_service(None) → None → _build_end_at uses default duration
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        wd = await _seed_workday(
+            session, ctx, work_date=target_date,
+            start_time=time(10, 0), end_time=time(12, 0),
+        )
+        workday_id = wd.id
+
+    captured: dict[str, Any] = {}
+    fake_result = MagicMock()
+    fake_result.booking_id = UUID("00000000-0000-0000-0000-000000000010")
+    fake_result.start_at = datetime.now(UTC) + timedelta(days=1)
+    fake_result.master_notification_text = "Новая запись"
+
+    async def _fake_create(*args: Any, **kwargs: Any) -> Any:
+        payload = args[1]
+        captured["service_id"] = payload.service_id
+        return fake_result
+
+    monkeypatch.setattr(client_handlers, "create_booking", _fake_create)
+    monkeypatch.setattr(client_handlers, "schedule_for_booking", MagicMock())
+
+    cb, callback_data = _make_confirm_callback()
+    state = _make_state()
+    # Simulate post-service_msg state: service_id=None (F1 fix applied)
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=600,
+        client_name="Паша",
+        service_title="Стрижка",
+        service_id=None,  # F1 fix: service_msg reset this
+    )
+    scheduler = MagicMock(spec=AsyncIOScheduler)
+
+    await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
+
+    assert captured.get("service_id") is None, (
+        "confirm_cb must pass service_id=None when service_msg cleared stale "
+        "service_id from previous picker tap (F1 fix end-to-end)"
+    )
+    state.clear.assert_awaited_once()
