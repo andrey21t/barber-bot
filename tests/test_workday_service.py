@@ -25,14 +25,15 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from bot.models import Booking, WorkDay
+from bot.models import Booking, NotificationLog, WorkDay
 from bot.services.workday import (
     WorkDayShrinkError,
     close_workday,
+    close_workday_with_cancellations,
     open_workday,
     update_workday,
 )
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 BUSINESS_TZ = "Europe/Moscow"
@@ -570,3 +571,214 @@ async def test_close_workday_not_found_returns_false(
     fake_id = uuid4()
     closed = await close_workday(session, fake_id, business_tz=BUSINESS_TZ)
     assert closed is False
+
+
+# ---------------------------------------------------------------------------
+# close_workday_with_cancellations (Session 5.26)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_close_with_cancellations_no_workday_returns_none(
+    session: AsyncSession,
+    seed_data: dict[str, Any],  # noqa: ARG001 — fixture seeds DB schema
+) -> None:
+    """close_workday_with_cancellations on a non-existent workday_id → None.
+
+    Handler branch: 'день не открыт' message (admin tried to close a day
+    that was never opened via /openweek or /openday).
+    """
+    fake_id = uuid4()
+    result = await close_workday_with_cancellations(
+        session, fake_id, business_tz=BUSINESS_TZ
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_close_with_cancellations_already_closed_idempotent(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Idempotent: WorkDay already is_active=False → return ClosedDayResult
+    with was_already_closed=True and empty cancelled_bookings (no second
+    cancellation pass — admin can re-run /closeday safely).
+    """
+    new_date = (datetime.now(UTC) + timedelta(days=18)).date()
+    workday = await open_workday(
+        session,
+        seed_data["master_id"],
+        new_date,
+        dt_time(10, 0),
+        dt_time(20, 0),
+        business_tz=BUSINESS_TZ,
+    )
+    # First close: no bookings → is_active=False
+    await close_workday(session, workday.id, business_tz=BUSINESS_TZ)
+
+    # Now add an active booking UNDER the closed day (edge case: admin opened
+    # a booking via direct API after closing). Second close must NOT cancel it
+    # — was_already_closed short-circuits.
+    booking = await _direct_insert_booking(
+        session,
+        seed_data,
+        start_at=_local_to_utc(new_date, 14, 0),
+        end_at=_local_to_utc(new_date, 15, 0),
+    )
+
+    result = await close_workday_with_cancellations(
+        session, workday.id, business_tz=BUSINESS_TZ
+    )
+    assert result is not None
+    assert result.was_already_closed is True
+    assert result.cancelled_bookings == []
+    assert result.workday_id == workday.id
+    assert result.work_date == new_date
+
+    # The post-close booking is NOT cancelled.
+    await session.refresh(booking)
+    assert booking.status == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_close_with_cancellations_no_active_bookings(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Active workday, NO active bookings → is_active=False, empty
+    cancelled_bookings, was_already_closed=False. Mirrors /closeday happy
+    path when master closes an empty day (no client notifications sent).
+    """
+    new_date = (datetime.now(UTC) + timedelta(days=19)).date()
+    workday = await open_workday(
+        session,
+        seed_data["master_id"],
+        new_date,
+        dt_time(10, 0),
+        dt_time(20, 0),
+        business_tz=BUSINESS_TZ,
+    )
+
+    result = await close_workday_with_cancellations(
+        session, workday.id, business_tz=BUSINESS_TZ
+    )
+    assert result is not None
+    assert result.was_already_closed is False
+    assert result.cancelled_bookings == []
+    assert result.work_date == new_date
+
+    await session.refresh(workday)
+    assert workday.is_active is False
+
+
+@pytest.mark.asyncio
+async def test_close_with_cancellations_cancels_active_bookings(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Active workday + 2 active bookings (one 'confirmed', one 'transferred')
+    → both cancelled, NotificationLog('master_cancel') per booking,
+    was_already_closed=False, is_active=False.
+    """
+    new_date = (datetime.now(UTC) + timedelta(days=20)).date()
+    workday = await open_workday(
+        session,
+        seed_data["master_id"],
+        new_date,
+        dt_time(10, 0),
+        dt_time(20, 0),
+        business_tz=BUSINESS_TZ,
+    )
+    booking_confirmed = await _direct_insert_booking(
+        session,
+        seed_data,
+        start_at=_local_to_utc(new_date, 14, 0),
+        end_at=_local_to_utc(new_date, 15, 0),
+        status="confirmed",
+    )
+    booking_transferred = await _direct_insert_booking(
+        session,
+        seed_data,
+        start_at=_local_to_utc(new_date, 16, 0),
+        end_at=_local_to_utc(new_date, 17, 0),
+        status="transferred",
+    )
+
+    result = await close_workday_with_cancellations(
+        session, workday.id, business_tz=BUSINESS_TZ
+    )
+    assert result is not None
+    assert result.was_already_closed is False
+    assert result.work_date == new_date
+    cancelled_ids = {b.id for b in result.cancelled_bookings}
+    assert cancelled_ids == {booking_confirmed.id, booking_transferred.id}
+
+    # Bookings persisted as 'cancelled'.
+    await session.refresh(booking_confirmed)
+    await session.refresh(booking_transferred)
+    assert booking_confirmed.status == "cancelled"
+    assert booking_transferred.status == "cancelled"
+
+    # WorkDay is closed.
+    await session.refresh(workday)
+    assert workday.is_active is False
+
+    # NotificationLog('master_cancel') per booking (2 entries total).
+    log_count = await session.scalar(
+        select(func.count())
+        .select_from(NotificationLog)
+        .where(NotificationLog.kind == "master_cancel")
+    )
+    assert log_count == 2
+
+
+@pytest.mark.asyncio
+async def test_close_with_cancellations_skips_cancelled_bookings(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Active workday + 1 confirmed + 1 already-cancelled booking → only
+    the confirmed one is cancelled (status IN ('confirmed','transferred')
+    filter excludes 'cancelled'). NotificationLog count == 1.
+    """
+    new_date = (datetime.now(UTC) + timedelta(days=21)).date()
+    workday = await open_workday(
+        session,
+        seed_data["master_id"],
+        new_date,
+        dt_time(10, 0),
+        dt_time(20, 0),
+        business_tz=BUSINESS_TZ,
+    )
+    booking_active = await _direct_insert_booking(
+        session,
+        seed_data,
+        start_at=_local_to_utc(new_date, 14, 0),
+        end_at=_local_to_utc(new_date, 15, 0),
+        status="confirmed",
+    )
+    booking_cancelled = await _direct_insert_booking(
+        session,
+        seed_data,
+        start_at=_local_to_utc(new_date, 16, 0),
+        end_at=_local_to_utc(new_date, 17, 0),
+        status="cancelled",
+    )
+
+    result = await close_workday_with_cancellations(
+        session, workday.id, business_tz=BUSINESS_TZ
+    )
+    assert result is not None
+    cancelled_ids = {b.id for b in result.cancelled_bookings}
+    assert cancelled_ids == {booking_active.id}
+
+    # The pre-cancelled booking is unchanged (still 'cancelled', no re-write).
+    await session.refresh(booking_cancelled)
+    assert booking_cancelled.status == "cancelled"
+
+    log_count = await session.scalar(
+        select(func.count())
+        .select_from(NotificationLog)
+        .where(NotificationLog.kind == "master_cancel")
+    )
+    assert log_count == 1

@@ -1694,6 +1694,18 @@ def _state_data_passed(state: MagicMock) -> dict[str, Any]:
     return result
 
 
+def _state_all_updates(state: MagicMock) -> dict[str, Any]:
+    """Merge ALL update_data calls (Session 5.26: handlers may call update_data
+    twice — picked_end_minute then selected_weekdays=[] in openweek_end_cb).
+    Later calls overwrite earlier for the same key (mirror FSM semantics).
+    """
+    merged: dict[str, Any] = {}
+    for call in state.update_data.call_args_list:
+        args, kwargs = call
+        merged.update(args[0] if args else kwargs)
+    return merged
+
+
 # --- /addslots calendar_cb -------------------------------------------------
 
 
@@ -2158,3 +2170,806 @@ async def test_admin_window_cancel_cb_clears_state(
     state.clear.assert_called_once()
     text = callback_answer_text(callback)
     assert "Действие отменено" in text
+
+
+# ============================================================
+# /openweek handlers (Session 5.26)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_cmd_openweek_shows_start_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """/openweek → state.clear + set_state(opening_week_start) + reply with
+    start picker (admin_window_slot_picker_keyboard mode='start' БЕЗ booked_slots).
+    """
+    from bot.states import AdminStates
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(ADMIN_TG_ID, text="/openweek")
+    state = _make_mock_state()
+
+    await admin_handlers.cmd_openweek(msg, state)
+
+    state.clear.assert_called_once()
+    state.set_state.assert_called_once_with(AdminStates.opening_week_start)
+    data = _state_data_passed(state)
+    assert "business_tz" in data
+
+    args, kwargs = msg.answer.call_args
+    text = args[0] if args else kwargs.get("text", "")
+    assert "Открыть неделю" in text
+    reply_markup = kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
+    assert reply_markup is not None, "Expected start picker reply_markup"
+
+
+@pytest.mark.asyncio
+async def test_cmd_openweek_master_not_found_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """/openweek without seeded master → '❌ Мастер не найден', state untouched
+    (handler returns before set_state)."""
+    async with session_factory():
+        pass  # no seed
+
+    msg = _make_message(ADMIN_TG_ID, text="/openweek")
+    state = _make_mock_state()
+
+    await admin_handlers.cmd_openweek(msg, state)
+
+    text = _answer_text(msg)
+    assert "Мастер не найден" in text
+    state.set_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_openweek_entry_cb_sets_state_and_shows_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[🗓 Открыть неделю] tap → state.clear + set_state(opening_week_start) +
+    edit_text with start picker (callback.message is Message).
+    """
+    from bot.states import AdminStates
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    from bot.keyboards.admin import AdminOpenWeekEntryCallbackData
+
+    cb_data = AdminOpenWeekEntryCallbackData()
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+
+    await admin_handlers.admin_openweek_entry_cb(callback, state)
+
+    state.clear.assert_called_once()
+    state.set_state.assert_called_once_with(AdminStates.opening_week_start)
+    assert callback.message.edit_text.called
+    edit_args, edit_kwargs = callback.message.edit_text.call_args
+    text = edit_args[0] if edit_args else edit_kwargs.get("text", "")
+    assert "Открыть неделю" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_openweek_start_cb_saves_start_and_shows_end_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[start slot tap] in opening_week_start → update_data(picked_start_minute),
+    set_state(opening_week_end), answer with end picker (mode='end').
+    """
+    from uuid import UUID as _UUID
+
+    from bot.keyboards.admin import AdminWindowSlot30CallbackData
+    from bot.states import AdminStates
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    sentinel = _UUID(int=0)
+    cb_data = AdminWindowSlot30CallbackData(workday_id=sentinel, start_minute=600)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state({"business_tz": TZ})
+
+    await admin_handlers.admin_openweek_start_cb(callback, cb_data, state)
+
+    state.update_data.assert_called()
+    state.set_state.assert_called_once_with(AdminStates.opening_week_end)
+    data = _state_data_passed(state)
+    assert data["picked_start_minute"] == 600
+    args, kwargs = callback.message.answer.call_args
+    text = args[0] if args else kwargs.get("text", "")
+    assert "Шаг 2" in text
+    reply_markup = kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
+    assert reply_markup is not None, "Expected end picker reply_markup"
+
+
+@pytest.mark.asyncio
+async def test_admin_openweek_end_cb_saves_end_and_shows_days(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[end slot tap] in opening_week_end → update_data(picked_end_minute +
+    selected_weekdays=[]), set_state(opening_week_days), answer with 7-toggle
+    keyboard.
+    """
+    from uuid import UUID as _UUID
+
+    from bot.keyboards.admin import AdminWindowSlot30CallbackData
+    from bot.states import AdminStates
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    sentinel = _UUID(int=0)
+    cb_data = AdminWindowSlot30CallbackData(workday_id=sentinel, start_minute=1080)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state({"business_tz": TZ, "picked_start_minute": 600})
+
+    await admin_handlers.admin_openweek_end_cb(callback, cb_data, state)
+
+    state.set_state.assert_called_once_with(AdminStates.opening_week_days)
+    data = _state_all_updates(state)
+    assert data["picked_end_minute"] == 1080
+    assert data["selected_weekdays"] == []
+    args, kwargs = callback.message.answer.call_args
+    text = args[0] if args else kwargs.get("text", "")
+    assert "Шаг 3" in text
+    reply_markup = kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
+    assert reply_markup is not None, "Expected days keyboard reply_markup"
+
+
+@pytest.mark.asyncio
+async def test_admin_openweek_end_cb_state_loss_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[end slot tap] but picked_start_minute missing in state → state.clear()
+    + answer 'данные потеряны' + return (mirror admin_window_end_cb).
+    """
+    from uuid import UUID as _UUID
+
+    from bot.keyboards.admin import AdminWindowSlot30CallbackData
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    sentinel = _UUID(int=0)
+    cb_data = AdminWindowSlot30CallbackData(workday_id=sentinel, start_minute=1080)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state({"business_tz": TZ})  # no picked_start_minute
+
+    await admin_handlers.admin_openweek_end_cb(callback, cb_data, state)
+
+    state.clear.assert_called_once()
+    state.set_state.assert_not_called()
+    text = callback_answer_text(callback)
+    assert "потеряны" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_openweek_days_cb_toggles_weekday(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[weekday tap] → toggle weekday in selected_weekdays, edit_reply_markup.
+    First tap on weekday=0 (Mon) → selected=[0], second tap → [] (deselect).
+    """
+    from bot.keyboards.admin import AdminOpenWeekCallbackData
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cb_data = AdminOpenWeekCallbackData(weekday=0)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_reply_markup = AsyncMock()
+    state = _make_mock_state({"selected_weekdays": []})
+
+    await admin_handlers.admin_openweek_days_cb(callback, cb_data, state)
+
+    data = _state_data_passed(state)
+    assert data["selected_weekdays"] == [0]
+    assert callback.message.edit_reply_markup.called
+
+
+@pytest.mark.asyncio
+async def test_admin_openweek_days_cb_deselect_existing_weekday(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[weekday tap] on already-selected weekday → remove from list, re-render.
+    """
+    from bot.keyboards.admin import AdminOpenWeekCallbackData
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cb_data = AdminOpenWeekCallbackData(weekday=2)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_reply_markup = AsyncMock()
+    state = _make_mock_state({"selected_weekdays": [0, 2, 4]})
+
+    await admin_handlers.admin_openweek_days_cb(callback, cb_data, state)
+
+    data = _state_data_passed(state)
+    assert data["selected_weekdays"] == [0, 4]
+
+
+@pytest.mark.asyncio
+async def test_admin_openweek_confirm_cb_no_days_keeps_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[✅ Открыть] with empty selected → callback.answer('выберите хотя бы один
+    день', show_alert=True), state NOT cleared (user can toggle and retry).
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_openweek_confirm"
+    state = _make_mock_state({
+        "picked_start_minute": 600,
+        "picked_end_minute": 1080,
+        "selected_weekdays": [],
+        "business_tz": TZ,
+    })
+
+    await admin_handlers.admin_openweek_confirm_cb(callback, state)
+
+    state.clear.assert_not_called()
+    callback.answer.assert_called_once()
+    call_args = callback.answer.call_args
+    text_arg = call_args.args[0] if call_args.args else call_args.kwargs.get("text", "")
+    assert "хотя бы один" in text_arg
+
+
+@pytest.mark.asyncio
+async def test_admin_openweek_confirm_cb_state_loss_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[✅ Открыть] but picked_start_minute missing → state.clear + answer
+    'данные потеряны' + return.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_openweek_confirm"
+    state = _make_mock_state({
+        "picked_end_minute": 1080,
+        "selected_weekdays": [0],
+        "business_tz": TZ,
+    })  # missing picked_start_minute
+
+    await admin_handlers.admin_openweek_confirm_cb(callback, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "потеряны" in text
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-08-30 14:00:00", tz_offset=0)  # Sunday UTC 14:00
+async def test_admin_openweek_confirm_cb_opens_days(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[✅ Открыть] with 2 selected weekdays (Mon, Wed) → open_workday called
+    for Monday and Wednesday of current week. Monday = today_local - weekday()
+    where today_local uses business_tz (Moscow = UTC+3, so 17:00 Sunday 30 Aug).
+    """
+    from bot.models import WorkDay
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_openweek_confirm"
+    state = _make_mock_state({
+        "picked_start_minute": 600,  # 10:00
+        "picked_end_minute": 1200,  # 20:00
+        "selected_weekdays": [0, 2],  # Mon, Wed
+        "business_tz": TZ,
+    })
+
+    await admin_handlers.admin_openweek_confirm_cb(callback, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "✅" in text
+    # Compute expected Monday/Wednesday from frozen time (mirror handler logic).
+    # UTC 14:00 2026-08-30 → Moscow 17:00 2026-08-30 (Sunday, weekday=6).
+    # Monday = 30 - 6 = 2026-08-24.
+    today_local = datetime.now(ZoneInfo(TZ)).date()
+    monday = today_local - timedelta(days=today_local.weekday())
+    mon_date = monday + timedelta(days=0)
+    wed_date = monday + timedelta(days=2)
+
+    async with session_factory() as session:
+        mon = await session.scalar(
+            select(WorkDay).where(
+                WorkDay.master_id == ctx["master_id"],
+                WorkDay.work_date == mon_date,
+            )
+        )
+        wed = await session.scalar(
+            select(WorkDay).where(
+                WorkDay.master_id == ctx["master_id"],
+                WorkDay.work_date == wed_date,
+            )
+        )
+    assert mon is not None and mon.is_active
+    assert wed is not None and wed.is_active
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-08-30 14:00:00", tz_offset=0)
+async def test_admin_openweek_confirm_cb_partial_failure_shrinks_lines(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[✅ Открыть] with [Mon, Wed] but open_workday raises WorkDayShrinkError
+    for Monday only → summary contains ❌ Mon line AND ✅ Wed line. Both in
+    one summary (partial failure is OK — handler continues).
+    """
+    from unittest.mock import patch
+
+    from bot.services.workday import WorkDayShrinkError
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_openweek_confirm"
+    state = _make_mock_state({
+        "picked_start_minute": 600,   # 10:00
+        "picked_end_minute": 720,     # 12:00
+        "selected_weekdays": [0, 2],  # Mon(0), Wed(2)
+        "business_tz": TZ,
+    })
+
+    real_open = admin_handlers.open_workday
+
+    async def fake_open(session, master_id, work_date, start_time, end_time, *, business_tz):
+        # Compute Monday of frozen week (mirror handler logic).
+        today_local = datetime.now(ZoneInfo(business_tz)).date()
+        monday = today_local - timedelta(days=today_local.weekday())
+        if work_date == monday:
+            raise WorkDayShrinkError("active")
+        return await real_open(
+            session, master_id, work_date, start_time, end_time, business_tz=business_tz
+        )
+
+    with patch.object(admin_handlers, "open_workday", side_effect=fake_open):
+        await admin_handlers.admin_openweek_confirm_cb(callback, state)
+
+    text = callback_answer_text(callback)
+    assert "Пн" in text and "Ср" in text
+    assert "❌" in text and "✅" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_openweek_cancel_cb_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[❌ Отмена] (string F.data == 'admin_openweek_cancel') → state.clear +
+    answer 'Открытие недели отменено'.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_openweek_cancel"
+    state = _make_mock_state()
+
+    await admin_handlers.admin_openweek_cancel_cb(callback, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "Открытие недели отменено" in text
+
+
+# ============================================================
+# /closeday handlers (Session 5.26)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_cmd_closeday_shows_calendar(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """/closeday → state.clear + set_state(closing_day_date) + reply with
+    SimpleCalendar reply_markup.
+    """
+    from bot.states import AdminStates
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(ADMIN_TG_ID, text="/closeday")
+    state = _make_mock_state()
+
+    await admin_handlers.cmd_closeday(msg, state)
+
+    state.clear.assert_called_once()
+    state.set_state.assert_called_once_with(AdminStates.closing_day_date)
+    args, kwargs = msg.answer.call_args
+    text = args[0] if args else kwargs.get("text", "")
+    assert "Выберите дату" in text
+    reply_markup = kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
+    assert reply_markup is not None, "Expected calendar reply_markup"
+
+
+@pytest.mark.asyncio
+async def test_cmd_closeday_master_not_found(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """/closeday without master → '❌ Мастер не найден'."""
+    async with session_factory():
+        pass
+
+    msg = _make_message(ADMIN_TG_ID, text="/closeday")
+    state = _make_mock_state()
+
+    await admin_handlers.cmd_closeday(msg, state)
+
+    text = _answer_text(msg)
+    assert "Мастер не найден" in text
+    state.set_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_closeday_entry_cb_sets_state_and_shows_calendar(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[📅 Закрыть день] tap → state.clear + set_state(closing_day_date) +
+    answer with calendar."""
+    from bot.states import AdminStates
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    from bot.keyboards.admin import AdminCloseDayEntryCallbackData
+
+    cb_data = AdminCloseDayEntryCallbackData()
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state()
+
+    await admin_handlers.admin_closeday_entry_cb(callback, state)
+
+    state.clear.assert_called_once()
+    state.set_state.assert_called_once_with(AdminStates.closing_day_date)
+    args, kwargs = callback.message.answer.call_args
+    text = args[0] if args else kwargs.get("text", "")
+    assert "Выберите дату" in text
+    reply_markup = kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
+    assert reply_markup is not None, "Expected calendar reply_markup"
+
+
+@pytest.mark.asyncio
+async def test_admin_closeday_calendar_cb_no_workday_redirects(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Calendar day-select on a date with NO WorkDay → edit_text 'не открыт,
+    нечего закрывать' + state.clear (4-branch path 1).
+    """
+    from unittest.mock import patch
+
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    future_date = datetime.now(UTC) + timedelta(days=30)
+    cal_cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=future_date.year, month=future_date.month, day=future_date.day,
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state({"business_tz": TZ})
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(True, future_date),
+    ):
+        await admin_handlers.admin_closeday_calendar_cb(callback, cal_cb_data, state)
+
+    state.clear.assert_called_once()
+    assert callback.message.edit_text.called
+    text = str(callback.message.edit_text.call_args.args[0])
+    assert "не открыт" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_closeday_calendar_cb_already_closed(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Calendar day-select on is_active=False workday → edit_text 'уже закрыт'
+    + state.clear (4-branch path 2).
+    """
+    from unittest.mock import patch
+
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        future = (datetime.now(UTC) + timedelta(days=15)).date()
+        await _seed_workday(session, ctx=ctx, work_date=future, is_active=False)
+
+    future_date = datetime.combine(future, datetime.min.time())
+    cal_cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=future_date.year, month=future_date.month, day=future_date.day,
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state({"business_tz": TZ})
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(True, future_date),
+    ):
+        await admin_handlers.admin_closeday_calendar_cb(callback, cal_cb_data, state)
+
+    state.clear.assert_called_once()
+    text = str(callback.message.edit_text.call_args.args[0])
+    assert "уже закрыт" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_closeday_calendar_cb_no_bookings_closes_immediately(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Calendar day-select on is_active=True with NO active bookings →
+    close_workday_with_cancellations called, answer '✅ закрыт. Активных
+    записей не было.' + state.clear (4-branch path 3).
+    """
+    from unittest.mock import patch
+
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        future = (datetime.now(UTC) + timedelta(days=16)).date()
+        await _seed_workday(session, ctx=ctx, work_date=future, is_active=True)
+
+    future_date = datetime.combine(future, datetime.min.time())
+    cal_cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=future_date.year, month=future_date.month, day=future_date.day,
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
+    callback.message.answer = AsyncMock()
+    state = _make_mock_state({"business_tz": TZ})
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(True, future_date),
+    ):
+        await admin_handlers.admin_closeday_calendar_cb(callback, cal_cb_data, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "✅" in text and "не было" in text
+
+    # Verify workday is now closed.
+    async with session_factory() as session:
+        from bot.models import WorkDay as _WD
+
+        wd = await session.scalar(
+            select(_WD).where(
+                _WD.master_id == ctx["master_id"], _WD.work_date == future
+            )
+        )
+    assert wd is not None and wd.is_active is False
+
+
+@pytest.mark.asyncio
+async def test_admin_closeday_calendar_cb_with_bookings_shows_confirm(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Calendar day-select on is_active=True with active bookings → set_state
+    (closing_day_confirm) + edit_text list of bookings + admin_closeday_
+    confirm_keyboard (4-branch path 4).
+    """
+    from unittest.mock import patch
+
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        future = (datetime.now(UTC) + timedelta(days=17)).date()
+        workday = await _seed_workday(session, ctx=ctx, work_date=future, is_active=True)
+        slot = await _seed_slot(
+            session, master_id=ctx["master_id"], slot_date=future, hour=14, status="booked"
+        )
+        future_local = datetime.combine(future, datetime.min.time(), ZoneInfo(TZ))
+        await _seed_booking(
+            session, ctx=ctx, slot=slot,
+            start_at_utc_naive=future_local.replace(hour=14).astimezone(UTC).replace(tzinfo=None),
+            status="confirmed",
+        )
+
+    future_date = datetime.combine(future, datetime.min.time())
+    cal_cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=future_date.year, month=future_date.month, day=future_date.day,
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state({"business_tz": TZ})
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(True, future_date),
+    ):
+        await admin_handlers.admin_closeday_calendar_cb(callback, cal_cb_data, state)
+
+    from bot.states import AdminStates
+
+    state.set_state.assert_called_once_with(AdminStates.closing_day_confirm)
+    data = _state_data_passed(state)
+    assert data["closing_day_workday_id"] == str(workday.id)
+    assert callback.message.edit_text.called
+    text = str(callback.message.edit_text.call_args.args[0])
+    assert "Закрыть день" in text and "отменить" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_admin_closeday_calendar_cb_cancel_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Calendar 'Отмена' button (SimpleCalAct.cancel) → state.clear + edit_text
+    'Закрытие дня отменено'.
+    """
+    from unittest.mock import patch
+
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cal_cb_data = SimpleCalendarCallback(act=SimpleCalAct.cancel)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state({"business_tz": TZ})
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(False, None),
+    ):
+        await admin_handlers.admin_closeday_calendar_cb(callback, cal_cb_data, state)
+
+    state.clear.assert_called_once()
+    text = str(callback.message.edit_text.call_args.args[0])
+    assert "Закрытие дня отменено" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_closeday_confirm_cb_closes_and_notifies(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[✅ Да, отменить записи] → close_workday_with_cancellations, send_message
+    per cancelled booking, remove_jobs_for_booking per booking, summary shows
+    count + notified_count.
+    """
+    from unittest.mock import AsyncMock as _AsyncMock
+    from unittest.mock import patch
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        future = (datetime.now(UTC) + timedelta(days=18)).date()
+        workday = await _seed_workday(session, ctx=ctx, work_date=future, is_active=True)
+        slot = await _seed_slot(
+            session, master_id=ctx["master_id"], slot_date=future, hour=14, status="booked"
+        )
+        future_local = datetime.combine(future, datetime.min.time(), ZoneInfo(TZ))
+        booking = await _seed_booking(
+            session, ctx=ctx, slot=slot,
+            start_at_utc_naive=future_local.replace(hour=14).astimezone(UTC).replace(tzinfo=None),
+            status="confirmed",
+        )
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_closeday_confirm"
+    callback.bot.send_message = _AsyncMock()
+    state = _make_mock_state({
+        "business_tz": TZ,
+        "closing_day_workday_id": str(workday.id),
+    })
+
+    scheduler = MagicMock()
+    with patch("bot.handlers.admin.remove_jobs_for_booking") as rm_jobs:
+        await admin_handlers.admin_closeday_confirm_cb(callback, state, scheduler)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "✅" in text and "закрыт" in text
+    assert "отменено" in text.lower()
+    # send_message called for client notification.
+    assert callback.bot.send_message.called
+    # remove_jobs_for_booking called once per cancelled booking.
+    rm_jobs.assert_called_once()
+    call_args = rm_jobs.call_args
+    assert call_args.args[0] == scheduler
+    assert call_args.args[1] == booking.id
+
+    # Verify workday is now closed.
+    async with session_factory() as session:
+        from bot.models import WorkDay as _WD
+
+        wd = await session.scalar(
+            select(_WD).where(
+                _WD.master_id == ctx["master_id"], _WD.work_date == future
+            )
+        )
+    assert wd is not None and wd.is_active is False
+
+
+@pytest.mark.asyncio
+async def test_admin_closeday_confirm_cb_state_loss_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[✅ Да] but closing_day_workday_id missing in state → state.clear +
+    answer 'данные потеряны'."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_closeday_confirm"
+    state = _make_mock_state({"business_tz": TZ})  # no workday_id
+
+    scheduler = MagicMock()
+    await admin_handlers.admin_closeday_confirm_cb(callback, state, scheduler)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "потеряны" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_closeday_cancel_cb_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[❌ Не закрывать] (string F.data == 'admin_closeday_cancel') →
+    state.clear + answer 'Закрытие дня отменено'.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_closeday_cancel"
+    state = _make_mock_state()
+
+    await admin_handlers.admin_closeday_cancel_cb(callback, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "отменено" in text.lower()
