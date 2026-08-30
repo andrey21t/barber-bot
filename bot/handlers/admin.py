@@ -2088,16 +2088,7 @@ async def admin_move_cancel_cb(callback: CallbackQuery, state: FSMContext) -> No
 
 @router.message(Command("openweek"), StateFilter(None))
 async def cmd_openweek(message: Message, state: FSMContext) -> None:
-    """/openweek — entry point для batch open week flow (Session 5.26).
-
-    Аналог cmd_openday_calendar_cb, но БЕЗ calendar — start picker сразу
-    (окно применяется к выбранному дню недели, не к конкретной дате).
-    Reuses admin_window_slot_picker_keyboard (mode='start', БЕЗ booked_slots —
-    новый день, не modify existing window).
-
-    Workday_id на этом этапе — sentinel NIL UUID (WorkDay ещё не создан,
-    реальный open_workday вызовется на confirm). Picker требует UUID в payload.
-    """
+    logger.info("DEBUG /openweek cmd_openweek called")
     if not _is_admin(message):
         return
 
@@ -2130,11 +2121,7 @@ async def cmd_openweek(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(AdminOpenWeekEntryCallbackData.filter(), StateFilter("*"))
 async def admin_openweek_entry_cb(callback: CallbackQuery, state: FSMContext) -> None:
-    """[🗓 Открыть неделю] tap → start /openweek flow (Session 5.26).
-
-    Mirror admin_openday_cb (line 866): state.clear() then set_state.
-    UX-edge: tap mid-FSM → state.clear() + set_state(opening_week_start).
-    """
+    logger.info("DEBUG admin_openweek_entry_cb called")
     if not _is_admin_callback(callback):
         await callback.answer()
         return
@@ -2183,12 +2170,7 @@ async def admin_openweek_start_cb(
     callback_data: AdminWindowSlot30CallbackData,
     state: FSMContext,
 ) -> None:
-    """[start slot tap] → save picked_start_minute, set_state(opening_week_end),
-    show end-picker (mode='end', picked_start_minute from callback_data).
-
-    Mirror admin_window_start_cb (line 1128) but БЕЗ booked_slots — new day,
-    no existing bookings to filter against.
-    """
+    logger.info("DEBUG admin_openweek_start_cb called, start_minute=%s", callback_data.start_minute)
     if not _is_admin_callback(callback):
         await callback.answer()
         return
@@ -2233,11 +2215,7 @@ async def admin_openweek_end_cb(
     callback_data: AdminWindowSlot30CallbackData,
     state: FSMContext,
 ) -> None:
-    """[end slot tap] → save picked_end_minute, set_state(opening_week_days),
-    show 7 toggle дней + [✅ Открыть] + [❌ Отмена].
-
-    Mirror admin_window_end_cb (line 1207).
-    """
+    logger.info("DEBUG admin_openweek_end_cb called, end_minute=%s", callback_data.start_minute)
     if not _is_admin_callback(callback):
         await callback.answer()
         return
