@@ -508,10 +508,14 @@ async def _seed_workday_tomorrow(
         session.add(wd)
         await session.flush()
 
-        # Two active services — picker should show both
+        # Four active services — picker shows all 4 + "Своя услуга" (matches prod
+        # after 2026-08-30 sync: Стрижка 60, Окрашивание 120, Окрашивание и стрижка
+        # 120, Мелирование 120).
         svc1 = Service(business_id=biz.id, name="Стрижка", duration_minutes=60)
         svc2 = Service(business_id=biz.id, name="Окрашивание", duration_minutes=120)
-        session.add_all([svc1, svc2])
+        svc3 = Service(business_id=biz.id, name="Окрашивание и стрижка", duration_minutes=120)
+        svc4 = Service(business_id=biz.id, name="Мелирование", duration_minutes=120)
+        session.add_all([svc1, svc2, svc3, svc4])
         await session.commit()
 
         return {
@@ -520,6 +524,8 @@ async def _seed_workday_tomorrow(
             "workday_id": wd.id,
             "service1_id": svc1.id,
             "service2_id": svc2.id,
+            "service3_id": svc3.id,
+            "service4_id": svc4.id,
         }
 
 
@@ -624,11 +630,16 @@ async def test_booking_flow_with_service_picker_creates_booking(
             f"5.27 FEAT: with services in DB, must show inline picker. "
             f"Got: {step4!r}"
         )
-        # Both services present + 'Своя услуга' fallback.
+        # All 4 services present + 'Своя услуга' fallback (matches prod after
+        # 2026-08-30 sync).
         svc_btn = await _find_button_by_label(bot, "Стрижка")
         assert svc_btn is not None, "Стрижка button in picker"
         svc2_btn = await _find_button_by_label(bot, "Окрашивание")
         assert svc2_btn is not None, "Окрашивание button in picker"
+        svc3_btn = await _find_button_by_label(bot, "Окрашивание и стрижка")
+        assert svc3_btn is not None, "Окрашивание и стрижка button in picker"
+        svc4_btn = await _find_button_by_label(bot, "Мелирование")
+        assert svc4_btn is not None, "Мелирование button in picker"
         custom_btn = await _find_button_by_label(bot, "Своя услуга")
         assert custom_btn is not None, "✏️ Своя услуга fallback button"
 
