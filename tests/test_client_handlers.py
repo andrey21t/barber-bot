@@ -3072,7 +3072,95 @@ async def test_simple_calendar_cb_slots_path_inactive_workday_shows_hint(
 
 
 @pytest.mark.asyncio
-async def test_slot_30_cb_saves_workday_id_start_minute() -> None:
+async def test_simple_calendar_cb_book_path_fallback_to_workday(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session 5.27: /book legacy path — slots empty but active WorkDay exists
+    → fallback to 30-min slot picker (BookSlot30CallbackData). Regression for
+    bug discovered in production: /openweek writes to work_days only, /book
+    only reads slots → clients couldn't book days opened via /openweek.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        # Active workday — simulates /openweek / /openday. NO Slot rows.
+        await _seed_workday(
+            session, ctx, work_date=target_date,
+            start_time=time(10, 0), end_time=time(12, 0),
+        )
+
+    target_dt = datetime.combine(target_date, time(11, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
+
+    state = _make_state()
+    # /book path — is_slots_path=False (cmd_book default).
+    await state.update_data(is_slots_path=False)
+    await client_handlers.simple_calendar_cb(cb, callback_data, state)
+
+    # Fallback kicked in: state advanced, 30-min picker shown.
+    state.update_data.assert_awaited()
+    assert state.update_data.call_args.kwargs.get("selected_date") == target_date.isoformat()
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.selecting_slot
+
+    text = _answer_text(cb.message)
+    assert "Выберите время" in text
+    reply_markup = _answer_reply_markup(cb.message)
+    assert isinstance(reply_markup, InlineKeyboardMarkup)
+    rows = reply_markup.inline_keyboard
+    assert rows, "30-min picker must have buttons"
+    first_cb = rows[0][0].callback_data
+    assert first_cb is not None, "callback_data must be set on slot buttons"
+    assert first_cb.startswith("book_slot_30:"), (
+        f"fallback callback must use BookSlot30CallbackData, got {first_cb!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_simple_calendar_cb_book_path_fallback_closed_workday_shows_hint(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session 5.27: /book legacy path — slots empty AND WorkDay is_active=False
+    → 'День закрыт мастером.' (NOT generic 'нет свободных слотов'). The closed
+    hint is more actionable than the legacy 'нет слотов' message.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=2)).date()
+        await _seed_workday(
+            session, ctx, work_date=target_date, is_active=False
+        )
+
+    target_dt = datetime.combine(target_date, time(12, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = AsyncMock()
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
+
+    state = _make_state()
+    await state.update_data(is_slots_path=False)
+    await client_handlers.simple_calendar_cb(cb, callback_data, state)
+
+    text = _answer_text(cb.message)
+    assert "День закрыт мастером" in text
+    state.set_state.assert_not_awaited()
+    cb.answer.assert_awaited()
     """Этап 5.8b: slot_30_cb — valid BookSlot30CallbackData → state.update_data
     (workday_id, start_minute) + set_state(entering_name) + ask name message.
     """
