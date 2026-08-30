@@ -1323,6 +1323,57 @@ def callback_answer_text(callback: MagicMock) -> str:
 
 
 @pytest.mark.asyncio
+async def test_cmd_menu_fresh_shows_menu(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """/menu from fresh state (None) → answer '📋 Меню:' + admin_inline_menu.
+    No state to clear — state.clear() is a no-op on None.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(ADMIN_TG_ID, text="/menu")
+    state = _make_mock_state()
+
+    await admin_handlers.cmd_menu(msg, state)
+
+    args, kwargs = msg.answer.call_args
+    text = args[0] if args else kwargs.get("text", "")
+    assert "Меню" in text
+    reply_markup = kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
+    assert reply_markup is not None
+
+
+@pytest.mark.asyncio
+async def test_cmd_menu_escapes_from_fsm_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """/menu mid-FSM (stuck in opening_week_days) → state.clear + show menu.
+
+    Escape hatch: admin stuck in /openweek flow after partial interaction can
+    always /menu out without knowing /cancel. StateFilter("*") matches any
+    state including the FSM-trapped ones.
+    """
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(ADMIN_TG_ID, text="/menu")
+    state = _make_mock_state()  # state proxy, real FSM would have data
+
+    await admin_handlers.cmd_menu(msg, state)
+
+    state.clear.assert_called_once()
+    args, kwargs = msg.answer.call_args
+    text = args[0] if args else kwargs.get("text", "")
+    assert "Меню" in text
+    reply_markup = kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
+    assert reply_markup is not None
+
+
+@pytest.mark.asyncio
 async def test_cmd_today_renders_move_button_for_bookings(
     session_factory: Any,
     patched_session_factory: Any,
