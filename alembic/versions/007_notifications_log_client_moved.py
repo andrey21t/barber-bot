@@ -44,9 +44,7 @@ depends_on = None
 
 
 # Old + new CHECK constraint definitions (Postgres + SQLite via batch_alter).
-_OLD_CHECK = (
-    "kind IN ('remind_24h','remind_1h','master_new','master_cancel','master_transfer')"
-)
+_OLD_CHECK = "kind IN ('remind_24h','remind_1h','master_new','master_cancel','master_transfer')"
 _NEW_CHECK = (
     "kind IN ("
     "'remind_24h','remind_1h','master_new','master_cancel','master_transfer',"
@@ -62,9 +60,7 @@ def upgrade() -> None:
 
     if dialect == "postgresql":
         # Postgres: direct DROP + ADD CONSTRAINT.
-        op.execute(
-            f"ALTER TABLE notifications_log DROP CONSTRAINT IF EXISTS {_CONSTRAINT_NAME}"
-        )
+        op.execute(f"ALTER TABLE notifications_log DROP CONSTRAINT IF EXISTS {_CONSTRAINT_NAME}")
         op.create_check_constraint(
             _CONSTRAINT_NAME,
             "notifications_log",
@@ -89,9 +85,7 @@ def downgrade() -> None:
     dialect = bind.dialect.name
 
     if dialect == "postgresql":
-        op.execute(
-            f"ALTER TABLE notifications_log DROP CONSTRAINT IF EXISTS {_CONSTRAINT_NAME}"
-        )
+        op.execute(f"ALTER TABLE notifications_log DROP CONSTRAINT IF EXISTS {_CONSTRAINT_NAME}")
         op.create_check_constraint(
             _CONSTRAINT_NAME,
             "notifications_log",

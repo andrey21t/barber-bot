@@ -200,9 +200,7 @@ async def admin_move_booking(
     # Mirror transfer_booking:955 rationale: mixing ref here would break tests
     # that inject ref in far past to bypass the past-time check.
     if new_start_at <= datetime.now(UTC):
-        raise SlotInPastError(
-            f"New slot start_at={new_start_at} is in the past (admin_move)"
-        )
+        raise SlotInPastError(f"New slot start_at={new_start_at} is in the past (admin_move)")
 
     # Step 14: Acquire advisory lock on (master_id, new_workday.work_date).
     # Postgres-only — no-op on SQLite (file-based serializes writes via DB lock).

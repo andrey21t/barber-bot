@@ -130,9 +130,7 @@ async def _resolve_master_and_business(telegram_id: int) -> tuple[UUID, UUID, st
         return master.id, business.id, business.timezone
 
 
-def _bookings_to_booked_slots(
-    bookings: list[Booking], business_tz: str
-) -> list[BookedSlot]:
+def _bookings_to_booked_slots(bookings: list[Booking], business_tz: str) -> list[BookedSlot]:
     """Convert active Booking rows → BookedSlot list for picker (5.10 UX A).
 
     Booking.start_at / end_at are stored in UTC (naive on SQLite, aware on
@@ -804,9 +802,7 @@ async def admin_addslots_calendar_cb(
         # that don't cut bookings. Header goes into picker_text, filter
         # logic in admin_window_slot_picker_keyboard via booked_slots param.
         async with async_session_factory() as session:
-            active_bookings = await get_active_bookings_for_workday(
-                session, workday, tz
-            )
+            active_bookings = await get_active_bookings_for_workday(session, workday, tz)
         booked_slots = _bookings_to_booked_slots(active_bookings, tz)
 
         # INL-001: edit_message_text — чат не засоряется (calendar → slot picker).
@@ -1258,8 +1254,7 @@ async def admin_window_end_cb(
 
     if callback.message is not None:
         await callback.message.answer(
-            f"Изменить окно на <b>{start_time.strftime('%H:%M')}–"
-            f"{end_time.strftime('%H:%M')}</b>?",
+            f"Изменить окно на <b>{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}</b>?",
             reply_markup=admin_window_confirm_keyboard(),
         )
     await callback.answer()
@@ -1333,9 +1328,7 @@ async def admin_window_confirm_cb(
     await state.clear()
     async with async_session_factory() as session:
         try:
-            await open_workday(
-                session, master_id, work_date, start_time, end_time, business_tz=tz
-            )
+            await open_workday(session, master_id, work_date, start_time, end_time, business_tz=tz)
         except ValueError as exc:
             # open_workday raises ValueError on business validation (e.g. invalid
             # time range). Mirror shrink confirm pattern: render {exc} + restart
@@ -1684,9 +1677,7 @@ async def admin_move_select_cb(
     await callback.answer()
 
 
-@router.callback_query(
-    SimpleCalendarCallback.filter(), StateFilter(AdminMoveStates.selecting_date)
-)
+@router.callback_query(SimpleCalendarCallback.filter(), StateFilter(AdminMoveStates.selecting_date))
 async def admin_move_simple_calendar_cb(
     callback: CallbackQuery,
     callback_data: SimpleCalendarCallback,
@@ -1846,9 +1837,7 @@ async def admin_move_slot_30_cb(
         from sqlalchemy import select as sa_select
 
         booking = (
-            await session.execute(
-                sa_select(Booking).where(Booking.id == UUID(booking_id_str))
-            )
+            await session.execute(sa_select(Booking).where(Booking.id == UUID(booking_id_str)))
         ).scalar_one_or_none()
         if booking is None:
             await state.clear()
@@ -1857,9 +1846,7 @@ async def admin_move_slot_30_cb(
             await callback.answer()
             return
         workday = (
-            await session.execute(
-                sa_select(WorkDay).where(WorkDay.id == callback_data.workday_id)
-            )
+            await session.execute(sa_select(WorkDay).where(WorkDay.id == callback_data.workday_id))
         ).scalar_one_or_none()
         if workday is None:
             await state.clear()
@@ -2565,9 +2552,7 @@ async def admin_closeday_calendar_cb(
         if not active_bookings:
             # No active bookings — close immediately (nothing to lose).
             async with async_session_factory() as session:
-                result = await close_workday_with_cancellations(
-                    session, workday.id, business_tz=tz
-                )
+                result = await close_workday_with_cancellations(session, workday.id, business_tz=tz)
             if result is None:
                 if isinstance(callback.message, Message):
                     await callback.message.answer(
@@ -2686,9 +2671,7 @@ async def admin_closeday_confirm_cb(
 
     async with async_session_factory() as session:
         try:
-            result = await close_workday_with_cancellations(
-                session, workday_id, business_tz=tz
-            )
+            result = await close_workday_with_cancellations(session, workday_id, business_tz=tz)
         except SQLAlchemyError:
             if callback.message is not None:
                 await callback.message.answer("❌ Ошибка БД. Попробуйте позже через /menu")
@@ -2739,9 +2722,7 @@ async def admin_closeday_confirm_cb(
         )
         if callback.bot is not None:
             try:
-                await callback.bot.send_message(
-                    chat_id=client.telegram_id, text=client_text
-                )
+                await callback.bot.send_message(chat_id=client.telegram_id, text=client_text)
                 notified_count += 1
             except TelegramBadRequest:
                 logger.warning(
@@ -2755,8 +2736,7 @@ async def admin_closeday_confirm_cb(
         cancelled_count = len(result.cancelled_bookings)
         if cancelled_count == 0:
             summary = (
-                f"✅ День {result.work_date.strftime('%d %B %Y')} закрыт. "
-                "Активных записей не было."
+                f"✅ День {result.work_date.strftime('%d %B %Y')} закрыт. Активных записей не было."
             )
         else:
             summary = (
@@ -2788,7 +2768,13 @@ async def admin_closeday_cancel_cb(callback: CallbackQuery, state: FSMContext) -
 
 # Constants for /openweek summary labels (Python date.weekday() — Mon=0).
 _WEEKDAY_LABELS_HANDLER: tuple[str, ...] = (
-    "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс",
+    "Пн",
+    "Вт",
+    "Ср",
+    "Чт",
+    "Пт",
+    "Сб",
+    "Вс",
 )
 
 

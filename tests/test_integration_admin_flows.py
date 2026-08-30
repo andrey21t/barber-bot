@@ -186,9 +186,7 @@ async def _seed_admin(
         }
 
 
-def _make_text_update(
-    text: str, user_id: int = ADMIN_TG_ID, chat_id: int = ADMIN_TG_ID
-) -> Update:
+def _make_text_update(text: str, user_id: int = ADMIN_TG_ID, chat_id: int = ADMIN_TG_ID) -> Update:
     return Update(
         update_id=1,
         message=Message(

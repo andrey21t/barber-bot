@@ -666,9 +666,7 @@ async def test_get_available_slots_30_min_duration_filter(
     assert [s.label for s in available_no_filter] == ["13:30", "14:00", "14:30", "15:00", "15:30"]
 
     # With min_duration_min=60 — last slot dropped (15:30+60 > 16:00).
-    available = await get_available_slots_30(
-        session, wd, BUSINESS_TZ, min_duration_min=60
-    )
+    available = await get_available_slots_30(session, wd, BUSINESS_TZ, min_duration_min=60)
     assert len(available) == 4
     assert [s.label for s in available] == ["13:30", "14:00", "14:30", "15:00"]
 
