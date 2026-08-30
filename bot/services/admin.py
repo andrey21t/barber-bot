@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.models import Booking, Service
+from bot.models import Booking, Service, WorkDay
 
 
 async def get_today_bookings(
@@ -185,5 +185,52 @@ async def get_client_bookings(
         ref = now_utc or datetime.now(UTC)
         stmt = stmt.where(Booking.start_at > ref)
     stmt = stmt.order_by(Booking.start_at)
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def get_active_bookings_for_workday(
+    session: AsyncSession,
+    workday: WorkDay,
+    business_timezone: str,
+) -> list[Booking]:
+    """Active bookings (status confirmed/transferred) for a given WorkDay.
+
+    Used by admin MODIFY picker (5.10 UX Variant A, donor-standard) to:
+    1. Render header «🔒 Занято: HH:MM Имя (услуга)» above slot picker.
+    2. Filter picker slots — keep only slots that don't cut bookings
+       (start picker: slot <= min(booking.start_at); end picker:
+       slot >= max(booking.end_at)).
+
+    Same status set + overlap range as update_workday (workday.py:150-154)
+    and get_available_slots_30 (slots.py:172-177) — consistent with
+    WorkDayShrinkError semantics on confirm.
+
+    Args:
+        session: SQLAlchemy AsyncSession (read-only SELECT).
+        workday: WorkDay record — master_id + work_date bounds the query.
+            Overlap is computed against workday window in UTC via
+            _window_bounds_utc (slots.py:25).
+        business_timezone: IANA tz name (e.g. "Europe/Moscow") for LOCAL → UTC.
+
+    Returns:
+        List[Booking] ordered by start_at ascending. Empty if no active
+        bookings overlap the workday window.
+    """
+    from bot.services.workday import _window_bounds_utc
+
+    workday_start_utc, workday_end_utc = _window_bounds_utc(
+        workday.work_date, workday.start_time, workday.end_time, business_timezone
+    )
+    stmt = (
+        select(Booking)
+        .where(
+            Booking.master_id == workday.master_id,
+            Booking.start_at < workday_end_utc,
+            Booking.end_at > workday_start_utc,
+            Booking.status.in_(("confirmed", "transferred")),
+        )
+        .order_by(Booking.start_at)
+    )
     result = await session.execute(stmt)
     return list(result.scalars().all())

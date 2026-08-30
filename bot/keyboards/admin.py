@@ -18,6 +18,7 @@ Back-compat: admin_keyboard() (reply) оставлен как alias для те�
 AdminMoveSlot30CallbackData, AdminMoveConfirmCallbackData).
 """
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from datetime import time as dt_time
 from typing import cast
@@ -282,17 +283,61 @@ class AdminWindowConfirmCallbackData(CallbackData, prefix="admin_win_conf"):
     """
 
 
+@dataclass(frozen=True, slots=True)
+class BookedSlot:
+    """Active booking for picker filtering + header rendering (5.10 UX Variant A).
+
+    Mirrors booking range in minutes since midnight (LOCAL time) for easy
+    comparison with picker slots. client_name + service_title for header
+    «🔒 Занято: HH:MM Имя (услуга)».
+
+    Conversion Booking → BookedSlot done in handler (bot/handlers/admin.py)
+    via _booking_to_booked_slot helper — keyboards don't touch DB/Booking model.
+    """
+
+    start_minute: int  # booking.start_at LOCAL in minutes since midnight
+    end_minute: int    # booking.end_at LOCAL in minutes since midnight
+    client_name: str   # snapshot, already html.escape()'d in booking.py
+    service_title: str  # snapshot
+
+
+def render_booked_header(booked_slots: list[BookedSlot]) -> str:
+    """Render «🔒 Занято: HH:MM–HH:MM Имя (услуга)» header for picker (5.10 UX A).
+
+    Returns empty string if no bookings. Caller (handlers/admin.py) prepends
+    this to picker_text BEFORE showing keyboard — header is message text,
+    not part of InlineKeyboardMarkup.
+
+    Donor-standard (winnerxxx13/barbershop-telegram-bot booking.py:62-65):
+    picker shows only free slots; header lists occupied ranges so admin sees
+    where bookings are without scrolling.
+    """
+    if not booked_slots:
+        return ""
+    lines = ["🔒 <b>Занято:</b>"]
+    for bs in booked_slots:
+        start = _minute_to_time(bs.start_minute).strftime("%H:%M")
+        end = _minute_to_time(bs.end_minute).strftime("%H:%M")
+        lines.append(f"• {start}–{end} {bs.client_name} ({bs.service_title})")
+    return "\n".join(lines) + "\n\n"
+
+
 def admin_window_slot_picker_keyboard(
     workday_id: UUID,
     *,
     mode: str,
     business_tz: str = "Europe/Moscow",
     picked_start_minute: int | None = None,
+    booked_slots: list[BookedSlot] | None = None,
 ) -> InlineKeyboardMarkup:
     """Inline 30-min slot picker for /addslots (window start/end) — Этап 5.10.
 
     /closeslot SHRINK inline flow REMOVED (5.10 simplification) — «Изменить
     окно» (mode="start" + mode="end") handles both shrink+extend+shift.
+
+    5.10 UX Variant A (donor-standard, winnerxxx13/barbershop-telegram-bot):
+    picker shows ONLY slots that don't cut existing bookings + caller renders
+    «🔒 Занято: ...» header via render_booked_header() helper.
 
     Args:
         workday_id: UUID of the WorkDay being modified. Stored in callback_data
@@ -304,6 +349,16 @@ def admin_window_slot_picker_keyboard(
         picked_start_minute: required for mode="end" — start picked in previous
             step (admin_window_start_cb stored in FSM state, passed here to
             generate end slots starting from picked_start+30).
+        booked_slots: active bookings for the workday (from
+            get_active_bookings_for_workday, converted to BookedSlot list in
+            handler). Slots that would cut a booking are filtered OUT:
+            - mode="start": slot kept if slot <= min(booked.start_minute) —
+              new window starts at or before earliest booking, so no booking
+              is excluded from the left side.
+            - mode="end": slot kept if slot >= max(booked.end_minute) — new
+              window ends at or after latest booking, no booking excluded
+              from the right side.
+            None or empty list → no filtering (CREATE new day case).
 
     Slot ranges by mode (all slots are 30-min apart, label "HH:MM"):
         Business hours 09:00–20:00 (default work range for Екатерина):
@@ -337,6 +392,20 @@ def admin_window_slot_picker_keyboard(
         candidates = list(range(picked_start_minute + 30, 1201, 30))
     else:
         raise ValueError(f"unknown mode={mode!r}, expected 'start'|'end'")
+
+    # 5.10 UX Variant A: filter slots that would cut existing bookings.
+    # Donor-standard (winnerxxx13 booking.py:62) — picker shows only free slots.
+    if booked_slots:
+        if mode == "start":
+            # slot kept if slot <= min(booked.start_minute) — new window starts
+            # at/before earliest booking, no booking cut on the left side.
+            min_booking_start = min(bs.start_minute for bs in booked_slots)
+            candidates = [m for m in candidates if m <= min_booking_start]
+        else:  # mode == "end"
+            # slot kept if slot >= max(booked.end_minute) — new window ends
+            # at/after latest booking, no booking cut on the right side.
+            max_booking_end = max(bs.end_minute for bs in booked_slots)
+            candidates = [m for m in candidates if m >= max_booking_end]
 
     if not candidates:
         builder.button(text="Нет слотов", callback_data="noop")

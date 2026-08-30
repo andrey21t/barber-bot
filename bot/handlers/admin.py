@@ -49,16 +49,19 @@ from bot.keyboards.admin import (
     AdminWeekCallbackData,
     AdminWindowConfirmCallbackData,
     AdminWindowSlot30CallbackData,
+    BookedSlot,
     admin_calendar_keyboard,
     admin_inline_menu,
     admin_move_confirm_keyboard,
     admin_today_keyboard,
     admin_window_confirm_keyboard,
     admin_window_slot_picker_keyboard,
+    render_booked_header,
 )
 from bot.models import Booking, WorkDay
 from bot.services.admin import (
     create_service,
+    get_active_bookings_for_workday,
     get_today_bookings,
     get_week_bookings,
 )
@@ -118,6 +121,40 @@ async def _resolve_master_and_business(telegram_id: int) -> tuple[UUID, UUID, st
         if business is None:
             return None
         return master.id, business.id, business.timezone
+
+
+def _bookings_to_booked_slots(
+    bookings: list[Booking], business_tz: str
+) -> list[BookedSlot]:
+    """Convert active Booking rows → BookedSlot list for picker (5.10 UX A).
+
+    Booking.start_at / end_at are stored in UTC (naive on SQLite, aware on
+    Postgres). Convert to LOCAL minutes-since-midnight via business_tz for
+    easy comparison with picker slots (which are LOCAL minutes).
+
+    client_name_snapshot + service_title_snapshot already html.escape()'d
+    in booking.py:create_booking — pass through as-is (no re-escape).
+    """
+    from datetime import UTC
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(business_tz)
+    result: list[BookedSlot] = []
+    for b in bookings:
+        # b.start_at: naive on SQLite, aware UTC on Postgres. Inject tzinfo=UTC
+        # (no-op on Postgres) before .astimezone — Python interprets naive as
+        # system-local TZ otherwise.
+        start_local = b.start_at.replace(tzinfo=UTC).astimezone(tz)
+        end_local = b.end_at.replace(tzinfo=UTC).astimezone(tz)
+        result.append(
+            BookedSlot(
+                start_minute=start_local.hour * 60 + start_local.minute,
+                end_minute=end_local.hour * 60 + end_local.minute,
+                client_name=b.client_name_snapshot,
+                service_title=b.service_title_snapshot,
+            )
+        )
+    return result
 
 
 def _is_admin(message: Message) -> bool:
@@ -752,21 +789,33 @@ async def admin_addslots_calendar_cb(
         )
         await state.set_state(AdminStates.picking_window_start)
 
+        # 5.10 UX Variant A (donor-standard): SELECT active bookings → render
+        # «🔒 Занято: ...» header + filter picker slots to keep only those
+        # that don't cut bookings. Header goes into picker_text, filter
+        # logic in admin_window_slot_picker_keyboard via booked_slots param.
+        async with async_session_factory() as session:
+            active_bookings = await get_active_bookings_for_workday(
+                session, workday, tz
+            )
+        booked_slots = _bookings_to_booked_slots(active_bookings, tz)
+
         # INL-001: edit_message_text — чат не засоряется (calendar → slot picker).
-        # UX: показать текущее окно — иначе пользователь не понимает что picker
-        # меняет (semantic shift 5.10: /addslots = MODIFY, не "открыть слоты").
+        # UX: показать текущее окно + занятые слоты — иначе пользователь не
+        # понимает что picker меняет (semantic shift 5.10: /addslots = MODIFY).
         if isinstance(callback.message, Message):
             current_start = workday.start_time.strftime("%H:%M")
             current_end = workday.end_time.strftime("%H:%M")
             picker_text = (
                 f"📅 Дата: <b>{slot_date.strftime('%d %B %Y')}</b>\n"
                 f"🕒 Текущее окно: <b>{current_start}–{current_end}</b>\n"
-                "⏰ Выберите новое время начала окна:"
+                + render_booked_header(booked_slots)
+                + "⏰ Выберите новое время начала окна:"
             )
             picker_kb = admin_window_slot_picker_keyboard(
                 workday_id=workday.id,
                 mode="start",
                 business_tz=tz,
+                booked_slots=booked_slots,
             )
             try:
                 await callback.message.edit_text(picker_text, reply_markup=picker_kb)
@@ -1120,14 +1169,32 @@ async def admin_window_start_cb(
     await state.update_data(picked_start_minute=picked_start_minute)
     await state.set_state(AdminStates.picking_window_end)
 
+    # 5.10 UX Variant A: re-SELECT active bookings for the workday (same set
+    # as in calendar_cb — re-SELECT instead of FSM-cached for freshness,
+    # +1 DB call, pet-project OK). Pass to picker for slot filtering.
+    workday_id = callback_data.workday_id
+    async with async_session_factory() as session:
+        workday = await session.get(WorkDay, workday_id)
+        if workday is None:
+            await state.clear()
+            if callback.message is not None:
+                await callback.message.answer(
+                    "❌ Рабочий день не найден. /addslots чтобы начать заново"
+                )
+            await callback.answer()
+            return
+        active_bookings = await get_active_bookings_for_workday(session, workday, tz)
+    booked_slots = _bookings_to_booked_slots(active_bookings, tz)
+
     if callback.message is not None:
         await callback.message.answer(
-            "⏰ Выберите время окончания окна:",
+            render_booked_header(booked_slots) + "⏰ Выберите время окончания окна:",
             reply_markup=admin_window_slot_picker_keyboard(
                 workday_id=callback_data.workday_id,
                 mode="end",
                 business_tz=tz,
                 picked_start_minute=picked_start_minute,
+                booked_slots=booked_slots,
             ),
         )
     await callback.answer()
