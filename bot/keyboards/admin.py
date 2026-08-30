@@ -123,23 +123,26 @@ class AdminMoveConfirmCallbackData(CallbackData, prefix="admin_move_confirm"):
 
 
 def admin_inline_menu() -> InlineKeyboardMarkup:
-    """Inline keyboard с 5 кнопками для мастера (spec.md 251, Вариант B + Этап 5.1).
+    """Inline keyboard с 7 кнопками для мастера (spec.md 251, Вариант B + Этап 5.1 + Session 5.26).
 
-    Layout: 2 + 2 + 1 (3 rows) — semantic shift 5.10: «Открыть слоты» →
+    Layout: 2 + 2 + 2 + 1 (4 rows) — semantic shift 5.10: «Открыть слоты» →
     «Изменить окно» (/addslots = MODIFY). SHRINK button REMOVED (5.10
     simplification) — «Изменить окно» handles both shrink+extend+shift via
     two-phase picker start→end. /openday (CREATE) без изменений.
     Row 1: 📅 Открыть день (CREATE), ➕ Изменить окно (MODIFY, 5.10).
     Row 2: 📅 Сегодня, 🗓 Неделя.
-    Row 3: 💇 Услуги (entering_service flow).
+    Row 3: 🗓 Открыть неделю (batch CREATE, 5.26), 📅 Закрыть день (5.26).
+    Row 4: 💇 Услуги (entering_service flow).
     """
     builder = InlineKeyboardBuilder()
     builder.button(text="📅 Открыть день", callback_data=AdminOpendayCallbackData().pack())
     builder.button(text="➕ Изменить окно", callback_data=AdminAddslotsCallbackData().pack())
     builder.button(text="📅 Сегодня", callback_data=AdminTodayCallbackData().pack())
     builder.button(text="🗓 Неделя", callback_data=AdminWeekCallbackData().pack())
+    builder.button(text="🗓 Открыть неделю", callback_data=AdminOpenWeekEntryCallbackData().pack())
+    builder.button(text="📅 Закрыть день", callback_data=AdminCloseDayEntryCallbackData().pack())
     builder.button(text="💇 Услуги", callback_data=AdminServicesCallbackData().pack())
-    builder.adjust(2, 2, 1)
+    builder.adjust(2, 2, 2, 1)
     return builder.as_markup()
 
 
@@ -280,6 +283,40 @@ class AdminWindowConfirmCallbackData(CallbackData, prefix="admin_win_conf"):
     FSM state, NOT from callback payload — keeps callback_data small and avoids
     race where user could change FSM state mid-tap. Same pattern as
     AdminMoveConfirmCallbackData + admin_move_confirm_cb.
+    """
+
+
+# ============================================================
+# Session 5.26: /openweek + /closeday callbacks + keyboards
+# ============================================================
+
+
+class AdminOpenWeekEntryCallbackData(CallbackData, prefix="admin_openweek_entry"):
+    """Trigger /openweek flow from inline menu (Session 5.26).
+
+    No payload (mirror AdminOpendayCallbackData). Tap → picker start
+    (admin_window_slot_picker_keyboard mode='start' БЕЗ booked_slots — новый
+    день, не modify existing window).
+    """
+
+
+class AdminOpenWeekCallbackData(CallbackData, prefix="admin_openweek_days"):
+    """Toggle weekday in /openweek flow (Session 5.26).
+
+    Payload:
+    - weekday: int 0-6 — Mon=0, Tue=1, ..., Sun=6 (Python date.weekday()).
+
+    Wire format: "admin_openweek_days:<int>" ≈ 21+1+1 = 23 bytes < 64 limit.
+    """
+
+    weekday: int
+
+
+class AdminCloseDayEntryCallbackData(CallbackData, prefix="admin_closeday_entry"):
+    """Trigger /closeday flow from inline menu (Session 5.26).
+
+    No payload (mirror AdminOpendayCallbackData). Tap → SimpleCalendar for
+    date selection (next handler admin_closeday_calendar_cb).
     """
 
 
@@ -456,3 +493,54 @@ def _minute_to_time(minute: int) -> dt_time:
     if not 0 <= minute <= 1439:
         raise ValueError(f"minute {minute} out of range 0-1439")
     return dt_time(minute // 60, minute % 60)
+
+
+# ============================================================
+# Session 5.26: /openweek + /closeday keyboards
+# ============================================================
+
+_WEEKDAY_LABELS: tuple[str, ...] = (
+    "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс",
+)
+
+
+def admin_week_days_keyboard(selected: set[int]) -> InlineKeyboardMarkup:
+    """7 toggle-кнопок дней недели + «✅ Открыть» + «❌ Отмена» (Session 5.26).
+
+    Args:
+        selected: set of weekday ints (0=Mon..6=Sun) currently toggled ON.
+            Toggle handler updates this set in FSM state and re-renders keyboard.
+
+    Layout: 7 weekday buttons (1 row, adjust(7) compresses to ≤8/row Telegram
+    inline limit 8 buttons/row), then [✅ Открыть] + [❌ Отмена] row.
+
+    Selected weekdays помечены ✅ prefix; unselected — без prefix.
+    «✅ Открыть» callback_data="admin_openweek_confirm" (string).
+    «❌ Отмена» callback_data="admin_openweek_cancel" (string).
+    """
+    builder = InlineKeyboardBuilder()
+    for weekday in range(7):
+        label = _WEEKDAY_LABELS[weekday]
+        prefix = "✅ " if weekday in selected else ""
+        builder.button(
+            text=f"{prefix}{label}",
+            callback_data=AdminOpenWeekCallbackData(weekday=weekday).pack(),
+        )
+    builder.button(text="✅ Открыть", callback_data="admin_openweek_confirm")
+    builder.button(text="❌ Отмена", callback_data="admin_openweek_cancel")
+    builder.adjust(7, 2)
+    return builder.as_markup()
+
+
+def admin_closeday_confirm_keyboard() -> InlineKeyboardMarkup:
+    """[✅ Да, отменить записи] / [❌ Не закрывать] keyboard for /closeday
+    confirm step (Session 5.26).
+
+    «✅ Да» callback_data="admin_closeday_confirm" (string).
+    «❌ Не закрывать» callback_data="admin_closeday_cancel" (string).
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Да, отменить записи", callback_data="admin_closeday_confirm")
+    builder.button(text="❌ Не закрывать", callback_data="admin_closeday_cancel")
+    builder.adjust(1)
+    return builder.as_markup()

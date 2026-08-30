@@ -53,6 +53,15 @@ class AdminStates(StatesGroup):
     opening_workday_end = State()
     entering_service_name = State()
     entering_service_duration = State()
+    # /openweek (Session 5.26): batch open week — picker start → picker end →
+    # toggle weekdays → confirm → open_workday per selected day.
+    opening_week_start = State()
+    opening_week_end = State()
+    opening_week_days = State()
+    # /closeday (Session 5.26): close concrete day — calendar → confirm
+    # (if active bookings) → close_workday_with_cancellations.
+    closing_day_date = State()
+    closing_day_confirm = State()
 
 
 class AdminMoveStates(StatesGroup):

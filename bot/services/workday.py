@@ -34,14 +34,16 @@ it via _resolve_master_and_business) — service layer stays config-free.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.models import Booking, WorkDay
+from bot.models import Booking, NotificationLog, WorkDay
 from bot.services.booking import _acquire_advisory_lock
 
 
@@ -226,6 +228,120 @@ async def select_workday(session: AsyncSession, master_id: UUID, work_date: date
     stmt = select(WorkDay).where(WorkDay.master_id == master_id, WorkDay.work_date == work_date)
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
+
+
+@dataclass(frozen=True)
+class ClosedDayResult:
+    """Result of close_workday_with_cancellations (Session 5.26).
+
+    Returned to /closeday handler for Telegram I/O:
+    - workday_id: closed WorkDay.id
+    - work_date: closed date (for "✅ День <date> закрыт" message)
+    - cancelled_bookings: list of Booking objects (cancelled in this call) —
+      handler reads client_id + start_at + client_name_snapshot for each to
+      send client notifications "Ваша запись отменена мастером".
+    - was_already_closed: True if WorkDay.is_active was already False (idempotent
+      no-op close on already-closed day — cancelled_bookings is empty).
+
+    Mirrors CancelResult pattern (booking.py:637) — snapshots already html.escape()'d
+    in DB; handler renders WITHOUT re-escape.
+    """
+
+    workday_id: UUID
+    work_date: date
+    cancelled_bookings: list[Booking]
+    was_already_closed: bool
+
+
+async def close_workday_with_cancellations(
+    session: AsyncSession,
+    workday_id: UUID,
+    business_tz: str,
+) -> ClosedDayResult | None:
+    """Close a WorkDay AND cancel all active bookings on it (Session 5.26).
+
+    Used by /closeday admin command — atomic within one transaction:
+      1. SELECT WorkDay. None → return None (caller shows "день не открыт").
+      2. If is_active=False → return ClosedDayResult(was_already_closed=True,
+         cancelled_bookings=[]) — idempotent no-op close.
+      3. SELECT active bookings overlapping the workday window (status IN
+         ('confirmed','transferred'), same overlap semantics as close_workday
+         — start_at < window_end_utc AND end_at > window_start_utc).
+      4. UPDATE Booking SET status='cancelled' WHERE id IN (cancelled ids).
+      5. INSERT NotificationLog(booking_id, kind='master_cancel') per cancelled
+         booking — SAVEPOINT idempotency (mirror cancel_booking step 7).
+      6. UPDATE WorkDay SET is_active=False.
+      7. commit.
+      8. Return ClosedDayResult (booking objects alive — fixture uses
+         expire_on_commit=False).
+
+    Distinct from close_workday (workday.py:173): close_workday REFUSES with
+    WorkDayShrinkError if active bookings remain (admin must cancel them first).
+    close_workday_with_cancellations AUTO-CANCELS them — that's the whole point
+    of /closeday (master wants to close the day, all bookings go away).
+
+    Scheduler jobs (remind_24h / remind_1h) are NOT removed here — service layer
+    has no scheduler ref. Handler calls remove_jobs_for_booking per cancelled
+    booking AFTER commit (mirror cancel_booking step 10).
+    """
+    workday = await session.get(WorkDay, workday_id)
+    if workday is None:
+        return None
+
+    if workday.is_active is False:
+        return ClosedDayResult(
+            workday_id=workday.id,
+            work_date=workday.work_date,
+            cancelled_bookings=[],
+            was_already_closed=True,
+        )
+
+    new_start_utc, new_end_utc = _window_bounds_utc(
+        workday.work_date, workday.start_time, workday.end_time, business_tz
+    )
+    conflict_stmt = select(Booking).where(
+        Booking.master_id == workday.master_id,
+        Booking.start_at < new_end_utc,
+        Booking.end_at > new_start_utc,
+        Booking.status.in_(("confirmed", "transferred")),
+    )
+    conflicts = (await session.execute(conflict_stmt)).scalars().all()
+
+    if conflicts:
+        # UPDATE bookings → 'cancelled' (single bulk UPDATE — preserves
+        # race protection via WHERE status IN ('confirmed','transferred')).
+        booking_ids = [b.id for b in conflicts]
+        await session.execute(
+            update(Booking)
+            .where(
+                Booking.id.in_(booking_ids),
+                Booking.status.in_(("confirmed", "transferred")),
+            )
+            .values(status="cancelled")
+        )
+        # Log NotificationLog(master_cancel) per booking — SAVEPOINT idempotency
+        # (mirror cancel_booking.py:749-759). If already logged (duplicate retry),
+        # only the savepoint rolls back, main transaction survives.
+        for booking_id in booking_ids:
+            log_entry = NotificationLog(booking_id=booking_id, kind="master_cancel")
+            try:
+                async with session.begin_nested():
+                    session.add(log_entry)
+                    await session.flush()
+            except IntegrityError:
+                pass  # already logged — idempotent
+
+    await session.execute(
+        update(WorkDay).where(WorkDay.id == workday_id).values(is_active=False)
+    )
+    await session.commit()
+
+    return ClosedDayResult(
+        workday_id=workday.id,
+        work_date=workday.work_date,
+        cancelled_bookings=list(conflicts),
+        was_already_closed=False,
+    )
 
 
 def _window_bounds_utc(
