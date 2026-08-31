@@ -18,6 +18,7 @@ Contract (spec.md 200-213, 251, 307-309):
 - slot_date validation: /addslots rejects past dates (spec.md 401, slot_date >= today_local).
 """
 
+import asyncio
 import html
 import logging
 from datetime import UTC, date, datetime, timedelta
@@ -26,7 +27,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
@@ -2004,6 +2005,27 @@ async def admin_move_confirm_cb(
                     chat_id=result.client_telegram_id,
                     text=client_text,
                 )
+            except TelegramRetryAfter as e:
+                # Flood control — retry once after retry_after (mirror scheduler.py:192-201).
+                logger.warning(
+                    "admin_move: flood control for client %s, retry after %ss (booking %s)",
+                    result.client_telegram_id,
+                    e.retry_after,
+                    result.booking_id,
+                )
+                await asyncio.sleep(e.retry_after)
+                try:
+                    await callback.bot.send_message(
+                        chat_id=result.client_telegram_id,
+                        text=client_text,
+                    )
+                except (TelegramBadRequest, TelegramRetryAfter):
+                    logger.warning(
+                        "admin_move: client %s blocked the bot after retry — notification skipped "
+                        "(booking %s moved)",
+                        result.client_telegram_id,
+                        result.booking_id,
+                    )
             except TelegramBadRequest:
                 # Client blocked the bot — log and skip (booking is still moved).
                 logger.warning(
@@ -2724,6 +2746,25 @@ async def admin_closeday_confirm_cb(
             try:
                 await callback.bot.send_message(chat_id=client.telegram_id, text=client_text)
                 notified_count += 1
+            except TelegramRetryAfter as e:
+                # Flood control — retry once after retry_after (mirror scheduler.py:192-201).
+                logger.warning(
+                    "closeday: flood control for client %s, retry after %ss (booking %s)",
+                    client.telegram_id,
+                    e.retry_after,
+                    booking.id,
+                )
+                await asyncio.sleep(e.retry_after)
+                try:
+                    await callback.bot.send_message(chat_id=client.telegram_id, text=client_text)
+                    notified_count += 1
+                except (TelegramBadRequest, TelegramRetryAfter):
+                    logger.warning(
+                        "closeday: client %s blocked the bot after retry — notification skipped "
+                        "(booking %s cancelled)",
+                        client.telegram_id,
+                        booking.id,
+                    )
             except TelegramBadRequest:
                 logger.warning(
                     "closeday: client %s blocked the bot — notification skipped "

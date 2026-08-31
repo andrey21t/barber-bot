@@ -316,21 +316,28 @@ async def close_workday_with_cancellations(
     conflicts = (await session.execute(conflict_stmt)).scalars().all()
 
     if conflicts:
-        # UPDATE bookings → 'cancelled' (single bulk UPDATE — preserves
-        # race protection via WHERE status IN ('confirmed','transferred')).
+        # UPDATE bookings → 'cancelled' (single bulk UPDATE). Use RETURNING to
+        # capture actually-updated IDs — filters out bookings concurrently
+        # cancelled/transferred between T0 SELECT (line 316) and this UPDATE.
+        # Without RETURNING, ClosedDayResult.cancelled_bookings would contain
+        # stale entries → handler sends false "cancelled by master" notification
+        # to clients who already cancelled themselves (race with cancel_booking).
         booking_ids = [b.id for b in conflicts]
-        await session.execute(
+        update_result = await session.execute(
             update(Booking)
             .where(
                 Booking.id.in_(booking_ids),
                 Booking.status.in_(("confirmed", "transferred")),
             )
             .values(status="cancelled")
+            .returning(Booking.id)
         )
-        # Log NotificationLog(master_cancel) per booking — SAVEPOINT idempotency
-        # (mirror cancel_booking.py:749-759). If already logged (duplicate retry),
+        actually_cancelled_ids = set(update_result.scalars().all())
+        actually_cancelled = [b for b in conflicts if b.id in actually_cancelled_ids]
+        # Log NotificationLog(master_cancel) per actually-cancelled booking — SAVEPOINT
+        # idempotency (mirror cancel_booking.py:749-759). If already logged (duplicate retry),
         # only the savepoint rolls back, main transaction survives.
-        for booking_id in booking_ids:
+        for booking_id in actually_cancelled_ids:
             log_entry = NotificationLog(booking_id=booking_id, kind="master_cancel")
             try:
                 async with session.begin_nested():
@@ -345,7 +352,7 @@ async def close_workday_with_cancellations(
     return ClosedDayResult(
         workday_id=workday.id,
         work_date=workday.work_date,
-        cancelled_bookings=list(conflicts),
+        cancelled_bookings=actually_cancelled if conflicts else [],
         was_already_closed=False,
     )
 
