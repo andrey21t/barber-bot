@@ -1,7 +1,8 @@
 # NEXT_SESSION_PROMPT.md — handoff после Session 5.27
 
 > Pet-project git free (AGENTS.md § git-repo-categories): commit + push без переспроса.
-> VPS deploy через `ssh root@188.225.82.248` (password rotated 27 авг, не в .env — спрашивать у пользователя).
+> VPS deploy: `ssh root@188.225.82.248`, пароль ротирован 27 авг (НЕ в .env, спросить у пользователя).
+> Бот в `/opt/barber-bot` (НЕ `/var/www/`), запуск через `docker compose restart bot` (НЕ systemd).
 
 ## Что сделано в 5.27 (pushed to origin/main)
 
@@ -38,37 +39,32 @@
 
 ## Что НЕ сделано в 5.27 (переносится на следующую сессию)
 
-### 🔴 КРИТИЧНО — Deploy 5.27 на VPS (блокирует всё остальное)
+### 🟡 ВАЖНО — Smoke-test 5.27 в Telegram (пользователь проверяет)
 
-`2e76561` уже в `origin/main` (push выполнен в прошлой сессии). Нужно deploy:
+`2e76561` уже в `origin/main` (push выполнен в прошлой сессии) + **deploy
+сделан в сессии 5.27** (VPS `/opt/barber-bot`, `docker compose restart bot`).
 
-```bash
-ssh root@188.225.82.248
-cd /var/www/barber-bot
-git pull
-systemctl restart barber-bot
-systemctl status barber-bot
-# smoke-test в Telegram (см. ниже)
-```
-
-⚠️ Пароль VPS ротирован 27 авг, НЕ в `.env`. Спросить у пользователя.
-
-### Smoke-test в Telegram (пользователь проверяет)
+Smoke-test в Telegram (пользователь проверяет):
 - `/openweek` → picker → выбор 2-3 дней текущей недели → ✅ в summary
 - `/closeday` на день с активной записью → confirm → уведомление клиенту
 - `/closeday` на день без записей → immediate close
 - `/closeday` на уже закрытый день → «уже закрыт»
-- `/book` → выбор услуги из 4 сервисов (Haircut 30мин, Beard 30мин, Haircut+Beard 60мин, Kids 30мин) → календарь → выбор слота → confirm
+- `/book` → выбор услуги из 4 сервисов → календарь → выбор слота → confirm
 - `/menu` из любого FSM state → выходит в меню
+- `/week` → список всех записей (прошедшие + будущие, БЕЗ статусов completed/no_show — см. PLANS.md REJECTED BB-107)
 
-### 🟡 ВАЖНО — BB-107: 4 статуса booking (после smoke-test)
+### 🔴 REJECTED (2026-08-31): BB-107 — 4 статуса booking
 
-PLANS.md:901 — изначально планировалось в 5.27, но 5.27 ушёл в service picker.
+**Не делать.** Single-master Екатерина (1-3 записи в день) не будет тыкать
+статусы каждого клиента — ручная работа без gain. `/week` показывает все
+записи, история видна.
 
-- Добавить `completed` + `no_show` в `Booking.status` (текущие: confirmed | transferred | cancelled)
-- `transition_appointment_status` pattern (donor database.py:652-690) — проверяемые переходы (только из confirmed → cancelled/completed/no_show)
-- Admin UI: кнопки в карточке записи (✅ Завершить / ❌ Неявка / ❌ Отмена)
-- Unlocks: reviews (5.28), CSV-экспорт (5.29), history filter (5.30)
+Features, что зависели от BB-107 — переоценены, не зависят:
+- Reviews 5.28 — триггер по времени (end_at + 1h), не по ручному «completed»
+- CSV-экспорт 5.29 — фильтр по дате, не по статусу
+- History filter 5.30 — прошедшие vs будущие по дате
+
+Подробности — PLANS.md «REJECTED BB-107».
 
 ### 🟡 ВАЖНО — Migration 008 drop table slots (после smoke-test 006 на prod ~1 неделя)
 
@@ -88,9 +84,11 @@ PLANS.md:179 — backlog с Session 5.23.
 ## Quick start prompt для следующей сессии
 
 ```
-Продолжи barber-bot. Прочитай NEXT_SESSION_PROMPT.md. Сначала deploy 5.27 на VPS
-(спроси пароль), потом smoke-test с пользователем. Если smoke-test OK —
-начинаем BB-107 (4 статуса booking, PLANS.md:901).
+Продолжи barber-bot. Прочитай NEXT_SESSION_PROMPT.md. 5.27 уже задеплоен
+на VPS (/opt/barber-bot, docker compose restart bot, @My_Barber_hair_bot
+работает). Ждём smoke-test от пользователя по /openweek /closeday /book
+/menu. После — следующая фича (без BB-107, он REJECTED): BB-110
+(скрыть прошедшие дни в календаре /book) или reviews 5.28 по времени.
 ```
 
 ## Pet-project git
