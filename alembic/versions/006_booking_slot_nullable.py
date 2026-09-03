@@ -70,8 +70,8 @@ def upgrade() -> None:
     # SQLAlchemy 2.0 default naming convention для unnamed FK:
     # `<table>_<column>_fkey` (001_initial.py:160 `sa.ForeignKey("slots.id")`
     # без explicit name → FK auto-named `bookings_slot_id_fkey` на Postgres).
-    # `IF EXISTS` молча skip'ает если имя не совпадает → было F1 (code-reviewer
-    # [REDACTED-SESSION-ID], 2026-08-29): wrong name `fk_bookings_slot_id`
+    # `IF EXISTS` молча skip'ает если имя не совпадает → было F1 (code-reviewer,
+    # 2026-08-29): wrong name `fk_bookings_slot_id`
     # silently skip'ал drop → FK оставался → блокировал 008 `DROP TABLE slots`.
     if dialect == "postgresql":
         op.execute("ALTER TABLE bookings DROP CONSTRAINT IF EXISTS bookings_slot_id_fkey")
