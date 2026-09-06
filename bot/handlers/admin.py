@@ -2396,8 +2396,20 @@ async def admin_openweek_confirm_cb(
                 f"✅ {day_label} {date_label} "
                 f"{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}"
             )
-        except WorkDayShrinkError:
-            fail_lines.append(f"❌ {day_label} {date_label}: нельзя сузить, есть бронь")
+        except WorkDayShrinkError as exc:
+            # Показываем КАКАЯ бронь блокирует (имя, время, услуга) — пользователь
+            # видит что мешает и решает: отменить, перенести или выбрать окно пошире.
+            conflict_lines = []
+            for b in exc.conflicts:
+                local_start = b.start_at.astimezone(ZoneInfo(tz))
+                time_str = local_start.strftime("%H:%M")
+                conflict_lines.append(
+                    f"   ↳ {b.client_name_snapshot}, {time_str}, {b.service_title_snapshot}"
+                )
+            conflicts_str = "\n".join(conflict_lines) if conflict_lines else ""
+            fail_lines.append(
+                f"❌ {day_label} {date_label}: нельзя сузить, есть бронь\n{conflicts_str}"
+            )
         except ValueError:
             fail_lines.append(f"❌ {day_label} {date_label}: ошибка данных")
         except SQLAlchemyError:

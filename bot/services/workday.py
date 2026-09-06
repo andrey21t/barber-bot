@@ -59,7 +59,16 @@ class WorkDayShrinkError(Exception):
     the multi-client capacity check (booking.py:_check_multi_client_capacity)
     and the EXCLUDE constraint (migration 002, dropped in 005). Cancelled
     bookings are excluded — they no longer occupy the window.
+
+    Attributes:
+        conflicts: list of Booking rows that block the shrink/close.
+            Caller renders client_name_snapshot, service_title_snapshot,
+            start_at/end_at (local) so the master sees WHO blocks and WHEN.
     """
+
+    def __init__(self, message: str, conflicts: list[Booking] | None = None) -> None:
+        super().__init__(message)
+        self.conflicts: list[Booking] = conflicts or []
 
 
 async def open_workday(
@@ -159,7 +168,8 @@ async def update_workday(
         raise WorkDayShrinkError(
             f"WorkDay {workday_id} shrink to [{new_start_time}, {new_end_time}] "
             f"would leave {len(conflicts)} active booking(s) outside the window. "
-            f"Cancel them first: {[str(b.id) for b in conflicts]}"
+            f"Cancel them first: {[str(b.id) for b in conflicts]}",
+            conflicts=list(conflicts),
         )
 
     await session.execute(
@@ -212,7 +222,8 @@ async def close_workday(
     if conflicts:
         raise WorkDayShrinkError(
             f"WorkDay {workday_id} cannot be closed — {len(conflicts)} active "
-            f"booking(s) remain. Cancel them first: {[str(b.id) for b in conflicts]}"
+            f"booking(s) remain. Cancel them first: {[str(b.id) for b in conflicts]}",
+            conflicts=list(conflicts),
         )
 
     await session.execute(update(WorkDay).where(WorkDay.id == workday_id).values(is_active=False))
