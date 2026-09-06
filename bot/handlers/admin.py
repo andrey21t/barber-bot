@@ -2383,6 +2383,11 @@ async def admin_openweek_days_cb(
         return
     assert callback.from_user is not None
 
+    # Telegram UX: answer() снимает loading-индикатор с кнопки мгновенно,
+    # до network roundtrip на edit_reply_markup. Без этого при быстрых тапах
+    # Пн-Пт loading накапливается, и на Сб кнопка "тупит" (журём 5 pending edits).
+    await callback.answer()
+
     data = await state.get_data()
     selected: list[int] = list(data.get("selected_weekdays", []))
     weekday = callback_data.weekday
@@ -2403,7 +2408,6 @@ async def admin_openweek_days_cb(
                     "Дни недели обновлены. Тапните ещё раз чтобы отметить/снять:",
                     reply_markup=new_kb,
                 )
-    await callback.answer()
 
 
 @router.callback_query(
