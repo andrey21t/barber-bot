@@ -327,3 +327,43 @@ async def test_openday_open_no_reopen_message_when_was_active(
         workdays = (await verify.execute(select(WorkDay))).scalars().all()
         assert len(workdays) == 1  # UPDATE, not INSERT
         assert workdays[0].is_active is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "start_str,end_str",
+    [
+        ("11.00", "18.00"),  # dot separator — iPhone numeric keypad has '.'
+        ("11,00", "18,00"),  # comma separator — Russian iOS layout
+        ("11:00", "18:00"),  # colon — existing (regression guard)
+    ],
+)
+async def test_openday_accepts_dot_comma_colon_separators(
+    session_factory: Any,
+    patched_session_factory: Any,
+    start_str: str,
+    end_str: str,
+) -> None:
+    """Master types '11.00' / '11,00' / '11:00' on phone keypad — all parse to
+    11:00. No need to switch layout to reach ':' (which on Russian iOS is in
+    a submenu). Validates _parse_hhmm accepts all three separators.
+    """
+    target = _tomorrow()
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(
+        user_id=ADMIN_TG_ID,
+        text=f"/openday {target} {start_str} {end_str}",
+    )
+    await admin_handlers.cmd_openday(msg, _make_command(f"{target} {start_str} {end_str}"))
+
+    text = _answer_text(msg)
+    assert "✅ День открыт" in text, f"failed for separator in '{start_str}/{end_str}'"
+    assert "11:00" in text and "18:00" in text  # rendered normalised to ':'
+
+    async with session_factory() as verify:
+        workdays = (await verify.execute(select(WorkDay))).scalars().all()
+        assert len(workdays) == 1
+        assert workdays[0].start_time == dt_time(11, 0)
+        assert workdays[0].end_time == dt_time(18, 0)

@@ -21,6 +21,7 @@ Contract (spec.md 200-213, 251, 307-309):
 import asyncio
 import html
 import logging
+import re
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dt_time
 from uuid import UUID
@@ -343,7 +344,8 @@ async def cmd_openday(message: Message, command: CommandObject) -> None:
     if len(args) != 3:
         await message.answer(
             "Формат: <code>/openday ГГГГ-ММ-ДД ЧЧ:ММ ЧЧ:ММ</code>\n"
-            "Пример: <code>/openday 2026-03-17 11:00 18:00</code>"
+            "Пример: <code>/openday 2026-03-17 11:00 18:00</code>\n"
+            "Разделитель: <code>:</code> или <code>.</code> или <code>,</code>"
         )
         return
 
@@ -358,7 +360,10 @@ async def cmd_openday(message: Message, command: CommandObject) -> None:
         start_time = _parse_hhmm(args[1])
         end_time = _parse_hhmm(args[2])
     except ValueError:
-        await message.answer("❌ Время должно быть ЧЧ:ММ (например 11:00 18:00)")
+        await message.answer(
+            "❌ Время должно быть ЧЧ:ММ (или ЧЧ.ММ / ЧЧ,ММ). "
+            "Например 11:00 18:00"
+        )
         return
 
     admin_id = _require_admin_or_silent(message)
@@ -412,12 +417,16 @@ async def cmd_openday(message: Message, command: CommandObject) -> None:
 def _parse_hhmm(s: str) -> dt_time:
     """Parse 'HH:MM' → datetime.time. Raises ValueError on bad format.
 
+    Separators accepted: ':', '.', ','. Master types '11.00' or '11,00' on
+    phone keypad (no need to switch layout to reach ':'). Single separator
+    only — '11.00' OK, '11.00.30' (len=3) raises ValueError.
+
     Used by cmd_openday (text args) and admin_openday_start_msg / end_msg (FSM
     text input). Centralised parse keeps error messages consistent.
     """
-    parts = s.split(":")
+    parts = re.split(r"[:.,]", s)
     if len(parts) != 2:
-        raise ValueError(f"expected HH:MM, got {s!r}")
+        raise ValueError(f"expected HH:MM (or HH.MM / HH,MM), got {s!r}")
     hh, mm = int(parts[0]), int(parts[1])
     if not (0 <= hh <= 23 and 0 <= mm <= 59):
         raise ValueError(f"HH 0-23, MM 0-59, got {s!r}")
@@ -947,7 +956,7 @@ async def admin_openday_calendar_cb(
 
         ask_text = (
             f"Дата: <b>{work_date.strftime('%d %B %Y')}</b>\n"
-            "Введите время начала (ЧЧ:ММ, например <code>11:00</code>):"
+            "Введите время начала (ЧЧ:ММ / ЧЧ.ММ / ЧЧ,ММ, например <code>11:00</code>):"
         )
         if isinstance(callback.message, Message):
             try:
@@ -1004,14 +1013,16 @@ async def admin_openday_start_msg(message: Message, state: FSMContext) -> None:
     try:
         start_time = _parse_hhmm(text.strip())
     except ValueError:
-        await message.answer("❌ Формат ЧЧ:ММ (например <code>11:00</code>)")
+        await message.answer(
+            "❌ Формат ЧЧ:ММ (или ЧЧ.ММ / ЧЧ,ММ). Например <code>11:00</code>"
+        )
         return  # state stays — ask again
 
     await state.update_data(start_time=start_time.isoformat())
     await state.set_state(AdminStates.opening_workday_end)
     await message.answer(
         f"Начало: <b>{start_time.strftime('%H:%M')}</b>\n"
-        "Введите время окончания (ЧЧ:ММ, например <code>18:00</code>):"
+        "Введите время окончания (ЧЧ:ММ / ЧЧ.ММ / ЧЧ,ММ, например <code>18:00</code>):"
     )
 
 
@@ -1046,7 +1057,9 @@ async def admin_openday_end_msg(message: Message, state: FSMContext) -> None:
     try:
         end_time = _parse_hhmm(text.strip())
     except ValueError:
-        await message.answer("❌ Формат ЧЧ:ММ (например <code>18:00</code>)")
+        await message.answer(
+            "❌ Формат ЧЧ:ММ (или ЧЧ.ММ / ЧЧ,ММ). Например <code>18:00</code>"
+        )
         return  # state stays — ask again
 
     admin_id = _require_admin_or_silent(message)
