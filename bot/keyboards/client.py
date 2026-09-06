@@ -1,10 +1,12 @@
 """Inline keyboards for booking flow — date picker, slot picker, confirm.
 
-Date picker: aiogram_calendar.SimpleCalendar (month navigation, ru_RU locale,
-Russian cancel/today labels) replaces the old 7-day button list. Range is
-bounded by min_date/max_date (today..today+MAX_BOOKING_DAYS_AHEAD in business
-timezone). Caller must strip tzinfo via .replace(tzinfo=None) — aiogram_calendar
-compares with naive datetime(year, month, day) internally (common.py:56).
+Date picker (Session 5.28 — BB-110): tap-to-select flat list of bookable dates
+(``date_picker_keyboard`` + ``BookDateCallbackData``) replaces the full-month
+SimpleCalendar in /book and /slots — single-master schedule is sparse, month
+grid mostly surfaced "Мастер не работает в этот день" (PLANS.md:827).
+SimpleCalendar (``calendar_keyboard``) REMAINS for the /transfer flow (re-uses
+SimpleCalendarCallback picker, distinct FSM state) and for stale-keyboard
+retries posted before the 5.28 deploy.
 
 CallbackData factories (aiogram 3.x):
 - BookSlotCallbackData: prefix="book_slot", slot_id: UUID
@@ -13,12 +15,13 @@ CallbackData factories (aiogram 3.x):
 - MyBookingsCancelCallbackData: prefix="mybook_cancel", booking_id: UUID  (cancel existing booking)
 - MyBookingsTransferCallbackData: prefix="mybook_transfer", booking_id: UUID
   (transfer existing booking — re-uses SimpleCalendar picker in subsequent FSM steps)
+- BookDateCallbackData: prefix="book_date", work_date: ISO date str (BB-110)
 
 Note: prefix uses '_' not ':' — aiogram 3.x forbids separator ':' inside prefix
 (ValueError: "Separator symbol ':' can not be used inside prefix").
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import cast
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -119,6 +122,30 @@ class BookServiceCallbackData(CallbackData, prefix="book_service"):
     service_id: UUID
 
 
+class BookDateCallbackData(CallbackData, prefix="book_date"):
+    """Date picker callback (Session 5.28 — BB-110, replaces SimpleCalendar).
+
+    Payload: work_date as ISO string ("YYYY-MM-DD"). aiogram CallbackData
+    pack() forbids ':' inside values (verified aiogram 3.x source — same
+    constraint as BookSlot30CallbackData.start_minute); ISO date has only
+    '-' separators → pack() safe. Handler parses via date.fromisoformat.
+
+    Wire format: "book_date:2026-09-08" = 9+1+10 = 20 bytes < 64 limit.
+
+    Distinct prefix from booking flow callbacks (book_slot, book_slot_30,
+    book_service) — aiogram dispatch is exact-prefix match, no conflict.
+    Shared by /book and /slots flows (both set BookingStates.selecting_date;
+    handler branches on the is_slots_path FSM flag, same as the legacy
+    simple_calendar_cb).
+
+    Cancel is a plain string "book_date_cancel" (no payload) caught by
+    F.data == "book_date_cancel" filter — mirrors the "book_service_custom"
+    pattern (BookServiceCallbackData docstring).
+    """
+
+    work_date: str
+
+
 async def calendar_keyboard(min_date: datetime, max_date: datetime) -> InlineKeyboardMarkup:
     """Build SimpleCalendar markup with date range.
 
@@ -139,6 +166,73 @@ async def calendar_keyboard(min_date: datetime, max_date: datetime) -> InlineKey
     cal.set_dates_range(min_date=min_date, max_date=max_date)
     # aiogram_calendar has no type stubs — cast to satisfy mypy (lib returns InlineKeyboardMarkup).
     return cast(InlineKeyboardMarkup, await cal.start_calendar())
+
+
+WEEKDAYS_RU = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+
+DATE_PICKER_CANCEL_CB = "book_date_cancel"
+
+
+def _date_button_label(d: date, today: date) -> str:
+    """Human label for a date button: 'Пн 08.09' / '⚡ Сегодня, Пн 08.09'.
+
+    Weekday prefix gives enough context without a year (picker window is
+    <= 60 days ahead). 'Сегодня' marker makes the edge case (booking for
+    today) discoverable — slots for today are still filtered by past time
+    in get_available_slots_30, so the marker can't mislead.
+    """
+    wd = WEEKDAYS_RU[d.weekday()]
+    if d == today:
+        return f"⚡ Сегодня, {wd} {d.strftime('%d.%m')}"
+    return f"{wd} {d.strftime('%d.%m')}"
+
+
+def date_picker_keyboard(dates: list[date], today: date) -> InlineKeyboardMarkup:
+    """Build tap-to-select date picker (Session 5.28 — BB-110).
+
+    Replaces SimpleCalendar in /book and /slots: single-master schedule is
+    sparse (1-3 working days/week), so a flat list of bookable dates is
+    better UX than a month grid where most taps surfaced "Мастер не
+    работает в этот день" (PLANS.md:827). Pattern mirrors the 5.27 service
+    picker (tap-to-select CallbackData + last-row action buttons).
+
+    Args:
+        dates: bookable dates from get_bookable_dates (sorted ascending by
+            the service — labels render in the given order).
+        today: today's date in the business timezone — used for the
+            '⚡ Сегодня' marker only.
+
+    Returns:
+        InlineKeyboardMarkup — date buttons (2 per row) + last row
+        ['❌ Отмена'] (callback DATE_PICKER_CANCEL_CB). Empty dates list
+        renders a single disabled 'Нет свободных дат' button before cancel —
+        callers that pre-check emptiness (cmd_book) show a text-only empty
+        state instead; this defensive branch covers retry paths where all
+        dates got booked between render and tap (race).
+
+    Built with explicit InlineKeyboardButton rows (not
+    InlineKeyboardBuilder.adjust) — guarantees cancel lands on its own row
+    instead of pairing with the last date under adjust(2) (matches mybookings
+    UX where action buttons sit in their own row).
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    pair: list[InlineKeyboardButton] = []
+    for d in dates:
+        pair.append(
+            InlineKeyboardButton(
+                text=_date_button_label(d, today),
+                callback_data=BookDateCallbackData(work_date=d.isoformat()).pack(),
+            )
+        )
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    if not dates:
+        rows.append([InlineKeyboardButton(text="Нет свободных дат", callback_data="noop")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=DATE_PICKER_CANCEL_CB)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def slot_picker_keyboard(slots: list[Slot]) -> InlineKeyboardMarkup:

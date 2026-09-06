@@ -13,6 +13,7 @@ from bot.services.slots import (
     close_slot,
     get_available_slots,
     get_available_slots_30,
+    get_bookable_dates,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.selectable import Select
@@ -691,3 +692,262 @@ async def test_get_available_slots_30_min_duration_filter(
         session, wd_narrow, BUSINESS_TZ, min_duration_min=60
     )
     assert available_narrow == []
+
+
+# ============================================================
+# BB-110 (Session 5.28) — get_bookable_dates pre-filtering
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_get_bookable_dates_includes_active_workday_with_free_slots(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Active WorkDay tomorrow [10:00, 20:00] (seeded), no bookings → tomorrow
+    in the result. Past days excluded by the date range.
+    """
+    tomorrow = seed_data["slot_date"]
+    dates = await get_bookable_dates(
+        session, seed_data["master_id"], BUSINESS_TZ, min_duration_min=60,
+    )
+    assert dates == [tomorrow], f"expected only tomorrow, got {dates}"
+
+
+@pytest.mark.asyncio
+async def test_get_bookable_dates_excludes_closed_workday(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """WorkDay is_active=False (closed via /closeday) → not bookable, even
+    with free slots in the window. The 30-min slot picker for a closed workday
+    would show free slots but create_booking rejects (День закрыт мастером),
+    so the date must be hidden at the picker layer.
+
+    Uses include_legacy_slots=False to isolate the WorkDay branch — seed_data
+    contains a legacy Slot at the same date, which would surface the date
+    through the legacy branch regardless of WorkDay.is_active (legacy slots
+    have no link to WorkDay). /slots scope is workday-only, so this test
+    mirrors cmd_slots semantics (include_legacy_slots=False).
+    """
+    tomorrow = seed_data["slot_date"]
+    # Close the seeded workday for tomorrow.
+    seeded_wd = seed_data["workday"]
+    seeded_wd.is_active = False
+    session.add(seeded_wd)
+    await session.commit()
+
+    # Add a fresh active workday for day+5 to keep the result non-empty.
+    future_wd_date = (datetime.now(UTC) + timedelta(days=5)).date()
+    await _make_workday(session, seed_data, future_wd_date, 10, 18, capacity=1)
+
+    dates = await get_bookable_dates(
+        session, seed_data["master_id"], BUSINESS_TZ,
+        include_legacy_slots=False, min_duration_min=60,
+    )
+    assert tomorrow not in dates, "closed workday must not be bookable"
+    assert future_wd_date in dates
+
+
+@pytest.mark.asyncio
+async def test_get_bookable_dates_excludes_fully_booked_workday(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """cap=1 WorkDay with a booking covering every grid cell → date excluded.
+    Otherwise the date picker would surface a date whose slot picker is empty
+    (race window + misleading UX)."""
+    # Override the seeded workday to a short 1-slot window with a booking.
+    work_date = (datetime.now(UTC) + timedelta(days=7)).date()
+    wd_short = await _make_workday(session, seed_data, work_date, 10, 11, capacity=1)
+    # Booking [10:00, 11:00] covers the only grid cell (10:00 fits 60 min,
+    # 10:30+60=11:30 > 11:00 → filtered, so 1 slot total).
+    await _insert_booking(
+        session, seed_data,
+        start_at=_local_to_utc(work_date, 10, 0),
+        end_at=_local_to_utc(work_date, 11, 0),
+    )
+    # Sanity: get_available_slots_30 is empty for this workday.
+    slots = await get_available_slots_30(
+        session, wd_short, BUSINESS_TZ, min_duration_min=60,
+    )
+    assert slots == []
+
+    dates = await get_bookable_dates(
+        session, seed_data["master_id"], BUSINESS_TZ, min_duration_min=60,
+    )
+    assert work_date not in dates, "fully-booked workday must not appear in picker"
+
+
+@pytest.mark.asyncio
+async def test_get_bookable_dates_excludes_workday_with_no_fit_for_min_duration(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """BUG2 propagation: WorkDay 15:30-16:00 has 1 grid cell (15:30) but
+    15:30+60=16:30 > 16:00 → no slot fits 60 min → date excluded (mirrors
+    get_available_slots_30 min_duration filter at the date-picker layer).
+
+    _make_workday takes hour ints only — so build the :30-start window directly
+    via the WorkDay constructor (same pattern as the existing min_duration
+    test at test_slots.py:680).
+    """
+    work_date = (datetime.now(UTC) + timedelta(days=9)).date()
+    wd_narrow = WorkDay(
+        master_id=seed_data["master_id"],
+        work_date=work_date,
+        start_time=dt_time(15, 30),
+        end_time=dt_time(16, 0),
+        max_concurrent_clients=1,
+        is_active=True,
+    )
+    session.add(wd_narrow)
+    await session.commit()
+    # Sanity: 30-min grid yields 1 cell but no fit.
+    slots = await get_available_slots_30(
+        session, wd_narrow, BUSINESS_TZ, min_duration_min=60,
+    )
+    assert slots == []
+
+    dates = await get_bookable_dates(
+        session, seed_data["master_id"], BUSINESS_TZ, min_duration_min=60,
+    )
+    assert work_date not in dates, "no slot fits min_duration → date excluded"
+
+
+@pytest.mark.asyncio
+async def test_get_bookable_dates_includes_legacy_open_slots(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Date with legacy open slots but NO WorkDay → included (include_legacy=True).
+    Mirrors /book fallback path (legacy slots first, then WorkDay).
+    """
+    legacy_date = (datetime.now(UTC) + timedelta(days=12)).date()
+    session.add(Slot(
+        master_id=seed_data["master_id"],
+        slot_date=legacy_date,
+        slot_hour=14,
+        status="open",
+    ))
+    await session.commit()
+
+    dates = await get_bookable_dates(
+        session, seed_data["master_id"], BUSINESS_TZ, include_legacy_slots=True,
+    )
+    assert legacy_date in dates
+
+
+@pytest.mark.asyncio
+async def test_get_bookable_dates_excludes_legacy_when_flag_false(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """include_legacy_slots=False (/slots scope) — legacy-only date excluded."""
+    legacy_date = (datetime.now(UTC) + timedelta(days=12)).date()
+    session.add(Slot(
+        master_id=seed_data["master_id"],
+        slot_date=legacy_date,
+        slot_hour=14,
+        status="open",
+    ))
+    await session.commit()
+
+    dates = await get_bookable_dates(
+        session, seed_data["master_id"], BUSINESS_TZ, include_legacy_slots=False,
+    )
+    assert legacy_date not in dates, "/slots must not list legacy-only dates"
+
+
+@pytest.mark.asyncio
+async def test_get_bookable_dates_excludes_legacy_past_hours_today(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """For TODAY (today_local), legacy slots whose hour already started are
+    filtered out — if every open slot for today has slot_hour <= now_hour →
+    today must not appear in the picker (avoids the trivially-past dead-end).
+
+    Inject now_utc to the LATE side so today's seeded legacy slot (hour=14)
+    would be 'past' — and add a separate day+2 workday so the result isn't
+    empty (we only assert today's absence).
+    """
+    # 'today' in business TZ
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(BUSINESS_TZ)
+    now_utc = datetime.now(tz).replace(hour=20, minute=0, second=0, microsecond=0).astimezone(UTC)
+    today_local = now_utc.astimezone(tz).date()
+
+    # Open legacy slot for today at hour=14 (definitely < 20:00).
+    session.add(Slot(
+        master_id=seed_data["master_id"],
+        slot_date=today_local,
+        slot_hour=14,
+        status="open",
+    ))
+    await session.commit()
+
+    dates = await get_bookable_dates(
+        session, seed_data["master_id"], BUSINESS_TZ,
+        include_legacy_slots=True, now_utc=now_utc,
+    )
+    assert today_local not in dates, (
+        f"all today's legacy slots already started (now=20:00 local) "
+        f"→ today must be excluded; got {dates}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_bookable_dates_empty_when_no_workdays_no_legacy(
+    session: AsyncSession,
+) -> None:
+    """Master with no workdays and no legacy slots → empty list."""
+    # Create master without anything.
+    biz = Business(name="x", telegram_owner_id=461355056, timezone=BUSINESS_TZ)
+    session.add(biz)
+    await session.flush()
+    master = Master(business_id=biz.id, name="x", telegram_id=461355056, role="owner")
+    session.add(master)
+    await session.commit()
+
+    dates = await get_bookable_dates(session, master.id, BUSINESS_TZ, min_duration_min=60)
+    assert dates == []
+
+
+@pytest.mark.asyncio
+async def test_get_bookable_dates_sorted_ascending(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Multiple bookable dates returned in ascending order — picker renders
+    them in the given order (closest dates first, better UX)."""
+    # Seeded workday for tomorrow. Add two more workdays.
+    d1 = (datetime.now(UTC) + timedelta(days=5)).date()
+    d2 = (datetime.now(UTC) + timedelta(days=12)).date()
+    await _make_workday(session, seed_data, d1, 10, 18, capacity=1)
+    await _make_workday(session, seed_data, d2, 10, 18, capacity=1)
+
+    dates = await get_bookable_dates(
+        session, seed_data["master_id"], BUSINESS_TZ, min_duration_min=60,
+    )
+    assert dates == sorted(dates), f"expected ascending, got {dates}"
+    assert len(dates) == 3  # tomorrow + d1 + d2
+
+
+@pytest.mark.asyncio
+async def test_get_bookable_dates_caps_at_days_ahead(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """days_ahead bounds the query window — workday at days_ahead+5 excluded."""
+    near_date = (datetime.now(UTC) + timedelta(days=2)).date()
+    far_date = (datetime.now(UTC) + timedelta(days=30)).date()
+    await _make_workday(session, seed_data, near_date, 10, 18, capacity=1)
+    await _make_workday(session, seed_data, far_date, 10, 18, capacity=1)
+
+    dates = await get_bookable_dates(
+        session, seed_data["master_id"], BUSINESS_TZ,
+        min_duration_min=60, days_ahead=10,
+    )
+    assert near_date in dates
+    assert far_date not in dates, "days_ahead=10 must exclude workday 30 days out"

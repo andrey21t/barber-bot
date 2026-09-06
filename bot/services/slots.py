@@ -329,3 +329,118 @@ async def get_available_slots(
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+# ============================================================
+# Date picker pre-filtering (BB-110 — Session 5.28)
+# ============================================================
+
+
+async def get_bookable_dates(
+    session: AsyncSession,
+    master_id: UUID,
+    business_timezone: str,
+    *,
+    include_legacy_slots: bool = True,
+    now_utc: datetime | None = None,
+    min_duration_min: int = 0,
+    days_ahead: int = 60,
+) -> list[date]:
+    """Return bookable DATES in [today_local, today_local + days_ahead] (BB-110).
+
+    Replaces the full-month SimpleCalendar in /book and /slots (PLANS.md:827):
+    single-master Екатерина has a sparse floating schedule (1-3 days/week), so
+    the month grid mostly shows non-working days where a tap surfaced
+    "Мастер не работает в этот день". This pre-filter lists only dates the
+    client can actually book — past days are excluded by the >= today_local
+    range condition.
+
+    Bookable date criteria:
+    - WorkDay: master_id, work_date in range, is_active=True, and
+      get_available_slots_30(workday, tz, min_duration_min) returns >= 1 slot.
+      min_duration_min must mirror the value the handler passes to the slot
+      picker (BUG2 fix — without it a date may show but its 30-min picker
+      yields no slot that fits the default duration, surfacing a misleading
+      error at confirm time).
+    - Legacy Slot: master_id, slot_date in range, status='open'. For today
+      we additionally require slot_hour > now_local.hour so the picker doesn't
+      list a date whose every legacy slot already started. The legacy slot
+      picker itself still renders past slots (get_available_slots has no
+      now-filter — pre-existing quirk until migration 008 drops the table);
+      the pre-filter only hides the trivially-empty case. A mixed date
+      (future + past hours) keeps past-hour slots visible in the picker —
+      unchanged behavior, SlotInPast at confirm.
+    - include_legacy_slots=False (used by /slots): WorkDay dates only.
+      /slots is the workday-only command (cmd_slots never falls back to
+      legacy slots), so a date opened only via /addslots must not appear
+      under /slots.
+
+    Args:
+        session: SQLAlchemy AsyncSession (read-only SELECTs).
+        master_id: Master.id (single-master MVP).
+        business_timezone: IANA tz name (e.g. "Europe/Moscow") — today_local
+            derived from now_utc.astimezone(...) for the correct day boundary.
+        include_legacy_slots: True (default, /book) — union of WorkDay and
+            legacy slot dates; False (/slots) — WorkDay dates only.
+        now_utc: injected for tests (production uses datetime.now(UTC)).
+        min_duration_min: passed through to get_available_slots_30 for the
+            WorkDay branch. Default 0 = no BUG2 filter (occupancy-only test
+            callers); handlers pass SERVICE_DEFAULT_DURATION_MIN.
+        days_ahead: window size in days. Handlers pass
+            Settings.MAX_BOOKING_DAYS_AHEAD; the default preserves
+            unit-test convenience.
+
+    Returns:
+        Sorted list (ascending) of bookable dates. Empty when the master has
+        no active WorkDay with free slots and no open legacy slots in range.
+        Caller (cmd_book / cmd_slots) shows an empty-state message instead
+        of entering FSM.
+    """
+    now = now_utc if now_utc is not None else datetime.now(UTC)
+    tz = ZoneInfo(business_timezone)
+    today_local = now.astimezone(tz).date()
+    max_local = today_local + timedelta(days=days_ahead)
+    now_hour_local = now.astimezone(tz).hour
+
+    bookable: set[date] = set()
+
+    # WorkDay branch: active workdays in range whose 30-min grid yields
+    # >= 1 slot fitting min_duration_min.
+    workdays_stmt = (
+        select(WorkDay)
+        .where(
+            WorkDay.master_id == master_id,
+            WorkDay.work_date >= today_local,
+            WorkDay.work_date <= max_local,
+            WorkDay.is_active == True,  # noqa: E712
+        )
+        .order_by(WorkDay.work_date)
+    )
+    workdays = (await session.execute(workdays_stmt)).scalars().all()
+    for wd in workdays:
+        slots_30 = await get_available_slots_30(
+            session,
+            wd,
+            business_timezone,
+            now_utc=now,
+            min_duration_min=min_duration_min,
+        )
+        if slots_30:
+            bookable.add(wd.work_date)
+
+    # Legacy Slot branch (/book only): open slots in range. For today, drop
+    # slots whose hour already started (trivially-past guard).
+    if include_legacy_slots:
+        slots_stmt = select(Slot).where(
+            Slot.master_id == master_id,
+            Slot.slot_date >= today_local,
+            Slot.slot_date <= max_local,
+            Slot.status == "open",
+        )
+        legacy_slots = (await session.execute(slots_stmt)).scalars().all()
+        for s in legacy_slots:
+            if s.slot_date == today_local and s.slot_hour <= now_hour_local:
+                continue  # slot already started today
+            bookable.add(s.slot_date)
+
+    return sorted(bookable)

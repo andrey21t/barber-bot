@@ -23,7 +23,7 @@ Invariants (spec.md + MY-VIBE-RULES.md):
 """
 
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from datetime import time as dt_time
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -32,16 +32,19 @@ from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback
 from aiogram_calendar.schemas import SimpleCalAct
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from scheduler import schedule_for_booking
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings, get_settings
 from bot.db import async_session_factory
 from bot.keyboards.client import (
     BookConfirmCallbackData,
+    BookDateCallbackData,
     BookServiceCallbackData,
     BookSlot30CallbackData,
     BookSlotCallbackData,
@@ -50,12 +53,13 @@ from bot.keyboards.client import (
     _format_booking_summary_from_start_at,
     calendar_keyboard,
     confirm_keyboard,
+    date_picker_keyboard,
     mybookings_keyboard,
     service_picker_keyboard,
     slot_picker_keyboard,
     slot_picker_keyboard_30min,
 )
-from bot.models import Booking, Slot, WorkDay
+from bot.models import Booking, Master, Slot, WorkDay
 from bot.schemas import BookingCreate
 from bot.services.booking import (
     BookingAlreadyCancelledError,
@@ -76,7 +80,11 @@ from bot.services.booking import (
     create_booking,
     transfer_booking,
 )
-from bot.services.slots import get_available_slots, get_available_slots_30
+from bot.services.slots import (
+    get_available_slots,
+    get_available_slots_30,
+    get_bookable_dates,
+)
 from bot.states import BookingStates, TransferStates
 
 logger = logging.getLogger(__name__)
@@ -109,21 +117,42 @@ def _calendar_range(settings: Settings) -> tuple[datetime, datetime]:
 # ============================================================
 @router.message(Command("book"), StateFilter(None))
 async def cmd_book(message: Message, state: FSMContext) -> None:
-    """Show SimpleCalendar (month navigation) for date selection.
+    """Show date picker (Session 5.28 — BB-110, replaces SimpleCalendar).
 
-    Этап 5.8b: explicitly set is_slots_path=False in FSM data to prevent
-    state pollution — if user was in /slots flow (is_slots_path=True) and
-    started /book without completing it, the flag would otherwise linger
-    (state.set_state does NOT clear data). Default dict.get returns None
-    for missing key, but explicit False is defensive against future FSM
-    changes. /book → legacy slot path (BookSlotCallbackData + slot_picker_keyboard).
+    /book → flat list of bookable dates (active WorkDay with >=1 free 30-min
+    slot fitting min_duration, OR legacy open slots) in
+    [today, today+MAX_BOOKING_DAYS_AHEAD]. Past days excluded by the date
+    range; non-working days excluded by the pre-filter — no more 'Мастер
+    не работает' dead-end (PLANS.md:827).
+
+    Empty bookable list → text-only empty state + state.clear (don't enter
+    FSM with a dead-end keyboard). Non-empty → selecting_date + picker,
+    is_slots_path=False (consistent with the legacy _handle_simple_calendar
+    branches reachable via stale-calendar keyboards after the 5.28 deploy).
     """
     settings = get_settings()
+    async with async_session_factory() as session:
+        master = await _select_master(session, settings)
+        if master is None:
+            await message.answer("❌ Не удалось найти мастера. Обратитесь к администратору.")
+            return
+        dates = await get_bookable_dates(
+            session,
+            master.id,
+            settings.TIMEZONE,
+            include_legacy_slots=True,
+            min_duration_min=settings.SERVICE_DEFAULT_DURATION_MIN,
+            days_ahead=settings.MAX_BOOKING_DAYS_AHEAD,
+        )
+    if not dates:
+        await message.answer("Сейчас нет свободных дат для записи. Загляните позже 🙏")
+        return
     await state.set_state(BookingStates.selecting_date)
     await state.update_data(is_slots_path=False)
+    today_local = datetime.now(ZoneInfo(settings.TIMEZONE)).date()
     await message.answer(
         "📅 Выберите дату записи:",
-        reply_markup=await calendar_keyboard(*_calendar_range(settings)),
+        reply_markup=date_picker_keyboard(dates, today=today_local),
     )
 
 
@@ -132,26 +161,267 @@ async def cmd_book(message: Message, state: FSMContext) -> None:
 # ============================================================
 @router.message(Command("slots"), StateFilter(None))
 async def cmd_slots(message: Message, state: FSMContext) -> None:
-    """Entry point for /slots — same SimpleCalendar date picker as /book,
-    but sets `is_slots_path=True` flag in FSM data. _handle_simple_calendar
-    branches on this flag: True → fetch WorkDay for date + 30-min slots →
-    slot_picker_keyboard_30min (BookSlot30CallbackData). False → existing
-    /book path (slot_picker_keyboard + BookSlotCallbackData).
+    """Entry point for /slots — date picker (BB-110), WorkDay-only scope.
 
-    The flag is needed because BookingStates.selecting_date is shared between
-    /book and /slots — single-master MVP doesn't warrant a separate
-    SlotsBookingStates group (state pollution handled by explicit flag reset
-    in cmd_book + state.clear() in cancel paths). See Pass 3 state-pollution
-    tradeoff in deep-analysis-protocol Session 5.23 (critic iter 2 — pragmatic
-    for 2 flows; if a 3rd client flow is added, refactor to SlotsBookingStates).
+    Mirrors cmd_book but uses include_legacy_slots=False: /slots is the
+    workday-only command (cmd_slots _handle_simple_calendar branch never
+    falls back to legacy slots), so a date opened only via /addslots must
+    NOT appear under /slots. Bookable date = active WorkDay with >=1 free
+    30-min slot fitting min_duration.
+
+    Sets `is_slots_path=True` in FSM data (unchanged since 5.8b): the
+    shared _process_selected_date helper branches on this flag — True →
+    workday-only slot picker (slot_picker_keyboard_30min); False → legacy
+    /book path with WorkDay fallback (slot_picker_keyboard or 30-min).
+    BookingStates.selecting_date is shared between /book and /slots —
+    single-master MVP doesn't warrant a separate SlotsBookingStates group
+    (see Pass 3 state-pollution tradeoff in deep-analysis-protocol
+    Session 5.23 critic iter 2 — pragmatic for 2 flows; if a 3rd client
+    flow is added, refactor to SlotsBookingStates).
     """
     settings = get_settings()
+    async with async_session_factory() as session:
+        master = await _select_master(session, settings)
+        if master is None:
+            await message.answer("❌ Не удалось найти мастера. Обратитесь к администратору.")
+            return
+        dates = await get_bookable_dates(
+            session,
+            master.id,
+            settings.TIMEZONE,
+            include_legacy_slots=False,
+            min_duration_min=settings.SERVICE_DEFAULT_DURATION_MIN,
+            days_ahead=settings.MAX_BOOKING_DAYS_AHEAD,
+        )
+    if not dates:
+        await message.answer("Сейчас нет свободных дат для записи. Загляните позже 🙏")
+        return
     await state.set_state(BookingStates.selecting_date)
     await state.update_data(is_slots_path=True)
+    today_local = datetime.now(ZoneInfo(settings.TIMEZONE)).date()
     await message.answer(
         "📅 Выберите дату записи:",
-        reply_markup=await calendar_keyboard(*_calendar_range(settings)),
+        reply_markup=date_picker_keyboard(dates, today=today_local),
     )
+
+
+# ============================================================
+# 1c. _select_master / _retry_markup / _process_selected_date
+# Shared helpers for cmd_book/cmd_slots + simple_calendar_cb (stale keyboards)
+# + book_date_cb (BB-110 date picker).
+# ============================================================
+
+
+async def _select_master(session: AsyncSession, settings: Settings) -> Master | None:
+    """Resolve single-master by ADMIN_ID (single-master MVP, BB-001).
+
+    Used by cmd_book/cmd_slots (BB-110 date picker entry) and
+    _process_selected_date (post-tap slot fetching) to avoid duplicating
+    the lookup inline — Inline `from sqlalchemy import select`/`from bot.models
+    import Master` blocks previously repeated the same 4-line block in every
+    site (4 occurrences pre-5.28).
+    """
+    stmt = select(Master).where(Master.telegram_id == settings.ADMIN_ID).limit(1)
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def _retry_markup(
+    session: AsyncSession,
+    master: Master,
+    settings: Settings,
+    *,
+    is_transfer: bool,
+    is_slots_path: bool | None,
+) -> InlineKeyboardMarkup:
+    """Re-render date selector after a race (workday closed / slots gone).
+
+    Transfer flow keeps SimpleCalendar (BB-110 scope = /book and /slots
+    only — /transfer semantics differ: user picks a new date for an existing
+    booking; the calendar lets them navigate freely across the month).
+
+    /book and /slots re-query get_bookable_dates and render the new picker;
+    empty result renders the defensive 'Нет свободных дат' button (see
+    date_picker_keyboard). min_duration_min mirrors the value the slot picker
+    will pass to get_available_slots_30 (BUG2 fix consistency).
+    include_legacy mirrors the cmd entry (/slots workday-only; /book union).
+    is_slots_path=None (pre-5.8b in-flight FSM data) is treated as /book
+    legacy semantics — falsy → include_legacy_slots=True — backward compat.
+
+    Caller responsibility: pass is_slots_path from FSM data.
+    """
+    if is_transfer:
+        return await calendar_keyboard(*_calendar_range(settings))
+    dates = await get_bookable_dates(
+        session,
+        master.id,
+        settings.TIMEZONE,
+        include_legacy_slots=not is_slots_path,
+        min_duration_min=settings.SERVICE_DEFAULT_DURATION_MIN,
+        days_ahead=settings.MAX_BOOKING_DAYS_AHEAD,
+    )
+    today_local = datetime.now(ZoneInfo(settings.TIMEZONE)).date()
+    return date_picker_keyboard(dates, today=today_local)
+
+
+async def _process_selected_date(
+    callback: CallbackQuery,
+    state: FSMContext,
+    settings: Settings,
+    *,
+    selecting_slot_state: State,
+    is_transfer: bool,
+    slot_date: date,
+) -> None:
+    """Shared body of simple_calendar_cb act=day (stale-keyboard retry) and
+    book_date_cb tap (BB-110).
+
+    Fetches master, reads is_slots_path FSM flag, branches on workday vs
+    legacy slot path, renders the slot picker or a retry date selector.
+
+    Retry paths (workday None/closed, no free slots) use _retry_markup —
+    calendar for /transfer, date picker for /book and /slots. Race
+    protection: between picker render and tap, all slots may have been
+    booked by another client or /closeday may have deactivated the workday.
+    """
+    fsm_data = await state.get_data()
+    is_slots_path: bool | None = fsm_data.get("is_slots_path")
+
+    async with async_session_factory() as session:
+        master = await _select_master(session, settings)
+        if master is None:
+            await state.clear()
+            if callback.message is not None:
+                await callback.message.answer(
+                    "❌ Не удалось найти мастера. Обратитесь к администратору."
+                )
+            await callback.answer()
+            return
+
+        if is_slots_path:
+            # === /slots workday branch (Этап 5.8b) ===
+            # Fetch WorkDay for (master_id, slot_date). If None → master doesn't
+            # work that day (no /openday). If is_active=False → closed via
+            # /closeday. Both → user-facing hint, no slot picker shown.
+            # BB-110: /slots entry pre-filters dates so this branch is only
+            # reachable via stale-keyboard retry or race (workday closed
+            # between picker render and tap).
+            workday = await _select_workday_for_slot(session, master.id, slot_date)
+            if workday is None:
+                if callback.message is not None:
+                    await callback.message.answer(
+                        "Мастер не работает в этот день. Выберите другую дату:",
+                        reply_markup=await _retry_markup(
+                            session, master, settings,
+                            is_transfer=is_transfer, is_slots_path=is_slots_path,
+                        ),
+                    )
+                await callback.answer()
+                return
+            if not workday.is_active:
+                if callback.message is not None:
+                    await callback.message.answer(
+                        "День закрыт мастером. Выберите другую дату:",
+                        reply_markup=await _retry_markup(
+                            session, master, settings,
+                            is_transfer=is_transfer, is_slots_path=is_slots_path,
+                        ),
+                    )
+                await callback.answer()
+                return
+            # WorkDay active — fetch 30-min slots with capacity check.
+            # get_available_slots_30 filters past slots via now_utc injection
+            # (default datetime.now(UTC) inside — caller doesn't need to pass).
+            # Session 5.27 BUG2: pass min_duration_min=SERVICE_DEFAULT_DURATION_MIN
+            # so slots that don't fit a default 60-min booking are hidden —
+            # prevents misleading BookingOutsideWorkDayError at confirm.
+            slots_30 = await get_available_slots_30(
+                session,
+                workday,
+                settings.TIMEZONE,
+                min_duration_min=settings.SERVICE_DEFAULT_DURATION_MIN,
+            )
+            if not slots_30:
+                if callback.message is not None:
+                    await callback.message.answer(
+                        "На эту дату нет свободного времени. Выберите другую дату:",
+                        reply_markup=await _retry_markup(
+                            session, master, settings,
+                            is_transfer=is_transfer, is_slots_path=is_slots_path,
+                        ),
+                    )
+                await callback.answer()
+                return
+            await state.update_data(selected_date=slot_date.isoformat())
+            await state.set_state(selecting_slot_state)
+            if callback.message is not None:
+                await callback.message.answer(
+                    "Выберите новое время:" if is_transfer else "Выберите время:",
+                    reply_markup=slot_picker_keyboard_30min(slots_30, workday.id),
+                )
+            await callback.answer()
+            return
+
+        # === /book legacy slot branch (existing) ===
+        slots = await get_available_slots(session, master.id, slot_date)
+        if not slots:
+            # Session 5.27 fallback: legacy slots empty → try WorkDay.
+            # /openweek (Session 5.26) writes to work_days, not slots.
+            # Without this fallback, /book users can't book days opened
+            # via /openweek — only /slots could. Maintain backward compat
+            # by transparently switching /book to 30-min WorkDay picker
+            # when no legacy slots exist for the date.
+            # BB-110: /book entry pre-filters dates so this is reachable via
+            # stale-keyboard retry or race only.
+            workday = await _select_workday_for_slot(session, master.id, slot_date)
+            if workday is not None and workday.is_active:
+                slots_30 = await get_available_slots_30(
+                    session,
+                    workday,
+                    settings.TIMEZONE,
+                    min_duration_min=settings.SERVICE_DEFAULT_DURATION_MIN,
+                )
+                if slots_30:
+                    await state.update_data(selected_date=slot_date.isoformat())
+                    await state.set_state(selecting_slot_state)
+                    if callback.message is not None:
+                        await callback.message.answer(
+                            "Выберите новое время:" if is_transfer else "Выберите время:",
+                            reply_markup=slot_picker_keyboard_30min(slots_30, workday.id),
+                        )
+                    await callback.answer()
+                    return
+                # workday active but no free slots — fall through to message below.
+            elif workday is not None and not workday.is_active:
+                # workday exists but closed via /closeday — show closed hint.
+                if callback.message is not None:
+                    await callback.message.answer(
+                        "День закрыт мастером. Выберите другую дату:",
+                        reply_markup=await _retry_markup(
+                            session, master, settings,
+                            is_transfer=is_transfer, is_slots_path=is_slots_path,
+                        ),
+                    )
+                await callback.answer()
+                return
+            if callback.message is not None:
+                await callback.message.answer(
+                    "На эту дату нет свободных слотов. Выберите другую дату:",
+                    reply_markup=await _retry_markup(
+                        session, master, settings,
+                        is_transfer=is_transfer, is_slots_path=is_slots_path,
+                    ),
+                )
+            await callback.answer()
+            return
+        await state.update_data(selected_date=slot_date.isoformat())
+        await state.set_state(selecting_slot_state)
+        if callback.message is not None:
+            await callback.message.answer(
+                "Выберите новое время:" if is_transfer else "Выберите время:",
+                reply_markup=slot_picker_keyboard(slots),
+            )
+        await callback.answer()
+        return
 
 
 # ============================================================
@@ -167,6 +437,14 @@ async def cmd_slots(message: Message, state: FSMContext) -> None:
 #   - act=cancel: lib calls delete_reply_markup (no answer) → handler answers + state.clear()
 #   - act=day + out-of-range: lib calls query.answer(alert) → handler returns (selected=False)
 #   - act=day + in-range: lib calls delete_reply_markup (no answer) → handler answers + fetch slots
+#
+# Session 5.28 (BB-110): this handler REMAINS for /transfer (its picker is
+# still SimpleCalendar) AND for stale-calendar keyboards from before the
+# 5.28 deploy — clients with an old picker message on screen can still
+# tap a day; the act=day body delegates to _process_selected_date, which
+# re-renders the NEW date picker on retry (graceful upgrade path). New
+# clients go through cmd_book/cmd_slots → date_picker_keyboard →
+# book_date_cb instead.
 async def _handle_simple_calendar(
     callback: CallbackQuery,
     callback_data: SimpleCalendarCallback,
@@ -205,135 +483,20 @@ async def _handle_simple_calendar(
         if not selected:
             return  # F7 fix: out-of-range, lib answered alert, do nothing
         slot_date = selected_date.date()
-
-        # Этап 5.8b: read is_slots_path flag from FSM data BEFORE session.
-        # Defaults None for /transfer (TransferStates — flag never set) → falsy →
-        # legacy slot branch. Defaults None for /book pre-5.8b sessions (cmd_book
-        # now explicitly sets False, but defensive for in-flight pre-upgrade flows).
-        fsm_data = await state.get_data()
-        is_slots_path: bool | None = fsm_data.get("is_slots_path")
-
-        async with async_session_factory() as session:
-            from sqlalchemy import select
-
-            from bot.models import Master
-
-            stmt = select(Master).where(Master.telegram_id == settings.ADMIN_ID).limit(1)
-            master = (await session.execute(stmt)).scalar_one_or_none()
-            if master is None:
-                await state.clear()
-                if callback.message is not None:
-                    await callback.message.answer(
-                        "❌ Не удалось найти мастера. Обратитесь к администратору."
-                    )
-                await callback.answer()
-                return
-
-            if is_slots_path:
-                # === /slots workday branch (Этап 5.8b) ===
-                # Fetch WorkDay for (master_id, slot_date). If None → master doesn't
-                # work that day (no /openday). If is_active=False → closed via
-                # /closeday. Both → user-facing hint, no slot picker shown.
-                workday = await _select_workday_for_slot(session, master.id, slot_date)
-                if workday is None:
-                    if callback.message is not None:
-                        await callback.message.answer(
-                            "Мастер не работает в этот день. /book для записи по часам.",
-                            reply_markup=await calendar_keyboard(*_calendar_range(settings)),
-                        )
-                    await callback.answer()
-                    return
-                if not workday.is_active:
-                    if callback.message is not None:
-                        await callback.message.answer(
-                            "День закрыт мастером. Выберите другую дату:",
-                            reply_markup=await calendar_keyboard(*_calendar_range(settings)),
-                        )
-                    await callback.answer()
-                    return
-                # WorkDay active — fetch 30-min slots with capacity check.
-                # get_available_slots_30 filters past slots via now_utc injection
-                # (default datetime.now(UTC) inside — caller doesn't need to pass).
-                # Session 5.27 BUG2: pass min_duration_min=SERVICE_DEFAULT_DURATION_MIN
-                # so slots that don't fit a default 60-min booking are hidden —
-                # prevents misleading BookingOutsideWorkDayError at confirm.
-                slots_30 = await get_available_slots_30(
-                    session,
-                    workday,
-                    settings.TIMEZONE,
-                    min_duration_min=settings.SERVICE_DEFAULT_DURATION_MIN,
-                )
-                if not slots_30:
-                    if callback.message is not None:
-                        await callback.message.answer(
-                            "На эту дату нет свободного времени. Выберите другую дату:",
-                            reply_markup=await calendar_keyboard(*_calendar_range(settings)),
-                        )
-                    await callback.answer()
-                    return
-                await state.update_data(selected_date=slot_date.isoformat())
-                await state.set_state(selecting_slot_state)
-                if callback.message is not None:
-                    await callback.message.answer(
-                        "Выберите новое время:" if is_transfer else "Выберите время:",
-                        reply_markup=slot_picker_keyboard_30min(slots_30, workday.id),
-                    )
-                await callback.answer()
-                return
-
-            # === /book legacy slot branch (existing) ===
-            slots = await get_available_slots(session, master.id, slot_date)
-            if not slots:
-                # Session 5.27 fallback: legacy slots empty → try WorkDay.
-                # /openweek (Session 5.26) writes to work_days, not slots.
-                # Without this fallback, /book users can't book days opened
-                # via /openweek — only /slots could. Maintain backward compat
-                # by transparently switching /book to 30-min WorkDay picker
-                # when no legacy slots exist for the date.
-                workday = await _select_workday_for_slot(session, master.id, slot_date)
-                if workday is not None and workday.is_active:
-                    slots_30 = await get_available_slots_30(
-                        session,
-                        workday,
-                        settings.TIMEZONE,
-                        min_duration_min=settings.SERVICE_DEFAULT_DURATION_MIN,
-                    )
-                    if slots_30:
-                        await state.update_data(selected_date=slot_date.isoformat())
-                        await state.set_state(selecting_slot_state)
-                        if callback.message is not None:
-                            await callback.message.answer(
-                                "Выберите новое время:" if is_transfer else "Выберите время:",
-                                reply_markup=slot_picker_keyboard_30min(slots_30, workday.id),
-                            )
-                        await callback.answer()
-                        return
-                    # workday active but no free slots — fall through to message below.
-                elif workday is not None and not workday.is_active:
-                    # workday exists but closed via /closeday — show closed hint.
-                    if callback.message is not None:
-                        await callback.message.answer(
-                            "День закрыт мастером. Выберите другую дату:",
-                            reply_markup=await calendar_keyboard(*_calendar_range(settings)),
-                        )
-                    await callback.answer()
-                    return
-                if callback.message is not None:
-                    await callback.message.answer(
-                        "На эту дату нет свободных слотов. Выберите другую дату:",
-                        reply_markup=await calendar_keyboard(*_calendar_range(settings)),
-                    )
-                await callback.answer()
-                return
-            await state.update_data(selected_date=slot_date.isoformat())
-            await state.set_state(selecting_slot_state)
-            if callback.message is not None:
-                await callback.message.answer(
-                    "Выберите новое время:" if is_transfer else "Выберите время:",
-                    reply_markup=slot_picker_keyboard(slots),
-                )
-            await callback.answer()
-            return
+        # BB-110: act=day here means a STALE SimpleCalendar keyboard (pre-5.28
+        # deploy) or a /transfer keyboard — both still navigate via this
+        # handler. Body extracted to _process_selected_date (shared with
+        # book_date_cb) so retries render the NEW date picker for /book and
+        # /slots while /transfer keeps SimpleCalendar.
+        await _process_selected_date(
+            callback,
+            state,
+            settings,
+            selecting_slot_state=selecting_slot_state,
+            is_transfer=is_transfer,
+            slot_date=slot_date,
+        )
+        return
 
     if callback_data.act == SimpleCalAct.cancel:
         # Этап 5.8b W1 (code-review iter 2): /slots vs /book hint branching.
@@ -368,7 +531,16 @@ async def simple_calendar_cb(
     callback_data: SimpleCalendarCallback,
     state: FSMContext,
 ) -> None:
-    """SimpleCalendar navigation + day select for booking flow (cmd_book)."""
+    """SimpleCalendar navigation + day select for booking flow (cmd_book).
+
+    Session 5.28: only reachable via stale keyboards from before the 5.28
+    deploy (BB-110 replaced the calendar with the flat date picker for
+    /book and /slots). New clients go through book_date_cb. The act=day
+    branch delegates to _process_selected_date which uses _retry_markup
+    (NEW date picker for /book and /slots, calendar for /transfer) — so
+    stale-keyboard taps upgrade the UX in-place: any retry re-renders the
+    picker instead of re-showing the month grid.
+    """
     await _handle_simple_calendar(
         callback=callback,
         callback_data=callback_data,
@@ -376,6 +548,72 @@ async def simple_calendar_cb(
         selecting_slot_state=BookingStates.selecting_slot,
         is_transfer=False,
     )
+
+
+# ============================================================
+# 2b. book_date_cb — user tapped a date button in the BB-110 picker
+# ============================================================
+@router.callback_query(BookDateCallbackData.filter(), StateFilter(BookingStates.selecting_date))
+async def book_date_cb(
+    callback: CallbackQuery,
+    callback_data: BookDateCallbackData,
+    state: FSMContext,
+) -> None:
+    """Date picker tap → fetch slots for that date (Session 5.28 — BB-110).
+
+    Parses ISO work_date, delegates to _process_selected_date (same body
+    the stale-keyboard simple_calendar_cb act=day uses) — single source of
+    truth for the slot-fetch branches. is_transfer=False (the picker is
+    /book and /slots only; /transfer keeps SimpleCalendar via the
+    transfer_simple_calendar_cb handler).
+
+    Defensive parse: callback_data could be tampered (Telegram allows users
+    to send arbitrary callback_data). date.fromisoformat raises ValueError
+    on invalid input — caught, answer '❌ Неверная дата' and return (FSM
+    state preserved so user can tap another button or cancel).
+    """
+    settings = get_settings()
+    try:
+        slot_date = date.fromisoformat(callback_data.work_date)
+    except ValueError:
+        if callback.message is not None:
+            await callback.message.answer("❌ Неверная дата. Выберите другую:")
+        await callback.answer()
+        return
+    await _process_selected_date(
+        callback,
+        state,
+        settings,
+        selecting_slot_state=BookingStates.selecting_slot,
+        is_transfer=False,
+        slot_date=slot_date,
+    )
+
+
+# ============================================================
+# 2c. book_date_cancel_cb — user tapped '❌ Отмена' in the BB-110 picker
+# ============================================================
+@router.callback_query(F.data == "book_date_cancel", StateFilter(BookingStates.selecting_date))
+async def book_date_cancel_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """Cancel date selection — clears FSM with /book or /slots hint.
+
+    Mirrors the simple_calendar_cb act=cancel W1 logic (read is_slots_path
+    BEFORE state.clear — flag is lost after clear) and applies the same
+    /book vs /slots hint branching. /transfer doesn't reach this handler
+    (uses TransferStates.selecting_date + transfer_simple_calendar_cb +
+    SimpleCalendar's own 'Отмена' button → SimpleCalAct.cancel branch).
+    """
+    fsm_data = await state.get_data()
+    is_slots_path: bool | None = fsm_data.get("is_slots_path")
+    # state.clear() BEFORE callback.answer (race condition, MY-VIBE-RULES.md:23).
+    await state.clear()
+    if callback.message is not None:
+        if is_slots_path:
+            hint = "Ввод отменён. /slots чтобы начать заново"
+        else:
+            hint = "Ввод отменён. /book чтобы начать заново"
+        await callback.message.answer(hint)
+    await callback.answer()
 
 
 # ============================================================

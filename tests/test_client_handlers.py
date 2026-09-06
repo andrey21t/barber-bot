@@ -1413,9 +1413,19 @@ async def test_cmd_book_sets_state_and_shows_date_picker(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """T5a: cmd_book (client.py:75-81) — /book sets FSM to selecting_date + shows
-    date picker keyboard with 7-day window.
+    """T5a (BB-110): cmd_book — /book resolves master, queries bookable dates,
+    sets FSM to selecting_date + is_slots_path=False + shows date_picker_keyboard
+    (replaces SimpleCalendar since Session 5.28).
+
+    Seeded: master + one active WorkDay tomorrow (10:00-18:00) → 1 bookable
+    date expected. Past days excluded by get_bookable_dates range; non-working
+    days excluded by the pre-filter — BB-110 UX-pain fix (PLANS.md:827).
     """
+    tomorrow = (datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=1)).date()
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        await _seed_workday(session, ctx, work_date=tomorrow)
+
     msg = _make_message(user_id=111222333, text="/book")
     state = _make_state()
 
@@ -1424,6 +1434,9 @@ async def test_cmd_book_sets_state_and_shows_date_picker(
     state.set_state.assert_awaited_once()
     assert state.set_state.call_args.args[0] == BookingStates.selecting_date
 
+    update_kwargs = state.update_data.call_args.kwargs
+    assert update_kwargs.get("is_slots_path") is False
+
     msg.answer.assert_awaited_once()
     text = _answer_text(msg)
     assert "Выберите дату" in text
@@ -1431,6 +1444,51 @@ async def test_cmd_book_sets_state_and_shows_date_picker(
     assert isinstance(reply_markup, InlineKeyboardMarkup), (
         "cmd_book must show date picker inline keyboard"
     )
+    # Picker rows: pairs of date buttons (1 here) + last row '❌ Отмена'
+    last_row = reply_markup.inline_keyboard[-1]
+    assert len(last_row) == 1 and "Отмена" in last_row[0].text
+
+
+@pytest.mark.asyncio
+async def test_cmd_book_no_bookable_dates_shows_empty_message_no_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """BB-110 empty state: master exists but no active WorkDay with free slots
+    AND no open legacy slots → message + state NOT entered (no dead-end FSM).
+    """
+    async with session_factory() as session:
+        await _seed_full_stack(session)  # master, no workday, no slots
+
+    msg = _make_message(user_id=111222333, text="/book")
+    state = _make_state()
+
+    await client_handlers.cmd_book(msg, state)
+
+    state.set_state.assert_not_awaited()
+    state.update_data.assert_not_awaited()
+    msg.answer.assert_awaited_once()
+    text = _answer_text(msg)
+    assert "нет свободных дат" in text.lower(), f"expected empty hint, got: {text!r}"
+
+
+@pytest.mark.asyncio
+async def test_cmd_book_master_not_found_shows_error_no_state(
+    patched_session_factory: Any,
+) -> None:
+    """BB-110 defensive: cmd_book with NO master in DB → 'Не удалось найти
+    мастера' + state NOT entered. Mirrors _process_selected_date master-None
+    branch (pre-existing) at the entry path.
+    """
+    # No _seed_full_stack — DB has no master row.
+    msg = _make_message(user_id=111222333, text="/book")
+    state = _make_state()
+
+    await client_handlers.cmd_book(msg, state)
+
+    state.set_state.assert_not_awaited()
+    msg.answer.assert_awaited_once()
+    assert "Не удалось найти мастера" in _answer_text(msg)
 
 
 # ============================================================
@@ -2924,11 +2982,22 @@ async def test_cmd_slots_sets_state_and_shows_date_picker(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """Этап 5.8b: cmd_slots — /slots sets FSM selecting_date + is_slots_path=True.
+    """Этап 5.8b + BB-110: cmd_slots — /slots resolves master, queries
+    bookable WorkDay-only dates (include_legacy_slots=False), sets FSM
+    selecting_date + is_slots_path=True + shows date_picker_keyboard.
 
-    Same calendar picker as /book; the slots-branch flag is read by
-    _handle_simple_calendar to dispatch to WorkDay lookup + 30-min slot picker.
+    is_slots_path=True flag is read by _process_selected_date to dispatch to
+    WorkDay lookup + 30-min slot picker (NOT legacy slot picker, which is /book
+    only). A date opened via /addslots (legacy) must NOT appear under /slots
+    — pre-filter scope is workday-only (mirror cmd_slots post-tap semantics).
+
+    Seeded: master + active WorkDay tomorrow (10:00-18:00).
     """
+    tomorrow = (datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=1)).date()
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        await _seed_workday(session, ctx, work_date=tomorrow)
+
     msg = _make_message(user_id=111222333, text="/slots")
     state = _make_state()
 
@@ -2944,6 +3013,40 @@ async def test_cmd_slots_sets_state_and_shows_date_picker(
     msg.answer.assert_awaited_once()
     assert "Выберите дату" in _answer_text(msg)
     assert isinstance(_answer_reply_markup(msg), InlineKeyboardMarkup)
+
+
+@pytest.mark.asyncio
+async def test_cmd_slots_excludes_legacy_only_dates(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """BB-110 scope invariant: /slots pre-filter excludes dates opened ONLY
+    via /addslots (legacy slots) — include_legacy_slots=False. A date with
+    legacy open slots but NO WorkDay should not appear under /slots (it
+    surfaces under /book instead, where legacy fallback path is preserved).
+
+    Seeded: master + 1 legacy open Slot tomorrow, NO WorkDay.
+    Expect: empty bookable list → 'нет свободных дат' empty state.
+    """
+    tomorrow = (datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=1)).date()
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        # Legacy open slot for tomorrow (slot_hour=14).
+        session.add(Slot(
+            master_id=ctx["master_id"],
+            slot_date=tomorrow,
+            slot_hour=14,
+            status="open",
+        ))
+        await session.commit()
+
+    msg = _make_message(user_id=111222333, text="/slots")
+    state = _make_state()
+
+    await client_handlers.cmd_slots(msg, state)
+
+    state.set_state.assert_not_awaited()  # empty → no FSM entered
+    assert "нет свободных дат" in _answer_text(msg).lower()
 
 
 @pytest.mark.asyncio
