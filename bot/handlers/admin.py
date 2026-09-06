@@ -1433,11 +1433,26 @@ async def admin_window_confirm_cb(
             return
 
     if callback.message is not None:
-        await callback.message.answer(
+        result_text = (
             f"✅ Окно изменено на {work_date.strftime('%d %B %Y')}:\n"
-            f"<b>{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}</b>",
-            reply_markup=admin_inline_menu(),
+            f"<b>{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}</b>"
         )
+        # edit_text заменяет сообщение с кнопкой [✅ Подтвердить] на результат —
+        # кнопка исчезает (FSM cleared, повторный тап = state loss). reply_markup=
+        # admin_inline_menu даёт свежее меню в этом же сообщении.
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(
+                    result_text, reply_markup=admin_inline_menu()
+                )
+            except TelegramBadRequest:
+                await callback.message.answer(
+                    result_text, reply_markup=admin_inline_menu()
+                )
+        else:
+            await callback.message.answer(
+                result_text, reply_markup=admin_inline_menu()
+            )
     await callback.answer()
 
 
@@ -2492,11 +2507,37 @@ async def admin_openweek_confirm_cb(
     sunday = monday + timedelta(days=6)
     week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
 
+    # Автопоказ записей на неделю — мастер сразу видит результат без отдельной
+    # команды /week (UX: не надо листать вверх или вводить /week вручную).
+    async with async_session_factory() as session:
+        bookings = await get_week_bookings(session, master_id, tz, days_ahead=7)
+    bookings_block = ""
+    if bookings:
+        bookings_block = "\n\n" + _render_bookings("📅 Записи на неделю:", bookings, tz)
+
+    # edit_text заменяет последнее сообщение FSM (с кнопкой [✅ Открыть]) на
+    # результат — кнопка исчезает, мастер не может тапнуть её повторно (FSM
+    # уже cleared, повторный тап = "данные сессии потеряны"). reply_markup=
+    # admin_inline_menu даёт свежее меню в этом же сообщении (не надо листать
+    # вверх к старому меню). TelegramBadRequest fallback на answer если
+    # сообщение >48h или удалено.
     if callback.message is not None:
-        await callback.message.answer(
-            f"🗓 <b>Открыть неделю ({week_range})</b>\n\n{summary}",
-            reply_markup=admin_inline_menu(),
+        result_text = (
+            f"🗓 <b>Открыть неделю ({week_range})</b>\n\n{summary}{bookings_block}"
         )
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(
+                    result_text, reply_markup=admin_inline_menu()
+                )
+            except TelegramBadRequest:
+                await callback.message.answer(
+                    result_text, reply_markup=admin_inline_menu()
+                )
+        else:
+            await callback.message.answer(
+                result_text, reply_markup=admin_inline_menu()
+            )
     await callback.answer()
 
 

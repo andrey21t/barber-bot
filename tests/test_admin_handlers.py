@@ -1317,7 +1317,13 @@ def _make_mock_state(data: dict[str, Any] | None = None) -> MagicMock:
 
 
 def callback_answer_text(callback: MagicMock) -> str:
-    """Extract text from callback.message.answer (first positional arg)."""
+    """Extract text from callback.message — supports both edit_text (preferred
+    when handler replaces the inline-keyboard message) and answer (fallback for
+    new message or when edit_text raised TelegramBadRequest).
+    """
+    if callback.message.edit_text.called:
+        args, _ = callback.message.edit_text.call_args
+        return str(args[0])
     args, _ = callback.message.answer.call_args
     return str(args[0])
 
