@@ -71,6 +71,7 @@ from bot.services.admin import (
     create_service,
     get_active_bookings_for_workday,
     get_bookings_for_date,
+    get_bookings_for_date_range,
     get_today_bookings,
     get_week_bookings,
 )
@@ -2568,8 +2569,16 @@ async def admin_openweek_confirm_cb(
 
     # Автопоказ записей на неделю — мастер сразу видит результат без отдельной
     # команды /week (UX: не надо листать вверх или вводить /week вручную).
+    #
+    # Диапазон выборки = выбранная неделя (monday..sunday), НЕ "today + 7 days"
+    # как в get_week_bookings. На Sunday-rule today=06.09 → get_week_bookings
+    # вернёт 06.09..12.09 (включая прошлую неделю), но заголовок обещает
+    # 07.09–13.09 → несоответствие. Используем get_bookings_for_date_range
+    # чтобы записи строго совпадали с заголовком.
     async with async_session_factory() as session:
-        bookings = await get_week_bookings(session, master_id, tz, days_ahead=7)
+        bookings = await get_bookings_for_date_range(
+            session, master_id, tz, monday, sunday
+        )
     bookings_block = ""
     if bookings:
         bookings_block = "\n\n" + _render_bookings("📅 Записи на неделю:", bookings, tz)

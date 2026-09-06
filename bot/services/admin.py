@@ -93,18 +93,42 @@ async def get_bookings_for_date(
     Status filter: ('confirmed', 'transferred') — same as update_workday
     and WorkDayShrinkError semantics (workday.py:150-154).
     """
+    return await get_bookings_for_date_range(
+        session, master_id, business_timezone, target_day, target_day
+    )
+
+
+async def get_bookings_for_date_range(
+    session: AsyncSession,
+    master_id: UUID,
+    business_timezone: str,
+    start_day: date,
+    end_day: date,
+) -> list[Booking]:
+    """Active bookings (confirmed/transferred) in LOCAL date range [start_day, end_day].
+
+    Used by /openweek to show bookings only for the OPENED week (Monday..Sunday),
+    not "today + 7 days" — get_week_bookings uses rolling window from today,
+    which includes past-week bookings on Sunday (today=06.09 → returns 06.09..12.09,
+    but /openweek header promises 07.09–13.09).
+
+    Window: [start_of_start_day_local_utc, start_of_(end_day+1)_local_utc) —
+    half-open. Identical semantics to get_bookings_for_date but for range.
+
+    Status filter: ('confirmed', 'transferred') — same as get_bookings_for_date.
+    """
     tz = ZoneInfo(business_timezone)
-    start_of_day_utc = datetime.combine(target_day, time(0, 0), tzinfo=tz).astimezone(UTC)
-    start_of_next_day_utc = datetime.combine(
-        target_day + timedelta(days=1), time(0, 0), tzinfo=tz
+    start_utc = datetime.combine(start_day, time(0, 0), tzinfo=tz).astimezone(UTC)
+    end_utc = datetime.combine(
+        end_day + timedelta(days=1), time(0, 0), tzinfo=tz
     ).astimezone(UTC)
 
     stmt = (
         select(Booking)
         .where(
             Booking.master_id == master_id,
-            Booking.start_at >= start_of_day_utc,
-            Booking.start_at < start_of_next_day_utc,
+            Booking.start_at >= start_utc,
+            Booking.start_at < end_utc,
             Booking.status.in_(("confirmed", "transferred")),
         )
         .order_by(Booking.start_at)

@@ -2759,6 +2759,62 @@ async def test_admin_openweek_confirm_cb_partial_failure_shrinks_lines(
 
 
 @pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)  # Sunday UTC 14:00 → Moscow 17:00
+async def test_admin_openweek_confirm_cb_ignores_past_week_bookings(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Past-week booking must NOT appear in /openweek "📅 Записи на неделю:" block.
+
+    Regression: get_week_bookings(days_ahead=7) on Sunday returns 06.09..12.09
+    (today + 6 days) → includes past-week booking 06.09 19:00 — but /openweek
+    header promises 07.09–13.09 (next week). Mismatch confused master.
+
+    Fix: /openweek uses get_bookings_for_date_range(monday, sunday) — strict
+    range match to header. Booking on 06.09 (last week) must NOT appear.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        # Booking on 06.09 (Sunday, today in freeze) at 19:00 Moscow — past week
+        booking_local = datetime(2026, 9, 6, 19, 0, tzinfo=ZoneInfo(TZ))
+        slot = await _seed_slot(
+            session,
+            master_id=ctx["master_id"],
+            slot_date=booking_local.date(),
+            hour=19,
+            status="open",
+        )
+        await _seed_booking(
+            session,
+            ctx=ctx,
+            slot=slot,
+            start_at_utc_naive=_local_to_utc_naive(booking_local),
+            status="confirmed",
+        )
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_openweek_confirm"
+    state = _make_mock_state(
+        {
+            "picked_start_minute": 600,   # 10:00
+            "picked_end_minute": 1200,    # 20:00
+            "selected_weekdays": [0, 1, 3, 5],  # Mon, Tue, Thu, Sat (next week)
+            "business_tz": TZ,
+        }
+    )
+
+    await admin_handlers.admin_openweek_confirm_cb(callback, state)
+
+    text = callback_answer_text(callback)
+    # Header must show next week (07.09–13.09)
+    assert "07.09 – 13.09" in text, f"Header should be next week; got: {text!r}"
+    # Past-week booking (06.09) must NOT leak into "Записи на неделю" block
+    assert "06 сен" not in text, (
+        f"Past-week booking 06.09 must NOT appear in next-week block; got: {text!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_admin_openweek_cancel_cb_clears_state(
     session_factory: Any,
     patched_session_factory: Any,
