@@ -2319,17 +2319,26 @@ async def admin_openweek_start_cb(
 
     sentinel = _UUID(int=0)
     if callback.message is not None:
-        await callback.message.answer(
+        step2_text = (
             f"Шаг 2: выберите время окончания окна:\n\n"
-            f"{_openweek_week_header(business_tz)}",
-            reply_markup=admin_window_slot_picker_keyboard(
-                workday_id=sentinel,
-                mode="end",
-                business_tz=business_tz,
-                picked_start_minute=picked_start_minute,
-                booked_slots=None,
-            ),
+            f"{_openweek_week_header(business_tz)}"
         )
+        step2_kb = admin_window_slot_picker_keyboard(
+            workday_id=sentinel,
+            mode="end",
+            business_tz=business_tz,
+            picked_start_minute=picked_start_minute,
+            booked_slots=None,
+        )
+        # edit_text заменяет picker Шага 1 на picker Шага 2 в том же сообщении —
+        # старая клавиатура исчезает, нельзя тапнуть две таблицы одновременно.
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(step2_text, reply_markup=step2_kb)
+            except TelegramBadRequest:
+                await callback.message.answer(step2_text, reply_markup=step2_kb)
+        else:
+            await callback.message.answer(step2_text, reply_markup=step2_kb)
     await callback.answer()
 
 
@@ -2372,17 +2381,30 @@ async def admin_openweek_end_cb(
     start_time = dt_time(int(picked_start_minute) // 60, int(picked_start_minute) % 60)
     end_time = dt_time(picked_end_minute // 60, picked_end_minute % 60)
 
-    # Показываем числа этой недели в header Шага 3 — мастер сразу видит какие
-    # даты проставляет (особенно важно в Сб/Вс когда открывает следующую неделю).
+    # Шаг 3 — только диапазон недели (week_range), без перечисления дней.
+    # Пользователю(msg follow-up) перечисление «Пн 07.09 · Вт 08.09 · ...»
+    # кажется лишним: окно + диапазон недели уже дают контекст.
     business_tz = data.get("business_tz") or _tz
+    monday = _current_week_monday(business_tz)
+    sunday = monday + timedelta(days=6)
+    week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
 
     if callback.message is not None:
-        await callback.message.answer(
+        step3_text = (
             f"Шаг 3: выберите дни недели (тап → ✅).\n\n"
             f"Окно: <b>{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}</b>\n"
-            f"{_openweek_week_header(business_tz)}",
-            reply_markup=admin_week_days_keyboard(set()),
+            f"Неделя <b>{week_range}</b>"
         )
+        step3_kb = admin_week_days_keyboard(set())
+        # edit_text заменяет picker Шага 2 на days keyboard в том же сообщении —
+        # старая клавиатура исчезает, нельзя тапнуть две таблицы одновременно.
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(step3_text, reply_markup=step3_kb)
+            except TelegramBadRequest:
+                await callback.message.answer(step3_text, reply_markup=step3_kb)
+        else:
+            await callback.message.answer(step3_text, reply_markup=step3_kb)
     await callback.answer()
 
 

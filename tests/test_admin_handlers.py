@@ -2361,10 +2361,15 @@ async def test_admin_openweek_start_cb_saves_start_and_shows_end_picker(
     state.set_state.assert_called_once_with(AdminStates.opening_week_end)
     data = _state_data_passed(state)
     assert data["picked_start_minute"] == 600
-    args, kwargs = callback.message.answer.call_args
-    text = args[0] if args else kwargs.get("text", "")
+    # edit_text (preferred) or answer fallback — callback_answer_text handles both.
+    text = callback_answer_text(callback)
     assert "Шаг 2" in text
-    reply_markup = kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
+    # reply_markup is on edit_text (preferred) or answer (fallback).
+    if callback.message.edit_text.called:
+        _, kwargs = callback.message.edit_text.call_args
+    else:
+        _, kwargs = callback.message.answer.call_args
+    reply_markup = kwargs.get("reply_markup")
     assert reply_markup is not None, "Expected end picker reply_markup"
 
 
@@ -2396,10 +2401,15 @@ async def test_admin_openweek_end_cb_saves_end_and_shows_days(
     data = _state_all_updates(state)
     assert data["picked_end_minute"] == 1080
     assert data["selected_weekdays"] == []
-    args, kwargs = callback.message.answer.call_args
-    text = args[0] if args else kwargs.get("text", "")
+    # edit_text (preferred) or answer fallback — callback_answer_text handles both.
+    text = callback_answer_text(callback)
     assert "Шаг 3" in text
-    reply_markup = kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
+    # reply_markup is on edit_text (preferred) or answer (fallback).
+    if callback.message.edit_text.called:
+        _, kwargs = callback.message.edit_text.call_args
+    else:
+        _, kwargs = callback.message.answer.call_args
+    reply_markup = kwargs.get("reply_markup")
     assert reply_markup is not None, "Expected days keyboard reply_markup"
 
 
