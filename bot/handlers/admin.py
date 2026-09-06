@@ -2380,11 +2380,12 @@ async def admin_openweek_confirm_cb(
     for weekday in sorted(selected):
         work_date = monday + timedelta(days=weekday)
         day_label = _WEEKDAY_LABELS_HANDLER[weekday]
+        date_label = work_date.strftime("%d.%m")
         # Skip past days — mirror /addslots past-date guard (admin.py:291).
         # On weekend (Sat/Sun) the current week's Mon-Fri are already past;
         # user running /openweek on weekend wants upcoming days, not past.
         if work_date < today_local:
-            fail_lines.append(f"❌ {day_label}: прошедшая дата")
+            fail_lines.append(f"❌ {day_label} {date_label}: прошедшая дата")
             continue
         try:
             async with async_session_factory() as session:
@@ -2392,21 +2393,27 @@ async def admin_openweek_confirm_cb(
                     session, master_id, work_date, start_time, end_time, business_tz=tz
                 )
             success_lines.append(
-                f"✅ {day_label} {start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}"
+                f"✅ {day_label} {date_label} "
+                f"{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}"
             )
         except WorkDayShrinkError:
-            fail_lines.append(f"❌ {day_label}: нельзя сузить, есть бронь")
+            fail_lines.append(f"❌ {day_label} {date_label}: нельзя сузить, есть бронь")
         except ValueError:
-            fail_lines.append(f"❌ {day_label}: ошибка данных")
+            fail_lines.append(f"❌ {day_label} {date_label}: ошибка данных")
         except SQLAlchemyError:
-            fail_lines.append(f"❌ {day_label}: ошибка БД")
+            fail_lines.append(f"❌ {day_label} {date_label}: ошибка БД")
 
     summary_lines = success_lines + fail_lines
     summary = "\n".join(summary_lines) if summary_lines else "Ничего не открыто."
 
+    # Диапазон недели в заголовке: Пн ... Вс. Помогает понять какую неделю открыли
+    # (особенно при Sunday-rule — следующая, не текущая).
+    sunday = monday + timedelta(days=6)
+    week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
+
     if callback.message is not None:
         await callback.message.answer(
-            f"🗓 <b>Открыть неделю</b>\n\n{summary}",
+            f"🗓 <b>Открыть неделю ({week_range})</b>\n\n{summary}",
             reply_markup=admin_inline_menu(),
         )
     await callback.answer()
