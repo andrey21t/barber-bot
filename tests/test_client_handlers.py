@@ -4470,3 +4470,31 @@ async def test_post_booking_again_button_starts_book_flow(
 
     # callback.answer() called to clear the spinner
     cb.answer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_client_mybookings_cb_from_user_none_early_return() -> None:
+    """Session 6 — Task 1 follow-up (code-review W2): callback.from_user is None
+    (rare Telegram edge — channel-post callbacks, anonymous admins) →
+    early return + callback.answer() without calling _render_mybookings.
+
+    Mirrors the pattern of test_mybookings_transfer_cb_unknown_user (line 2787)
+    and test_transfer_slot_cb_from_user_none_early_return (line 2842) — both
+    guard the same `callback.from_user is None` branch in their respective
+    handlers. Without this test, a future refactor could accidentally drop
+    the callback.answer() call (Telegram spinner would hang forever).
+    """
+    from bot.keyboards.client import ClientMenuMyBookingsCallbackData
+
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = None  # edge case under test
+    cb.message = _make_message(user_id=111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    callback_data = ClientMenuMyBookingsCallbackData()
+
+    await client_handlers.client_mybookings_cb(cb, callback_data)
+
+    # Early return: callback.answer called once (clear spinner), message.answer
+    # NEVER awaited (would crash on None user_id resolution inside _render_mybookings).
+    cb.answer.assert_awaited_once()
+    cb.message.answer.assert_not_awaited()

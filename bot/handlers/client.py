@@ -1394,8 +1394,13 @@ async def client_mybookings_cb(
     StateFilter(None): the post-booking keyboard is shown after confirm_cb
     succeeded and state.clear() ran, so the client is in State(None) when
     they tap. If they re-enter FSM via /book and a stale post-booking button
-    is tapped mid-flow, aiogram dispatch falls through to
-    no_state_callback_fallback (the catch-all at the bottom of this router).
+    is tapped mid-flow, NEITHER this handler NOR no_state_callback_fallback
+    matches (both use StateFilter(None) — the catch-all at the bottom of
+    this router is also State(None)-scoped). The callback silently drops
+    (aiogram logs "callback query not answered"); consistent with all other
+    StateFilter(None) callback handlers (mybookings_cancel_cb,
+    mybookings_transfer_cb). To avoid the silent drop, the client would
+    need to /cancel first to reach State(None) — same UX as before Task 1.
 
     `callback_data` is required by aiogram dispatch (CallbackData.filter()
     injects the unpacked payload) — the dataclass itself carries no fields,
