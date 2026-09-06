@@ -2233,7 +2233,8 @@ async def cmd_openweek(message: Message, state: FSMContext) -> None:
 
     sentinel = _UUID(int=0)
     await message.answer(
-        "🗓 <b>Открыть неделю</b>\n\n"
+        f"🗓 <b>Открыть неделю</b>\n\n"
+        f"{_openweek_week_header(tz)}\n\n"
         "Шаг 1: выберите время начала окна (общее для всех выбранных дней):",
         reply_markup=admin_window_slot_picker_keyboard(
             workday_id=sentinel,
@@ -2272,13 +2273,15 @@ async def admin_openweek_entry_cb(callback: CallbackQuery, state: FSMContext) ->
     if isinstance(callback.message, Message):
         try:
             await callback.message.edit_text(
-                "🗓 <b>Открыть неделю</b>\n\n"
+                f"🗓 <b>Открыть неделю</b>\n\n"
+                f"{_openweek_week_header(tz)}\n\n"
                 "Шаг 1: выберите время начала окна (общее для всех выбранных дней):",
                 reply_markup=picker_kb,
             )
         except TelegramBadRequest:
             await callback.message.answer(
-                "🗓 <b>Открыть неделю</b>\n\n"
+                f"🗓 <b>Открыть неделю</b>\n\n"
+                f"{_openweek_week_header(tz)}\n\n"
                 "Шаг 1: выберите время начала окна (общее для всех выбранных дней):",
                 reply_markup=picker_kb,
             )
@@ -2317,7 +2320,8 @@ async def admin_openweek_start_cb(
     sentinel = _UUID(int=0)
     if callback.message is not None:
         await callback.message.answer(
-            "Шаг 2: выберите время окончания окна:",
+            f"Шаг 2: выберите время окончания окна:\n\n"
+            f"{_openweek_week_header(business_tz)}",
             reply_markup=admin_window_slot_picker_keyboard(
                 workday_id=sentinel,
                 mode="end",
@@ -2371,19 +2375,12 @@ async def admin_openweek_end_cb(
     # Показываем числа этой недели в header Шага 3 — мастер сразу видит какие
     # даты проставляет (особенно важно в Сб/Вс когда открывает следующую неделю).
     business_tz = data.get("business_tz") or _tz
-    monday = _current_week_monday(business_tz)
-    dates_line = " · ".join(
-        f"{_WEEKDAY_LABELS_HANDLER[i]} {(monday + timedelta(days=i)).strftime('%d.%m')}"
-        for i in range(7)
-    )
-    sunday = monday + timedelta(days=6)
-    week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
 
     if callback.message is not None:
         await callback.message.answer(
             f"Шаг 3: выберите дни недели (тап → ✅).\n\n"
             f"Окно: <b>{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}</b>\n"
-            f"Неделя <b>{week_range}</b>:\n{dates_line}",
+            f"{_openweek_week_header(business_tz)}",
             reply_markup=admin_week_days_keyboard(set()),
         )
     await callback.answer()
@@ -3022,6 +3019,23 @@ def _current_week_monday(tz: str) -> date:
     if today_local.weekday() == 6:  # Вс → следующая неделя
         monday += timedelta(days=7)
     return monday
+
+
+def _openweek_week_header(tz: str) -> str:
+    """Render week line for /openweek headers: 'Неделя 07.09 – 13.09:
+    Пн 07.09 · Вт 08.09 · ... · Вс 13.09'.
+
+    Used in Шаг 1 (cmd_openweek + entry_cb), Шаг 2 (start_cb), Шаг 3 (end_cb).
+    Single source of truth — avoids divergence between 3 callsites.
+    """
+    monday = _current_week_monday(tz)
+    sunday = monday + timedelta(days=6)
+    week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
+    dates_line = " · ".join(
+        f"{_WEEKDAY_LABELS_HANDLER[i]} {(monday + timedelta(days=i)).strftime('%d.%m')}"
+        for i in range(7)
+    )
+    return f"Неделя <b>{week_range}</b>:\n{dates_line}"
 
 
 
