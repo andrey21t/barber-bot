@@ -4264,3 +4264,209 @@ async def test_confirm_cb_workday_path_with_stale_service_id_after_text_input(
         "fix, this would be the stale UUID — wrong end_at duration."
     )
     state.clear.assert_awaited_once()
+
+
+# ============================================================
+# Post-booking keyboard (Session 6 — Task 1, 2026-09-06)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_book_confirm_renders_post_booking_keyboard(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session 6 — Task 1: confirm_cb success attaches post_booking_keyboard
+    to the "✅ Вы записаны" message (regression guard for the UX fix that
+    stopped clients from dead-ending after a successful booking).
+
+    Before this fix confirm_cb sent bare text with no inline buttons → clients
+    didn't know how to view their bookings or start another one (handoff
+    NEXT_SESSION_PROMPT.md Task 1, root cause). This test pins the contract:
+    every successful confirm_cb answer MUST carry an InlineKeyboardMarkup
+    with both [📋 Мои записи] and [💇 Ещё запись] buttons.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = Slot(
+            master_id=ctx["master_id"],
+            slot_date=target_date,
+            slot_hour=14,
+            status="open",
+        )
+        session.add(slot)
+        await session.commit()
+        slot_id = slot.id
+
+    fake_result = MagicMock()
+    fake_result.booking_id = UUID("00000000-0000-0000-0000-0000000000aa")
+    fake_result.start_at = datetime.now(UTC) + timedelta(days=1)
+    fake_result.master_notification_text = "Новая запись"
+
+    async def _fake_create(*args: Any, **kwargs: Any) -> Any:
+        return fake_result
+
+    monkeypatch.setattr(client_handlers, "create_booking", _fake_create)
+    monkeypatch.setattr(client_handlers, "schedule_for_booking", MagicMock())
+
+    cb, callback_data = _make_confirm_callback()
+    state = _make_state()
+    await state.update_data(
+        slot_id=str(slot_id),
+        client_name="Паша",
+        service_title="Стрижка",
+    )
+    scheduler = MagicMock(spec=AsyncIOScheduler)
+
+    await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
+
+    # success message + reply_markup both present
+    text = _answer_text(cb.message)
+    assert "Вы записаны" in text
+    reply_markup = _answer_reply_markup(cb.message)
+    assert isinstance(reply_markup, InlineKeyboardMarkup), (
+        "confirm_cb success MUST attach post_booking_keyboard so client can "
+        "tap [📋 Мои записи] or [💇 Ещё запись] (Session 6 — Task 1 UX fix)."
+    )
+
+    # Exactly 2 buttons in post_booking_keyboard: [📋 Мои записи] + [💇 Ещё запись]
+    flat = [btn for row in reply_markup.inline_keyboard for btn in row]
+    assert len(flat) == 2, "post_booking_keyboard has exactly 2 buttons"
+    texts = [btn.text for btn in flat]
+    assert "📋 Мои записи" in texts
+    assert "💇 Ещё запись" in texts
+
+    # callback_data packs correct CallbackData classes (router dispatch relies on it)
+    from bot.keyboards.client import (
+        ClientMenuBookCallbackData,
+        ClientMenuMyBookingsCallbackData,
+    )
+
+    mybookings_btn = next(btn for btn in flat if "Мои записи" in btn.text)
+    again_btn = next(btn for btn in flat if "Ещё запись" in btn.text)
+    assert mybookings_btn.callback_data is not None
+    assert again_btn.callback_data is not None
+    # unpack must not raise — proves the packed payload matches the declared prefix
+    ClientMenuMyBookingsCallbackData.unpack(mybookings_btn.callback_data)
+    ClientMenuBookCallbackData.unpack(again_btn.callback_data)
+
+
+@pytest.mark.asyncio
+async def test_post_booking_mybookings_button_starts_mybookings_flow(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Session 6 — Task 1: tapping [📋 Мои записи] on the post-booking keyboard
+    routes to client_mybookings_cb → _render_mybookings → renders the same
+    list as /mybookings (single source of truth via shared helper).
+
+    Seeds a cancelable booking (3 days ahead) so the rendered list contains
+    "📋 Ваши записи:" plus the [❌ Отменить] inline button. Asserts the rendered
+    text matches what /mybookings produces (no drift between command and
+    inline-button paths).
+    """
+    from bot.keyboards.client import ClientMenuMyBookingsCallbackData
+
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        future_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=3)
+        future_local = future_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=future_local)
+
+    # Mock CallbackQuery for client_mybookings_cb (ClientMenuMyBookingsCallbackData)
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(user_id=111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    callback_data = ClientMenuMyBookingsCallbackData()
+
+    await client_handlers.client_mybookings_cb(cb, callback_data)
+
+    # _render_mybookings answered with the bookings list on callback.message
+    cb.message.answer.assert_awaited_once()
+    text = _answer_text(cb.message)
+    assert "📋 Ваши записи:" in text, (
+        "client_mybookings_cb must render the same list header as /mybookings"
+    )
+    assert "Стрижка" in text  # service_title_snapshot from _seed_booking
+
+    # Cancelable booking → mybookings_keyboard attached with [Отменить] button
+    reply_markup = _answer_reply_markup(cb.message)
+    assert isinstance(reply_markup, InlineKeyboardMarkup), (
+        "cancelable booking must produce inline [Отменить] buttons (parity with /mybookings)"
+    )
+    buttons = [btn for row in reply_markup.inline_keyboard for btn in row]
+    assert any("Отменить" in btn.text for btn in buttons)
+
+    # callback.answer() called to clear the Telegram loading spinner
+    cb.answer.assert_awaited_once()
+
+    # Sanity: the booking shown is the one we seeded (booking_id round-trips
+    # via MyBookingsCancelCallbackData on the [Отменить] button).
+    cancel_btn = next(btn for btn in buttons if "Отменить" in btn.text)
+    assert cancel_btn.callback_data is not None
+    cancel_cb_data = MyBookingsCancelCallbackData.unpack(cancel_btn.callback_data)
+    assert cancel_cb_data.booking_id == booking.id
+
+
+@pytest.mark.asyncio
+async def test_post_booking_again_button_starts_book_flow(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Session 6 — Task 1: tapping [💇 Ещё запись] on the post-booking keyboard
+    routes to client_book_cb (existing ClientMenuBookCallbackData handler) →
+    sets BookingStates.selecting_date + shows date picker.
+
+    Confirms the post-booking keyboard reuses the SAME callback_data prefix
+    as the /start menu [💇 Записаться] button — single handler, two entry
+    points (start menu + post-booking). No new handler needed for [Ещё запись].
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        # Open a workday 3 days ahead so get_bookable_dates returns it (within
+        # MAX_BOOKING_DAYS_AHEAD window, active, has free 30-min slots).
+        work_date = (datetime.now(UTC) + timedelta(days=3)).date()
+        await _seed_workday(
+            session,
+            ctx=ctx,
+            work_date=work_date,
+            start_time=time(10, 0),
+            end_time=time(18, 0),
+        )
+
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(user_id=111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = AsyncMock()
+    state = _make_state()
+
+    # client_book_cb signature is (callback, state) — no callback_data arg
+    # (ClientMenuBookCallbackData carries no payload, aiogram doesn't inject it).
+    await client_handlers.client_book_cb(cb, state)
+
+    # Same effect as /book: entering selecting_date + date picker shown
+    state.set_state.assert_awaited_once()
+    set_state_args = state.set_state.call_args.args
+    assert set_state_args[0] == BookingStates.selecting_date, (
+        "client_book_cb (entered from [Ещё запись]) must set selecting_date state"
+    )
+
+    # is_slots_path=False (mirrors cmd_book / client_book_cb contract)
+    update_data_kwargs = state.update_data.call_args.kwargs
+    assert update_data_kwargs.get("is_slots_path") is False
+
+    # Date picker shown (message.answer with reply_markup=InlineKeyboardMarkup)
+    cb.message.answer.assert_awaited_once()
+    text = _answer_text(cb.message)
+    assert "Выберите дату" in text
+    reply_markup = _answer_reply_markup(cb.message)
+    assert isinstance(reply_markup, InlineKeyboardMarkup), (
+        "date picker must be an inline keyboard (date_picker_keyboard)"
+    )
+
+    # callback.answer() called to clear the spinner
+    cb.answer.assert_awaited_once()
