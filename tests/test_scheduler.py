@@ -509,3 +509,68 @@ async def test_on_startup_scan_phase_2_reschedules_upcoming(
         assert f"remind_24h_{booking.id}" in {j.id for j in jobs}
 
         scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_schedule_for_booking_skips_past_due_remind_24h(
+    scheduler: AsyncIOScheduler,
+) -> None:
+    """Past-due skip (BB-PAST-DUE): client books 7h before start → remind_24h_at
+    is 17h in the past (past > grace=1h) → skip silently. remind_1h_at is 6h in
+    the future → add normally. Reproduces the Оля case (booked 7.5h before).
+    """
+    _start_scheduler(scheduler)
+
+    booking_id = uuid4()
+    start_at = datetime.now(UTC) + timedelta(hours=7)
+
+    schedule_for_booking(scheduler, booking_id, start_at)
+
+    assert scheduler.get_job(f"remind_24h_{booking_id}") is None
+    assert scheduler.get_job(f"remind_1h_{booking_id}") is not None
+
+    scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_schedule_for_booking_within_grace_keeps_past_due_remind_1h(
+    scheduler: AsyncIOScheduler,
+) -> None:
+    """Borderline grace: client books 30m before start → remind_1h_at is 30m in
+    the past. 30m < grace (1h=3600s) → APScheduler fires immediately on add →
+    keep the job. remind_24h_at is 23h30m in the past (>> grace) → skip.
+    Verifies that the skip threshold matches APScheduler misfire logic (strict
+    `past > grace`), not `past >= grace`.
+    """
+    _start_scheduler(scheduler)
+
+    booking_id = uuid4()
+    start_at = datetime.now(UTC) + timedelta(minutes=30)
+
+    schedule_for_booking(scheduler, booking_id, start_at)
+
+    assert scheduler.get_job(f"remind_24h_{booking_id}") is None
+    assert scheduler.get_job(f"remind_1h_{booking_id}") is not None
+
+    scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_schedule_for_booking_keeps_both_when_far_future(
+    scheduler: AsyncIOScheduler,
+) -> None:
+    """Regression guard: past-due skip must not affect normal future bookings.
+    start_at = now + 25h → both remind_24h (now + 1h) and remind_1h (now + 24h)
+    are in the future → both added.
+    """
+    _start_scheduler(scheduler)
+
+    booking_id = uuid4()
+    start_at = datetime.now(UTC) + timedelta(hours=25)
+
+    schedule_for_booking(scheduler, booking_id, start_at)
+
+    assert scheduler.get_job(f"remind_24h_{booking_id}") is not None
+    assert scheduler.get_job(f"remind_1h_{booking_id}") is not None
+
+    scheduler.shutdown(wait=False)

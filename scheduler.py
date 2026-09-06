@@ -231,32 +231,62 @@ def schedule_for_booking(
     """Schedule remind_24h + remind_1h for a booking.
 
     replace_existing=True — idempotent, safe to call multiple times.
-    If start_at - 24h is in the past, APScheduler's misfire_grace_time handles it
-    (job fires immediately if within grace window, otherwise dropped — on_startup_scan catches).
+
+    Past-due skip (BB-PAST-DUE): if remind_X_at is past beyond misfire_grace_time,
+    skip add_job silently — APScheduler would drop it with WARNING anyway
+    (log "Run time of job ... was missed by HH:MM:SS"). Within grace window
+    (past <= grace) APScheduler fires the job immediately — that's expected.
+    Threshold matches APScheduler 3.x misfire logic (fire iff now - run_time
+    <= grace; drop iff now - run_time > grace).
+    SQLite stores naive datetime → mark UTC explicitly for TZ-safe comparison
+    with now(UTC). Postgres returns aware timestamptz → no-op replace.
     """
     settings = get_settings()
-    remind_24h_at = start_at - timedelta(hours=settings.REMINDER_24H_BEFORE)
-    remind_1h_at = start_at - timedelta(hours=settings.REMINDER_1H_BEFORE)
+    now_utc = datetime.now(UTC)
+    grace = timedelta(seconds=settings.MISFIRE_GRACE_TIME)
+    cutoff = now_utc - grace
+    start_at_aware = start_at.replace(tzinfo=UTC) if start_at.tzinfo is None else start_at
+    remind_24h_at = start_at_aware - timedelta(hours=settings.REMINDER_24H_BEFORE)
+    remind_1h_at = start_at_aware - timedelta(hours=settings.REMINDER_1H_BEFORE)
 
     job_id_24h = f"remind_24h_{booking_id}"
     job_id_1h = f"remind_1h_{booking_id}"
 
-    scheduler.add_job(
-        send_reminder,
-        trigger="date",
-        run_date=remind_24h_at,
-        args=[booking_id, "remind_24h"],
-        id=job_id_24h,
-        replace_existing=True,
-    )
-    scheduler.add_job(
-        send_reminder,
-        trigger="date",
-        run_date=remind_1h_at,
-        args=[booking_id, "remind_1h"],
-        id=job_id_1h,
-        replace_existing=True,
-    )
+    if remind_24h_at >= cutoff:
+        scheduler.add_job(
+            send_reminder,
+            trigger="date",
+            run_date=remind_24h_at,
+            args=[booking_id, "remind_24h"],
+            id=job_id_24h,
+            replace_existing=True,
+        )
+    else:
+        logger.info(
+            "schedule_for_booking: skip remind_24h (past-due, booking=%s, "
+            "remind_at=%s, cutoff=%s)",
+            booking_id,
+            remind_24h_at,
+            cutoff,
+        )
+
+    if remind_1h_at >= cutoff:
+        scheduler.add_job(
+            send_reminder,
+            trigger="date",
+            run_date=remind_1h_at,
+            args=[booking_id, "remind_1h"],
+            id=job_id_1h,
+            replace_existing=True,
+        )
+    else:
+        logger.info(
+            "schedule_for_booking: skip remind_1h (past-due, booking=%s, "
+            "remind_at=%s, cutoff=%s)",
+            booking_id,
+            remind_1h_at,
+            cutoff,
+        )
 
 
 def remove_jobs_for_booking(scheduler: AsyncIOScheduler, booking_id: UUID) -> None:
