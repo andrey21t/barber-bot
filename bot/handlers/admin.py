@@ -2921,7 +2921,22 @@ async def admin_closeday_confirm_cb(
                 f"Отменено записей: {cancelled_count}. "
                 f"Клиентов уведомлено: {notified_count}."
             )
-        await callback.message.answer(summary, reply_markup=admin_inline_menu())
+        # edit_text заменяет сообщение с кнопкой [✅ Закрыть] на результат —
+        # кнопка исчезает (FSM cleared, повторный тап = state loss). reply_markup=
+        # admin_inline_menu даёт свежее меню в этом же сообщении (UX: не листать вверх).
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(
+                    summary, reply_markup=admin_inline_menu()
+                )
+            except TelegramBadRequest:
+                await callback.message.answer(
+                    summary, reply_markup=admin_inline_menu()
+                )
+        else:
+            await callback.message.answer(
+                summary, reply_markup=admin_inline_menu()
+            )
     await callback.answer()
 
 
