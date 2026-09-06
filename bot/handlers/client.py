@@ -49,6 +49,7 @@ from bot.keyboards.client import (
     BookSlot30CallbackData,
     BookSlotCallbackData,
     ClientMenuBookCallbackData,
+    ClientMenuMyBookingsCallbackData,
     MyBookingsCancelCallbackData,
     MyBookingsTransferCallbackData,
     _format_booking_summary_from_start_at,
@@ -56,6 +57,7 @@ from bot.keyboards.client import (
     confirm_keyboard,
     date_picker_keyboard,
     mybookings_keyboard,
+    post_booking_keyboard,
     service_picker_keyboard,
     slot_picker_keyboard,
     slot_picker_keyboard_30min,
@@ -1215,7 +1217,18 @@ async def confirm_cb(
     # state.clear() BEFORE answer (race condition, MY-VIBE-RULES.md 24)
     await state.clear()
     if callback.message is not None:
-        await callback.message.answer("✅ Вы записаны. Напомню за 24ч и за 1ч.")
+        # Session 6 — Task 1: attach post-booking inline keyboard so the
+        # client isn't left in a dead-end after "✅ Вы записаны". Two buttons:
+        # [📋 Мои записи] (ClientMenuMyBookingsCallbackData → re-renders the
+        # /mybookings list via _render_mybookings) and [💇 Ещё запись]
+        # (ClientMenuBookCallbackData → starts a new /book flow). Both
+        # handlers require StateFilter(None) — confirm_cb just cleared state,
+        # so both callbacks are reachable. See post_booking_keyboard docstring
+        # for the "no has_bookings flag" rationale (we just booked → non-empty).
+        await callback.message.answer(
+            "✅ Вы записаны. Напомню за 24ч и за 1ч.",
+            reply_markup=post_booking_keyboard(),
+        )
     await callback.answer()
 
 
@@ -1248,17 +1261,30 @@ async def cancel_msg(message: Message, state: FSMContext) -> None:
 # ============================================================
 # 8. mybookings_msg — /mybookings (StateFilter(None)) — list client bookings
 # ============================================================
-@router.message(Command("mybookings"), StateFilter(None))
-async def mybookings_msg(message: Message) -> None:
-    """List confirmed/transferred upcoming bookings for the current user.
+# 8a. _render_mybookings — shared renderer (Session 6 — Task 1, 2026-09-06)
+# ============================================================
+async def _render_mybookings(message: Message, user_id: int) -> None:
+    """Render the user's upcoming bookings list + inline [Отменить]/[Перенести]
+    buttons for cancelable bookings (start_at - CANCEL_MIN_HOURS > now).
 
-    Spec.md 41: `/mybookings` → отмена (>24ч) или перенос (>24ч).
-    This handler renders the list AND shows inline [Отменить] buttons for
-    bookings that are still within the cancellation window (start_at - 24h > now).
-    Cancellation itself is performed by mybookings_cancel_cb (next handler).
+    Extracted from mybookings_msg (Session 6 — Task 1) so the new
+    client_mybookings_cb handler (post-booking [📋 Мои записи] tap) can re-use
+    the exact same rendering path as /mybookings — single source of truth,
+    no drift between "list from command" and "list from inline button".
 
-    Resolution: client by telegram_id (booking.py pattern, _select_or_create_client).
-    Filter: upcoming (start_at > now UTC), status IN (confirmed, transferred).
+    Args:
+        message: the aiogram Message to answer on. For /mybookings this is
+            the user's /mybookings text message; for client_mybookings_cb
+            this is the callback.message the inline button was attached to.
+            Both expose .answer(text, reply_markup=...) — same API.
+        user_id: telegram user id to resolve the Client row. Caller passes
+            message.from_user.id (command handler) OR callback.from_user.id
+            (callback handler) — NOT message.from_user.id, because in a
+            callback context message.from_user is the BOT, not the user who
+            tapped (would yield None / wrong user → no bookings shown).
+
+    Empty cases (no Client row, no bookings) answer a hint with /book —
+    consistent with pre-extract behavior (test_mybookings_msg_no_*).
     """
     from zoneinfo import ZoneInfo
 
@@ -1267,10 +1293,6 @@ async def mybookings_msg(message: Message) -> None:
     from bot.config import get_settings
     from bot.models import Business, Client
     from bot.services.admin import get_client_bookings
-
-    if message.from_user is None:
-        return
-    user_id = message.from_user.id
 
     settings = get_settings()
     async with async_session_factory() as session:
@@ -1333,6 +1355,69 @@ async def mybookings_msg(message: Message) -> None:
     else:
         lines.append("Отменить запись нельзя — все записи менее чем через 24ч.")
         await message.answer("\n".join(lines))
+
+
+# ============================================================
+# 8b. mybookings_msg — /mybookings command (delegates to _render_mybookings)
+# ============================================================
+@router.message(Command("mybookings"), StateFilter(None))
+async def mybookings_msg(message: Message) -> None:
+    """List confirmed/transferred upcoming bookings for the current user.
+
+    Spec.md 41: `/mybookings` → отмена (>24ч) или перенос (>24ч).
+    This handler is a thin entry point — rendering lives in _render_mybookings
+    (shared with client_mybookings_cb since Session 6 — Task 1). Cancellation
+    itself is performed by mybookings_cancel_cb (next handler).
+
+    Resolution: client by telegram_id (booking.py pattern, _select_or_create_client).
+    Filter: upcoming (start_at > now UTC), status IN (confirmed, transferred).
+    """
+    if message.from_user is None:
+        return
+    await _render_mybookings(message, message.from_user.id)
+
+
+# ============================================================
+# 8c. client_mybookings_cb — [📋 Мои записи] tap from post-booking keyboard
+# ============================================================
+@router.callback_query(ClientMenuMyBookingsCallbackData.filter(), StateFilter(None))
+async def client_mybookings_cb(
+    callback: CallbackQuery,
+    callback_data: ClientMenuMyBookingsCallbackData,
+) -> None:
+    """Client tapped [📋 Мои записи] in the post-booking keyboard (Session 6 — Task 1).
+
+    Re-uses _render_mybookings (same code path as /mybookings) so the list
+    rendered from the inline button is byte-identical to the one rendered
+    from the text command — single source of truth, no drift.
+
+    StateFilter(None): the post-booking keyboard is shown after confirm_cb
+    succeeded and state.clear() ran, so the client is in State(None) when
+    they tap. If they re-enter FSM via /book and a stale post-booking button
+    is tapped mid-flow, aiogram dispatch falls through to
+    no_state_callback_fallback (the catch-all at the bottom of this router).
+
+    `callback_data` is required by aiogram dispatch (CallbackData.filter()
+    injects the unpacked payload) — the dataclass itself carries no fields,
+    but the parameter must be declared for aiogram to populate it. Same
+    pattern as confirm_cb / mybookings_cancel_cb.
+
+    callback.answer() closes the Telegram loading spinner on the inline
+    button (UX contract — every callback handler must answer). Empty
+    bookings case: helper already answers "У вас нет активных записей",
+    callback.answer still runs to clear the spinner.
+    """
+    if callback.from_user is None:
+        await callback.answer()
+        return
+    # Type narrowing: callback.message is `Message | InaccessibleMessage` in
+    # aiogram 3.x — only Message has .answer(). InaccessibleMessage covers the
+    # "inaccessible message" edge case (channel posts older than 48h, etc) —
+    # _render_mybookings needs a real Message to call .answer() on. Same guard
+    # pattern as confirm_cb / mybookings_cancel_cb above.
+    if isinstance(callback.message, Message):
+        await _render_mybookings(callback.message, callback.from_user.id)
+    await callback.answer()
 
 
 # ============================================================

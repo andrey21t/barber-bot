@@ -158,6 +158,30 @@ class ClientMenuBookCallbackData(CallbackData, prefix="client_book"):
     Distinct prefix from booking flow callbacks (book_slot, book_slot_30,
     book_service, book_date) — aiogram dispatch is exact-prefix match.
     Plain prefix (no payload) — same pattern as BookConfirmCallbackData.
+
+    Also re-used by post_booking_keyboard [💇 Ещё запись] button (2026-09-06
+    Session 6 — Task 1): after a successful booking, the client taps this
+    button to start another booking without typing /book. StateFilter(None)
+    on client_book_cb allows entry from the just-cleared confirm_cb state.
+    """
+
+
+class ClientMenuMyBookingsCallbackData(CallbackData, prefix="client_mybookings"):
+    """Post-booking [📋 Мои записи] button (Session 6 — Task 1, 2026-09-06).
+
+    Used by post_booking_keyboard to give the client a one-tap way to view
+    their existing bookings after a successful confirm. Tap → handler
+    re-uses the same _render_mybookings helper as /mybookings (shows list +
+    [❌ Отменить] / [🔄 Перенести] buttons for cancelable bookings).
+
+    Distinct prefix from booking flow callbacks (book_*, mybook_*) — aiogram
+    dispatch is exact-prefix match. Plain prefix (no payload) — same pattern
+    as ClientMenuBookCallbackData / BookConfirmCallbackData.
+
+    Why a NEW CallbackData instead of reusing MyBookingsCancelCallbackData:
+    the latter carries a booking_id payload and triggers cancellation, not
+    list rendering. Reusing it for "show my list" would collide semantically
+    with the cancel handler's filter and confuse aiogram dispatch.
     """
 
 
@@ -173,6 +197,32 @@ def client_inline_menu() -> InlineKeyboardMarkup:
     """
     builder = InlineKeyboardBuilder()
     builder.button(text="💇 Записаться", callback_data=ClientMenuBookCallbackData().pack())
+    return builder.as_markup()
+
+
+def post_booking_keyboard() -> InlineKeyboardMarkup:
+    """Two-button inline menu shown after a successful booking (Session 6 — Task 1).
+
+    Layout: 1 row, 2 buttons:
+      - [📋 Мои записи] → ClientMenuMyBookingsCallbackData → re-renders the
+        /mybookings list (cancelable bookings get [❌ Отменить] buttons).
+      - [💇 Ещё запись]  → ClientMenuBookCallbackData → starts a new /book
+        flow (state.clear already done in confirm_cb, StateFilter(None) OK).
+
+    Why both buttons unconditionally (no has_bookings flag): the mybookings
+    handler already says "У вас нет активных записей" when the list is empty,
+    so showing [📋 Мои записи] after a successful booking is never misleading
+    (we just created one — list is non-empty). Skipping a DB count lookup
+    here keeps the keyboard builder pure (no session needed) and matches
+    the Pure/I-O contract of keyboard helpers (no side effects, no DB).
+
+    adjust(2) — both buttons on the same row (Telegram renders side-by-side
+    on desktop, stacked on narrow mobile — both layouts are readable).
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📋 Мои записи", callback_data=ClientMenuMyBookingsCallbackData().pack())
+    builder.button(text="💇 Ещё запись", callback_data=ClientMenuBookCallbackData().pack())
+    builder.adjust(2)
     return builder.as_markup()
 
 
