@@ -70,6 +70,7 @@ from bot.models import Booking, WorkDay
 from bot.services.admin import (
     create_service,
     get_active_bookings_for_workday,
+    get_bookings_for_date,
     get_today_bookings,
     get_week_bookings,
 )
@@ -451,10 +452,22 @@ def _render_shrink_conflicts(exc: WorkDayShrinkError, business_tz: str) -> str:
         return str(exc)
     lines = []
     for b in exc.conflicts:
-        local_start = b.start_at.astimezone(ZoneInfo(business_tz))
+        local_start = _booking_local_time(b.start_at, business_tz)
         time_str = local_start.strftime("%H:%M")
         lines.append(f"   ↳ {b.client_name_snapshot}, {time_str}, {b.service_title_snapshot}")
     return "\n".join(lines)
+
+
+def _booking_local_time(start_at: datetime, business_tz: str) -> datetime:
+    """Convert Booking.start_at (naive UTC from SQLite, aware UTC from
+    Postgres asyncpg) to aware LOCAL time in business_tz.
+
+    SQLite path: naive.astimezone(tz) wrongly assumes local machine time,
+    not UTC — must replace(tzinfo=UTC) first. Postgres path: already aware
+    UTC, replace is a no-op. Same pattern as services/admin.py:55-60.
+    """
+    aware_utc = start_at.replace(tzinfo=UTC) if start_at.tzinfo is None else start_at
+    return aware_utc.astimezone(ZoneInfo(business_tz))
 
 
 # ============================================================
@@ -978,8 +991,32 @@ async def admin_openday_calendar_cb(
         await state.update_data(selected_date=work_date.isoformat())
         await state.set_state(AdminStates.opening_workday_start)
 
+        # Pre-prompt active bookings on the chosen date — master sees which
+        # bookings block a narrow window upfront, doesn't reach
+        # WorkDayShrinkError on confirm with UUIDs.
+        bookings_block = ""
+        async with async_session_factory() as session:
+            bookings = await get_bookings_for_date(
+                session, _master_id, tz, work_date
+            )
+        if bookings:
+            lines = []
+            for b in bookings:
+                local_start = _booking_local_time(b.start_at, tz)
+                time_str = local_start.strftime("%H:%M")
+                lines.append(
+                    f"   • {time_str} {b.client_name_snapshot} — {b.service_title_snapshot}"
+                )
+            bookings_block = (
+                "\n📋 <b>Записи на этот день:</b>\n"
+                + "\n".join(lines)
+                + "\n\n<i>Окно должно покрывать все записи. Чтобы сузить — сначала "
+                "отмените запись через /cancelbooking (или попросите клиентов).</i>\n\n"
+            )
+
         ask_text = (
             f"Дата: <b>{work_date.strftime('%d %B %Y')}</b>\n"
+            f"{bookings_block}"
             "Введите время начала (ЧЧ:ММ / ЧЧ.ММ / ЧЧ,ММ, например <code>11:00</code>):"
         )
         if isinstance(callback.message, Message):

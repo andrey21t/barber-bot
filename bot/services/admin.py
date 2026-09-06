@@ -16,7 +16,7 @@ Contract (spec.md 200-213, 307-309):
   только upcoming + active status (confirmed/transferred), без past/cancelled.
 """
 
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -65,6 +65,46 @@ async def get_today_bookings(
             Booking.master_id == master_id,
             Booking.start_at >= start_of_today_utc,
             Booking.start_at < start_of_tomorrow_utc,
+            Booking.status.in_(("confirmed", "transferred")),
+        )
+        .order_by(Booking.start_at)
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def get_bookings_for_date(
+    session: AsyncSession,
+    master_id: UUID,
+    business_timezone: str,
+    target_day: date,
+) -> list[Booking]:
+    """Active bookings (confirmed/transferred) overlapping a given LOCAL day.
+
+    Used by /openday FSM to pre-prompt master with active bookings on the
+    chosen date BEFORE typing the workday window — master sees which
+    bookings block a narrow window upfront, doesn't reach WorkDayShrinkError
+    on confirm with UUIDs.
+
+    Window: [start_of_target_day_local_utc, start_of_next_day_local_utc) —
+    half-open. Identical to get_today_bookings (lines 30-73) but for arbitrary
+    target_day instead of ref.astimezone(tz).date().
+
+    Status filter: ('confirmed', 'transferred') — same as update_workday
+    and WorkDayShrinkError semantics (workday.py:150-154).
+    """
+    tz = ZoneInfo(business_timezone)
+    start_of_day_utc = datetime.combine(target_day, time(0, 0), tzinfo=tz).astimezone(UTC)
+    start_of_next_day_utc = datetime.combine(
+        target_day + timedelta(days=1), time(0, 0), tzinfo=tz
+    ).astimezone(UTC)
+
+    stmt = (
+        select(Booking)
+        .where(
+            Booking.master_id == master_id,
+            Booking.start_at >= start_of_day_utc,
+            Booking.start_at < start_of_next_day_utc,
             Booking.status.in_(("confirmed", "transferred")),
         )
         .order_by(Booking.start_at)
