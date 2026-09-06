@@ -3044,20 +3044,18 @@ def _current_week_monday(tz: str) -> date:
 
 
 def _openweek_week_header(tz: str) -> str:
-    """Render week line for /openweek headers: 'Неделя 07.09 – 13.09:
-    Пн 07.09 · Вт 08.09 · ... · Вс 13.09'.
+    """Render week line for /openweek headers: 'Неделя 07.09 – 13.09'.
 
     Used in Шаг 1 (cmd_openweek + entry_cb), Шаг 2 (start_cb), Шаг 3 (end_cb).
     Single source of truth — avoids divergence between 3 callsites.
+
+    Перечисление «Пн 07.09 · Вт 08.09 · ...» убрано — диапазон недели даёт
+    достаточный контекст, подробности в самом days keyboard (Шаг 3).
     """
     monday = _current_week_monday(tz)
     sunday = monday + timedelta(days=6)
     week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
-    dates_line = " · ".join(
-        f"{_WEEKDAY_LABELS_HANDLER[i]} {(monday + timedelta(days=i)).strftime('%d.%m')}"
-        for i in range(7)
-    )
-    return f"Неделя <b>{week_range}</b>:\n{dates_line}"
+    return f"Неделя <b>{week_range}</b>"
 
 
 
