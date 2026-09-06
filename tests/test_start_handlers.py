@@ -102,9 +102,11 @@ async def test_cmd_start_admin_shows_welcome_and_inline_menu() -> None:
 
 @pytest.mark.asyncio
 async def test_cmd_start_client_shows_booking_hint() -> None:
-    """/start from non-admin → 'Привет! Я бот для записи...' + '/book' hint.
+    """/start from non-admin → 'Привет! Я бот для записи...' + inline menu button.
 
-    No admin_keyboard — client gets booking instructions only.
+    2026-09-06 fix: client /start now shows inline [💇 Записаться] button
+    instead of bare text "Запишитесь командой /book". Clients without bot
+    experience were closing the chat because they didn't know what to do.
     """
     msg = _make_message(user_id=NON_ADMIN_TG_ID)
     state = _make_state()
@@ -115,7 +117,16 @@ async def test_cmd_start_client_shows_booking_hint() -> None:
     text = _answer_text(msg)
     assert "Привет" in text
     assert "бот для записи к парикмахеру" in text
-    assert "/book" in text
-    # No admin_keyboard for client
+    # 2026-09-06: client gets inline menu with [Записаться] button (NOT bare text)
+    assert "/book" not in text, "client /start must NOT show /book text hint — use inline menu"
     reply_markup = msg.answer.call_args.kwargs.get("reply_markup")
-    assert reply_markup is None, "client /start must NOT include admin_keyboard"
+    assert reply_markup is not None, "client /start must include inline menu"
+    from aiogram.types import InlineKeyboardMarkup
+
+    assert isinstance(reply_markup, InlineKeyboardMarkup), "must be inline keyboard"
+    # Inline menu has at least one button — [💇 Записаться]
+    flat_buttons = [
+        btn for row in reply_markup.inline_keyboard for btn in row
+    ]
+    assert len(flat_buttons) >= 1
+    assert any("Записаться" in btn.text for btn in flat_buttons)

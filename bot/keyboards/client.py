@@ -146,6 +146,36 @@ class BookDateCallbackData(CallbackData, prefix="book_date"):
     work_date: str
 
 
+class ClientMenuBookCallbackData(CallbackData, prefix="client_book"):
+    """Client /start menu — single [💇 Записаться] button (2026-09-06 fix).
+
+    Entry point for clients: tap → handler sets BookingStates.selecting_date
+    + shows calendar (same flow as /book, but triggered from inline menu
+    instead of text command). Solves "client sees empty chat after /start"
+    — before this, /start replied with bare text "Запишитесь командой /book"
+    and clients without bot experience didn't know what to do.
+
+    Distinct prefix from booking flow callbacks (book_slot, book_slot_30,
+    book_service, book_date) — aiogram dispatch is exact-prefix match.
+    Plain prefix (no payload) — same pattern as BookConfirmCallbackData.
+    """
+
+
+def client_inline_menu() -> InlineKeyboardMarkup:
+    """Single-button inline menu for client /start (2026-09-06 fix).
+
+    Layout: 1 button [💇 Записаться] — starts /book flow via callback
+    (ClientMenuBookCallbackData). Kept minimal per user request:
+    "клиент зашёл — сразу кнопка для записи, без «О нас» / «Контакты»".
+
+    If later we add more client actions (e.g. 📋 Мои записи, 📞 Контакты),
+    extend here with more buttons + adjust() layout.
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💇 Записаться", callback_data=ClientMenuBookCallbackData().pack())
+    return builder.as_markup()
+
+
 async def calendar_keyboard(min_date: datetime, max_date: datetime) -> InlineKeyboardMarkup:
     """Build SimpleCalendar markup with date range.
 

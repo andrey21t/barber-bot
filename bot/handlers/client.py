@@ -48,6 +48,7 @@ from bot.keyboards.client import (
     BookServiceCallbackData,
     BookSlot30CallbackData,
     BookSlotCallbackData,
+    ClientMenuBookCallbackData,
     MyBookingsCancelCallbackData,
     MyBookingsTransferCallbackData,
     _format_booking_summary_from_start_at,
@@ -154,6 +155,68 @@ async def cmd_book(message: Message, state: FSMContext) -> None:
         "📅 Выберите дату записи:",
         reply_markup=date_picker_keyboard(dates, today=today_local),
     )
+
+
+# ============================================================
+# 1a. client_book_cb — [💇 Записаться] tap from /start menu (2026-09-06)
+# ============================================================
+@router.callback_query(ClientMenuBookCallbackData.filter(), StateFilter(None))
+async def client_book_cb(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """Client tapped [💇 Записаться] in /start inline menu — start booking flow.
+
+    Same effect as /book (cmd_book): set BookingStates.selecting_date +
+    is_slots_path=False + show date_picker_keyboard. Extracted as a callback
+    handler so clients who tap the /start menu button don't need to know
+    about the /book text command (solves "client sees empty chat" — before
+    this fix /start replied with bare text "Запишитесь командой /book"
+    and clients without bot experience closed the chat).
+
+    Empty bookable list → text-only empty state + state.clear (mirrors
+    cmd_book). Non-empty → entering FSM + showing date picker.
+
+    StateFilter(None) — booking entry only works outside FSM. If user is
+    mid-flow and somehow taps a stale /start menu button, aiogram dispatch
+    falls through to no_state_callback_fallback (line ~1600) which shows
+    "Сессия истекла" alert.
+
+    callback.answer() closes the Telegram loading spinner on the inline
+    button (UX contract — every callback handler must answer).
+    """
+    settings = get_settings()
+    async with async_session_factory() as session:
+        master = await _select_master(session, settings)
+        if master is None:
+            if callback.message is not None:
+                await callback.message.answer(
+                    "❌ Не удалось найти мастера. Обратитесь к администратору."
+                )
+            await callback.answer()
+            return
+        dates = await get_bookable_dates(
+            session,
+            master.id,
+            settings.TIMEZONE,
+            include_legacy_slots=True,
+            min_duration_min=settings.SERVICE_DEFAULT_DURATION_MIN,
+            days_ahead=settings.MAX_BOOKING_DAYS_AHEAD,
+        )
+    if not dates:
+        if callback.message is not None:
+            await callback.message.answer("Сейчас нет свободных дат для записи. Загляните позже 🙏")
+        await callback.answer()
+        return
+    await state.set_state(BookingStates.selecting_date)
+    await state.update_data(is_slots_path=False)
+    today_local = datetime.now(ZoneInfo(settings.TIMEZONE)).date()
+    if callback.message is not None:
+        await callback.message.answer(
+            "📅 Выберите дату записи:",
+            reply_markup=date_picker_keyboard(dates, today=today_local),
+        )
+    await callback.answer()
 
 
 # ============================================================
