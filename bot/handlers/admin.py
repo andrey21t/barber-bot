@@ -394,7 +394,8 @@ async def cmd_openday(message: Message, command: CommandObject) -> None:
             return
         except WorkDayShrinkError as exc:
             await message.answer(
-                f"❌ Нельзя сократить окно — есть активные записи.\n{exc}\n"
+                f"❌ Нельзя сократить окно — есть активные записи:\n"
+                f"{_render_shrink_conflicts(exc, tz)}\n"
                 "Сначала отмените записи командой /cancelbooking (или попросите клиентов)."
             )
             return
@@ -431,6 +432,29 @@ def _parse_hhmm(s: str) -> dt_time:
     if not (0 <= hh <= 23 and 0 <= mm <= 59):
         raise ValueError(f"HH 0-23, MM 0-59, got {s!r}")
     return dt_time(hh, mm)
+
+
+def _render_shrink_conflicts(exc: WorkDayShrinkError, business_tz: str) -> str:
+    """Render WorkDayShrinkError conflicts as readable multi-line text.
+
+    Used by 4 admin handlers that catch WorkDayShrinkError (cmd_openday,
+    admin_openday_end_msg, admin_window_confirm_cb, admin_openweek_confirm_cb).
+    Returns text block with one row per blocking booking (client name, local
+    start time, service title) — master sees WHICH booking blocks the shrink
+    and decides: cancel via /cancelbooking, reschedule via /movslot, or pick
+    a wider window.
+
+    Empty conflicts (back-compat: WorkDayShrinkError raised without
+    conflicts=...) → fallback to str(exc) (technical message with booking IDs).
+    """
+    if not exc.conflicts:
+        return str(exc)
+    lines = []
+    for b in exc.conflicts:
+        local_start = b.start_at.astimezone(ZoneInfo(business_tz))
+        time_str = local_start.strftime("%H:%M")
+        lines.append(f"   ↳ {b.client_name_snapshot}, {time_str}, {b.service_title_snapshot}")
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -1094,7 +1118,8 @@ async def admin_openday_end_msg(message: Message, state: FSMContext) -> None:
             return  # state stays — admin can retry end_time
         except WorkDayShrinkError as exc:
             await message.answer(
-                f"❌ Нельзя сократить окно — есть активные записи.\n{exc}\n"
+                f"❌ Нельзя сократить окно — есть активные записи:\n"
+                f"{_render_shrink_conflicts(exc, tz)}\n"
                 "Сначала отмените записи (/cancelbooking) или выберите другое время."
             )
             return  # state stays — admin can retry end_time (расширяя окно)
@@ -1356,7 +1381,8 @@ async def admin_window_confirm_cb(
             # booking outside the new (narrower) window.
             if callback.message is not None:
                 await callback.message.answer(
-                    f"❌ Нельзя сократить окно — есть активные записи.\n{exc}\n"
+                    f"❌ Нельзя сократить окно — есть активные записи:\n"
+                    f"{_render_shrink_conflicts(exc, tz)}\n"
                     "Сначала отмените записи (/cancelbooking) или выберите другое время."
                 )
             await callback.answer()
@@ -2412,14 +2438,7 @@ async def admin_openweek_confirm_cb(
         except WorkDayShrinkError as exc:
             # Показываем КАКАЯ бронь блокирует (имя, время, услуга) — пользователь
             # видит что мешает и решает: отменить, перенести или выбрать окно пошире.
-            conflict_lines = []
-            for b in exc.conflicts:
-                local_start = b.start_at.astimezone(ZoneInfo(tz))
-                time_str = local_start.strftime("%H:%M")
-                conflict_lines.append(
-                    f"   ↳ {b.client_name_snapshot}, {time_str}, {b.service_title_snapshot}"
-                )
-            conflicts_str = "\n".join(conflict_lines) if conflict_lines else ""
+            conflicts_str = _render_shrink_conflicts(exc, tz)
             fail_lines.append(
                 f"❌ {day_label} {date_label}: нельзя сузить, есть бронь\n{conflicts_str}"
             )
