@@ -557,6 +557,27 @@ def admin_week_days_keyboard(selected: set[int]) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def admin_openweek_overwrite_keyboard() -> InlineKeyboardMarkup:
+    """[✅ Да, перезаписать] / [❌ Нет, отмена] keyboard for /openweek
+    overwrite confirm step (Session 5.27 B).
+
+    Triggered when master taps [✅ Открыть] but some selected days already have
+    WorkDay rows. Without this guard, open_workday UPCERT would silently
+    overwrite existing windows (data loss risk — master forgot week was open).
+
+    «✅ Да» callback_data="admin_openweek_overwrite_yes" (string).
+    «❌ Нет» callback_data="admin_openweek_overwrite_no" (string).
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="✅ Да, перезаписать",
+        callback_data="admin_openweek_overwrite_yes",
+    )
+    builder.button(text="❌ Нет, отмена", callback_data="admin_openweek_overwrite_no")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
 def admin_closeday_confirm_keyboard() -> InlineKeyboardMarkup:
     """[✅ Да, отменить записи] / [❌ Не закрывать] keyboard for /closeday
     confirm step (Session 5.26).

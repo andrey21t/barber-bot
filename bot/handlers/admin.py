@@ -60,6 +60,7 @@ from bot.keyboards.admin import (
     admin_closeday_confirm_keyboard,
     admin_inline_menu,
     admin_move_confirm_keyboard,
+    admin_openweek_overwrite_keyboard,
     admin_today_keyboard,
     admin_week_days_keyboard,
     admin_window_confirm_keyboard,
@@ -2456,6 +2457,94 @@ async def admin_openweek_days_cb(
                 )
 
 
+async def _apply_openweek(
+    master_id: UUID,
+    tz: str,
+    monday: date,
+    selected: list[int],
+    start_time: dt_time,
+    end_time: dt_time,
+) -> str:
+    """Apply open_workday to each selected weekday, render result text.
+
+    Shared by `admin_openweek_confirm_cb` (silent path — no existing days) and
+    `admin_openweek_overwrite_yes_cb` (after user confirmed overwrite). Returns
+    the full result text (header + summary + bookings block) for edit_text/answer.
+    """
+    today_local = datetime.now(ZoneInfo(tz)).date()
+
+    success_lines: list[str] = []
+    fail_lines: list[str] = []
+    for weekday in sorted(selected):
+        work_date = monday + timedelta(days=weekday)
+        day_label = _WEEKDAY_LABELS_HANDLER[weekday]
+        date_label = work_date.strftime("%d.%m")
+        # Skip past days — mirror /addslots past-date guard.
+        # On weekend the current week's Mon-Fri are already past; user running
+        # /openweek on weekend wants upcoming days, not past fail spam.
+        if work_date < today_local:
+            fail_lines.append(f"❌ {day_label} {date_label}: прошедшая дата")
+            continue
+        try:
+            async with async_session_factory() as session:
+                await open_workday(
+                    session, master_id, work_date, start_time, end_time, business_tz=tz
+                )
+            success_lines.append(
+                f"✅ {day_label} {date_label} "
+                f"{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}"
+            )
+        except WorkDayShrinkError as exc:
+            # Показываем КАКАЯ бронь блокирует (имя, время, услуга) — пользователь
+            # видит что мешает и решает: отменить, перенести или выбрать окно пошире.
+            conflicts_str = _render_shrink_conflicts(exc, tz)
+            fail_lines.append(
+                f"❌ {day_label} {date_label}: нельзя сузить, есть бронь\n{conflicts_str}"
+            )
+        except ValueError:
+            fail_lines.append(f"❌ {day_label} {date_label}: ошибка данных")
+        except SQLAlchemyError:
+            fail_lines.append(f"❌ {day_label} {date_label}: ошибка БД")
+
+    summary_lines = success_lines + fail_lines
+    summary = "\n".join(summary_lines) if summary_lines else "Ничего не открыто."
+
+    sunday = monday + timedelta(days=6)
+    week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
+
+    # Диапазон выборки = выбранная неделя (monday..sunday), НЕ "today + 7 days"
+    # (see get_bookings_for_date_range docstring — strict match to header).
+    async with async_session_factory() as session:
+        bookings = await get_bookings_for_date_range(
+            session, master_id, tz, monday, sunday
+        )
+    bookings_block = ""
+    if bookings:
+        bookings_block = "\n\n" + _render_bookings("📅 Записи на неделю:", bookings, tz)
+
+    return f"🗓 <b>Открыть неделю ({week_range})</b>\n\n{summary}{bookings_block}"
+
+
+async def _render_openweek_result(callback: CallbackQuery, result_text: str) -> None:
+    """edit_text with TelegramBadRequest fallback to answer (mirror existing
+    pattern from inline admin_inline_menu render)."""
+    if callback.message is None:
+        return
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_text(
+                result_text, reply_markup=admin_inline_menu()
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                result_text, reply_markup=admin_inline_menu()
+            )
+    else:
+        await callback.message.answer(
+            result_text, reply_markup=admin_inline_menu()
+        )
+
+
 @router.callback_query(
     F.data == "admin_openweek_confirm",
     StateFilter(AdminStates.opening_week_days),
@@ -2464,14 +2553,18 @@ async def admin_openweek_confirm_cb(
     callback: CallbackQuery,
     state: FSMContext,
 ) -> None:
-    """[✅ Открыть] → apply open_workday to each selected weekday of current
-    week. Render summary "✅ Открыто: Пн 11-18, Ср 11-18\n❌ Вт: нельзя сузить".
+    """[✅ Открыть] → check existing WorkDays; if any → alert with overwrite
+    confirm; else silent apply.
 
-    Current week Monday = today_local - weekday() (Mon=0). For each selected
-    weekday: work_date = monday + weekday. Call open_workday; WorkDayShrinkError
-    per day → ❌ for that day, continue others (partial failure OK).
+    B (Session 5.27): guard against silent UPCERT overwrite. If user opens a
+    week that already has WorkDay rows, open_workday would silently replace
+    the window — data loss risk (master forgot week was open, opened with
+    different window, lost original slots). Now shows per-day existing windows
+    and asks [✅ Да, перезаписать] / [❌ Нет, отмена] before applying.
 
-    state.clear() BEFORE apply (race protection, mirror admin_window_confirm_cb).
+    State preserved on alert (yes-handler needs picked_start_minute,
+    picked_end_minute, selected_weekdays from state). Cleared on silent path
+    and in both overwrite handlers.
     """
     if not _is_admin_callback(callback):
         await callback.answer()
@@ -2514,98 +2607,145 @@ async def admin_openweek_confirm_cb(
         await callback.answer()
         return
 
-    # state.clear() BEFORE apply (race protection).
-    await state.clear()
-
-    # Current week Monday (Mon=0): today_local - weekday().
-    # В воскресенье текущая рабочая неделя (Пн-Сб) уже прошла — пользователь
-    # запускает /openweek, чтобы планировать следующую неделю, а не видеть
-    # 6 кнопок «❌ прошедшая дата». Для сегодняшних слотов есть /openday
-    # (точечная команда). Суббота (weekday=5) → текущая неделя (есть сегодня
-    # + завтра). Воскресенье (weekday=6) → следующая неделя (+7 дней к monday).
-    today_local = datetime.now(ZoneInfo(tz)).date()
     monday = _current_week_monday(tz)
+    today_local = datetime.now(ZoneInfo(tz)).date()
 
-    success_lines: list[str] = []
-    fail_lines: list[str] = []
+    # B: check existing WorkDays among selected (skip past days — they will
+    # fail in apply, no point warning about "existing" for past dates).
+    # select_workday returns rows regardless of is_active — closed days
+    # (closed via /closeday) appear here too. Alert text adapts: "(закрыт)"
+    # suffix for is_active=False so master doesn't confuse "already open"
+    # with "closed" — semantically different actions (re-open vs overwrite).
+    existing_lines: list[str] = []
     for weekday in sorted(selected):
         work_date = monday + timedelta(days=weekday)
-        day_label = _WEEKDAY_LABELS_HANDLER[weekday]
-        date_label = work_date.strftime("%d.%m")
-        # Skip past days — mirror /addslots past-date guard (admin.py:291).
-        # On weekend (Sat/Sun) the current week's Mon-Fri are already past;
-        # user running /openweek on weekend wants upcoming days, not past.
         if work_date < today_local:
-            fail_lines.append(f"❌ {day_label} {date_label}: прошедшая дата")
             continue
-        try:
-            async with async_session_factory() as session:
-                await open_workday(
-                    session, master_id, work_date, start_time, end_time, business_tz=tz
-                )
-            success_lines.append(
-                f"✅ {day_label} {date_label} "
-                f"{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}"
-            )
-        except WorkDayShrinkError as exc:
-            # Показываем КАКАЯ бронь блокирует (имя, время, услуга) — пользователь
-            # видит что мешает и решает: отменить, перенести или выбрать окно пошире.
-            conflicts_str = _render_shrink_conflicts(exc, tz)
-            fail_lines.append(
-                f"❌ {day_label} {date_label}: нельзя сузить, есть бронь\n{conflicts_str}"
-            )
-        except ValueError:
-            fail_lines.append(f"❌ {day_label} {date_label}: ошибка данных")
-        except SQLAlchemyError:
-            fail_lines.append(f"❌ {day_label} {date_label}: ошибка БД")
+        async with async_session_factory() as session:
+            wd = await select_workday(session, master_id, work_date)
+        if wd is not None:
+            day_label = _WEEKDAY_LABELS_HANDLER[weekday]
+            date_label = work_date.strftime("%d.%m")
+            window = f"{wd.start_time.strftime('%H:%M')}–{wd.end_time.strftime('%H:%M')}"
+            status = " (закрыт)" if not wd.is_active else ""
+            existing_lines.append(f"• {day_label} {date_label} {window}{status}")
 
-    summary_lines = success_lines + fail_lines
-    summary = "\n".join(summary_lines) if summary_lines else "Ничего не открыто."
-
-    # Диапазон недели в заголовке: Пн ... Вс. Помогает понять какую неделю открыли
-    # (особенно при Sunday-rule — следующая, не текущая).
-    sunday = monday + timedelta(days=6)
-    week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
-
-    # Автопоказ записей на неделю — мастер сразу видит результат без отдельной
-    # команды /week (UX: не надо листать вверх или вводить /week вручную).
-    #
-    # Диапазон выборки = выбранная неделя (monday..sunday), НЕ "today + 7 days"
-    # как в get_week_bookings. На Sunday-rule today=06.09 → get_week_bookings
-    # вернёт 06.09..12.09 (включая прошлую неделю), но заголовок обещает
-    # 07.09–13.09 → несоответствие. Используем get_bookings_for_date_range
-    # чтобы записи строго совпадали с заголовком.
-    async with async_session_factory() as session:
-        bookings = await get_bookings_for_date_range(
-            session, master_id, tz, monday, sunday
+    if existing_lines:
+        # НЕ clear state — yes-handler needs picked_start_minute etc.
+        new_window = f"{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}"
+        existing_str = "\n".join(existing_lines)
+        alert_text = (
+            f"⚠️ Уже есть окно:\n{existing_str}\n\n"
+            f"Перезаписать окно на {new_window}?"
         )
-    bookings_block = ""
-    if bookings:
-        bookings_block = "\n\n" + _render_bookings("📅 Записи на неделю:", bookings, tz)
-
-    # edit_text заменяет последнее сообщение FSM (с кнопкой [✅ Открыть]) на
-    # результат — кнопка исчезает, мастер не может тапнуть её повторно (FSM
-    # уже cleared, повторный тап = "данные сессии потеряны"). reply_markup=
-    # admin_inline_menu даёт свежее меню в этом же сообщении (не надо листать
-    # вверх к старому меню). TelegramBadRequest fallback на answer если
-    # сообщение >48h или удалено.
-    if callback.message is not None:
-        result_text = (
-            f"🗓 <b>Открыть неделю ({week_range})</b>\n\n{summary}{bookings_block}"
-        )
-        if isinstance(callback.message, Message):
-            try:
-                await callback.message.edit_text(
-                    result_text, reply_markup=admin_inline_menu()
-                )
-            except TelegramBadRequest:
+        if callback.message is not None:
+            if isinstance(callback.message, Message):
+                try:
+                    await callback.message.edit_text(
+                        alert_text,
+                        reply_markup=admin_openweek_overwrite_keyboard(),
+                    )
+                except TelegramBadRequest:
+                    await callback.message.answer(
+                        alert_text,
+                        reply_markup=admin_openweek_overwrite_keyboard(),
+                    )
+            else:
                 await callback.message.answer(
-                    result_text, reply_markup=admin_inline_menu()
+                    alert_text,
+                    reply_markup=admin_openweek_overwrite_keyboard(),
                 )
-        else:
+        await callback.answer()
+        return
+
+    # No existing → silent apply (current behavior, backward compat).
+    await state.clear()
+    result_text = await _apply_openweek(
+        master_id, tz, monday, selected, start_time, end_time
+    )
+    await _render_openweek_result(callback, result_text)
+    await callback.answer()
+
+
+@router.callback_query(
+    F.data == "admin_openweek_overwrite_yes",
+    StateFilter(AdminStates.opening_week_days),
+)
+async def admin_openweek_overwrite_yes_cb(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """[✅ Да, перезаписать] → apply open_workday to all selected weekdays
+    (overwrite existing). state.clear() before apply (race protection).
+
+    Reads picked_start_minute, picked_end_minute, selected_weekdays from state
+    (preserved by admin_openweek_confirm_cb on alert path).
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await state.clear()
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    master_id, _business_id, tz = resolved
+
+    data = await state.get_data()
+    picked_start_minute = data.get("picked_start_minute")
+    picked_end_minute = data.get("picked_end_minute")
+    selected: list[int] = list(data.get("selected_weekdays", []))
+    if picked_start_minute is None or picked_end_minute is None or not selected:
+        await state.clear()
+        if callback.message is not None:
             await callback.message.answer(
-                result_text, reply_markup=admin_inline_menu()
+                "❌ Данные сессии потеряны. /openweek чтобы начать заново"
             )
+        await callback.answer()
+        return
+
+    try:
+        start_time = dt_time(int(picked_start_minute) // 60, int(picked_start_minute) % 60)
+        end_time = dt_time(picked_end_minute // 60, picked_end_minute % 60)
+    except (ValueError, TypeError):
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer(
+                "❌ Ошибка данных в сессии. /openweek чтобы начать заново"
+            )
+        await callback.answer()
+        return
+
+    await state.clear()
+    monday = _current_week_monday(tz)
+    result_text = await _apply_openweek(
+        master_id, tz, monday, selected, start_time, end_time
+    )
+    await _render_openweek_result(callback, result_text)
+    await callback.answer()
+
+
+@router.callback_query(
+    F.data == "admin_openweek_overwrite_no",
+    StateFilter(AdminStates.opening_week_days),
+)
+async def admin_openweek_overwrite_no_cb(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """[❌ Нет, отмена] → clear state, answer. Mirror admin_openweek_cancel_cb
+    semantics but distinct string (triggered from overwrite alert, not days
+    keyboard)."""
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    await state.clear()
+    if callback.message is not None:
+        await callback.message.answer(
+            "❌ Открытие недели отменено. /menu для меню",
+            reply_markup=admin_inline_menu(),
+        )
     await callback.answer()
 
 

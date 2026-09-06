@@ -2918,6 +2918,252 @@ async def test_admin_openweek_cancel_cb_clears_state(
 
 
 # ============================================================
+# /openweek overwrite guard (Session 5.27 B)
+# ============================================================
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)  # Sunday UTC 14:00 → Moscow 17:00
+async def test_openweek_confirm_warns_when_days_already_open(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B: confirm shows overwrite alert if any selected day already has WorkDay.
+
+    Setup: Sunday 06.09 → next week 07.09–13.09. Seed WorkDay for Mon 07.09 and
+    Wed 09.09 (10:00–19:00). Select Mon+Wed+Fri (Fri has no WorkDay). Confirm
+    with new window 09:00–18:00.
+
+    Expected: alert "⚠️ Уже открыты: ... Пн 07.09 10:00–19:00, Ср 09.09 10:00–19:00
+    Перезаписать на 09:00–18:00?"; state NOT cleared (yes-handler needs it);
+    open_workday NOT called (WorkDay rows unchanged).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        # Next week Mon 07.09 and Wed 09.09 — already opened 10-19
+        await _seed_workday(
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
+        )
+        await _seed_workday(
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 9).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
+        )
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_openweek_confirm"
+    state = _make_mock_state(
+        {
+            "picked_start_minute": 540,   # 09:00
+            "picked_end_minute": 1080,    # 18:00
+            "selected_weekdays": [0, 2, 4],  # Mon, Wed, Fri
+            "business_tz": TZ,
+        }
+    )
+
+    await admin_handlers.admin_openweek_confirm_cb(callback, state)
+
+    # state NOT cleared — yes-handler needs picked_start_minute etc.
+    state.clear.assert_not_called()
+    text = callback_answer_text(callback)
+    assert "Уже есть окно" in text, f"Should warn about existing days; got: {text!r}"
+    assert "Пн 07.09 10:00–19:00" in text, f"Should list existing Mon window; got: {text!r}"
+    assert "Ср 09.09 10:00–19:00" in text, f"Should list existing Wed window; got: {text!r}"
+    assert "Перезаписать окно на 09:00–18:00" in text, f"Should show new window; got: {text!r}"
+    # No silent-apply artifacts
+    assert "✅" not in text, f"Should NOT apply silently; got: {text!r}"
+    assert "📅 Записи на неделю" not in text, f"Should NOT show bookings block; got: {text!r}"
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_overwrite_yes_applies_overwrite(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B: [✅ Да, перезаписать] applies open_workday to all selected, overwrites
+    existing windows.
+
+    Pre-condition: WorkDay Mon 07.09 10-19 and Wed 09.09 10-19, Fri 11.09 none.
+    After yes: Mon and Wed become 09-18, Fri created 09-18. state.clear called.
+    """
+    from bot.services.workday import select_workday
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        master_id = ctx["master_id"]
+        await _seed_workday(
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
+        )
+        await _seed_workday(
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 9).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
+        )
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_openweek_overwrite_yes"
+    state = _make_mock_state(
+        {
+            "picked_start_minute": 540,   # 09:00
+            "picked_end_minute": 1080,    # 18:00
+            "selected_weekdays": [0, 2, 4],  # Mon, Wed, Fri
+            "business_tz": TZ,
+        }
+    )
+
+    await admin_handlers.admin_openweek_overwrite_yes_cb(callback, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    # All 3 days applied with new window 09:00–18:00
+    assert "Пн 07.09 09:00–18:00" in text, f"Mon should be overwritten; got: {text!r}"
+    assert "Ср 09.09 09:00–18:00" in text, f"Wed should be overwritten; got: {text!r}"
+    assert "Пт 11.09 09:00–18:00" in text, f"Fri should be created; got: {text!r}"
+
+    # Verify DB state — WorkDay rows updated to 09:00–18:00
+    async with session_factory() as session:
+        mon_wd = await select_workday(session, master_id, datetime(2026, 9, 7).date())
+        wed_wd = await select_workday(session, master_id, datetime(2026, 9, 9).date())
+        fri_wd = await select_workday(session, master_id, datetime(2026, 9, 11).date())
+    assert mon_wd is not None and str(mon_wd.start_time) == "09:00:00", "Mon overwritten"
+    assert wed_wd is not None and str(wed_wd.end_time) == "18:00:00", "Wed overwritten"
+    assert fri_wd is not None, "Fri created"
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_overwrite_no_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B: [❌ Нет, отмена] clears state, answers 'Открытие недели отменено'."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_openweek_overwrite_no"
+    state = _make_mock_state(
+        {
+            "picked_start_minute": 540,
+            "picked_end_minute": 1080,
+            "selected_weekdays": [0, 2, 4],
+            "business_tz": TZ,
+        }
+    )
+
+    await admin_handlers.admin_openweek_overwrite_no_cb(callback, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "Открытие недели отменено" in text, f"Should say cancelled; got: {text!r}"
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_confirm_silent_when_no_existing(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B regression: if NO existing WorkDays among selected, confirm applies
+    silently (current behavior, no alert). Avoid false-positive alerts when
+    opening a fresh week.
+
+    Setup: no WorkDay seeded. Select Mon+Wed. Confirm with 09:00–18:00.
+    Expected: silent apply, summary with ✅ lines, state.clear called, no
+    "Уже открыты" alert.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_openweek_confirm"
+    state = _make_mock_state(
+        {
+            "picked_start_minute": 540,   # 09:00
+            "picked_end_minute": 1080,    # 18:00
+            "selected_weekdays": [0, 2],  # Mon, Wed
+            "business_tz": TZ,
+        }
+    )
+
+    await admin_handlers.admin_openweek_confirm_cb(callback, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "Уже есть окно" not in text, f"Should NOT warn when no existing; got: {text!r}"
+    assert "Пн 07.09 09:00–18:00" in text, f"Mon should be applied; got: {text!r}"
+    assert "Ср 09.09 09:00–18:00" in text, f"Wed should be applied; got: {text!r}"
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_confirm_alert_marks_closed_days(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B W1 fix: alert marks closed days (is_active=False) with "(закрыт)" suffix.
+
+    Setup: Mon 07.09 closed (is_active=False), Wed 09.09 active. Select both.
+    Expected: alert lists "Пн 07.09 10:00–19:00 (закрыт)" and "Ср 09.09 10:00–19:00"
+    (no suffix). Master sees closed status explicitly — no confusion between
+    "already open" and "closed, can re-open".
+    """
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        await _seed_workday(
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
+            is_active=False,  # closed via /closeday
+        )
+        await _seed_workday(
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 9).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
+            is_active=True,
+        )
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_openweek_confirm"
+    state = _make_mock_state(
+        {
+            "picked_start_minute": 540,
+            "picked_end_minute": 1080,
+            "selected_weekdays": [0, 2],  # Mon (closed), Wed (active)
+            "business_tz": TZ,
+        }
+    )
+
+    await admin_handlers.admin_openweek_confirm_cb(callback, state)
+
+    state.clear.assert_not_called()
+    text = callback_answer_text(callback)
+    assert "Пн 07.09 10:00–19:00 (закрыт)" in text, (
+        f"Closed day should be marked; got: {text!r}"
+    )
+    assert "Ср 09.09 10:00–19:00 (закрыт)" not in text, (
+        f"Active day should NOT have (закрыт) suffix; got: {text!r}"
+    )
+
+
+# ============================================================
 # /closeday handlers (Session 5.26)
 # ============================================================
 
