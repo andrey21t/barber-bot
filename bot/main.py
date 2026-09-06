@@ -13,7 +13,15 @@ Wiring order (spec.md 236, 358-382):
   8. start_polling
 """
 
+import contextlib
+import locale
 import logging
+
+# ru_RU.UTF-8 для strftime %b/%B (%d %b → "06 сент.", %d %B → "06 сентября").
+# Docker: ru_RU.UTF-8 сгенерирован в Dockerfile (locale-gen). macOS: есть в системе.
+# Если локаль недоступна (exotic CI) — fallback на C, даты латиницей (не падаем).
+with contextlib.suppress(locale.Error):
+    locale.setlocale(locale.LC_TIME, "ru_RU.UTF-8")
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
