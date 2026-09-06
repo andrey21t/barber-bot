@@ -811,7 +811,7 @@ async def test_cmd_week_happy_with_booking(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """Booking within next 7 days (LOCAL) → '📅 Записи на неделю:'."""
+    """Future booking → '📅 Ближайшие записи:' (now shows all upcoming, not just 7 days)."""
     async with session_factory() as session:
         ctx = await _seed_admin_stack(session)
         # 3 days ahead at 15:00 Moscow
@@ -837,7 +837,7 @@ async def test_cmd_week_happy_with_booking(
     await admin_handlers.cmd_week(msg)
 
     text = _answer_text(msg)
-    assert "Записи на неделю" in text
+    assert "Ближайшие записи" in text
     assert "Паша" in text
 
 
@@ -877,7 +877,7 @@ async def test_cmd_week_no_bookings_shows_empty_message(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """No bookings within 7 days → 'На ближайшую неделю записей нет.'"""
+    """No future bookings → 'Ближайших записей нет.'"""
     async with session_factory() as session:
         await _seed_admin_stack(session)
 
@@ -885,7 +885,88 @@ async def test_cmd_week_no_bookings_shows_empty_message(
     await admin_handlers.cmd_week(msg)
 
     text = _answer_text(msg)
-    assert "На ближайшую неделю записей нет" in text
+    assert "Ближайших записей нет" in text
+
+
+@pytest.mark.asyncio
+async def test_cmd_week_shows_far_future_booking_beyond_7_days(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Booking 30 days ahead (beyond old 7-day limit) → still appears in /week.
+
+    New behavior (get_all_future_bookings): no upper bound. Old behavior
+    (get_week_bookings days_ahead=7) hid bookings past day 7. Master wants
+    to see ALL upcoming bookings, even if weeks ahead.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        # 30 days ahead at 15:00 Moscow — well beyond old 7-day window
+        in_30_days_local = (datetime.now(ZoneInfo(TZ)) + timedelta(days=30)).replace(
+            hour=15, minute=0, second=0, microsecond=0
+        )
+        slot = await _seed_slot(
+            session,
+            master_id=ctx["master_id"],
+            slot_date=in_30_days_local.date(),
+            hour=15,
+            status="open",
+        )
+        await _seed_booking(
+            session,
+            ctx=ctx,
+            slot=slot,
+            start_at_utc_naive=_local_to_utc_naive(in_30_days_local),
+            status="confirmed",
+        )
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/week")
+    await admin_handlers.cmd_week(msg)
+
+    text = _answer_text(msg)
+    assert "Ближайшие записи" in text, f"Header should be 'Ближайшие записи'; got: {text!r}"
+    assert "Паша" in text, f"Far-future booking must appear (no 7-day limit); got: {text!r}"
+
+
+@pytest.mark.asyncio
+async def test_cmd_week_ignores_past_bookings(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Past booking (yesterday) must NOT appear in /week.
+
+    get_all_future_bookings: window [start_of_today_utc, +∞). Past bookings
+    (start_at < today) excluded. Edge case: booking yesterday at 23:00 with
+    status='confirmed' must not leak.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        # Yesterday at 15:00 Moscow
+        yesterday_local = (datetime.now(ZoneInfo(TZ)) - timedelta(days=1)).replace(
+            hour=15, minute=0, second=0, microsecond=0
+        )
+        slot = await _seed_slot(
+            session,
+            master_id=ctx["master_id"],
+            slot_date=yesterday_local.date(),
+            hour=15,
+            status="open",
+        )
+        await _seed_booking(
+            session,
+            ctx=ctx,
+            slot=slot,
+            start_at_utc_naive=_local_to_utc_naive(yesterday_local),
+            status="confirmed",
+        )
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/week")
+    await admin_handlers.cmd_week(msg)
+
+    text = _answer_text(msg)
+    assert "Ближайших записей нет" in text, (
+        f"Past booking must NOT appear; got: {text!r}"
+    )
 
 
 # ============================================================

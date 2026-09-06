@@ -179,6 +179,43 @@ async def get_week_bookings(
     return list(result.scalars().all())
 
 
+async def get_all_future_bookings(
+    session: AsyncSession,
+    master_id: UUID,
+    business_timezone: str,
+    *,
+    now_utc: datetime | None = None,  # must be tz-aware UTC (datetime.now(UTC))
+) -> list[Booking]:
+    """All confirmed/transferred bookings from today onwards (no upper bound).
+
+    Used by /week command and "неделя" menu button — master wants to see ALL
+    upcoming bookings, not just next 7 days. If master opened weeks ahead
+    (e.g. 14.09–20.09 already open) and clients booked there, those bookings
+    appear too. Replaces get_week_bookings(days_ahead=7) which hid bookings
+    beyond day 7.
+
+    Window: [start_of_today_local_utc, +∞). Filter by Booking.start_at (UTC).
+
+    `now_utc` injected for tests. Default `datetime.now(UTC)`.
+    """
+    tz = ZoneInfo(business_timezone)
+    ref = now_utc or datetime.now(UTC)
+    today_local = ref.astimezone(tz).date()
+    start_of_today_utc = datetime.combine(today_local, time(0, 0), tzinfo=tz).astimezone(UTC)
+
+    stmt = (
+        select(Booking)
+        .where(
+            Booking.master_id == master_id,
+            Booking.start_at >= start_of_today_utc,
+            Booking.status.in_(("confirmed", "transferred")),
+        )
+        .order_by(Booking.start_at)
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
 async def create_service(
     session: AsyncSession,
     business_id: UUID,

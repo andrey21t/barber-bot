@@ -70,10 +70,10 @@ from bot.models import Booking, WorkDay
 from bot.services.admin import (
     create_service,
     get_active_bookings_for_workday,
+    get_all_future_bookings,
     get_bookings_for_date,
     get_bookings_for_date_range,
     get_today_bookings,
-    get_week_bookings,
 )
 from bot.services.admin_move import (
     AdminMoveResult,
@@ -588,13 +588,13 @@ async def cmd_week(message: Message) -> None:
     master_id, _business_id, tz = resolved
 
     async with async_session_factory() as session:
-        bookings = await get_week_bookings(session, master_id, tz, days_ahead=7)
+        bookings = await get_all_future_bookings(session, master_id, tz)
 
     if not bookings:
-        await message.answer("На ближайшую неделю записей нет.")
+        await message.answer("Ближайших записей нет.")
         return
 
-    await message.answer(_render_bookings("📅 Записи на неделю:", bookings, tz))
+    await message.answer(_render_bookings("📅 Ближайшие записи:", bookings, tz))
 
 
 # ============================================================
@@ -1566,13 +1566,13 @@ async def admin_week_cb(callback: CallbackQuery) -> None:
     master_id, _business_id, tz = resolved
 
     async with async_session_factory() as session:
-        bookings = await get_week_bookings(session, master_id, tz, days_ahead=7)
+        bookings = await get_all_future_bookings(session, master_id, tz)
 
     if callback.message is not None:
         if not bookings:
-            await callback.message.answer("На ближайшую неделю записей нет.")
+            await callback.message.answer("Ближайших записей нет.")
         else:
-            await callback.message.answer(_render_bookings("📅 Записи на неделю:", bookings, tz))
+            await callback.message.answer(_render_bookings("📅 Ближайшие записи:", bookings, tz))
     await callback.answer()
 
 
