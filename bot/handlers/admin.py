@@ -2342,10 +2342,22 @@ async def admin_openweek_end_cb(
     start_time = dt_time(int(picked_start_minute) // 60, int(picked_start_minute) % 60)
     end_time = dt_time(picked_end_minute // 60, picked_end_minute % 60)
 
+    # Показываем числа этой недели в header Шага 3 — мастер сразу видит какие
+    # даты проставляет (особенно важно в Сб/Вс когда открывает следующую неделю).
+    business_tz = data.get("business_tz") or _tz
+    monday = _current_week_monday(business_tz)
+    dates_line = " · ".join(
+        f"{_WEEKDAY_LABELS_HANDLER[i]} {(monday + timedelta(days=i)).strftime('%d.%m')}"
+        for i in range(7)
+    )
+    sunday = monday + timedelta(days=6)
+    week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
+
     if callback.message is not None:
         await callback.message.answer(
             f"Шаг 3: выберите дни недели (тап → ✅).\n\n"
-            f"Окно: <b>{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}</b>",
+            f"Окно: <b>{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}</b>\n"
+            f"Неделя <b>{week_range}</b>:\n{dates_line}",
             reply_markup=admin_week_days_keyboard(set()),
         )
     await callback.answer()
@@ -2462,9 +2474,7 @@ async def admin_openweek_confirm_cb(
     # (точечная команда). Суббота (weekday=5) → текущая неделя (есть сегодня
     # + завтра). Воскресенье (weekday=6) → следующая неделя (+7 дней к monday).
     today_local = datetime.now(ZoneInfo(tz)).date()
-    monday = today_local - timedelta(days=today_local.weekday())
-    if today_local.weekday() == 6:  # Вс → следующая неделя
-        monday += timedelta(days=7)
+    monday = _current_week_monday(tz)
 
     success_lines: list[str] = []
     fail_lines: list[str] = []
@@ -2968,6 +2978,21 @@ _WEEKDAY_LABELS_HANDLER: tuple[str, ...] = (
     "Сб",
     "Вс",
 )
+
+
+def _current_week_monday(tz: str) -> date:
+    """Monday of the work week user is planning right now.
+
+    Sunday-rule: in Sunday the current Mon-Sat week is already past — user
+    opens /openweek to plan NEXT week, not to see 6 "❌ прошедшая дата".
+    Sat (weekday=5) → current week (today + tomorrow still alive).
+    """
+    today_local = datetime.now(ZoneInfo(tz)).date()
+    monday = today_local - timedelta(days=today_local.weekday())
+    if today_local.weekday() == 6:  # Вс → следующая неделя
+        monday += timedelta(days=7)
+    return monday
+
 
 
 # ============================================================
