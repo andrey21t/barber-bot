@@ -2365,8 +2365,15 @@ async def admin_openweek_confirm_cb(
     await state.clear()
 
     # Current week Monday (Mon=0): today_local - weekday().
+    # В воскресенье текущая рабочая неделя (Пн-Сб) уже прошла — пользователь
+    # запускает /openweek, чтобы планировать следующую неделю, а не видеть
+    # 6 кнопок «❌ прошедшая дата». Для сегодняшних слотов есть /openday
+    # (точечная команда). Суббота (weekday=5) → текущая неделя (есть сегодня
+    # + завтра). Воскресенье (weekday=6) → следующая неделя (+7 дней к monday).
     today_local = datetime.now(ZoneInfo(tz)).date()
     monday = today_local - timedelta(days=today_local.weekday())
+    if today_local.weekday() == 6:  # Вс → следующая неделя
+        monday += timedelta(days=7)
 
     success_lines: list[str] = []
     fail_lines: list[str] = []

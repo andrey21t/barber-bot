@@ -2504,13 +2504,16 @@ async def test_admin_openweek_confirm_cb_state_loss_clears_state(
 
 
 @pytest.mark.asyncio
-@freeze_time("2026-08-30 14:00:00", tz_offset=0)  # Sunday UTC 14:00 → Moscow 17:00
+@freeze_time("2026-08-29 14:00:00", tz_offset=0)  # Saturday UTC 14:00 → Moscow 17:00
 async def test_admin_openweek_confirm_cb_skips_past_days(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """[✅ Открыть] on Sunday with [Mon, Tue, Wed] selected — all 3 are past
-    (Mon 24, Tue 25, Wed 26 Aug). All get ❌ 'прошедшая дата', no WorkDay created.
+    """[✅ Открыть] on Saturday with [Mon, Tue, Wed] selected — all 3 are past
+    (Mon 24, Tue 25, Wed 26 Aug, current week). All get ❌ 'прошедшая дата',
+    no WorkDay created. Saturday keeps current week (Sunday rule excluded —
+    on Sunday /openweek targets next week instead, see
+    test_admin_openweek_confirm_cb_sunday_targets_next_week).
     Mirror /addslots past-date guard (admin.py:291).
     """
     from bot.models import WorkDay
@@ -2548,6 +2551,62 @@ async def test_admin_openweek_confirm_cb_skips_past_days(
             )
             count += 1 if wd is not None else 0
     assert count == 0, "No WorkDay should be created for past days"
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-08-30 14:00:00", tz_offset=0)  # Sunday UTC 14:00 → Moscow 17:00
+async def test_admin_openweek_confirm_cb_sunday_targets_next_week(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Sunday rule: /openweek on Sunday targets NEXT week, not current.
+
+    Without the rule, on Sunday 30 Aug the current week's Mon-Sat (24-29 Aug)
+    are all past → 6 'прошедшая дата' buttons, useless UX. User on Sunday wants
+    to plan next week (Mon 31 Aug - Sun 6 Sep).
+
+    Selected [Mon, Tue, Wed] → work_dates Mon 31 Aug, Tue 1 Sep, Wed 2 Sep
+    (all future) → all 3 should open successfully (✅ lines, no past-skip).
+    """
+    from bot.models import WorkDay
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_openweek_confirm"
+    state = _make_mock_state(
+        {
+            "picked_start_minute": 600,   # 10:00
+            "picked_end_minute": 1200,    # 20:00
+            "selected_weekdays": [0, 1, 2],  # Mon, Tue, Wed
+            "business_tz": TZ,
+        }
+    )
+
+    await admin_handlers.admin_openweek_confirm_cb(callback, state)
+
+    text = callback_answer_text(callback)
+    assert "прошедшая дата" not in text, (
+        f"Sunday must target next week (all future); got: {text!r}"
+    )
+    assert "✅ Пн" in text and "✅ Вт" in text and "✅ Ср" in text
+    # Verify WorkDay created for next week's Mon/Tue/Wed (31 Aug, 1, 2 Sep).
+    today_local = datetime.now(ZoneInfo(TZ)).date()
+    monday_this = today_local - timedelta(days=today_local.weekday())
+    monday_next = monday_this + timedelta(days=7)
+    async with session_factory() as session:
+        for weekday in [0, 1, 2]:
+            wd_date = monday_next + timedelta(days=weekday)
+            wd = await session.scalar(
+                select(WorkDay).where(
+                    WorkDay.master_id == ctx["master_id"],
+                    WorkDay.work_date == wd_date,
+                )
+            )
+            assert wd is not None, (
+                f"WorkDay for next-week weekday={weekday} ({wd_date}) should be created"
+            )
 
 
 @pytest.mark.asyncio
