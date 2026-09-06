@@ -2221,6 +2221,34 @@ async def test_admin_window_cancel_cb_clears_state(
     assert "Действие отменено" in text
 
 
+@pytest.mark.asyncio
+async def test_admin_window_booked_cb_alerts_no_state_change(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[🔒 слот занят] (string F.data == 'admin_window_booked') → show_alert с
+    подсказкой /today + /closeday. State НЕ трогается (accidental tap не теряет FSM).
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_window_booked"
+    state = _make_mock_state({"picked_start_minute": 600})  # FSM есть — не должен чиститься
+
+    await admin_handlers.admin_window_booked_cb(callback)
+
+    # state.clear НЕ вызывался — admin может тапнуть 🔒 случайно без потери FSM.
+    state.clear.assert_not_called()
+    # callback.answer с show_alert=True — текст содержит подсказки.
+    args, kwargs = callback.answer.call_args
+    alert_text = args[0] if args else kwargs.get("text", "")
+    assert "🔒" in alert_text
+    assert "/today" in alert_text and "Перенести" in alert_text
+    assert "/closeday" in alert_text
+    assert kwargs.get("show_alert") is True
+
+
 # ============================================================
 # /openweek handlers (Session 5.26)
 # ============================================================

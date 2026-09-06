@@ -1491,6 +1491,29 @@ async def admin_window_cancel_cb(callback: CallbackQuery, state: FSMContext) -> 
     await callback.answer()
 
 
+@router.callback_query(F.data == "admin_window_booked", StateFilter(AdminStates))
+async def admin_window_booked_cb(callback: CallbackQuery) -> None:
+    """🔒 слот занят — alert "🔒 Занято ..." для picker'а с подсветкой (msg 242).
+
+    Picker показывает ВСЕ слоты (free + busy) — занятые с 🔒 prefix и этим
+    callback'ом. State НЕ трогаем (admin может тапнуть случайно, не теряем FSM).
+    show_alert=True — модальное окно в Telegram (поверх picker), фокус.
+
+    Hint ведёт к /today → [🔄 Перенести] (single booking) или /closeday
+    (массовая отмена) — рабочий flow перенос/отмены записей.
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    await callback.answer(
+        "🔒 Этот слот уже занят записью.\n\n"
+        "Чтобы изменить:\n"
+        "• /today → 🔄 Перенести — для одной записи\n"
+        "• /closeday — для массовой отмены дня",
+        show_alert=True,
+    )
+
+
 @router.callback_query(AdminTodayCallbackData.filter(), StateFilter("*"))
 async def admin_today_cb(callback: CallbackQuery) -> None:
     """Menu tap: сегодня — мгновенный список записей (no FSM).

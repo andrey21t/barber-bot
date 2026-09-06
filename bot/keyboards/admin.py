@@ -385,17 +385,15 @@ def admin_window_slot_picker_keyboard(
         business_tz: IANA tz for slot labels (HH:MM in local time).
         picked_start_minute: required for mode="end" — start picked in previous
             step (admin_window_start_cb stored in FSM state, passed here to
-            generate end slots starting from picked_start+30).
+            generate end slots starting from picked_start+30.
         booked_slots: active bookings for the workday (from
             get_active_bookings_for_workday, converted to BookedSlot list in
-            handler). Slots that would cut a booking are filtered OUT:
-            - mode="start": slot kept if slot <= min(booked.start_minute) —
-              new window starts at or before earliest booking, so no booking
-              is excluded from the left side.
-            - mode="end": slot kept if slot >= max(booked.end_minute) — new
-              window ends at or after latest booking, no booking excluded
-              from the right side.
-            None or empty list → no filtering (CREATE new day case).
+            handler). Slots overlapping a booking (start_minute <= slot <
+            end_minute) rendered with 🔒 prefix and disabled callback
+            "admin_window_booked" (handler shows alert "🔒 Занято ...").
+            None or empty list → no bookings, all slots clickable.
+            Bizarre-but-true: slots INSIDE booking range are shown as 🔒
+            (user wants to SEE the booking in picker, msg 242).
 
     Slot ranges by mode (all slots are 30-min apart, label "HH:MM"):
         Business hours 09:00–20:00 (default work range for Екатерина):
@@ -430,23 +428,44 @@ def admin_window_slot_picker_keyboard(
     else:
         raise ValueError(f"unknown mode={mode!r}, expected 'start'|'end'")
 
-    # 5.10 UX Variant A: filter slots that would cut existing bookings.
-    # Donor-standard (winnerxxx13 booking.py:62) — picker shows only free slots.
+    # msg 242 UX: picker показывает ВСЕ слоты, занятые с 🔒 prefix + disabled
+    # callback. Заменяет donor-standard "filter out busy" (Variant A) —
+    # пользователь хочет ВИДЕТЬ где занято прямо в picker, не только в header.
     if booked_slots:
-        if mode == "start":
-            # slot kept if slot <= min(booked.start_minute) — new window starts
-            # at/before earliest booking, no booking cut on the left side.
-            min_booking_start = min(bs.start_minute for bs in booked_slots)
-            candidates = [m for m in candidates if m <= min_booking_start]
-        else:  # mode == "end"
-            # slot kept if slot >= max(booked.end_minute) — new window ends
-            # at/after latest booking, no booking cut on the right side.
-            max_booking_end = max(bs.end_minute for bs in booked_slots)
-            candidates = [m for m in candidates if m >= max_booking_end]
+        # Build a set of minutes that overlap any booking.
+        # slot m is "busy" if m is inside [bs.start_minute, bs.end_minute) —
+        # half-open: booking ending at 19:00 doesn't block slot 19:00.
+        busy_minutes: set[int] = set()
+        for bs in booked_slots:
+            for m in range(bs.start_minute, bs.end_minute, 30):
+                busy_minutes.add(m)
+    else:
+        busy_minutes = set()
 
     if not candidates:
         builder.button(text="Нет слотов", callback_data="noop")
         return builder.as_markup()
+
+    # Build date from minute for label rendering (use today's date — only
+    # HH:MM matters for label, date is irrelevant).
+    from datetime import date as dt_date
+    from datetime import datetime as dt_datetime
+
+    ref_date = dt_date(2000, 1, 1)  # arbitrary, only .time() is used
+    for minute in candidates:
+        local_time = dt_datetime.combine(ref_date, _minute_to_time(minute), tzinfo=tz).time()
+        label = local_time.strftime("%H:%M")
+        if minute in busy_minutes:
+            # 🔒 слот занят — показываем как disabled (callback="admin_window_booked").
+            builder.button(text=f"🔒 {label}", callback_data="admin_window_booked")
+        else:
+            cb = AdminWindowSlot30CallbackData(
+                workday_id=workday_id,
+                start_minute=minute,
+            )
+            builder.button(text=label, callback_data=cb.pack())
+    builder.adjust(3)
+    return builder.as_markup()
 
     # Build date from minute for label rendering (use today's date — only
     # HH:MM matters for label, date is irrelevant).
