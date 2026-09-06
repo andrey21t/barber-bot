@@ -241,7 +241,8 @@ async def test_openday_shrink_error_message_rendered(
     text = _answer_text(msg)
     assert "Нельзя сократить окно" in text
     assert "активные записи" in text
-    assert "/cancelbooking" in text
+    assert "/today" in text and "Перенести" in text
+    assert "/closeday" in text
 
     async with session_factory() as verify:
         workdays = (await verify.execute(select(WorkDay))).scalars().all()

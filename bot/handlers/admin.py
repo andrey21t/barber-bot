@@ -397,7 +397,8 @@ async def cmd_openday(message: Message, command: CommandObject) -> None:
             await message.answer(
                 f"❌ Нельзя сократить окно — есть активные записи:\n"
                 f"{_render_shrink_conflicts(exc, tz)}\n"
-                "Сначала отмените записи командой /cancelbooking (или попросите клиентов)."
+                "Сначала перенесите запись (/today → 🔄 Перенести) или закройте день (/closeday), "
+                "либо выберите окно пошире."
             )
             return
         except SQLAlchemyError:
@@ -442,8 +443,8 @@ def _render_shrink_conflicts(exc: WorkDayShrinkError, business_tz: str) -> str:
     admin_openday_end_msg, admin_window_confirm_cb, admin_openweek_confirm_cb).
     Returns text block with one row per blocking booking (client name, local
     start time, service title) — master sees WHICH booking blocks the shrink
-    and decides: cancel via /cancelbooking, reschedule via /movslot, or pick
-    a wider window.
+    and decides: reschedule via /today → [🔄 Перенести], mass-cancel via /closeday,
+    or pick a wider window.
 
     Empty conflicts (back-compat: WorkDayShrinkError raised without
     conflicts=...) → fallback to str(exc) (technical message with booking IDs).
@@ -1011,7 +1012,7 @@ async def admin_openday_calendar_cb(
                 "\n📋 <b>Записи на этот день:</b>\n"
                 + "\n".join(lines)
                 + "\n\n<i>Окно должно покрывать все записи. Чтобы сузить — сначала "
-                "отмените запись через /cancelbooking (или попросите клиентов).</i>\n\n"
+                "перенесите запись (/today → 🔄 Перенести) или закройте день (/closeday).</i>\n\n"
             )
 
         ask_text = (
@@ -1157,7 +1158,8 @@ async def admin_openday_end_msg(message: Message, state: FSMContext) -> None:
             await message.answer(
                 f"❌ Нельзя сократить окно — есть активные записи:\n"
                 f"{_render_shrink_conflicts(exc, tz)}\n"
-                "Сначала отмените записи (/cancelbooking) или выберите другое время."
+                "Сначала перенесите запись (/today → 🔄 Перенести) или закройте день (/closeday), "
+                "либо выберите другое время."
             )
             return  # state stays — admin can retry end_time (расширяя окно)
         except SQLAlchemyError:
@@ -1420,7 +1422,8 @@ async def admin_window_confirm_cb(
                 await callback.message.answer(
                     f"❌ Нельзя сократить окно — есть активные записи:\n"
                     f"{_render_shrink_conflicts(exc, tz)}\n"
-                    "Сначала отмените записи (/cancelbooking) или выберите другое время."
+                    "Сначала перенесите запись (/today → 🔄 Перенести) или закройте день "
+                    "(/closeday), либо выберите другое время."
                 )
             await callback.answer()
             return
