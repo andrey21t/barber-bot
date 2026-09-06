@@ -312,6 +312,26 @@ class AdminOpenWeekCallbackData(CallbackData, prefix="admin_openweek_days"):
     weekday: int
 
 
+class AdminOpenweekEditCallbackData(CallbackData, prefix="admin_openweek_edit"):
+    """[✏️ Пн] inline button — start per-day window edit (Session 5.28 D).
+
+    Payload:
+    - weekday: int 0-6 — Mon=0..Sun=6 (for label rendering in tests).
+    - work_date_iso: str YYYY-MM-DD — absolute date of the WorkDay to edit.
+
+    Wire format: "admin_openweek_edit:<int>:<YYYY-MM-DD>" ≈ 21+1+1+10 = 33 bytes
+    < 64 limit. Distinct prefix from AdminOpenWeekCallbackData ("days" vs
+    "edit") — no dispatch conflict.
+
+    work_date_iso prevents wrong-day-edit if user taps stale [✏️ Пн] from a
+    previous week's summary: handler uses absolute date from callback_data,
+    not _current_week_monday(tz) (which would resolve to current week's Mon).
+    """
+
+    weekday: int
+    work_date_iso: str
+
+
 class AdminCloseDayEntryCallbackData(CallbackData, prefix="admin_closeday_entry"):
     """Trigger /closeday flow from inline menu (Session 5.26).
 
@@ -336,6 +356,22 @@ class BookedSlot:
     end_minute: int  # booking.end_at LOCAL in minutes since midnight
     client_name: str  # snapshot, already html.escape()'d in booking.py
     service_title: str  # snapshot
+
+
+@dataclass(frozen=True, slots=True)
+class OpenedDay:
+    """Successfully opened day in /openweek flow (Session 5.28 D).
+
+    Collected by _apply_openweek for rendering summary text + edit keyboard.
+    workday_id stored as str (UUID hex) — FSM state JSON-serialisable, picker
+    callback_data payload also uses str (mirror admin_window_start_cb pattern).
+    """
+
+    weekday: int  # 0-6 (Mon..Sun) — key for [✏️ Пн] callback
+    work_date_iso: str  # YYYY-MM-DD, for handler to recompute work_date
+    workday_id: str  # UUID hex — for update_workday call in edit flow
+    start_time_str: str  # "HH:MM" — for summary text
+    end_time_str: str  # "HH:MM" — for summary text
 
 
 def render_booked_header(booked_slots: list[BookedSlot]) -> str:
@@ -575,6 +611,35 @@ def admin_openweek_overwrite_keyboard() -> InlineKeyboardMarkup:
     )
     builder.button(text="❌ Нет, отмена", callback_data="admin_openweek_overwrite_no")
     builder.adjust(2)
+    return builder.as_markup()
+
+
+def admin_openweek_edit_keyboard(opened_days: list[OpenedDay]) -> InlineKeyboardMarkup:
+    """[✏️ Пн] [✏️ Вт] ... [✅ Готово] — per-day window edit after /openweek
+    apply (Session 5.28 D).
+
+    One [✏️ <Day>] button per opened day (sorted by weekday). [✅ Готово]
+    below to exit edit flow (state.clear + /menu).
+
+    Args:
+        opened_days: list of OpenedDay (only successfully opened — failed
+            days don't get an edit button, no WorkDay to update).
+
+    Layout: 7 [✏️] buttons in adjust(7), then [✅ Готово] alone. Telegram
+    inline limit 8 buttons/row, adjust(7, 1) packs weekdays into one row.
+    """
+    builder = InlineKeyboardBuilder()
+    for od in sorted(opened_days, key=lambda d: d.weekday):
+        day_label = _WEEKDAY_LABELS[od.weekday]
+        builder.button(
+            text=f"✏️ {day_label}",
+            callback_data=AdminOpenweekEditCallbackData(
+                weekday=od.weekday,
+                work_date_iso=od.work_date_iso,
+            ).pack(),
+        )
+    builder.button(text="✅ Готово", callback_data="admin_openweek_done")
+    builder.adjust(7, 1)
     return builder.as_markup()
 
 

@@ -3164,6 +3164,342 @@ async def test_openweek_confirm_alert_marks_closed_days(
 
 
 # ============================================================
+# /openweek per-day edit (Session 5.28 D — Variant D)
+# ============================================================
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_apply_renders_edit_keyboard(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """D: after silent apply (no existing), summary shows [✏️ Пн] [✏️ Ср] ...
+    [✅ Готово] keyboard under text.
+
+    Setup: no existing WorkDays. Select Mon+Wed. Confirm 09:00–18:00.
+    Expected: summary text + reply_markup with [✏️ Пн] [✏️ Ср] [✅ Готово]
+    buttons (AdminOpenweekEditCallbackData for edit, "admin_openweek_done"
+    string for done).
+    """
+    from aiogram.types import InlineKeyboardMarkup
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_openweek_confirm"
+    state = _make_mock_state(
+        {
+            "picked_start_minute": 540,
+            "picked_end_minute": 1080,
+            "selected_weekdays": [0, 2],  # Mon, Wed
+            "business_tz": TZ,
+        }
+    )
+
+    await admin_handlers.admin_openweek_confirm_cb(callback, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "Пн 07.09 09:00–18:00" in text, f"Mon should be in summary; got: {text!r}"
+    assert "Ср 09.09 09:00–18:00" in text, f"Wed should be in summary; got: {text!r}"
+    # Verify edit keyboard rendered
+    args, kwargs = callback.message.edit_text.call_args
+    reply_markup = kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
+    assert isinstance(reply_markup, InlineKeyboardMarkup), "Should have edit keyboard"
+    buttons = [btn for row in reply_markup.inline_keyboard for btn in row]
+    button_texts = [btn.text for btn in buttons]
+    assert any("✏️ Пн" in t for t in button_texts), (
+        f"Should have [✏️ Пн] button; got: {button_texts}"
+    )
+    assert any("✏️ Ср" in t for t in button_texts), (
+        f"Should have [✏️ Ср] button; got: {button_texts}"
+    )
+    assert any("Готово" in t for t in button_texts), (
+        f"Should have [✅ Готово] button; got: {button_texts}"
+    )
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_edit_cb_starts_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """D: [✏️ Пн] (state=None) → set_state(opening_week_edit_start), save
+    edit_weekday/edit_workday_id/edit_monday_iso in state, show start picker.
+
+    Setup: seed WorkDay for Mon 07.09 10-19. Tap [✏️ Пн].
+    Expected: state.set_state(opening_week_edit_start), state.update_data with
+    edit_weekday=0, edit_workday_id=<UUID str>, edit_monday_iso="2026-09-07",
+    business_tz=TZ. callback.message.answer called with picker keyboard
+    (mode="start").
+    """
+    from bot.keyboards.admin import AdminOpenweekEditCallbackData
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        await _seed_workday(
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
+        )
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = AdminOpenweekEditCallbackData(
+        weekday=0, work_date_iso="2026-09-07"
+    ).pack()
+    state = _make_mock_state()  # state=None initially (post-apply)
+
+    await admin_handlers.admin_openweek_edit_cb(
+        callback,
+        AdminOpenweekEditCallbackData(weekday=0, work_date_iso="2026-09-07"),
+        state,
+    )
+
+    state.set_state.assert_called_once_with(admin_handlers.AdminStates.opening_week_edit_start)
+    update = _state_data_passed(state)
+    assert update["edit_weekday"] == 0, f"Should save edit_weekday=0; got: {update}"
+    assert "edit_workday_id" in update, f"Should save edit_workday_id; got: {update}"
+    assert update["edit_monday_iso"] == "2026-09-07", (
+        f"Should save monday ISO (=work_date's Monday); got: {update}"
+    )
+    # Picker rendered with day label (UX improvement S3)
+    args, kwargs = callback.message.answer.call_args
+    text = args[0] if args else kwargs.get("text", "")
+    assert "Редактирование Пн 07.09" in text, (
+        f"Should show day label in picker text; got: {text!r}"
+    )
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_edit_end_applies_update_workday(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """D: end picker tap → state.clear() → update_workday → re-render summary
+    with new window for that day.
+
+    Setup: WorkDay Mon 07.09 10-19. User taps [✏️ Пн] → start picker → 09:00 →
+    end picker → 18:00. Simulate end picker tap (state pre-populated with
+    edit_workday_id, edit_monday_iso, edit_picked_start_minute=540).
+
+    Expected: state.clear called, update_workday called with workday_id,
+    09:00, 18:00. Re-render summary shows "Пн 07.09 09:00–18:00".
+    """
+    from bot.keyboards.admin import AdminWindowSlot30CallbackData
+    from bot.services.workday import select_workday
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        master_id = ctx["master_id"]
+        wd = await _seed_workday(
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
+        )
+        workday_id = wd.id
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = AdminWindowSlot30CallbackData(
+        workday_id=workday_id, start_minute=1080  # 18:00
+    ).pack()
+    state = _make_mock_state(
+        {
+            "edit_weekday": 0,
+            "edit_workday_id": str(workday_id),
+            "edit_monday_iso": "2026-09-07",
+            "edit_picked_start_minute": 540,  # 09:00
+            "business_tz": TZ,
+        }
+    )
+
+    await admin_handlers.admin_openweek_edit_end_cb(
+        callback,
+        AdminWindowSlot30CallbackData(workday_id=workday_id, start_minute=1080),
+        state,
+    )
+
+    state.clear.assert_called_once()
+    # Verify DB state — WorkDay updated to 09:00–18:00
+    async with session_factory() as session:
+        wd_after = await select_workday(session, master_id, datetime(2026, 9, 7).date())
+    assert wd_after is not None, "WorkDay should still exist"
+    assert str(wd_after.start_time) == "09:00:00", (
+        f"Start should be 09:00; got: {wd_after.start_time}"
+    )
+    assert str(wd_after.end_time) == "18:00:00", (
+        f"End should be 18:00; got: {wd_after.end_time}"
+    )
+    # Re-render summary
+    text = callback_answer_text(callback)
+    assert "Пн 07.09 09:00–18:00" in text, f"Summary should show new window; got: {text!r}"
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_edit_end_shows_shrink_error(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """D: shrink-check protects existing bookings — edit to narrower window
+    that conflicts with booking → alert in summary, WorkDay unchanged.
+
+    Setup: WorkDay Mon 07.09 09-19, booking 13:00 (Стрижка, 60 min). Try to
+    edit to 09:00–12:00 (shrink past 13:00 booking) → WorkDayShrinkError.
+    Expected: summary shows "❌ Нельзя сузить" + conflict details, WorkDay
+    unchanged (still 09-19), edit keyboard re-rendered for retry.
+    """
+    from bot.keyboards.admin import AdminWindowSlot30CallbackData
+    from bot.services.workday import select_workday
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        master_id = ctx["master_id"]
+        wd = await _seed_workday(
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 7).date(),
+            start_time_str="09:00",
+            end_time_str="19:00",
+        )
+        workday_id = wd.id
+        # Booking at 13:00 Moscow (conflicts with shrink to 09-12)
+        booking_local = datetime(2026, 9, 7, 13, 0, tzinfo=ZoneInfo(TZ))
+        slot = await _seed_slot(
+            session,
+            master_id=master_id,
+            slot_date=booking_local.date(),
+            hour=13,
+            status="open",
+        )
+        await _seed_booking(
+            session,
+            ctx=ctx,
+            slot=slot,
+            start_at_utc_naive=_local_to_utc_naive(booking_local),
+            status="confirmed",
+        )
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = AdminWindowSlot30CallbackData(
+        workday_id=workday_id, start_minute=720  # 12:00 — shrink to 09:00–12:00
+    ).pack()
+    state = _make_mock_state(
+        {
+            "edit_weekday": 0,
+            "edit_workday_id": str(workday_id),
+            "edit_monday_iso": "2026-09-07",
+            "edit_picked_start_minute": 540,  # 09:00
+            "business_tz": TZ,
+        }
+    )
+
+    await admin_handlers.admin_openweek_edit_end_cb(
+        callback,
+        AdminWindowSlot30CallbackData(workday_id=workday_id, start_minute=720),
+        state,
+    )
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "Нельзя сузить" in text, f"Should show shrink alert; got: {text!r}"
+    # WorkDay unchanged
+    async with session_factory() as session:
+        wd_after = await select_workday(session, master_id, datetime(2026, 9, 7).date())
+    assert wd_after is not None and str(wd_after.start_time) == "09:00:00", "Start unchanged"
+    assert str(wd_after.end_time) == "19:00:00", (
+        f"End unchanged (still 19:00); got: {wd_after.end_time}"
+    )
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_done_cb_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """D: [✅ Готово] (state=None) → state.clear (defensive) + show /menu."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_openweek_done"
+    state = _make_mock_state()
+
+    await admin_handlers.admin_openweek_done_cb(callback, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "/menu" in text, f"Should show /menu hint; got: {text!r}"
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_edit_cb_alerts_for_past_day(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """D: [✏️ Пн] where Пн is past → alert "Прошедшая дата", no state change.
+
+    Edge: if user has stale edit keyboard from previous week and taps [✏️ Пн]
+    where Пн is now past (e.g. next week became current week), handler refuses.
+    """
+    # freeze: Sunday 06.09 → next week is 07.09-13.09 (Mon=07 is FUTURE).
+    # To test past-day skip, use a different freeze (mid-week, where Mon past).
+    pass  # placeholder — see test below with different freeze_time
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-09 14:00:00", tz_offset=0)  # Wednesday 09.09 → Mon 07.09 past
+async def test_openweek_edit_cb_alerts_for_past_day_wed(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """D: tap [✏️ Пн] where Mon 07.09 is past (today Wed 09.09) → alert.
+    _current_week_monday on Wed returns Mon 07.09 (current week) — work_date
+    = 07.09 < today_local (09.09) → past-day guard triggers.
+    """
+    from bot.keyboards.admin import AdminOpenweekEditCallbackData
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        await _seed_workday(
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
+        )
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = AdminOpenweekEditCallbackData(
+        weekday=0, work_date_iso="2026-09-07"
+    ).pack()
+    state = _make_mock_state()
+
+    await admin_handlers.admin_openweek_edit_cb(
+        callback,
+        AdminOpenweekEditCallbackData(weekday=0, work_date_iso="2026-09-07"),
+        state,
+    )
+
+    # state NOT changed (alert, no set_state)
+    state.set_state.assert_not_called()
+    # alert shown via callback.answer (show_alert=True)
+    callback.answer.assert_called_once()
+    args, kwargs = callback.answer.call_args
+    alert_text = args[0] if args else kwargs.get("text", "")
+    assert "Прошедшая дата" in alert_text, f"Should alert past day; got: {alert_text!r}"
+
+
+# ============================================================
 # /closeday handlers (Session 5.26)
 # ============================================================
 

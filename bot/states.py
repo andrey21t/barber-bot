@@ -58,6 +58,12 @@ class AdminStates(StatesGroup):
     opening_week_start = State()
     opening_week_end = State()
     opening_week_days = State()
+    # /openweek edit (Session 5.28 D): per-day window edit AFTER initial open.
+    # State=None between edits — edit is a fresh sub-flow from inline keyboard.
+    # [✏️ Пн] tap → opening_week_edit_start (pick new start) →
+    # opening_week_edit_end (pick new end) → update_workday → state.clear().
+    opening_week_edit_start = State()
+    opening_week_edit_end = State()
     # /closeday (Session 5.26): close concrete day — calendar → confirm
     # (if active bookings) → close_workday_with_cancellations.
     closing_day_date = State()

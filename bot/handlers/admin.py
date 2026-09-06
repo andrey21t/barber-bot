@@ -49,6 +49,7 @@ from bot.keyboards.admin import (
     AdminMoveSlot30CallbackData,
     AdminOpendayCallbackData,
     AdminOpenWeekCallbackData,
+    AdminOpenweekEditCallbackData,
     AdminOpenWeekEntryCallbackData,
     AdminServicesCallbackData,
     AdminTodayCallbackData,
@@ -56,10 +57,12 @@ from bot.keyboards.admin import (
     AdminWindowConfirmCallbackData,
     AdminWindowSlot30CallbackData,
     BookedSlot,
+    OpenedDay,
     admin_calendar_keyboard,
     admin_closeday_confirm_keyboard,
     admin_inline_menu,
     admin_move_confirm_keyboard,
+    admin_openweek_edit_keyboard,
     admin_openweek_overwrite_keyboard,
     admin_today_keyboard,
     admin_week_days_keyboard,
@@ -102,6 +105,7 @@ from bot.services.workday import (
     close_workday_with_cancellations,
     open_workday,
     select_workday,
+    update_workday,
 )
 from bot.states import AdminMoveStates, AdminStates
 
@@ -1493,6 +1497,367 @@ async def admin_window_cancel_cb(callback: CallbackQuery, state: FSMContext) -> 
     await callback.answer()
 
 
+# ============================================================
+# /openweek per-day edit (Session 5.28 D — Variant D)
+#
+# After /openweek apply, summary shows inline [✏️ Пн] [✏️ Ср] ... [✅ Готово].
+# State=None between edits — edit is a fresh sub-flow:
+#   [✏️ Пн] (state=None) → set_state(opening_week_edit_start) + show start picker
+#   start picker tap (state=opening_week_edit_start) → set_state(opening_week_edit_end)
+#   end picker tap (state=opening_week_edit_end) → update_workday → state.clear()
+#   + re-render summary with [✏️ ...] keyboard (refreshed windows)
+# ============================================================
+
+
+def _render_openweek_edit_summary(
+    monday: date,
+    opened_days: list[OpenedDay],
+    *,
+    extra_alert: str = "",
+) -> str:
+    """Re-render /openweek summary after per-day edit (Session 5.28 D).
+
+    Header (week range) + per-day window lines (refreshed from DB) + optional
+    extra_alert line (e.g. "❌ Нельзя сузить Пн: есть бронь ..."). Caller
+    appends edit keyboard separately via admin_openweek_edit_keyboard.
+
+    opened_days must be REFRESHED from DB after edit (caller re-queries
+    WorkDay rows) — not the pre-edit list, otherwise summary shows stale
+    windows.
+    """
+    sunday = monday + timedelta(days=6)
+    week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
+    lines = [f"🗓 <b>Открыть неделю ({week_range})</b>"]
+    if extra_alert:
+        lines.append(extra_alert)
+    lines.append("")  # blank line between header and days
+    for od in sorted(opened_days, key=lambda d: d.weekday):
+        day_label = _WEEKDAY_LABELS_HANDLER[od.weekday]
+        date_label = date.fromisoformat(od.work_date_iso).strftime("%d.%m")
+        lines.append(
+            f"✅ {day_label} {date_label} {od.start_time_str}–{od.end_time_str}"
+        )
+    return "\n".join(lines)
+
+
+async def _refresh_opened_days(
+    master_id: UUID,
+    tz: str,
+    monday: date,
+) -> list[OpenedDay]:
+    """Re-query WorkDay rows for the opened week (Mon..Sun) after per-day edit.
+
+    Returns OpenedDay list sorted by weekday — for re-render summary + edit
+    keyboard. Skips past days (no edit button for them) and inactive WorkDays
+    (closed via /closeday — not editable here, user should /openday to re-open).
+    """
+    today_local = datetime.now(ZoneInfo(tz)).date()
+    opened: list[OpenedDay] = []
+    for weekday in range(7):
+        work_date = monday + timedelta(days=weekday)
+        if work_date < today_local:
+            continue
+        async with async_session_factory() as session:
+            wd = await select_workday(session, master_id, work_date)
+        if wd is not None and wd.is_active:
+            opened.append(
+                OpenedDay(
+                    weekday=weekday,
+                    work_date_iso=work_date.isoformat(),
+                    workday_id=str(wd.id),
+                    start_time_str=wd.start_time.strftime("%H:%M"),
+                    end_time_str=wd.end_time.strftime("%H:%M"),
+                )
+            )
+    return opened
+
+
+@router.callback_query(
+    AdminOpenweekEditCallbackData.filter(),
+    StateFilter(None),
+)
+async def admin_openweek_edit_cb(
+    callback: CallbackQuery,
+    callback_data: AdminOpenweekEditCallbackData,
+    state: FSMContext,
+) -> None:
+    """[✏️ Пн] → start per-day edit: save context in FSM, show start picker.
+
+    State=None (post-apply) → set_state(opening_week_edit_start). State stores:
+    - edit_weekday: int (0-6) — for re-render after update
+    - edit_workday_id: str (UUID hex) — for update_workday call
+    - edit_monday_iso: str — to recompute monday for re-render
+    - business_tz: str — for picker label rendering
+
+    picker reuses admin_window_slot_picker_keyboard (mode="start") with
+    booked_slots from get_active_bookings_for_workday ( Variant A UX —
+    master sees 🔒 busy slots and avoids cutting bookings upfront).
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await state.clear()
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    master_id, _business_id, tz = resolved
+
+    # W2 fix: use absolute work_date_iso from callback_data, not
+    # _current_week_monday(tz) + weekday. Prevents wrong-day-edit if user
+    # taps stale [✏️ Пн] from a previous week's summary — handler edits the
+    # exact day the button was rendered for, not current week's same weekday.
+    weekday = callback_data.weekday
+    work_date = date.fromisoformat(callback_data.work_date_iso)
+    today_local = datetime.now(ZoneInfo(tz)).date()
+    if work_date < today_local:
+        await callback.answer("❌ Прошедшая дата нельзя редактировать", show_alert=True)
+        return
+
+    async with async_session_factory() as session:
+        wd = await select_workday(session, master_id, work_date)
+    if wd is None:
+        await callback.answer(
+            "❌ День не открыт. Сначала откройте через /openweek", show_alert=True
+        )
+        return
+    if not wd.is_active:
+        await callback.answer(
+            "❌ День закрыт. Откройте заново через /openday", show_alert=True
+        )
+        return
+
+    workday_id = wd.id
+    # monday for re-render after edit: work_date's Monday (not current week's).
+    monday = work_date - timedelta(days=work_date.weekday())
+    await state.update_data(
+        edit_weekday=weekday,
+        edit_workday_id=str(workday_id),
+        edit_monday_iso=monday.isoformat(),
+        business_tz=tz,
+    )
+    await state.set_state(AdminStates.opening_week_edit_start)
+
+    # Active bookings for picker (mirror admin_window_start_cb pattern).
+    async with async_session_factory() as session:
+        workday = await session.get(WorkDay, workday_id)
+        if workday is None:
+            await state.clear()
+            await callback.answer("❌ Рабочий день не найден", show_alert=True)
+            return
+        active_bookings = await get_active_bookings_for_workday(session, workday, tz)
+    booked_slots = _bookings_to_booked_slots(active_bookings, tz)
+
+    if callback.message is not None:
+        day_label = _WEEKDAY_LABELS_HANDLER[weekday]
+        date_label = work_date.strftime("%d.%m")
+        await callback.message.answer(
+            render_booked_header(booked_slots)
+            + f"✏️ Редактирование {day_label} {date_label} — выберите новое время начала окна:",
+            reply_markup=admin_window_slot_picker_keyboard(
+                workday_id=workday_id,
+                mode="start",
+                business_tz=tz,
+                booked_slots=booked_slots,
+            ),
+        )
+    await callback.answer()
+
+
+@router.callback_query(
+    AdminWindowSlot30CallbackData.filter(),
+    StateFilter(AdminStates.opening_week_edit_start),
+)
+async def admin_openweek_edit_start_cb(
+    callback: CallbackQuery,
+    callback_data: AdminWindowSlot30CallbackData,
+    state: FSMContext,
+) -> None:
+    """[start slot tap in edit flow] → save picked_start_minute, set_state
+    opening_week_edit_end, show end picker.
+
+    Distinct from admin_window_start_cb by StateFilter — dispatch by state
+    (opening_week_edit_start vs picking_window_start). Reads edit_* keys
+    from state (not selected_date/workday_id).
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await state.clear()
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    _master_id, _business_id, tz = resolved
+
+    data = await state.get_data()
+    workday_id_str = data.get("edit_workday_id")
+    if not workday_id_str:
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer(
+                "❌ Данные сессии потеряны. /openweek чтобы начать заново"
+            )
+        await callback.answer()
+        return
+
+    picked_start_minute = callback_data.start_minute
+    await state.update_data(edit_picked_start_minute=picked_start_minute)
+    await state.set_state(AdminStates.opening_week_edit_end)
+
+    workday_id = callback_data.workday_id
+    async with async_session_factory() as session:
+        workday = await session.get(WorkDay, workday_id)
+        if workday is None:
+            await state.clear()
+            if callback.message is not None:
+                await callback.message.answer(
+                    "❌ Рабочий день не найден. /openweek чтобы начать заново"
+                )
+            await callback.answer()
+            return
+        active_bookings = await get_active_bookings_for_workday(session, workday, tz)
+    booked_slots = _bookings_to_booked_slots(active_bookings, tz)
+
+    if callback.message is not None:
+        await callback.message.answer(
+            render_booked_header(booked_slots) + "⏰ Выберите новое время окончания окна:",
+            reply_markup=admin_window_slot_picker_keyboard(
+                workday_id=workday_id,
+                mode="end",
+                business_tz=tz,
+                picked_start_minute=picked_start_minute,
+                booked_slots=booked_slots,
+            ),
+        )
+    await callback.answer()
+
+
+@router.callback_query(
+    AdminWindowSlot30CallbackData.filter(),
+    StateFilter(AdminStates.opening_week_edit_end),
+)
+async def admin_openweek_edit_end_cb(
+    callback: CallbackQuery,
+    callback_data: AdminWindowSlot30CallbackData,
+    state: FSMContext,
+) -> None:
+    """[end slot tap in edit flow] → state.clear() (race protection) →
+    update_workday(workday_id, new_start, new_end, tz) → re-render summary
+    with [✏️ ...] keyboard.
+
+    Direct apply (no confirm step — shrink-check is the safety net, mirror
+    NEXT_SESSION_PROMPT.md Variant D spec). On WorkDayShrinkError: alert +
+    re-render summary (user sees the conflicting booking in alert, can pick
+    another day or retry with a wider window).
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await state.clear()
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    master_id, _business_id, tz = resolved
+
+    data = await state.get_data()
+    workday_id_str = data.get("edit_workday_id")
+    monday_iso = data.get("edit_monday_iso")
+    picked_start_minute = data.get("edit_picked_start_minute")
+    if not workday_id_str or not monday_iso or picked_start_minute is None:
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer(
+                "❌ Данные сессии потеряны. /openweek чтобы начать заново"
+            )
+        await callback.answer()
+        return
+
+    picked_end_minute = callback_data.start_minute
+
+    try:
+        new_start = dt_time(int(picked_start_minute) // 60, int(picked_start_minute) % 60)
+        new_end = dt_time(picked_end_minute // 60, picked_end_minute % 60)
+    except (ValueError, TypeError):
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer("❌ Ошибка данных в сессии. /openweek заново")
+        await callback.answer()
+        return
+
+    # state.clear() BEFORE DB write (race protection — mirror admin_move_confirm_cb).
+    await state.clear()
+    monday = date.fromisoformat(monday_iso)
+    workday_id = UUID(workday_id_str)
+
+    extra_alert = ""
+    try:
+        async with async_session_factory() as session:
+            await update_workday(session, workday_id, new_start, new_end, business_tz=tz)
+    except WorkDayShrinkError as exc:
+        # Show which booking blocks the shrink — master can cancel/transfer
+        # it first OR pick a wider window. Re-render summary unchanged (DB
+        # write failed, WorkDay windows are pre-edit).
+        conflicts_str = _render_shrink_conflicts(exc, tz)
+        extra_alert = f"❌ Нельзя сузить:\n{conflicts_str}"
+    except ValueError as exc:
+        extra_alert = f"❌ Ошибка: {exc}"
+    except SQLAlchemyError:
+        extra_alert = "❌ Ошибка БД при обновлении окна"
+
+    # Re-query all opened days (refreshed windows — pick up the edit or
+    # original windows if shrink failed).
+    opened_days = await _refresh_opened_days(master_id, tz, monday)
+    summary_text = _render_openweek_edit_summary(monday, opened_days, extra_alert=extra_alert)
+
+    if callback.message is not None:
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(
+                    summary_text,
+                    reply_markup=admin_openweek_edit_keyboard(opened_days),
+                )
+            except TelegramBadRequest:
+                await callback.message.answer(
+                    summary_text,
+                    reply_markup=admin_openweek_edit_keyboard(opened_days),
+                )
+        else:
+            await callback.message.answer(
+                summary_text,
+                reply_markup=admin_openweek_edit_keyboard(opened_days),
+            )
+    await callback.answer()
+
+
+@router.callback_query(
+    F.data == "admin_openweek_done",
+    StateFilter(None),
+)
+async def admin_openweek_done_cb(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """[✅ Готово] → exit /openweek edit flow, show /menu.
+
+    State=None (post-apply) — nothing to clear, just render menu. Distinct
+    from admin_openweek_cancel_cb (state=opening_week_days, mid-flow cancel).
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    # Defensive clear in case state somehow non-None (shouldn't be — handlers
+    # clear state before reaching this keyboard, but guard against stray state).
+    await state.clear()
+    if callback.message is not None:
+        await callback.message.answer("📋 /menu для действий", reply_markup=admin_inline_menu())
+    await callback.answer()
+
+
 @router.callback_query(F.data == "admin_window_booked", StateFilter(AdminStates))
 async def admin_window_booked_cb(callback: CallbackQuery) -> None:
     """🔒 слот занят — alert "🔒 Занято ..." для picker'а с подсветкой (msg 242).
@@ -2464,17 +2829,23 @@ async def _apply_openweek(
     selected: list[int],
     start_time: dt_time,
     end_time: dt_time,
-) -> str:
-    """Apply open_workday to each selected weekday, render result text.
+) -> tuple[str, list[OpenedDay]]:
+    """Apply open_workday to each selected weekday, render result text +
+    collect OpenedDay list for edit keyboard.
 
-    Shared by `admin_openweek_confirm_cb` (silent path — no existing days) and
-    `admin_openweek_overwrite_yes_cb` (after user confirmed overwrite). Returns
-    the full result text (header + summary + bookings block) for edit_text/answer.
+    Shared by `admin_openweek_confirm_cb` (silent path — no existing days)
+    and `admin_openweek_overwrite_yes_cb` (after user confirmed overwrite).
+    Returns (result_text, opened_days) — caller renders text + edit keyboard.
+
+    opened_days: only successfully opened non-past days (failed/past don't
+    get an edit button — no WorkDay to update). workday_id queried back via
+    select_workday after open_workday commits (UPCERT creates if absent).
     """
     today_local = datetime.now(ZoneInfo(tz)).date()
 
     success_lines: list[str] = []
     fail_lines: list[str] = []
+    opened_days: list[OpenedDay] = []
     for weekday in sorted(selected):
         work_date = monday + timedelta(days=weekday)
         day_label = _WEEKDAY_LABELS_HANDLER[weekday]
@@ -2490,10 +2861,23 @@ async def _apply_openweek(
                 await open_workday(
                     session, master_id, work_date, start_time, end_time, business_tz=tz
                 )
+                # Query workday_id back for edit keyboard (UPCERT created or
+                # updated — select_workday returns the row either way).
+                wd = await select_workday(session, master_id, work_date)
             success_lines.append(
                 f"✅ {day_label} {date_label} "
                 f"{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}"
             )
+            if wd is not None:
+                opened_days.append(
+                    OpenedDay(
+                        weekday=weekday,
+                        work_date_iso=work_date.isoformat(),
+                        workday_id=str(wd.id),
+                        start_time_str=start_time.strftime("%H:%M"),
+                        end_time_str=end_time.strftime("%H:%M"),
+                    )
+                )
         except WorkDayShrinkError as exc:
             # Показываем КАКАЯ бронь блокирует (имя, время, услуга) — пользователь
             # видит что мешает и решает: отменить, перенести или выбрать окно пошире.
@@ -2522,27 +2906,34 @@ async def _apply_openweek(
     if bookings:
         bookings_block = "\n\n" + _render_bookings("📅 Записи на неделю:", bookings, tz)
 
-    return f"🗓 <b>Открыть неделю ({week_range})</b>\n\n{summary}{bookings_block}"
+    text = f"🗓 <b>Открыть неделю ({week_range})</b>\n\n{summary}{bookings_block}"
+    return text, opened_days
 
 
-async def _render_openweek_result(callback: CallbackQuery, result_text: str) -> None:
+async def _render_openweek_result(
+    callback: CallbackQuery,
+    result_text: str,
+    opened_days: list[OpenedDay] | None = None,
+) -> None:
     """edit_text with TelegramBadRequest fallback to answer (mirror existing
-    pattern from inline admin_inline_menu render)."""
+    pattern from inline admin_inline_menu render).
+
+    opened_days: if non-empty, render edit keyboard under summary (Variant D).
+    If None/empty → admin_inline_menu (backward compat for callers without
+    edit keyboard, e.g. if _apply_openweek returns no opened days).
+    """
     if callback.message is None:
         return
+    reply_markup = (
+        admin_openweek_edit_keyboard(opened_days) if opened_days else admin_inline_menu()
+    )
     if isinstance(callback.message, Message):
         try:
-            await callback.message.edit_text(
-                result_text, reply_markup=admin_inline_menu()
-            )
+            await callback.message.edit_text(result_text, reply_markup=reply_markup)
         except TelegramBadRequest:
-            await callback.message.answer(
-                result_text, reply_markup=admin_inline_menu()
-            )
+            await callback.message.answer(result_text, reply_markup=reply_markup)
     else:
-        await callback.message.answer(
-            result_text, reply_markup=admin_inline_menu()
-        )
+        await callback.message.answer(result_text, reply_markup=reply_markup)
 
 
 @router.callback_query(
@@ -2660,10 +3051,10 @@ async def admin_openweek_confirm_cb(
 
     # No existing → silent apply (current behavior, backward compat).
     await state.clear()
-    result_text = await _apply_openweek(
+    result_text, opened_days = await _apply_openweek(
         master_id, tz, monday, selected, start_time, end_time
     )
-    await _render_openweek_result(callback, result_text)
+    await _render_openweek_result(callback, result_text, opened_days)
     await callback.answer()
 
 
@@ -2719,10 +3110,10 @@ async def admin_openweek_overwrite_yes_cb(
 
     await state.clear()
     monday = _current_week_monday(tz)
-    result_text = await _apply_openweek(
+    result_text, opened_days = await _apply_openweek(
         master_id, tz, monday, selected, start_time, end_time
     )
-    await _render_openweek_result(callback, result_text)
+    await _render_openweek_result(callback, result_text, opened_days)
     await callback.answer()
 
 
