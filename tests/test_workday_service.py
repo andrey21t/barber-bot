@@ -278,6 +278,49 @@ async def test_update_workday_shrink_with_active_bookings_refuse(
 
 
 @pytest.mark.asyncio
+async def test_update_workday_shrink_ignores_past_day_bookings(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Regression (msg follow-up 2026-09-06): shrink на 07.09 показывал конфликты
+    с бронью 06.09 — conflict_stmt не фильтровал по дате, и вчерашняя бронь
+    (start_at < new_start_utc всегда true) попадала в conflicts для будущих дней.
+
+    Setup: WorkDay 07.09 [10:00, 20:00]. Бронь 06.09 [19:00, 20:00] (вчера).
+    Shrink 07.09 end_time 20:00 → 18:00 — должен пройти без WorkDayShrinkError
+    (бронь 06.09 не относится к 07.09, она в прошлом дне).
+    """
+    today = datetime.now(UTC) + timedelta(days=11)
+    work_date = today.date()
+    yesterday = work_date - timedelta(days=1)
+    workday = await open_workday(
+        session,
+        seed_data["master_id"],
+        work_date,
+        dt_time(10, 0),
+        dt_time(20, 0),
+        business_tz=BUSINESS_TZ,
+    )
+    # Booking yesterday — should NOT block shrink of today's workday.
+    await _direct_insert_booking(
+        session,
+        seed_data,
+        start_at=_local_to_utc(yesterday, 19, 0),
+        end_at=_local_to_utc(yesterday, 20, 0),
+    )
+
+    # Shrink today's end_time 20:00 → 18:00 — past-day booking is irrelevant.
+    updated = await update_workday(
+        session,
+        workday.id,
+        dt_time(10, 0),
+        dt_time(18, 0),
+        business_tz=BUSINESS_TZ,
+    )
+    assert updated.end_time == dt_time(18, 0)
+
+
+@pytest.mark.asyncio
 async def test_update_workday_expand_ok(
     session: AsyncSession,
     seed_data: dict[str, Any],

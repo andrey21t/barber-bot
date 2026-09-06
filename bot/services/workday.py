@@ -35,7 +35,7 @@ it via _resolve_master_and_business) — service layer stays config-free.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -154,12 +154,19 @@ async def update_workday(
         workday.work_date, new_start_time, new_end_time, business_tz
     )
 
+    # Фильтр по локальному дню workday.work_date — иначе брони с прошлых дней
+    # попадают в conflicts (start_at < new_start_utc всегда true для вчерашних
+    # броней). day_bounds = [00:00, next-day 00:00) в UTC.
+    day_start_utc, day_end_utc = _day_bounds_utc(workday.work_date, business_tz)
+
     # Gap 8: parens MANDATORY — `AND` binds tighter than `OR`, without parens
     # cancelled bookings would false-positive (cancelled.status would bypass
     # the inner OR branch when start_at < new_start_utc but the AND clause
     # enforces status IN ('confirmed','transferred')).
     conflict_stmt = select(Booking).where(
         Booking.master_id == workday.master_id,
+        Booking.start_at >= day_start_utc,
+        Booking.start_at < day_end_utc,
         (Booking.start_at < new_start_utc) | (Booking.end_at > new_end_utc),
         Booking.status.in_(("confirmed", "transferred")),
     )
@@ -212,8 +219,13 @@ async def close_workday(
     new_start_utc, new_end_utc = _window_bounds_utc(
         workday.work_date, workday.start_time, workday.end_time, business_tz
     )
+    # Фильтр по локальному дню (как в update_workday) — иначе брони с прошлых
+    # дней попадают в conflicts при закрытии дня.
+    day_start_utc, day_end_utc = _day_bounds_utc(workday.work_date, business_tz)
     conflict_stmt = select(Booking).where(
         Booking.master_id == workday.master_id,
+        Booking.start_at >= day_start_utc,
+        Booking.start_at < day_end_utc,
         Booking.start_at < new_end_utc,
         Booking.end_at > new_start_utc,
         Booking.status.in_(("confirmed", "transferred")),
@@ -387,3 +399,22 @@ def _window_bounds_utc(
     start_utc = datetime.combine(work_date, start_time, tzinfo=tz).astimezone(UTC)
     end_utc = datetime.combine(work_date, end_time, tzinfo=tz).astimezone(UTC)
     return start_utc, end_utc
+
+
+def _day_bounds_utc(
+    work_date: date,
+    business_tz: str,
+) -> tuple[datetime, datetime]:
+    """Build UTC bounds for the LOCAL day [00:00, next-day 00:00).
+
+    Used to filter Booking rows belonging to the same local day as work_date
+    (cross-DB safe — pure datetime comparison, no SQL date functions).
+    A booking starting at 23:30 local has start_at inside [day_start_utc,
+    day_end_utc); a booking starting at 00:15 next day has start_at >= day_end_utc
+    → filtered out.
+    """
+    tz = ZoneInfo(business_tz)
+    day_start_utc = datetime.combine(work_date, time(0, 0), tzinfo=tz).astimezone(UTC)
+    next_day = work_date + timedelta(days=1)
+    day_end_utc = datetime.combine(next_day, time(0, 0), tzinfo=tz).astimezone(UTC)
+    return day_start_utc, day_end_utc
