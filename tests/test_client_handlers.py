@@ -53,6 +53,7 @@ from bot.keyboards.client import (
 from bot.models import Booking, Business, Client, Master, Service, Slot, WorkDay
 from bot.states import BookingStates, TransferStates
 from sqlalchemy import select
+from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # ============================================================
@@ -4072,6 +4073,131 @@ async def test_service_custom_cb_keeps_state_and_asks_text(
     state.update_data.assert_awaited_once()  # only pre-call, no handler calls
     text = _answer_text(cb.message)
     assert "Напишите услугу" in text
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_book_back_to_date_cb_returns_to_date_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Session 5.30 S1: book_back_to_date_cb — tap '↩️ Назад' in service picker
+    → state.set_state(selecting_date) + re-render date_picker_keyboard.
+    Lets user change date without /cancel + /book restart.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        await _seed_workday(session, ctx, work_date=target_date)
+
+    cb = _make_string_callback("book_back_to_date")
+    state = _make_state()
+    await state.update_data(is_slots_path=False, selected_date=target_date.isoformat())
+
+    await client_handlers.book_back_to_date_cb(cb, state)
+
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.selecting_date
+    text = _answer_text(cb.message)
+    assert "Выберите дату" in text
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_book_back_to_date_cb_master_not_found_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Session 5.30 S1: book_back_to_date_cb, master not found (race with
+    business config change) → state.clear + 'Мастер не найден' + callback.answer.
+    """
+    async with session_factory() as session:
+        await session.execute(sa_text("DELETE FROM masters"))
+
+    cb = _make_string_callback("book_back_to_date")
+    state = _make_state()
+    await state.update_data(is_slots_path=False)
+
+    await client_handlers.book_back_to_date_cb(cb, state)
+
+    state.clear.assert_awaited_once()
+    text = _answer_text(cb.message)
+    assert "Мастер не найден" in text
+    state.set_state.assert_not_awaited()
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_book_back_to_service_cb_returns_to_service_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Session 5.30 S1: book_back_to_service_cb — tap '↩️ Назад' in slot picker
+    → state.set_state(entering_service) + re-render service_picker_keyboard.
+    Lets user change service without /cancel + /book restart.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        await _seed_service(session, ctx, name="Стрижка", duration_minutes=60)
+
+    cb = _make_string_callback("book_back_to_service")
+    state = _make_state()
+    await state.update_data(selected_date="2026-09-08")
+
+    await client_handlers.book_back_to_service_cb(cb, state)
+
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.entering_service
+    text = _answer_text(cb.message)
+    assert "Выберите услугу" in text
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_book_back_to_service_cb_no_services_shows_free_text_prompt(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Session 5.30 S1: book_back_to_service_cb, no services in DB →
+    state.set_state(entering_service) + 'Какая услуга?' free-text prompt
+    (mirrors _process_selected_date no-services branch).
+    """
+    async with session_factory() as session:
+        await _seed_full_stack(session)  # business + master, no services
+
+    cb = _make_string_callback("book_back_to_service")
+    state = _make_state()
+    await state.update_data(selected_date="2026-09-08")
+
+    await client_handlers.book_back_to_service_cb(cb, state)
+
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.entering_service
+    text = _answer_text(cb.message)
+    assert "Какая услуга" in text
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_book_back_to_service_cb_master_not_found_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Session 5.30 S1: book_back_to_service_cb, master not found →
+    state.clear + 'Мастер не найден' + callback.answer.
+    """
+    async with session_factory() as session:
+        await session.execute(sa_text("DELETE FROM masters"))
+
+    cb = _make_string_callback("book_back_to_service")
+    state = _make_state()
+
+    await client_handlers.book_back_to_service_cb(cb, state)
+
+    state.clear.assert_awaited_once()
+    text = _answer_text(cb.message)
+    assert "Мастер не найден" in text
+    state.set_state.assert_not_awaited()
     cb.answer.assert_awaited()
 
 

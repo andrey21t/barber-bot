@@ -188,15 +188,18 @@ def test_slot_picker_30min_keyboard() -> None:
     assert isinstance(kb, InlineKeyboardMarkup)
     # aiogram InlineKeyboardMarkup exposes .inline_keyboard as list of rows.
     rows = kb.inline_keyboard
-    # adjust(3) groups buttons into rows of 3 then 1: row0=3 btns, row1=1 btn.
+    # Session 5.30 S1: last row adds "↩️ Назад" (callback_data="book_back_to_service").
+    # adjust(3) groups slot buttons into rows of 3 then 1, then back button on
+    # its own row: row0=3 slot btns, row1=1 slot btn + "↩️ Назад" → wait, adjust(3)
+    # applies globally. With 4 slots + 1 back = 5 buttons, adjust(3) → rows of 3+2.
     assert len(rows) == 2
     assert len(rows[0]) == 3
-    assert len(rows[1]) == 1
-    # Labels preserved in order.
+    assert len(rows[1]) == 2  # slot "11:30" + "↩️ Назад" (Session 5.30 S1)
+    # Labels: slots preserved in order, back button appended last.
     labels_row0 = [btn.text for btn in rows[0]]
     labels_row1 = [btn.text for btn in rows[1]]
     assert labels_row0 == ["10:00", "10:30", "11:00"]
-    assert labels_row1 == ["11:30"]
+    assert labels_row1 == ["11:30", "↩️ Назад"]
     # callback_data is BookSlot30CallbackData.pack() — round-trip via unpack().
     # First slot "10:00" → start_minute = 10*60 + 0 = 600.
     cb0_raw = rows[0][0].callback_data
@@ -205,15 +208,19 @@ def test_slot_picker_30min_keyboard() -> None:
     assert cb0.workday_id == workday_id
     assert cb0.start_minute == 600
     # Slot 4 "11:30" → start_minute = 11*60 + 30 = 690.
-    cb_last_raw = rows[1][0].callback_data
-    assert cb_last_raw is not None, "callback_data must be set on slot buttons"
-    cb_last = BookSlot30CallbackData.unpack(cb_last_raw)
-    assert cb_last.workday_id == workday_id
-    assert cb_last.start_minute == 690
+    cb_last_slot_raw = rows[1][0].callback_data
+    assert cb_last_slot_raw is not None, "callback_data must be set on slot buttons"
+    cb_last_slot = BookSlot30CallbackData.unpack(cb_last_slot_raw)
+    assert cb_last_slot.workday_id == workday_id
+    assert cb_last_slot.start_minute == 690
+    # Back button (last in row1) → plain string "book_back_to_service".
+    assert rows[1][1].callback_data == "book_back_to_service"
 
-    # Empty input → single "Нет свободных слотов" button.
+    # Empty input → "Нет свободных слотов" + "↩️ Назад" (Session 5.30 S1).
     kb_empty = slot_picker_keyboard_30min([], UUID(int=1))
     rows_empty = kb_empty.inline_keyboard
     assert len(rows_empty) == 1
-    assert len(rows_empty[0]) == 1
+    assert len(rows_empty[0]) == 2  # noop + back button
+    assert rows_empty[0][0].text == "Нет свободных слотов"
+    assert rows_empty[0][1].text == "↩️ Назад"
     assert rows_empty[0][0].text == "Нет свободных слотов"

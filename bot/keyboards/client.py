@@ -358,12 +358,16 @@ def slot_picker_keyboard_30min(
     `start_minute` = `slot.start_time_local.hour * 60 + slot.start_time_local.minute`
     (int 0-1439, no `:` — aiogram pack() safe per aiogram 3.x source).
 
-    Caller MUST pass `workday_id` (resolved in simple_calendar_cb slots branch
+    Builder MUST pass `workday_id` (resolved in simple_calendar_cb slots branch
     via `_select_workday_for_slot` or equivalent — single source of truth).
+
+    Session 5.30 (S1): last row adds "↩️ Назад" (callback_data="book_back_to_service")
+    to let user return to the service picker without /cancel + /book restart.
     """
     builder = InlineKeyboardBuilder()
     if not slots:
         builder.button(text="Нет свободных слотов", callback_data="noop")
+        builder.button(text="↩️ Назад", callback_data="book_back_to_service")
         return builder.as_markup()
 
     for slot in slots:
@@ -373,6 +377,7 @@ def slot_picker_keyboard_30min(
             start_minute=start_minute,
         )
         builder.button(text=slot.label, callback_data=cb.pack())
+    builder.button(text="↩️ Назад", callback_data="book_back_to_service")
     builder.adjust(3)
     return builder.as_markup()
 
@@ -395,6 +400,9 @@ def service_picker_keyboard(services: list[Service]) -> InlineKeyboardMarkup:
     fallback to the legacy free-text input — covers unusual requests that
     don't match the predefined service list.
 
+    Session 5.30 (S1): last row adds "↩️ Назад" (callback_data="book_back_to_date")
+    to let user return to the date picker without /cancel + /book restart.
+
     Empty services list is handled by the caller (name_msg shows text prompt
     instead when no services in DB — single-master MVP, rare case).
 
@@ -402,13 +410,15 @@ def service_picker_keyboard(services: list[Service]) -> InlineKeyboardMarkup:
         services: list of bot.models.Service (active, business-scoped).
 
     Returns:
-        InlineKeyboardMarkup — buttons in 2 columns, custom row last.
+        InlineKeyboardMarkup — buttons in 2 columns, custom row last,
+        back button on its own row.
     """
     builder = InlineKeyboardBuilder()
     for svc in services:
         cb = BookServiceCallbackData(service_id=svc.id)
         builder.button(text=svc.name, callback_data=cb.pack())
     builder.button(text="✏️ Своя услуга", callback_data="book_service_custom")
+    builder.button(text="↩️ Назад", callback_data="book_back_to_date")
     builder.adjust(2)
     return builder.as_markup()
 
