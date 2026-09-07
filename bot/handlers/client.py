@@ -942,6 +942,61 @@ async def slot_30_cb(
 
 
 # ============================================================
+# 3c. book_back_to_service_cb — user tapped '↩️ Назад' in slot picker
+# ============================================================
+@router.callback_query(F.data == "book_back_to_service", StateFilter(BookingStates.selecting_slot))
+async def book_back_to_service_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """Back from slot picker to service picker (Session 5.30 S1).
+
+    Lets user change service without /cancel + /book restart. Re-loads
+    services for master's business, renders service_picker_keyboard.
+
+    State transitions: selecting_slot → entering_service.
+    Defensive: master not found → state.clear + retry hint (race).
+    No business / no services → free-text prompt (mirrors _process_selected_date).
+    """
+    settings = get_settings()
+    async with async_session_factory() as session:
+        master = await _select_master(session, settings)
+        if master is None:
+            await state.clear()
+            if callback.message is not None:
+                await callback.message.answer("❌ Мастер не найден. /book чтобы начать")
+            await callback.answer()
+            return
+        from bot.models import Business, Service  # noqa: PLC0415
+
+        stmt_b = select(Business).where(Business.id == master.business_id).limit(1)
+        business = (await session.execute(stmt_b)).scalar_one_or_none()
+        if business is None:
+            await state.set_state(BookingStates.entering_service)
+            if callback.message is not None:
+                await callback.message.answer(
+                    "Какая услуга? (например: стрижка, окрашивание+стрижка)"
+                )
+            await callback.answer()
+            return
+        stmt_s = (
+            select(Service)
+            .where(Service.business_id == business.id, Service.is_active == True)  # noqa: E712
+            .order_by(Service.name)
+        )
+        services = list((await session.execute(stmt_s)).scalars().all())
+    await state.set_state(BookingStates.entering_service)
+    if callback.message is not None:
+        if not services:
+            await callback.message.answer(
+                "Какая услуга? (например: стрижка, окрашивание+стрижка)"
+            )
+        else:
+            await callback.message.answer(
+                "Выберите услугу тапом или напишите свою:",
+                reply_markup=service_picker_keyboard(services),
+            )
+    await callback.answer()
+
+
+# ============================================================
 # 4. name_msg — user typed name → ask for service
 # ============================================================
 @router.message(StateFilter(BookingStates.entering_name))
@@ -1197,6 +1252,45 @@ async def service_custom_cb(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.message.answer(
             "Напишите услугу текстом (например: стрижка, окрашивание+стрижка):"
         )
+    await callback.answer()
+
+
+# ============================================================
+# 4d. book_back_to_date_cb — user tapped '↩️ Назад' in service picker
+# ============================================================
+@router.callback_query(F.data == "book_back_to_date", StateFilter(BookingStates.entering_service))
+async def book_back_to_date_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """Back from service picker to date picker (Session 5.30 S1).
+
+    Lets user change date without /cancel + /book restart. Re-renders
+    date_picker_keyboard via _retry_markup (same path as race-retry). Keeps
+    is_slots_path from FSM data (consistent /book vs /slots semantics).
+
+    State transitions: entering_service → selecting_date.
+    Defensive: master not found → state.clear + retry hint (race with
+    business config change between render and back-tap).
+    """
+    fsm_data = await state.get_data()
+    is_slots_path: bool | None = fsm_data.get("is_slots_path")
+    settings = get_settings()
+    async with async_session_factory() as session:
+        master = await _select_master(session, settings)
+        if master is None:
+            await state.clear()
+            if callback.message is not None:
+                await callback.message.answer("❌ Мастер не найден. /book чтобы начать")
+            await callback.answer()
+            return
+        markup = await _retry_markup(
+            session,
+            master,
+            settings,
+            is_transfer=False,
+            is_slots_path=is_slots_path,
+        )
+    await state.set_state(BookingStates.selecting_date)
+    if callback.message is not None:
+        await callback.message.answer("📅 Выберите дату записи:", reply_markup=markup)
     await callback.answer()
 
 
