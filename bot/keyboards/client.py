@@ -324,17 +324,23 @@ def slot_picker_keyboard(slots: list[Slot]) -> InlineKeyboardMarkup:
     "HH:MM" labels (30-min step grid from WorkDay).
 
     Each button shows slot_hour (e.g. "14:00"), callback_data carries slot UUID.
-    Empty slots list → single "Нет свободных слотов" button (disabled).
+    Empty slots list → "Нет свободных слотов" placeholder + "↩️ Назад" button.
+
+    Session 5.30 (S1): added "↩️ Назад" (callback_data="book_back_to_service")
+    for UX consistency with `slot_picker_keyboard_30min` — /book users with
+    legacy slots can now return to the service picker without /cancel restart.
     """
     builder = InlineKeyboardBuilder()
     if not slots:
         builder.button(text="Нет свободных слотов", callback_data="noop")
+        builder.button(text="↩️ Назад", callback_data="book_back_to_service")
         return builder.as_markup()
 
     for slot in slots:
         cb = BookSlotCallbackData(slot_id=slot.id)
         label = f"{slot.slot_hour:02d}:00"
         builder.button(text=label, callback_data=cb.pack())
+    builder.button(text="↩️ Назад", callback_data="book_back_to_service")
     builder.adjust(3)  # 3 slots per row
     return builder.as_markup()
 
@@ -410,8 +416,10 @@ def service_picker_keyboard(services: list[Service]) -> InlineKeyboardMarkup:
         services: list of bot.models.Service (active, business-scoped).
 
     Returns:
-        InlineKeyboardMarkup — buttons in 2 columns, custom row last,
-        back button on its own row.
+        InlineKeyboardMarkup — buttons in 2 columns (adjust(2)), custom
+        "✏️ Своя услуга" + "↩️ Назад" appended last. With odd service count
+        the back button may pair with custom on the last row (adjust(2)
+        groups globally); with even count it lands on its own row.
     """
     builder = InlineKeyboardBuilder()
     for svc in services:

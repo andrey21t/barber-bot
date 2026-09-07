@@ -2904,25 +2904,28 @@ async def test_transfer_slot_cb_from_user_none_early_return(
 
 
 def test_slot_picker_keyboard_empty_slots_returns_noop_button() -> None:
-    """Covers keyboards/client.py:102-103 — `if not slots: button("Нет свободных
+    """Covers keyboards/client.py — `if not slots: button("Нет свободных
     слотов", callback_data="noop"); return markup`.
 
-    Empty slots list → single disabled-style button with noop callback (no
-    slot to select). Verifies the edge case branch (vs the for-loop default
-    path that builds per-slot buttons).
+    Empty slots list → "Нет свободных слотов" placeholder + "↩️ Назад"
+    button (Session 5.30 S1: back-button added for UX consistency with
+    slot_picker_keyboard_30min). Verifies the edge case branch (vs the
+    for-loop default path that builds per-slot buttons).
     """
     from bot.keyboards.client import slot_picker_keyboard
 
     markup = slot_picker_keyboard([])
 
     assert isinstance(markup, InlineKeyboardMarkup)
-    # Single button "Нет свободных слотов" with callback_data="noop"
+    # Two buttons on row 0: "Нет свободных слотов" (noop) + "↩️ Назад".
     buttons = markup.inline_keyboard
     assert len(buttons) == 1
-    assert len(buttons[0]) == 1
-    button = buttons[0][0]
-    assert button.text == "Нет свободных слотов"
-    assert button.callback_data == "noop"
+    assert len(buttons[0]) == 2  # Session 5.30 S1: +1 back button
+    placeholder, back_btn = buttons[0][0], buttons[0][1]
+    assert placeholder.text == "Нет свободных слотов"
+    assert placeholder.callback_data == "noop"
+    assert back_btn.text == "↩️ Назад"
+    assert back_btn.callback_data == "book_back_to_service"
 
 
 def test_no_op_button_helper_returns_noop_inline_button() -> None:
@@ -4100,6 +4103,15 @@ async def test_book_back_to_date_cb_returns_to_date_picker(
     assert state.set_state.call_args.args[0] == BookingStates.selecting_date
     text = _answer_text(cb.message)
     assert "Выберите дату" in text
+    # W2 (Session 5.30 S1 review): verify date picker keyboard contains the
+    # seeded work_date as a BookDateCallbackData payload (not just text —
+    # text label depends on weekday/today, callback_data is deterministic).
+    reply_markup = _answer_reply_markup(cb.message)
+    assert isinstance(reply_markup, InlineKeyboardMarkup)
+    flat_cbs = [btn.callback_data for row in reply_markup.inline_keyboard for btn in row]
+    assert any(target_date.isoformat() in (cb or "") for cb in flat_cbs), (
+        f"date picker keyboard must contain callback for {target_date.isoformat()}"
+    )
     cb.answer.assert_awaited()
 
 
@@ -4150,6 +4162,13 @@ async def test_book_back_to_service_cb_returns_to_service_picker(
     assert state.set_state.call_args.args[0] == BookingStates.entering_service
     text = _answer_text(cb.message)
     assert "Выберите услугу" in text
+    # W2 (Session 5.30 S1 review): verify service picker keyboard contains
+    # the seeded service "Стрижка" (catches rendering bugs that text-only
+    # assertions miss — mirrors test_simple_calendar_cb_day_select_happy).
+    reply_markup = _answer_reply_markup(cb.message)
+    assert isinstance(reply_markup, InlineKeyboardMarkup)
+    flat_texts = [btn.text for row in reply_markup.inline_keyboard for btn in row]
+    assert "Стрижка" in flat_texts, "service picker keyboard must contain seeded service"
     cb.answer.assert_awaited()
 
 
