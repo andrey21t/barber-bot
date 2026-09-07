@@ -70,7 +70,7 @@ from bot.keyboards.admin import (
     admin_window_slot_picker_keyboard,
     render_booked_header,
 )
-from bot.models import Booking, WorkDay
+from bot.models import Booking, Service, WorkDay
 from bot.services.admin import (
     create_service,
     get_active_bookings_for_workday,
@@ -2215,9 +2215,52 @@ async def admin_move_simple_calendar_cb(
             await callback.answer()
             return
 
-        # Workday found + active → fetch 30-min available slots.
+        # Workday found + active → fetch 30-min available slots filtered by
+        # the booking's service duration (Session 5.30: same overlap-fix as
+        # client.py Task 2). Was: get_available_slots_30(session, workday, tz)
+        # — without min_duration_min, slot 15:30 shown for 120-min booking
+        # 16:00-18:00 → admin_move confirm would overlap. Now fetch booking's
+        # service duration: service_id present → Service.duration_minutes,
+        # service_id=None (free-text "своя услуга") → SERVICE_DEFAULT_DURATION_MIN.
+        settings = get_settings()
+        data = await state.get_data()
+        booking_id_str = data.get("admin_move_booking_id")
+        if not booking_id_str:
+            await state.clear()
+            if callback.message is not None:
+                await callback.message.answer("❌ Данные потеряны. /today чтобы начать")
+            await callback.answer()
+            return
+
         async with async_session_factory() as session:
-            slots = await get_available_slots_30(session, workday, tz)
+            from sqlalchemy import select as sa_select
+
+            booking = (
+                await session.execute(
+                    sa_select(Booking).where(Booking.id == UUID(booking_id_str))
+                )
+            ).scalar_one_or_none()
+            if booking is None:
+                await state.clear()
+                if callback.message is not None:
+                    await callback.message.answer("❌ Запись не найдена. /today чтобы начать")
+                await callback.answer()
+                return
+
+            # Resolve min_duration_min from booking's service (or default).
+            min_duration_min = settings.SERVICE_DEFAULT_DURATION_MIN
+            if booking.service_id is not None:
+                service = (
+                    await session.execute(
+                        sa_select(Service).where(Service.id == booking.service_id)
+                    )
+                ).scalar_one_or_none()
+                if service is not None:
+                    min_duration_min = service.duration_minutes
+
+            slots = await get_available_slots_30(
+                session, workday, tz, min_duration_min=min_duration_min
+            )
 
         # Save new_workday_id for slot_30_cb + confirm_cb.
         await state.update_data(admin_move_new_workday_id=str(workday.id))
