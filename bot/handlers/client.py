@@ -661,6 +661,9 @@ async def _process_selected_date(
                 "Выберите новое время:" if is_transfer else "Выберите время:",
                 # S1 review fix F2: suppress back button in transfer flow (no service
                 # step in transfer → "back to service" has no meaning, dead button).
+                # Booking flow keeps back via _fetch_slot_picker_for_service (line 410,
+                # default show_back=True) — this line 664 only reached in transfer
+                # (booking returns earlier at line 513 entering service picker).
                 reply_markup=slot_picker_keyboard(slots, show_back=not is_transfer),
             )
         await callback.answer()

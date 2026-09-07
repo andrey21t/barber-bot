@@ -1911,7 +1911,16 @@ async def test_transfer_simple_calendar_cb_day_select_happy_shows_slot_picker(
 
     assert state.set_state.call_args.args[0] == TransferStates.selecting_slot
     assert "Выберите новое время" in _answer_text(cb.message)  # is_transfer=True branch
-    assert isinstance(_answer_reply_markup(cb.message), InlineKeyboardMarkup)
+    reply_markup = _answer_reply_markup(cb.message)
+    assert isinstance(reply_markup, InlineKeyboardMarkup)
+    # S1 review fix F2 + W1 (Session 5.31): transfer flow must NOT render
+    # '↩️ Назад' — back handler has BookingStates.selecting_slot StateFilter,
+    # doesn't cover TransferStates.selecting_slot → dead button. show_back=False
+    # passed via _process_selected_date(is_transfer=True) → slot_picker_keyboard.
+    flat_texts = [btn.text for row in reply_markup.inline_keyboard for btn in row]
+    assert "↩️ Назад" not in flat_texts, (
+        "transfer slot picker must not show back button (no service step in transfer)"
+    )
     cb.answer.assert_awaited()
 
 
