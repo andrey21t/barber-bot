@@ -1628,6 +1628,253 @@ async def test_admin_move_simple_calendar_inactive_workday_hint(
 
 
 @pytest.mark.asyncio
+async def test_admin_move_simple_calendar_missing_booking_id_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Session 5.30: admin_move_simple_calendar_cb, booking_id missing in state
+    (state corruption) → state.clear + 'Данные потеряны. /today чтобы начать'
+    + callback.answer. Defensive check BEFORE fetch slots.
+    """
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        from datetime import time as dt_time
+
+        from bot.models import WorkDay
+
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        workday = WorkDay(
+            master_id=ctx["master_id"],
+            work_date=tomorrow,
+            start_time=dt_time(10, 0),
+            end_time=dt_time(20, 0),
+            max_concurrent_clients=1,
+            is_active=True,
+        )
+        session.add(workday)
+        await session.commit()
+
+    cb = MagicMock(spec=["from_user", "message", "bot", "answer"])
+    cb.from_user = _make_user(ADMIN_TG_ID)
+    cb.message = MagicMock()
+    cb.message.answer = AsyncMock()
+    cb.answer = AsyncMock()
+
+    future_date = datetime.combine(tomorrow, datetime.min.time())
+    cal_cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=future_date.year,
+        month=future_date.month,
+        day=future_date.day,
+    )
+
+    # No admin_move_booking_id in state — simulates state corruption.
+    state = _make_mock_state(data={})
+
+    from unittest.mock import patch
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(True, future_date),
+    ):
+        await admin_handlers.admin_move_simple_calendar_cb(cb, cal_cb_data, state)
+
+    state.clear.assert_awaited_once()
+    text = callback_answer_text(cb)
+    assert "Данные потеряны" in text
+    state.set_state.assert_not_awaited()
+    state.update_data.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_admin_move_simple_calendar_booking_not_found_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Session 5.30: admin_move_simple_calendar_cb, booking_id in state but Booking
+    not in DB (deleted between select and calendar) → state.clear + retry hint.
+    """
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        from datetime import time as dt_time
+
+        from bot.models import WorkDay
+
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        workday = WorkDay(
+            master_id=ctx["master_id"],
+            work_date=tomorrow,
+            start_time=dt_time(10, 0),
+            end_time=dt_time(20, 0),
+            max_concurrent_clients=1,
+            is_active=True,
+        )
+        session.add(workday)
+        await session.commit()
+
+    cb = MagicMock(spec=["from_user", "message", "bot", "answer"])
+    cb.from_user = _make_user(ADMIN_TG_ID)
+    cb.message = MagicMock()
+    cb.message.answer = AsyncMock()
+    cb.answer = AsyncMock()
+
+    future_date = datetime.combine(tomorrow, datetime.min.time())
+    cal_cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=future_date.year,
+        month=future_date.month,
+        day=future_date.day,
+    )
+
+    # booking_id present but Booking not in DB (deleted).
+    bogus_id = "00000000-0000-0000-0000-000000000000"
+    state = _make_mock_state(data={"admin_move_booking_id": bogus_id})
+
+    from unittest.mock import patch
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(True, future_date),
+    ):
+        await admin_handlers.admin_move_simple_calendar_cb(cb, cal_cb_data, state)
+
+    state.clear.assert_awaited_once()
+    text = callback_answer_text(cb)
+    assert "не найдена" in text or "запись не найдена" in text.lower()
+    state.set_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_admin_move_simple_calendar_filters_slots_by_service_duration(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Session 5.30: admin_move_simple_calendar_cb filters 30-min slots by
+    the booking's service duration (same overlap-fix as client.py Task 2).
+    Booking 16:00-18:00 (Окрашивание 120 мин) → slot 15:30 should NOT appear
+    in picker (15:30+120=17:30 overlaps 16:00-18:00 half-open). Slot 14:00
+    should appear (14:00+120=16:00, half-open no overlap — 16:00 NOT < 16:00).
+    14:30 filtered (14:30+120=16:30, overlap: 16:00<16:30 AND 18:00>14:30).
+
+    Workday 13:00-20:00, booking 16:00-18:00, duration 120:
+      13:00 → 13:00+120=15:00, no overlap → shown
+      13:30 → 13:30+120=15:30, no overlap → shown
+      14:00 → 14:00+120=16:00, half-open no overlap (16:00 NOT < 16:00) → shown
+      14:30 → 14:30+120=16:30, overlap (16:00<16:30 AND 18:00>14:30) → filtered
+      15:00 → 15:00+120=17:00, overlap → filtered
+      15:30 → filtered (same)
+      16:00-17:30 → all overlap → filtered
+      18:00 → 18:00+120=20:00, half-open no overlap (18:00 NOT > 18:00) → shown
+      18:30 → 18:30+120=20:30 > 20:00 → filtered (workday end)
+    Expected: {13:00, 13:30, 14:00, 18:00} = 4 slots.
+    """
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        from datetime import time as dt_time
+
+        from bot.models import Booking, Service, WorkDay
+
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        workday = WorkDay(
+            master_id=ctx["master_id"],
+            work_date=tomorrow,
+            start_time=dt_time(13, 0),
+            end_time=dt_time(20, 0),
+            max_concurrent_clients=1,
+            is_active=True,
+        )
+        session.add(workday)
+        await session.flush()
+
+        service = Service(
+            business_id=ctx["business_id"],
+            name="Окрашивание",
+            duration_minutes=120,
+            is_active=True,
+        )
+        session.add(service)
+        await session.flush()
+
+        # Booking 16:00-18:00 on tomorrow (LOCAL 16:00 = UTC 13:00 if MSK tz).
+        tz = ZoneInfo(TZ)
+        start_local = datetime.combine(tomorrow, dt_time(16, 0), tzinfo=tz)
+        end_local = start_local + timedelta(hours=2)
+        booking = Booking(
+            business_id=ctx["business_id"],
+            master_id=ctx["master_id"],
+            client_id=ctx["client_id"],
+            service_id=service.id,
+            service_title_snapshot="Окрашивание",
+            client_name_snapshot="Паша",
+            start_at=start_local.astimezone(UTC),
+            end_at=end_local.astimezone(UTC),
+            status="confirmed",
+        )
+        session.add(booking)
+        await session.commit()
+
+        booking_id = str(booking.id)
+
+    cb = MagicMock(spec=["from_user", "message", "bot", "answer"])
+    cb.from_user = _make_user(ADMIN_TG_ID)
+    cb.message = MagicMock()
+    cb.message.answer = AsyncMock()
+    cb.answer = AsyncMock()
+
+    future_date = datetime.combine(tomorrow, datetime.min.time())
+    cal_cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=future_date.year,
+        month=future_date.month,
+        day=future_date.day,
+    )
+
+    state = _make_mock_state(data={"admin_move_booking_id": booking_id})
+
+    from unittest.mock import patch
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(True, future_date),
+    ):
+        await admin_handlers.admin_move_simple_calendar_cb(cb, cal_cb_data, state)
+
+    # Extract button labels from picker reply_markup (W1 fix: verify absence
+    # of 15:30, not just picker presence — guards regression of min_duration_min).
+    answer_calls = cb.message.answer.await_args_list
+    picker_call = None
+    for call in answer_calls:
+        args, kwargs = call
+        if args and "Выберите новое время" in str(args[0]):
+            picker_call = call
+            break
+    assert picker_call is not None, "Slot picker message not found"
+    reply_markup = picker_call.kwargs["reply_markup"]
+    button_texts = [
+        btn.text for row in reply_markup.inline_keyboard for btn in row
+    ]
+    # Expected slots: 13:00, 13:30, 14:00, 18:00 (4 slots).
+    assert "13:00" in button_texts
+    assert "14:00" in button_texts
+    assert "18:00" in button_texts
+    # 15:30 should NOT appear — overlaps 16:00-18:00 with 120-min duration.
+    assert "15:30" not in button_texts
+    # 14:30 should NOT appear — 14:30+120=16:30 overlaps 16:00-18:00 half-open.
+    assert "14:30" not in button_texts
+    # 16:00 should NOT appear — overlaps booking start.
+    assert "16:00" not in button_texts
+
+
+@pytest.mark.asyncio
 async def test_admin_move_slot_30_cb_saves_state_and_shows_summary(
     session_factory: Any,
     patched_session_factory: Any,
