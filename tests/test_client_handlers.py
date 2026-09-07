@@ -2928,6 +2928,60 @@ def test_slot_picker_keyboard_empty_slots_returns_noop_button() -> None:
     assert back_btn.callback_data == "book_back_to_service"
 
 
+def test_slot_picker_keyboard_non_empty_has_back_button() -> None:
+    """Session 5.31 S1 review W1: legacy slot_picker_keyboard NON-empty case
+    must include "↩️ Назад" (callback_data="book_back_to_service") as the
+    last button — UX consistency with slot_picker_keyboard_30min.
+    """
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from bot.keyboards.client import slot_picker_keyboard
+
+    slots = [
+        SimpleNamespace(id=uuid4(), slot_hour=14),
+        SimpleNamespace(id=uuid4(), slot_hour=16),
+        SimpleNamespace(id=uuid4(), slot_hour=18),
+    ]
+
+    markup = slot_picker_keyboard(slots)
+
+    assert isinstance(markup, InlineKeyboardMarkup)
+    flat_buttons = [(btn.text, btn.callback_data) for row in markup.inline_keyboard for btn in row]
+    # Last button is back, with correct callback_data (booking flow default).
+    last_text, last_cb = flat_buttons[-1]
+    assert last_text == "↩️ Назад"
+    assert last_cb == "book_back_to_service"
+    # All preceding buttons are slot buttons (not back).
+    assert all("↩️ Назад" not in t for t, _ in flat_buttons[:-1])
+
+
+def test_slot_picker_keyboard_show_back_false_suppresses_back_button() -> None:
+    """Session 5.31 S1 review F2: slot_picker_keyboard with show_back=False
+    (transfer flow) — no "↩️ Назад" button rendered, in both empty and
+    non-empty cases. Prevents dead-button UX regression (back handler has
+    BookingStates.selecting_slot StateFilter, doesn't cover
+    TransferStates.selecting_slot).
+    """
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from bot.keyboards.client import slot_picker_keyboard
+
+    # Non-empty case: slots only, no back button.
+    slots = [SimpleNamespace(id=uuid4(), slot_hour=14)]
+    markup_non_empty = slot_picker_keyboard(slots, show_back=False)
+    flat_texts_ne = [btn.text for row in markup_non_empty.inline_keyboard for btn in row]
+    assert "↩️ Назад" not in flat_texts_ne
+    assert any(":00" in t for t in flat_texts_ne), "slot button must be present"
+
+    # Empty case: placeholder only, no back button.
+    markup_empty = slot_picker_keyboard([], show_back=False)
+    flat_texts_e = [btn.text for row in markup_empty.inline_keyboard for btn in row]
+    assert flat_texts_e == ["Нет свободных слотов"]
+    assert "↩️ Назад" not in flat_texts_e
+
+
 def test_no_op_button_helper_returns_noop_inline_button() -> None:
     """Covers keyboards/client.py:124 — _no_op_button() helper returns an
     InlineKeyboardButton with text="Нет свободных слотов" and callback_data="noop".

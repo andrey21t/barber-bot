@@ -315,7 +315,11 @@ def date_picker_keyboard(dates: list[date], today: date) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def slot_picker_keyboard(slots: list[Slot]) -> InlineKeyboardMarkup:
+def slot_picker_keyboard(
+    slots: list[Slot],
+    *,
+    show_back: bool = True,
+) -> InlineKeyboardMarkup:
     """Build inline keyboard with available slots.
 
     DEPRECATED (Этап 5.4): kept for the legacy slot-based /book flow until
@@ -324,23 +328,36 @@ def slot_picker_keyboard(slots: list[Slot]) -> InlineKeyboardMarkup:
     "HH:MM" labels (30-min step grid from WorkDay).
 
     Each button shows slot_hour (e.g. "14:00"), callback_data carries slot UUID.
-    Empty slots list → "Нет свободных слотов" placeholder + "↩️ Назад" button.
+    Empty slots list → "Нет свободных слотов" placeholder + optional "↩️ Назад".
 
     Session 5.30 (S1): added "↩️ Назад" (callback_data="book_back_to_service")
     for UX consistency with `slot_picker_keyboard_30min` — /book users with
     legacy slots can now return to the service picker without /cancel restart.
+
+    Session 5.31 (S1 review fix F2): `show_back=False` suppresses the back
+    button — used by the transfer flow (`_process_selected_date` with
+    `is_transfer=True`) where "back to service" has no meaning (transfer has
+    no service step). The booking flow uses the default `show_back=True`.
+
+    Args:
+        slots: list of bot.models.Slot.
+        show_back: when True, append "↩️ Назад" (callback_data="book_back_to_service")
+            on the last row; when False, render slot buttons only. Default True
+            for backward-compat with existing booking callers.
     """
     builder = InlineKeyboardBuilder()
     if not slots:
         builder.button(text="Нет свободных слотов", callback_data="noop")
-        builder.button(text="↩️ Назад", callback_data="book_back_to_service")
+        if show_back:
+            builder.button(text="↩️ Назад", callback_data="book_back_to_service")
         return builder.as_markup()
 
     for slot in slots:
         cb = BookSlotCallbackData(slot_id=slot.id)
         label = f"{slot.slot_hour:02d}:00"
         builder.button(text=label, callback_data=cb.pack())
-    builder.button(text="↩️ Назад", callback_data="book_back_to_service")
+    if show_back:
+        builder.button(text="↩️ Назад", callback_data="book_back_to_service")
     builder.adjust(3)  # 3 slots per row
     return builder.as_markup()
 
@@ -348,6 +365,8 @@ def slot_picker_keyboard(slots: list[Slot]) -> InlineKeyboardMarkup:
 def slot_picker_keyboard_30min(
     slots: list[TimeSlot30],
     workday_id: UUID,
+    *,
+    show_back: bool = True,
 ) -> InlineKeyboardMarkup:
     """Build inline keyboard from 30-мин WorkDay slots (Этап 5.4 → 5.8b wired).
 
@@ -369,11 +388,24 @@ def slot_picker_keyboard_30min(
 
     Session 5.30 (S1): last row adds "↩️ Назад" (callback_data="book_back_to_service")
     to let user return to the service picker without /cancel + /book restart.
+
+    Session 5.31 (S1 review fix F2): `show_back=False` suppresses the back
+    button — used by the transfer flow (`_process_selected_date` with
+    `is_transfer=True`) where "back to service" has no meaning (transfer has
+    no service step). The booking flow uses the default `show_back=True`.
+
+    Args:
+        slots: list of TimeSlot30 (pre-formatted labels, business-tz).
+        workday_id: UUID of the WorkDay the slots belong to (single source of truth).
+        show_back: when True, append "↩️ Назад" (callback_data="book_back_to_service")
+            on the last row; when False, render slot buttons only. Default True
+            for backward-compat with existing booking callers.
     """
     builder = InlineKeyboardBuilder()
     if not slots:
         builder.button(text="Нет свободных слотов", callback_data="noop")
-        builder.button(text="↩️ Назад", callback_data="book_back_to_service")
+        if show_back:
+            builder.button(text="↩️ Назад", callback_data="book_back_to_service")
         return builder.as_markup()
 
     for slot in slots:
@@ -383,7 +415,8 @@ def slot_picker_keyboard_30min(
             start_minute=start_minute,
         )
         builder.button(text=slot.label, callback_data=cb.pack())
-    builder.button(text="↩️ Назад", callback_data="book_back_to_service")
+    if show_back:
+        builder.button(text="↩️ Назад", callback_data="book_back_to_service")
     builder.adjust(3)
     return builder.as_markup()
 
@@ -417,9 +450,9 @@ def service_picker_keyboard(services: list[Service]) -> InlineKeyboardMarkup:
 
     Returns:
         InlineKeyboardMarkup — buttons in 2 columns (adjust(2)), custom
-        "✏️ Своя услуга" + "↩️ Назад" appended last. With odd service count
-        the back button may pair with custom on the last row (adjust(2)
-        groups globally); with even count it lands on its own row.
+        "✏️ Своя услуга" + "↩️ Назад" appended last. With **even** service
+        count the back button pairs with custom on the last row (adjust(2)
+        groups globally); with **odd** count it lands on its own row.
     """
     builder = InlineKeyboardBuilder()
     for svc in services:
