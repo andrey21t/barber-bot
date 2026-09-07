@@ -964,9 +964,7 @@ async def test_cmd_week_ignores_past_bookings(
     await admin_handlers.cmd_week(msg)
 
     text = _answer_text(msg)
-    assert "Ближайших записей нет" in text, (
-        f"Past booking must NOT appear; got: {text!r}"
-    )
+    assert "Ближайших записей нет" in text, f"Past booking must NOT appear; got: {text!r}"
 
 
 # ============================================================
@@ -2702,8 +2700,8 @@ async def test_admin_openweek_confirm_cb_sunday_targets_next_week(
     callback.data = "admin_openweek_confirm"
     state = _make_mock_state(
         {
-            "picked_start_minute": 600,   # 10:00
-            "picked_end_minute": 1200,    # 20:00
+            "picked_start_minute": 600,  # 10:00
+            "picked_end_minute": 1200,  # 20:00
             "selected_weekdays": [0, 1, 2],  # Mon, Tue, Wed
             "business_tz": TZ,
         }
@@ -2712,9 +2710,7 @@ async def test_admin_openweek_confirm_cb_sunday_targets_next_week(
     await admin_handlers.admin_openweek_confirm_cb(callback, state)
 
     text = callback_answer_text(callback)
-    assert "прошедшая дата" not in text, (
-        f"Sunday must target next week (all future); got: {text!r}"
-    )
+    assert "прошедшая дата" not in text, f"Sunday must target next week (all future); got: {text!r}"
     assert "✅ Пн" in text and "✅ Вт" in text and "✅ Ср" in text
     # Verify WorkDay created for next week's Mon/Tue/Wed (31 Aug, 1, 2 Sep).
     today_local = datetime.now(ZoneInfo(TZ)).date()
@@ -2877,8 +2873,8 @@ async def test_admin_openweek_confirm_cb_ignores_past_week_bookings(
     callback.data = "admin_openweek_confirm"
     state = _make_mock_state(
         {
-            "picked_start_minute": 600,   # 10:00
-            "picked_end_minute": 1200,    # 20:00
+            "picked_start_minute": 600,  # 10:00
+            "picked_end_minute": 1200,  # 20:00
             "selected_weekdays": [0, 1, 3, 5],  # Mon, Tue, Thu, Sat (next week)
             "business_tz": TZ,
         }
@@ -2960,8 +2956,8 @@ async def test_openweek_confirm_warns_when_days_already_open(
     callback.data = "admin_openweek_confirm"
     state = _make_mock_state(
         {
-            "picked_start_minute": 540,   # 09:00
-            "picked_end_minute": 1080,    # 18:00
+            "picked_start_minute": 540,  # 09:00
+            "picked_end_minute": 1080,  # 18:00
             "selected_weekdays": [0, 2, 4],  # Mon, Wed, Fri
             "business_tz": TZ,
         }
@@ -3017,8 +3013,8 @@ async def test_openweek_overwrite_yes_applies_overwrite(
     callback.data = "admin_openweek_overwrite_yes"
     state = _make_mock_state(
         {
-            "picked_start_minute": 540,   # 09:00
-            "picked_end_minute": 1080,    # 18:00
+            "picked_start_minute": 540,  # 09:00
+            "picked_end_minute": 1080,  # 18:00
             "selected_weekdays": [0, 2, 4],  # Mon, Wed, Fri
             "business_tz": TZ,
         }
@@ -3092,8 +3088,8 @@ async def test_openweek_confirm_silent_when_no_existing(
     callback.data = "admin_openweek_confirm"
     state = _make_mock_state(
         {
-            "picked_start_minute": 540,   # 09:00
-            "picked_end_minute": 1080,    # 18:00
+            "picked_start_minute": 540,  # 09:00
+            "picked_end_minute": 1080,  # 18:00
             "selected_weekdays": [0, 2],  # Mon, Wed
             "business_tz": TZ,
         }
@@ -3155,9 +3151,7 @@ async def test_openweek_confirm_alert_marks_closed_days(
 
     state.clear.assert_not_called()
     text = callback_answer_text(callback)
-    assert "Пн 07.09 10:00–19:00 (закрыт)" in text, (
-        f"Closed day should be marked; got: {text!r}"
-    )
+    assert "Пн 07.09 10:00–19:00 (закрыт)" in text, f"Closed day should be marked; got: {text!r}"
     assert "Ср 09.09 10:00–19:00 (закрыт)" not in text, (
         f"Active day should NOT have (закрыт) suffix; got: {text!r}"
     )
@@ -3210,12 +3204,8 @@ async def test_openweek_apply_renders_edit_keyboard(
     assert isinstance(reply_markup, InlineKeyboardMarkup), "Should have edit keyboard"
     buttons = [btn for row in reply_markup.inline_keyboard for btn in row]
     button_texts = [btn.text for btn in buttons]
-    assert any("✏️ Пн" in t for t in button_texts), (
-        f"Should have [✏️ Пн] button; got: {button_texts}"
-    )
-    assert any("✏️ Ср" in t for t in button_texts), (
-        f"Should have [✏️ Ср] button; got: {button_texts}"
-    )
+    assert any("✏️ Пн" in t for t in button_texts), f"Should have [✏️ Пн] button; got: {button_texts}"
+    assert any("✏️ Ср" in t for t in button_texts), f"Should have [✏️ Ср] button; got: {button_texts}"
     assert any("Готово" in t for t in button_texts), (
         f"Should have [✅ Готово] button; got: {button_texts}"
     )
@@ -3249,9 +3239,7 @@ async def test_openweek_edit_cb_starts_picker(
         )
 
     callback = _make_callback(ADMIN_TG_ID)
-    callback.data = AdminOpenweekEditCallbackData(
-        weekday=0, work_date_iso="2026-09-07"
-    ).pack()
+    callback.data = AdminOpenweekEditCallbackData(weekday=0, work_date_iso="2026-09-07").pack()
     state = _make_mock_state()  # state=None initially (post-apply)
 
     await admin_handlers.admin_openweek_edit_cb(
@@ -3270,9 +3258,7 @@ async def test_openweek_edit_cb_starts_picker(
     # Picker rendered with day label (UX improvement S3)
     args, kwargs = callback.message.answer.call_args
     text = args[0] if args else kwargs.get("text", "")
-    assert "Редактирование Пн 07.09" in text, (
-        f"Should show day label in picker text; got: {text!r}"
-    )
+    assert "Редактирование Пн 07.09" in text, f"Should show day label in picker text; got: {text!r}"
 
 
 @pytest.mark.asyncio
@@ -3308,7 +3294,8 @@ async def test_openweek_edit_end_applies_update_workday(
 
     callback = _make_callback(ADMIN_TG_ID)
     callback.data = AdminWindowSlot30CallbackData(
-        workday_id=workday_id, start_minute=1080  # 18:00
+        workday_id=workday_id,
+        start_minute=1080,  # 18:00
     ).pack()
     state = _make_mock_state(
         {
@@ -3334,9 +3321,7 @@ async def test_openweek_edit_end_applies_update_workday(
     assert str(wd_after.start_time) == "09:00:00", (
         f"Start should be 09:00; got: {wd_after.start_time}"
     )
-    assert str(wd_after.end_time) == "18:00:00", (
-        f"End should be 18:00; got: {wd_after.end_time}"
-    )
+    assert str(wd_after.end_time) == "18:00:00", f"End should be 18:00; got: {wd_after.end_time}"
     # Re-render summary
     text = callback_answer_text(callback)
     assert "Пн 07.09 09:00–18:00" in text, f"Summary should show new window; got: {text!r}"
@@ -3389,7 +3374,8 @@ async def test_openweek_edit_end_shows_shrink_error(
 
     callback = _make_callback(ADMIN_TG_ID)
     callback.data = AdminWindowSlot30CallbackData(
-        workday_id=workday_id, start_minute=720  # 12:00 — shrink to 09:00–12:00
+        workday_id=workday_id,
+        start_minute=720,  # 12:00 — shrink to 09:00–12:00
     ).pack()
     state = _make_mock_state(
         {
@@ -3479,9 +3465,7 @@ async def test_openweek_edit_cb_alerts_for_past_day_wed(
         )
 
     callback = _make_callback(ADMIN_TG_ID)
-    callback.data = AdminOpenweekEditCallbackData(
-        weekday=0, work_date_iso="2026-09-07"
-    ).pack()
+    callback.data = AdminOpenweekEditCallbackData(weekday=0, work_date_iso="2026-09-07").pack()
     state = _make_mock_state()
 
     await admin_handlers.admin_openweek_edit_cb(

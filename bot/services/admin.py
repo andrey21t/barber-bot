@@ -119,9 +119,7 @@ async def get_bookings_for_date_range(
     """
     tz = ZoneInfo(business_timezone)
     start_utc = datetime.combine(start_day, time(0, 0), tzinfo=tz).astimezone(UTC)
-    end_utc = datetime.combine(
-        end_day + timedelta(days=1), time(0, 0), tzinfo=tz
-    ).astimezone(UTC)
+    end_utc = datetime.combine(end_day + timedelta(days=1), time(0, 0), tzinfo=tz).astimezone(UTC)
 
     stmt = (
         select(Booking)

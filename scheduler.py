@@ -263,8 +263,7 @@ def schedule_for_booking(
         )
     else:
         logger.info(
-            "schedule_for_booking: skip remind_24h (past-due, booking=%s, "
-            "remind_at=%s, cutoff=%s)",
+            "schedule_for_booking: skip remind_24h (past-due, booking=%s, remind_at=%s, cutoff=%s)",
             booking_id,
             remind_24h_at,
             cutoff,
@@ -281,8 +280,7 @@ def schedule_for_booking(
         )
     else:
         logger.info(
-            "schedule_for_booking: skip remind_1h (past-due, booking=%s, "
-            "remind_at=%s, cutoff=%s)",
+            "schedule_for_booking: skip remind_1h (past-due, booking=%s, remind_at=%s, cutoff=%s)",
             booking_id,
             remind_1h_at,
             cutoff,

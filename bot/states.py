@@ -4,7 +4,7 @@ from aiogram.fsm.state import State, StatesGroup
 class BookingStates(StatesGroup):
     """FSM states для booking flow (spec.md 221-227).
 
-    Порядок: date → slot → name → service → confirm.
+    Порядок: date → service → slot → name → confirm.
     Single-master (BB-001): select_specialist skip'ается.
     """
 
