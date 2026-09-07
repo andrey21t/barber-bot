@@ -224,3 +224,38 @@ def test_slot_picker_30min_keyboard() -> None:
     assert rows_empty[0][0].text == "Нет свободных слотов"
     assert rows_empty[0][1].text == "↩️ Назад"
     assert rows_empty[0][0].text == "Нет свободных слотов"
+
+
+def test_slot_picker_30min_keyboard_show_back_false_suppresses_back() -> None:
+    """Session 5.31 S1 review W1: slot_picker_keyboard_30min with show_back=False
+    (transfer flow) — no "↩️ Назад" button rendered, in both non-empty and
+    empty cases. Same rationale as F2 fix for legacy keyboard: transfer has
+    no service step, back handler has BookingStates.selecting_slot StateFilter,
+    doesn't cover TransferStates.selecting_slot → dead button without this fix.
+    """
+    workday_id = UUID(int=1)
+    slots_30 = [
+        TimeSlot30(
+            start_at_utc=datetime(2026, 9, 8, 7, 0, tzinfo=UTC),
+            start_time_local=time(10, 0),
+            label="10:00",
+        ),
+        TimeSlot30(
+            start_at_utc=datetime(2026, 9, 8, 8, 0, tzinfo=UTC),
+            start_time_local=time(11, 0),
+            label="11:00",
+        ),
+    ]
+
+    # Non-empty case: slots only, no back button.
+    markup_non_empty = slot_picker_keyboard_30min(slots_30, workday_id, show_back=False)
+    flat_texts_ne = [btn.text for row in markup_non_empty.inline_keyboard for btn in row]
+    assert "↩️ Назад" not in flat_texts_ne
+    assert "10:00" in flat_texts_ne
+    assert "11:00" in flat_texts_ne
+
+    # Empty case: placeholder only, no back button.
+    markup_empty = slot_picker_keyboard_30min([], workday_id, show_back=False)
+    flat_texts_e = [btn.text for row in markup_empty.inline_keyboard for btn in row]
+    assert flat_texts_e == ["Нет свободных слотов"]
+    assert "↩️ Назад" not in flat_texts_e

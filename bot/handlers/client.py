@@ -584,7 +584,11 @@ async def _process_selected_date(
             if callback.message is not None:
                 await callback.message.answer(
                     "Выберите новое время:" if is_transfer else "Выберите время:",
-                    reply_markup=slot_picker_keyboard_30min(slots_30, workday.id),
+                    # S1 review fix F2: suppress back button in transfer flow (no service
+                    # step in transfer → "back to service" has no meaning, dead button).
+                    reply_markup=slot_picker_keyboard_30min(
+                        slots_30, workday.id, show_back=not is_transfer
+                    ),
                 )
             await callback.answer()
             return
@@ -614,7 +618,10 @@ async def _process_selected_date(
                     if callback.message is not None:
                         await callback.message.answer(
                             "Выберите новое время:" if is_transfer else "Выберите время:",
-                            reply_markup=slot_picker_keyboard_30min(slots_30, workday.id),
+                            # S1 review fix F2: suppress back button in transfer flow.
+                            reply_markup=slot_picker_keyboard_30min(
+                                slots_30, workday.id, show_back=not is_transfer
+                            ),
                         )
                     await callback.answer()
                     return
@@ -652,7 +659,9 @@ async def _process_selected_date(
         if callback.message is not None:
             await callback.message.answer(
                 "Выберите новое время:" if is_transfer else "Выберите время:",
-                reply_markup=slot_picker_keyboard(slots),
+                # S1 review fix F2: suppress back button in transfer flow (no service
+                # step in transfer → "back to service" has no meaning, dead button).
+                reply_markup=slot_picker_keyboard(slots, show_back=not is_transfer),
             )
         await callback.answer()
         return
