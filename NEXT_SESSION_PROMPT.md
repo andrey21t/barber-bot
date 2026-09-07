@@ -1,46 +1,54 @@
-# NEXT_SESSION_PROMPT — barber-bot, handoff после 2026-09-07 (сессия 5.31)
+# NEXT_SESSION_PROMPT — barber-bot, handoff после 2026-09-07 (сессия 5.32)
 
 ## Текущее состояние (актуально)
 
-**VPS:** `369a18c` (S1 + review fixes задеплоены 2026-09-07, бот перезапущен).
-**Origin/main:** `369a18c fix(booking): S1 review fixes — W1/W2/S1`.
-**Гейты:** ruff ✅ · mypy ✅ (25 src) · pytest ✅ 484 passed, 2 skipped.
+**VPS:** `befc258` (S1 + review F1/F2 fixes задеплоены 2026-09-07, бот перезапущен).
+**Origin/main:** `befc258 fix(booking): S1 review F1+F2 fixes — docstring parity, show_back param for transfer flow`.
+**Гейты:** ruff ✅ · mypy ✅ (25 src) · pytest ✅ 487 passed, 2 skipped.
 
-## Сделано в сессии 5.31 (2026-09-07, ses_f88566c38ffeFCgzx8LMcCSL9m — продолжение)
+## Сделано в сессии 5.32 (2026-09-07, продолжение 5.31)
 
-- ✅ `369a18c` fix(booking): S1 review fixes — W1/W2/S1
+- ✅ `befc258` fix(booking): S1 review F1+F2 fixes — docstring parity, show_back param for transfer flow
 
 ### Что было сделано
 
-**Code-review S1 (1a98179)** — `task(subagent_type="code-reviewer")`, ses_f85511826ffe3TGshToZ12C7la.
-**VERDICT: LGTM, 0 critical.** 3 warnings (W1/W2/W3), 3 suggestions (S1/S2/S3).
-BP-10 A2 верификация TOP-3 фактов подтверждена (callback_data коллизии,
-`_retry_markup` использует master.id не business_id, W1 legacy keyboard без Back).
+**Self-check triggered** user-фраза "проверь себя" → auto-trigger `code-review` для ALL repos
+(§ Auto-trigger rules).
 
-**W1 fix** — добавлена "↩️ Назад" кнопка в legacy `slot_picker_keyboard`
-(bot/keyboards/client.py). /book users с legacy slots теперь могут вернуться
-к service picker без /cancel + /book restart — UX consistency с 30-min keyboard.
-Empty case: "Нет свободных слотов" placeholder + "↩️ Назад" на одном ряду.
+**2nd code-review (369a18c)** — `task(subagent_type="code-reviewer")`,
+ses_f8543550effeiDHAQrEST0V7HN. VERDICT: **LBTM, 2 critical** (F1+F2).
 
-**W2 fix** — добавлены keyboard-content assertions в 2 теста:
-- `test_book_back_to_date_cb_returns_to_date_picker`: callback_data содержит
-  `target_date.isoformat()` (детерминированно vs text label с weekday/today).
-- `test_book_back_to_service_cb_returns_to_service_picker`: "Стрижка" в
-  `flat_texts` (по аналогии с `test_simple_calendar_cb_day_select_happy`).
+**F1 fix** — docstring `service_picker_keyboard` был перевёрнут (чёт/нечёт).
+Расчёт: order `[svc1..svcS, custom, back]`, total S+2, `adjust(2)`. S=2 (чёт) →
+back в паре с custom; S=3 (нечёт) → back один. Теперь docstring говорит
+правильно: "even → pairs, odd → alone".
 
-**S1 fix** — поправлен docstring `service_picker_keyboard` (неверное утверждение
-про "back button on its own row" — adjust(2) может paired'ить back с custom
-в зависимости от количества услуг).
+**F2 fix** — `slot_picker_keyboard` (legacy) вызывался в `_process_selected_date`
+(client.py:655) с `is_transfer=True` → рендерил "↩️ Назад" в `TransferStates.selecting_slot`.
+Хендлер `book_back_to_service_cb` StateFilter=`BookingStates.selecting_slot` →
+не покрывает transfer → dead button (spinner). Fix: добавлен keyword-only
+параметр `show_back: bool = True`. Transfer flow передаёт `show_back=False`,
+booking — default `True`.
 
-**Test fix** — `test_slot_picker_keyboard_empty_slots_returns_noop_button`
-обновлён для нового 2-кнопочного empty layout (placeholder + back).
+**W1 fix (sibling того же F2)** — `slot_picker_keyboard_30min` рендерился в
+transfer flow (client.py:587, 617) с `TransferStates.selecting_slot` → тот же
+dead-button баг. Pre-existing из Session 5.30 S1, не введён моим фиксом, но
+rationale F2 применим равнозначно. Расширил `show_back` параметр на 30min
+keyboard, передаю `show_back=not is_transfer` в transfer-вызовах (lines 589, 622).
 
-### Не сделано (запланировано, но не критично)
-- **W3** (race-тест для двойного back-tap) — гипотеза, aiogram asyncio
-  single-threaded, приемлемо для pet-project.
-- **S2** (стилистическая inconsistency: state.set_state внутри/снаружи async
-  with в book_back_to_service_cb) — не влияет на behavior.
-- **S3** (отсутствие `noop` handler'а) — pre-existing, не введён S1.
+**3 new tests** (487 passed):
+- `test_slot_picker_keyboard_non_empty_has_back_button` — legacy non-empty + back
+- `test_slot_picker_keyboard_show_back_false_suppresses_back_button` — legacy show_back=False (both empty/non-empty)
+- `test_slot_picker_30min_keyboard_show_back_false_suppresses_back` — 30min show_back=False (W1 sibling)
+
+**Re-verify после F1+F2 fix** — `task(subagent_type="code-reviewer")`,
+ses_f853a19ccffeJROk2fjv8PucpX. VERDICT: **LGTM, 0 critical**. F1+F2 resolved,
+W1 (30-min sibling) расширил в этом же коммите, S1/S2/S3 suggestions опциональны.
+
+### Code-review summary (3 passes)
+1. **369a18c (S1 review)** — ses_f85511826ffe3TGshToZ12C7la — LGTM, 0 critical, 3 warnings (W1/W2/S1).
+2. **369a18c fixes** — ses_f8543550effeiDHAQrEST0V7HN — LBTM, 2 critical (F1+F2).
+3. **F1+F2 fixes** — ses_f853a19ccffeJROk2fjv8PucpX — LGTM, 0 critical. W1 (30-min sibling) расширен в befc258.
 
 ## Что осталось (не блокеры, отложенное)
 
@@ -55,6 +63,12 @@ Empty case: "Нет свободных слотов" placeholder + "↩️ На�
 - ↩️ Назад в service picker → возвращает к выбору даты (S1)
 - ↩️ Назад в slot picker → возвращает к выбору услуги (S1, оба path: 30-min + legacy)
 - /book с legacy slots → ↩️ Назад работает (W1 fix)
+- ⚠️ Transfer flow НЕ должен показывать ↩️ Назад (F2 fix, 30-min + legacy)
+
+### Не сделано (опционально из critic suggestions)
+- **S1** (comment уточнение про show_back defensive future-proof)
+- **S2** (интеграционный тест transfer-path → keyboard без back)
+- **S3** (keyword-only `*` consistency с mybookings_keyboard)
 
 ## Доступ к продакшену
 
@@ -92,6 +106,6 @@ Empty case: "Нет свободных слотов" placeholder + "↩️ На�
 
 ## Следующие задачи (предложения для новой сессии)
 
-1. Smoke-test S1 в Telegram (если есть доступ пользователя) — проверить 4 back-button flow.
+1. Smoke-test S1 в Telegram (если есть доступ пользователя) — проверить 4 back-button flow + отсутствие back в transfer.
 2. Бронь вне workday window — отдельный баг, нужна валидация `booking.start_at < workday.end_at`.
-3. Перейти к следующей задаче из backlog (если есть) — S1 закрыт полностью.
+3. Перейти к следующей задаче из backlog (если есть) — S1 закрыт полностью с multi-pass code-review.
