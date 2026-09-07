@@ -1,52 +1,48 @@
-# NEXT_SESSION_PROMPT — barber-bot, handoff после 2026-09-07 (сессия 5.30)
+# NEXT_SESSION_PROMPT — barber-bot, handoff после 2026-09-07 (сессия 5.31)
 
 ## Текущее состояние (актуально)
 
-**VPS:** `1a98179` (S1 задеплоен 2026-09-07, бот перезапущен).
-**Origin/main:** `1a98179 feat(booking): ↩️ Назад button in service/slot picker (S1)`.
+**VPS:** `369a18c` (S1 + review fixes задеплоены 2026-09-07, бот перезапущен).
+**Origin/main:** `369a18c fix(booking): S1 review fixes — W1/W2/S1`.
 **Гейты:** ruff ✅ · mypy ✅ (25 src) · pytest ✅ 484 passed, 2 skipped.
 
-## Сделано в сессии 5.30 (2026-09-07, ses_f88566c38ffeFCgzx8LMcCSL9m)
+## Сделано в сессии 5.31 (2026-09-07, ses_f88566c38ffeFCgzx8LMcCSL9m — продолжение)
 
-- ✅ `ed66fd2` Task 2 — FSM reorder (услуга ДО слота) + overlap fix + W1+W2
-- ✅ `b1aa5cf` docs(handoff): Task 2 closed
-- ✅ `06d4094` fix(admin_move): pass min_duration_min from booking's service (overlap fix для admin_move, аналог Task 2)
-- ✅ `1a98179` feat(booking): ↩️ Назад button in service/slot picker (S1)
+- ✅ `369a18c` fix(booking): S1 review fixes — W1/W2/S1
 
 ### Что было сделано
 
-**Task 2 (FSM reorder)** — основной flow: `date → service → slot → name → confirm`
-(было `date → slot → name → service → confirm`). Пользователь сначала выбирает
-услугу, потом слот под её duration. Overlap fix в `slots.py:224` — слот 15:30
-блокируется бронью 16:00-18:00 для 120-мин услуг.
+**Code-review S1 (1a98179)** — `task(subagent_type="code-reviewer")`, ses_f85511826ffe3TGshToZ12C7la.
+**VERDICT: LGTM, 0 critical.** 3 warnings (W1/W2/W3), 3 suggestions (S1/S2/S3).
+BP-10 A2 верификация TOP-3 фактов подтверждена (callback_data коллизии,
+`_retry_markup` использует master.id не business_id, W1 legacy keyboard без Back).
 
-**W2 fix** — defensive check `service_title` в `slot_cb`/`slot_30_cb` BEFORE
-`set_state(entering_name)`. Ловит stale state из in-flight сессии, пережившей
-restart с RedisStorage в prod.
+**W1 fix** — добавлена "↩️ Назад" кнопка в legacy `slot_picker_keyboard`
+(bot/keyboards/client.py). /book users с legacy slots теперь могут вернуться
+к service picker без /cancel + /book restart — UX consistency с 30-min keyboard.
+Empty case: "Нет свободных слотов" placeholder + "↩️ Назад" на одном ряду.
 
-**admin_move overlap fix** — `admin_move_simple_calendar_cb` теперь передаёт
-`min_duration_min` в `get_available_slots_30` (загружает `Service.duration_minutes`
-из переносимой брони, fallback на `SERVICE_DEFAULT_DURATION_MIN` для free-text).
-+ 2 defensive checks (booking_id missing, Booking not found).
+**W2 fix** — добавлены keyboard-content assertions в 2 теста:
+- `test_book_back_to_date_cb_returns_to_date_picker`: callback_data содержит
+  `target_date.isoformat()` (детерминированно vs text label с weekday/today).
+- `test_book_back_to_service_cb_returns_to_service_picker`: "Стрижка" в
+  `flat_texts` (по аналогии с `test_simple_calendar_cb_day_select_happy`).
 
-**S1 (↩️ Назад)** — кнопки "↩️ Назад" в service picker и slot picker. Handler'ы:
-- `book_back_to_date_cb` (F.data='book_back_to_date', entering_service → selecting_date)
-- `book_back_to_service_cb` (F.data='book_back_to_service', selecting_slot → entering_service)
+**S1 fix** — поправлен docstring `service_picker_keyboard` (неверное утверждение
+про "back button on its own row" — adjust(2) может paired'ить back с custom
+в зависимости от количества услуг).
 
-### Code-review
+**Test fix** — `test_slot_picker_keyboard_empty_slots_returns_noop_button`
+обновлён для нового 2-кнопочного empty layout (placeholder + back).
 
-- Task 2 (ed66fd2): LGTM, 0 critical, W1+W2 fixed
-- admin_move fix (06d4094): LGTM, 0 critical, W1 (weak assertion) fixed, S1 (docstring) fixed
-- **S1 (1a98179): code-review НЕ запущен** — сессия оборвалась на 3% батареи. NEXT SESSION: запустить `qa-code-review` для 1a98179 перед "готово".
+### Не сделано (запланировано, но не критично)
+- **W3** (race-тест для двойного back-tap) — гипотеза, aiogram asyncio
+  single-threaded, приемлемо для pet-project.
+- **S2** (стилистическая inconsistency: state.set_state внутри/снаружи async
+  with в book_back_to_service_cb) — не влияет на behavior.
+- **S3** (отсутствие `noop` handler'а) — pre-existing, не введён S1.
 
 ## Что осталось (не блокеры, отложенное)
-
-### Code-review для S1 (1a98179) — ПЕРВЫМ ДЕЛОМ в следующей сессии
-Запустить `task(subagent_type="code-reviewer")` для коммита 1a98179. Проверить:
-- `book_back_to_date_cb` / `book_back_to_service_cb` — state machine, race-condition
-- `service_picker_keyboard` / `slot_picker_keyboard_30min` — back button layout
-- Тесты покрывают happy path + defensive (master not found)
-- Если LBTM + critical → fix → re-verify → re-review (max 2 итерации)
 
 ### Бронь вне workday window (отдельный баг)
 Бронь 06.09 16:00-17:00 создана 08:31 UTC, workday 06.09 открыт 19:00-20:00.
@@ -57,7 +53,8 @@ restart с RedisStorage в prod.
 - /book → выбор услуги ДО слота (Task 2)
 - /today → [🔄 Перенести] → слоты фильтруются по duration (admin_move fix)
 - ↩️ Назад в service picker → возвращает к выбору даты (S1)
-- ↩️ Назад в slot picker → возвращает к выбору услуги (S1)
+- ↩️ Назад в slot picker → возвращает к выбору услуги (S1, оба path: 30-min + legacy)
+- /book с legacy slots → ↩️ Назад работает (W1 fix)
 
 ## Доступ к продакшену
 
@@ -93,23 +90,8 @@ restart с RedisStorage в prod.
 Линт: `.venv/bin/ruff check bot/ tests/`
 Тайпчек: `.venv/bin/mypy bot/`
 
-## Первое действие в новой сессии
+## Следующие задачи (предложения для новой сессии)
 
-1. Прочитать этот промт (уже прочитан)
-2. **ПЕРВЫМ ДЕЛОМ**: запустить `qa-code-review` для коммита `1a98179` (S1 — ↩️ Назад button).
-   Если LGTM → задача закрыта. Если LBTM + critical → fix → re-verify → re-review.
-3. VPS на `1a98179` — деплой НЕ требуется (S1 уже на prod).
-4. Smoke-test в Telegram (если есть доступ): проверить ↩️ Назад кнопки.
-
-## Промпт для вставки в начало следующей сессии
-
-```
-Продолжим barber-bot. Прочитай NEXT_SESSION_PROMPT.md — там handoff после сессии 5.30.
-Задача 2 (FSM reorder), admin_move overlap fix, S1 (↩️ Назад button) — всё задеплоено.
-VPS на 1a98179, гейты зелёные (484 passed).
-
-ПЕРВЫМ ДЕЛОМ: запусти qa-code-review для коммита 1a98179 (S1 — ↩️ Назад button).
-code-review НЕ был запущен — сессия оборвалась на 3% батареи.
-Если LBTM + critical → fix → re-verify → re-review (max 2 итерации).
-Pet-project git free. Деплой после green-гейтов если будут правки.
-```
+1. Smoke-test S1 в Telegram (если есть доступ пользователя) — проверить 4 back-button flow.
+2. Бронь вне workday window — отдельный баг, нужна валидация `booking.start_at < workday.end_at`.
+3. Перейти к следующей задаче из backlog (если есть) — S1 закрыт полностью.
