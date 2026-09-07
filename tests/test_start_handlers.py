@@ -125,8 +125,6 @@ async def test_cmd_start_client_shows_booking_hint() -> None:
 
     assert isinstance(reply_markup, InlineKeyboardMarkup), "must be inline keyboard"
     # Inline menu has at least one button — [💇 Записаться]
-    flat_buttons = [
-        btn for row in reply_markup.inline_keyboard for btn in row
-    ]
+    flat_buttons = [btn for row in reply_markup.inline_keyboard for btn in row]
     assert len(flat_buttons) >= 1
     assert any("Записаться" in btn.text for btn in flat_buttons)

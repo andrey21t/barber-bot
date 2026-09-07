@@ -570,15 +570,25 @@ async def test_booking_flow_with_service_picker_creates_booking(
     integration_dispatcher: tuple[Dispatcher, MagicMock],
     session_factory: Any,
 ) -> None:
-    """Session 5.27 FEAT E2E: /slots → calendar → slot → name → service
-    picker (tap service) → ✅ → booking created with service_id set.
+    """Session 5.27 FEAT E2E (reordered in 5.29 Task 2): /slots → calendar →
+    service picker (tap 'Окрашивание') → slot picker → name → ✅ → booking
+    created with service_id set.
+
+    New flow (Session 5.29 Task 2 — FSM reorder, услуга ДО слота):
+    1. /slots → SimpleCalendar (selecting_date)
+    2. tap tomorrow → service picker (entering_service)
+    3. tap 'Окрашивание' → slot picker (selecting_slot)
+    4. tap 10:00 slot → 'На чьё имя?' (entering_name)
+    5. type name → summary (confirming)
+    6. tap ✅ → booking created
 
     Verifies:
     - All handlers dispatch correctly (cmd_slots → simple_calendar_cb →
-      slot_30_cb → name_msg → service_picker_cb → confirm_cb)
+      service_picker_cb → slot_30_cb → name_msg → confirm_cb)
     - service_picker_keyboard shown with both seeded services + 'Своя услуга'
-    - Tap service → summary with service name → ✅ → BookingCreate.service_id
-      is the UUID (not None) — _build_end_at uses service.duration_minutes
+    - Tap service → slot picker filtered by service.duration_minutes (120)
+    - Tap slot → name prompt → Tap ✅ → BookingCreate.service_id is the UUID
+      (not None) — _build_end_at uses service.duration_minutes
     - Booking persisted to DB with correct service_id, service_title_snapshot,
       end_at = start_at + service.duration_minutes
     """
@@ -598,37 +608,13 @@ async def test_booking_flow_with_service_picker_creates_booking(
         step1 = _extract_send_text(bot)
         assert "Выберите дату" in step1, f"Expected date picker, got: {step1!r}"
 
-        # Step 2: tap tomorrow (2026-08-26) in calendar → slot picker.
+        # Step 2: tap tomorrow (2026-08-26) in calendar → service picker.
         tomorrow = (datetime.now(ZoneInfo(TZ)) + timedelta(days=1)).date()
         bot.reset()
-        await dp.feed_update(
-            bot, _make_calendar_day_update(tomorrow, user_id=client_tg)
-        )
+        await dp.feed_update(bot, _make_calendar_day_update(tomorrow, user_id=client_tg))
         step2 = _extract_send_text(bot)
-        # Either slot picker shown ('10:00' button) OR 'нет слотов' if workday
-        # window is empty. We seeded 10:00-12:00, so picker should appear.
-        slot_btn = await _find_button_by_label(bot, "10:00")
-        assert slot_btn is not None, (
-            f"Expected 10:00 slot button after calendar tap. Got text: {step2!r}"
-        )
-
-        # Step 3: tap 10:00 slot → 'На чьё имя?' prompt (entering_name).
-        bot.reset()
-        await dp.feed_update(
-            bot, _make_callback_update_from_button(slot_btn, user_id=client_tg)
-        )
-        step3 = _extract_send_text(bot)
-        assert "На чьё имя" in step3, f"Expected name prompt, got: {step3!r}"
-
-        # Step 4: type name → service picker shown (entering_service).
-        bot.reset()
-        await dp.feed_update(
-            bot, _make_text_update("Паша", user_id=client_tg)
-        )
-        step4 = _extract_send_text(bot)
-        assert "Выберите услугу тапом" in step4, (
-            f"5.27 FEAT: with services in DB, must show inline picker. "
-            f"Got: {step4!r}"
+        assert "Выберите услугу тапом" in step2, (
+            f"5.29 Task 2: with services in DB, must show service picker after date. Got: {step2!r}"
         )
         # All 4 services present + 'Своя услуга' fallback (matches prod after
         # 2026-08-30 sync).
@@ -643,11 +629,25 @@ async def test_booking_flow_with_service_picker_creates_booking(
         custom_btn = await _find_button_by_label(bot, "Своя услуга")
         assert custom_btn is not None, "✏️ Своя услуга fallback button"
 
-        # Step 5: tap 'Окрашивание' → summary with service name (confirming).
+        # Step 3: tap 'Окрашивание' → slot picker (selecting_slot).
         bot.reset()
-        await dp.feed_update(
-            bot, _make_callback_update_from_button(svc2_btn, user_id=client_tg)
+        await dp.feed_update(bot, _make_callback_update_from_button(svc2_btn, user_id=client_tg))
+        step3 = _extract_send_text(bot)
+        assert "Выберите время" in step3, f"5.29 Task 2: service tap → slot picker. Got: {step3!r}"
+        slot_btn = await _find_button_by_label(bot, "10:00")
+        assert slot_btn is not None, (
+            f"Expected 10:00 slot button after service tap. Got text: {step3!r}"
         )
+
+        # Step 4: tap 10:00 slot → 'На чьё имя?' prompt (entering_name).
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(slot_btn, user_id=client_tg))
+        step4 = _extract_send_text(bot)
+        assert "На чьё имя" in step4, f"Expected name prompt, got: {step4!r}"
+
+        # Step 5: type name → summary with service name (confirming).
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("Паша", user_id=client_tg))
         step5 = _extract_send_text(bot)
         assert "Подтвердите запись" in step5, f"Expected summary, got: {step5!r}"
         assert "Окрашивание" in step5, f"Service name in summary, got: {step5!r}"
@@ -657,9 +657,7 @@ async def test_booking_flow_with_service_picker_creates_booking(
         confirm_btn = await _find_button_by_label(bot, "Подтвердить")
         assert confirm_btn is not None, "✅ Подтвердить button on summary"
         bot.reset()
-        await dp.feed_update(
-            bot, _make_callback_update_from_button(confirm_btn, user_id=client_tg)
-        )
+        await dp.feed_update(bot, _make_callback_update_from_button(confirm_btn, user_id=client_tg))
         step6 = _extract_send_text(bot)
         assert "Вы записаны" in step6, f"Expected success, got: {step6!r}"
 
@@ -690,9 +688,18 @@ async def test_booking_flow_custom_service_text_uses_default_duration(
     integration_dispatcher: tuple[Dispatcher, MagicMock],
     session_factory: Any,
 ) -> None:
-    """5.27 FEAT E2E: /slots → calendar → slot → name → '✏️ Своя услуга' →
-    typed text → ✅ → booking with service_id=None + default duration
-    (SERVICE_DEFAULT_DURATION_MIN).
+    """5.27 FEAT E2E (reordered in 5.29 Task 2): /slots → calendar → service
+    picker → '✏️ Своя услуга' → typed text → slot picker → name → ✅ → booking
+    with service_id=None + default duration (SERVICE_DEFAULT_DURATION_MIN).
+
+    New flow (Session 5.29 Task 2 — FSM reorder, услуга ДО слота):
+    1. /slots → SimpleCalendar (selecting_date)
+    2. tap tomorrow → service picker (entering_service)
+    3. tap '✏️ Своя услуга' → ask for text (still entering_service)
+    4. type custom service → slot picker (selecting_slot)
+    5. tap 10:00 slot → 'На чьё имя?' (entering_name)
+    6. type name → summary (confirming)
+    7. tap ✅ → booking created
 
     Verifies the legacy fallback path: 'Своя услуга' button keeps state in
     entering_service, service_msg catches the next text message, service_id
@@ -711,53 +718,51 @@ async def test_booking_flow_custom_service_text_uses_default_duration(
 
         client_tg = 999_888_777
 
-        # Full flow: /slots → calendar → slot → name.
+        # Step 1: /slots → SimpleCalendar (selecting_date).
         await dp.feed_update(bot, _make_text_update("/slots", user_id=client_tg))
         assert "Выберите дату" in _extract_send_text(bot)
 
+        # Step 2: tap tomorrow → service picker (entering_service).
         tomorrow = (datetime.now(ZoneInfo(TZ)) + timedelta(days=1)).date()
         bot.reset()
-        await dp.feed_update(
-            bot, _make_calendar_day_update(tomorrow, user_id=client_tg)
-        )
-        slot_btn = await _find_button_by_label(bot, "10:00")
-        assert slot_btn is not None
-
-        bot.reset()
-        await dp.feed_update(
-            bot, _make_callback_update_from_button(slot_btn, user_id=client_tg)
-        )
-        assert "На чьё имя" in _extract_send_text(bot)
-
-        bot.reset()
-        await dp.feed_update(bot, _make_text_update("Паша", user_id=client_tg))
+        await dp.feed_update(bot, _make_calendar_day_update(tomorrow, user_id=client_tg))
         assert "Выберите услугу тапом" in _extract_send_text(bot)
 
-        # Tap '✏️ Своя услуга' → ask for text.
+        # Step 3: tap '✏️ Своя услуга' → ask for text (still entering_service).
         custom_btn = await _find_button_by_label(bot, "Своя услуга")
         assert custom_btn is not None
         bot.reset()
-        await dp.feed_update(
-            bot, _make_callback_update_from_button(custom_btn, user_id=client_tg)
-        )
+        await dp.feed_update(bot, _make_callback_update_from_button(custom_btn, user_id=client_tg))
         assert "Напишите услугу" in _extract_send_text(bot)
 
-        # Type custom service text.
+        # Step 4: type custom service text → slot picker (selecting_slot).
         bot.reset()
-        await dp.feed_update(
-            bot, _make_text_update("Борода + стрижка", user_id=client_tg)
+        await dp.feed_update(bot, _make_text_update("Борода + стрижка", user_id=client_tg))
+        step4 = _extract_send_text(bot)
+        assert "Выберите время" in step4, (
+            f"5.29 Task 2: custom service text → slot picker. Got: {step4!r}"
         )
+        slot_btn = await _find_button_by_label(bot, "10:00")
+        assert slot_btn is not None, "10:00 slot button after custom service"
+
+        # Step 5: tap 10:00 slot → 'На чьё имя?' (entering_name).
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(slot_btn, user_id=client_tg))
+        assert "На чьё имя" in _extract_send_text(bot)
+
+        # Step 6: type name → summary (confirming).
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("Паша", user_id=client_tg))
         summary = _extract_send_text(bot)
         assert "Подтвердите запись" in summary
         assert "Борода + стрижка" in summary
+        assert "Паша" in summary
 
-        # Tap ✅.
+        # Step 7: tap ✅.
         confirm_btn = await _find_button_by_label(bot, "Подтвердить")
         assert confirm_btn is not None
         bot.reset()
-        await dp.feed_update(
-            bot, _make_callback_update_from_button(confirm_btn, user_id=client_tg)
-        )
+        await dp.feed_update(bot, _make_callback_update_from_button(confirm_btn, user_id=client_tg))
         assert "Вы записаны" in _extract_send_text(bot)
 
         # Verify booking: service_id is None, end_at = start + default duration.
@@ -777,6 +782,5 @@ async def test_booking_flow_custom_service_text_uses_default_duration(
         default_min = get_settings().SERVICE_DEFAULT_DURATION_MIN
         duration = (booking.end_at - booking.start_at).total_seconds() / 60
         assert duration == default_min, (
-            f"end_at - start_at must be {default_min} min (default), "
-            f"got {duration}"
+            f"end_at - start_at must be {default_min} min (default), got {duration}"
         )

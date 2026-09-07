@@ -214,9 +214,17 @@ async def get_available_slots_30(
         for b in bookings
     ]
 
+    # Session 5.29 (Task 2): overlap check uses min_duration_min (real
+    # booking duration) instead of the fixed 30-min grid step. Bug: бронь
+    # 16:00-18:00 (Окрашивание 120 мин) not blocking slot 15:30 because
+    # 15:30+30=16:00 == 16:00 (half-open) — but client picks 15:30 + Стрижка
+    # (60) → real 15:30-16:30 overlaps → falls at confirm. Fallback to 30
+    # when min_duration_min=0 preserves occupancy-only callers (admin_move
+    # at admin.py:2239 — same overlap-bug, NOT fixed in this task).
+    effective_duration = min_duration_min if min_duration_min > 0 else 30
     available: list[TimeSlot30] = []
     for slot in candidates:
-        slot_end_utc = slot.start_at_utc + timedelta(minutes=30)
+        slot_end_utc = slot.start_at_utc + timedelta(minutes=effective_duration)
         overlap_count = sum(
             1 for bs, be in normalized if bs < slot_end_utc and be > slot.start_at_utc
         )

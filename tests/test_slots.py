@@ -709,7 +709,10 @@ async def test_get_bookable_dates_includes_active_workday_with_free_slots(
     """
     tomorrow = seed_data["slot_date"]
     dates = await get_bookable_dates(
-        session, seed_data["master_id"], BUSINESS_TZ, min_duration_min=60,
+        session,
+        seed_data["master_id"],
+        BUSINESS_TZ,
+        min_duration_min=60,
     )
     assert dates == [tomorrow], f"expected only tomorrow, got {dates}"
 
@@ -742,8 +745,11 @@ async def test_get_bookable_dates_excludes_closed_workday(
     await _make_workday(session, seed_data, future_wd_date, 10, 18, capacity=1)
 
     dates = await get_bookable_dates(
-        session, seed_data["master_id"], BUSINESS_TZ,
-        include_legacy_slots=False, min_duration_min=60,
+        session,
+        seed_data["master_id"],
+        BUSINESS_TZ,
+        include_legacy_slots=False,
+        min_duration_min=60,
     )
     assert tomorrow not in dates, "closed workday must not be bookable"
     assert future_wd_date in dates
@@ -763,18 +769,25 @@ async def test_get_bookable_dates_excludes_fully_booked_workday(
     # Booking [10:00, 11:00] covers the only grid cell (10:00 fits 60 min,
     # 10:30+60=11:30 > 11:00 → filtered, so 1 slot total).
     await _insert_booking(
-        session, seed_data,
+        session,
+        seed_data,
         start_at=_local_to_utc(work_date, 10, 0),
         end_at=_local_to_utc(work_date, 11, 0),
     )
     # Sanity: get_available_slots_30 is empty for this workday.
     slots = await get_available_slots_30(
-        session, wd_short, BUSINESS_TZ, min_duration_min=60,
+        session,
+        wd_short,
+        BUSINESS_TZ,
+        min_duration_min=60,
     )
     assert slots == []
 
     dates = await get_bookable_dates(
-        session, seed_data["master_id"], BUSINESS_TZ, min_duration_min=60,
+        session,
+        seed_data["master_id"],
+        BUSINESS_TZ,
+        min_duration_min=60,
     )
     assert work_date not in dates, "fully-booked workday must not appear in picker"
 
@@ -805,12 +818,18 @@ async def test_get_bookable_dates_excludes_workday_with_no_fit_for_min_duration(
     await session.commit()
     # Sanity: 30-min grid yields 1 cell but no fit.
     slots = await get_available_slots_30(
-        session, wd_narrow, BUSINESS_TZ, min_duration_min=60,
+        session,
+        wd_narrow,
+        BUSINESS_TZ,
+        min_duration_min=60,
     )
     assert slots == []
 
     dates = await get_bookable_dates(
-        session, seed_data["master_id"], BUSINESS_TZ, min_duration_min=60,
+        session,
+        seed_data["master_id"],
+        BUSINESS_TZ,
+        min_duration_min=60,
     )
     assert work_date not in dates, "no slot fits min_duration → date excluded"
 
@@ -824,16 +843,21 @@ async def test_get_bookable_dates_includes_legacy_open_slots(
     Mirrors /book fallback path (legacy slots first, then WorkDay).
     """
     legacy_date = (datetime.now(UTC) + timedelta(days=12)).date()
-    session.add(Slot(
-        master_id=seed_data["master_id"],
-        slot_date=legacy_date,
-        slot_hour=14,
-        status="open",
-    ))
+    session.add(
+        Slot(
+            master_id=seed_data["master_id"],
+            slot_date=legacy_date,
+            slot_hour=14,
+            status="open",
+        )
+    )
     await session.commit()
 
     dates = await get_bookable_dates(
-        session, seed_data["master_id"], BUSINESS_TZ, include_legacy_slots=True,
+        session,
+        seed_data["master_id"],
+        BUSINESS_TZ,
+        include_legacy_slots=True,
     )
     assert legacy_date in dates
 
@@ -845,16 +869,21 @@ async def test_get_bookable_dates_excludes_legacy_when_flag_false(
 ) -> None:
     """include_legacy_slots=False (/slots scope) — legacy-only date excluded."""
     legacy_date = (datetime.now(UTC) + timedelta(days=12)).date()
-    session.add(Slot(
-        master_id=seed_data["master_id"],
-        slot_date=legacy_date,
-        slot_hour=14,
-        status="open",
-    ))
+    session.add(
+        Slot(
+            master_id=seed_data["master_id"],
+            slot_date=legacy_date,
+            slot_hour=14,
+            status="open",
+        )
+    )
     await session.commit()
 
     dates = await get_bookable_dates(
-        session, seed_data["master_id"], BUSINESS_TZ, include_legacy_slots=False,
+        session,
+        seed_data["master_id"],
+        BUSINESS_TZ,
+        include_legacy_slots=False,
     )
     assert legacy_date not in dates, "/slots must not list legacy-only dates"
 
@@ -874,22 +903,28 @@ async def test_get_bookable_dates_excludes_legacy_past_hours_today(
     """
     # 'today' in business TZ
     from zoneinfo import ZoneInfo
+
     tz = ZoneInfo(BUSINESS_TZ)
     now_utc = datetime.now(tz).replace(hour=20, minute=0, second=0, microsecond=0).astimezone(UTC)
     today_local = now_utc.astimezone(tz).date()
 
     # Open legacy slot for today at hour=14 (definitely < 20:00).
-    session.add(Slot(
-        master_id=seed_data["master_id"],
-        slot_date=today_local,
-        slot_hour=14,
-        status="open",
-    ))
+    session.add(
+        Slot(
+            master_id=seed_data["master_id"],
+            slot_date=today_local,
+            slot_hour=14,
+            status="open",
+        )
+    )
     await session.commit()
 
     dates = await get_bookable_dates(
-        session, seed_data["master_id"], BUSINESS_TZ,
-        include_legacy_slots=True, now_utc=now_utc,
+        session,
+        seed_data["master_id"],
+        BUSINESS_TZ,
+        include_legacy_slots=True,
+        now_utc=now_utc,
     )
     assert today_local not in dates, (
         f"all today's legacy slots already started (now=20:00 local) "
@@ -928,7 +963,10 @@ async def test_get_bookable_dates_sorted_ascending(
     await _make_workday(session, seed_data, d2, 10, 18, capacity=1)
 
     dates = await get_bookable_dates(
-        session, seed_data["master_id"], BUSINESS_TZ, min_duration_min=60,
+        session,
+        seed_data["master_id"],
+        BUSINESS_TZ,
+        min_duration_min=60,
     )
     assert dates == sorted(dates), f"expected ascending, got {dates}"
     assert len(dates) == 3  # tomorrow + d1 + d2
@@ -946,8 +984,127 @@ async def test_get_bookable_dates_caps_at_days_ahead(
     await _make_workday(session, seed_data, far_date, 10, 18, capacity=1)
 
     dates = await get_bookable_dates(
-        session, seed_data["master_id"], BUSINESS_TZ,
-        min_duration_min=60, days_ahead=10,
+        session,
+        seed_data["master_id"],
+        BUSINESS_TZ,
+        min_duration_min=60,
+        days_ahead=10,
     )
     assert near_date in dates
     assert far_date not in dates, "days_ahead=10 must exclude workday 30 days out"
+
+
+# ============================================================
+# Session 5.29 Task 2 — overlap fix regression guards
+# (slots.py:219 — min_duration_min instead of fixed 30-min grid)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_overlap_uses_min_duration_not_30(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Session 5.29 Task 2 — overlap filter uses min_duration_min (real
+    service duration), not the fixed 30-min grid step. Regression guard for
+    the bug: бронь 16:00-18:00 (Окрашивание 120 мин) не блокировала слот 15:30,
+    because 15:30+30=16:00 == 16:00 (half-open) — client picks 15:30 +
+    Стрижка (60) → real 15:30-16:30 overlaps → falls at confirm.
+
+    With the fix (effective_duration = min_duration_min if >0 else 30):
+    slot 15:30 + 120 = 17:30 overlaps 16:00-18:00 → hidden. Slot 13:30 +
+    120 = 15:30 does NOT overlap (15:30 < 16:00) → available.
+    """
+    work_date = _future_workdate()
+    wd = await _make_workday(session, seed_data, work_date, 10, 18, capacity=1)
+    # Booking 16:00-18:00 LOCAL (120 min — Окрашивание)
+    await _insert_booking(
+        session,
+        seed_data,
+        start_at=_local_to_utc(work_date, 16, 0),
+        end_at=_local_to_utc(work_date, 18, 0),
+    )
+    available = await get_available_slots_30(session, wd, BUSINESS_TZ, min_duration_min=120)
+    labels = [s.label for s in available]
+    # 15:30 + 120 = 17:30 overlaps 16:00-18:00 → MUST be hidden (was visible
+    # pre-fix due to 15:30+30=16:00 half-open).
+    assert "15:30" not in labels, (
+        "5.29 Task 2 fix: slot 15:30 must be hidden with min_duration_min=120 "
+        "vs booking 16:00-18:00 (15:30+120=17:30 overlaps). Pre-fix: 15:30+30 "
+        "= 16:00 == 16:00 (half-open) → shown (BUG)."
+    )
+    # 16:00 + 120 = 18:00 overlaps → hidden
+    assert "16:00" not in labels
+    # 13:30 + 120 = 15:30 < 16:00 → available
+    assert "13:30" in labels
+
+
+@pytest.mark.asyncio
+async def test_overlap_default_0_preserves_30_min_behavior(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Session 5.29 Task 2 — backward-compat: min_duration_min=0 (default)
+    falls back to 30-min effective duration, preserving occupancy-only
+    callers (admin_move at admin.py:2239 has same overlap-bug, NOT fixed in
+    this task — admin_move calls get_available_slots_30 without
+    min_duration_min → 30-min fallback → pre-fix behavior preserved).
+    """
+    work_date = _future_workdate()
+    wd = await _make_workday(session, seed_data, work_date, 10, 13, capacity=1)
+    # Booking 11:00-12:30 LOCAL (90 min — long service)
+    await _insert_booking(
+        session,
+        seed_data,
+        start_at=_local_to_utc(work_date, 11, 0),
+        end_at=_local_to_utc(work_date, 12, 30),
+    )
+    # Default min_duration_min=0 → effective=30 (fallback)
+    available = await get_available_slots_30(session, wd, BUSINESS_TZ)
+    labels = [s.label for s in available]
+    # WorkDay [10:00, 13:00] = 6 slots: 10:00, 10:30, 11:00, 11:30, 12:00, 12:30
+    # Booking 11:00-12:30 covers (with 30-min overlap) slots 11:00, 11:30, 12:00.
+    # slot 12:00 + 30 = 12:30 overlaps (12:30 > 12:00 and 11:00 < 12:30) → hidden.
+    assert "11:00" not in labels
+    assert "11:30" not in labels
+    assert "12:00" not in labels
+    assert labels == ["10:00", "10:30", "12:30"]
+
+
+@pytest.mark.asyncio
+async def test_overlap_60_min_short_service_ok(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Session 5.29 Task 2 — short service (60 min) shows slots that long
+    service (120 min) hides against the same booking. Slot 14:30 with
+    duration 60 → 14:30+60=15:30 does NOT overlap booking 16:00-18:00
+    (15:30 < 16:00) → available. Same slot with duration 120 → 14:30+120=16:30
+    overlaps → hidden.
+
+    This is the user-visible win of the overlap fix: client picking Стрижка
+    (60) sees 14:30 open, while client picking Окрашивание (120) sees it
+    closed — reflecting real booking feasibility, not just grid occupancy.
+    """
+    work_date = _future_workdate()
+    wd = await _make_workday(session, seed_data, work_date, 10, 18, capacity=1)
+    # Booking 16:00-18:00 LOCAL (120 min)
+    await _insert_booking(
+        session,
+        seed_data,
+        start_at=_local_to_utc(work_date, 16, 0),
+        end_at=_local_to_utc(work_date, 18, 0),
+    )
+
+    # Short service (60 min) — slot 14:30 available, 15:30 hidden.
+    available_60 = await get_available_slots_30(session, wd, BUSINESS_TZ, min_duration_min=60)
+    labels_60 = [s.label for s in available_60]
+    assert "14:30" in labels_60, "14:30 + 60 = 15:30 < 16:00 → available"
+    assert "15:30" not in labels_60, "15:30 + 60 = 16:30 overlaps 16:00-18:00 → hidden"
+
+    # Long service (120 min) — slot 14:30 hidden (14:30+120=16:30 overlaps).
+    available_120 = await get_available_slots_30(session, wd, BUSINESS_TZ, min_duration_min=120)
+    labels_120 = [s.label for s in available_120]
+    assert "14:30" not in labels_120, (
+        "14:30 + 120 = 16:30 overlaps 16:00-18:00 → hidden for long service"
+    )

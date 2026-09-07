@@ -4,16 +4,33 @@ Contract (deep-analysis-protocol Pass 3):
 - NO business logic in handlers — validation, html.escape, timezone conversion live in services
 - 8 handlers + 1 fallback (no_state_fallback for State(None) after bot restart):
   1. cmd_book: /book, StateFilter(None) → selecting_date
-  2. simple_calendar_cb: callback simple_calendar, StateFilter(selecting_date) → selecting_slot
-     (aiogram_calendar month navigation, callback.answer contract verified against lib source)
+  2. simple_calendar_cb: callback simple_calendar, StateFilter(selecting_date) → entering_service
+     (Session 5.29 Task 2 — FSM reorder; was selecting_slot pre-5.29. Stale-keyboard only
+     — new clients use book_date_cb. aiogram_calendar month navigation, callback.answer
+     contract verified against lib source)
+  2b. book_date_cb: callback book_date, StateFilter(selecting_date) → entering_service
+      (BB-110 flat date picker; Session 5.29 Task 2 — was selecting_slot pre-5.29)
   3. slot_cb: callback book_slot:<uuid>, StateFilter(selecting_slot) → entering_name
-  4. name_msg: text, StateFilter(entering_name) → entering_service
-  5. service_msg: text, StateFilter(entering_service) → confirming
+  3b. slot_30_cb: callback book_slot_30, StateFilter(selecting_slot) → entering_name
+  4. service_picker_cb: callback book_service, StateFilter(entering_service) → selecting_slot
+     (Session 5.27 FEAT — tap-to-select; Session 5.29 Task 2 moved from confirming to
+     selecting_slot, fetches slots filtered by service.duration_minutes)
+  4b. service_custom_cb: callback book_service_custom, StateFilter(entering_service) → stays
+      in entering_service, asks for free-text
+  4c. service_msg: text, StateFilter(entering_service) → selecting_slot
+      (free-text service; Session 5.29 Task 2 moved from confirming to selecting_slot,
+      fetches slots filtered by SERVICE_DEFAULT_DURATION_MIN)
+  5. name_msg: text, StateFilter(entering_name) → confirming + render summary
+     (Session 5.29 Task 2 — summary rendering moved here from service_msg/service_picker_cb)
   6. confirm_cb: callback book_confirm, StateFilter(confirming) → State(None) + create_booking
   7. cancel_msg: /cancel, StateFilter("*") → state.clear() + message
   + mybookings_msg / mybookings_cancel_cb / mybookings_transfer_cb / transfer_simple_calendar_cb
   + transfer_slot_cb + no_state_fallback: State(None), F.text, ~F.text.startswith("/")
     → "Начните через /book"
+
+Flow (Session 5.29 Task 2 — услуга ДО слота):
+  booking:  date → service → slot → name → confirm
+  transfer: date → slot (existing booking's service reused) → confirm
 
 Invariants (spec.md + MY-VIBE-RULES.md):
 - state.clear() BEFORE event.answer (race condition)
@@ -271,7 +288,7 @@ async def cmd_slots(message: Message, state: FSMContext) -> None:
 
 
 # ============================================================
-# 1c. _select_master / _retry_markup / _process_selected_date
+# 1c. _select_master / _retry_markup / _fetch_slots_for_service / _process_selected_date
 # Shared helpers for cmd_book/cmd_slots + simple_calendar_cb (stale keyboards)
 # + book_date_cb (BB-110 date picker).
 # ============================================================
@@ -328,25 +345,114 @@ async def _retry_markup(
     return date_picker_keyboard(dates, today=today_local)
 
 
+async def _fetch_slot_picker_for_service(
+    session: AsyncSession,
+    master: Master,
+    slot_date: date,
+    settings: Settings,
+    *,
+    is_slots_path: bool,
+    min_duration_min: int,
+) -> InlineKeyboardMarkup | None:
+    """Fetch slots filtered by service duration and build slot picker keyboard
+    (Session 5.29 Task 2).
+
+    Used by service_picker_cb and service_msg AFTER service selection —
+    min_duration_min is the real service.duration_minutes (or
+    SERVICE_DEFAULT_DURATION_MIN for free-text). The overlap filter in
+    get_available_slots_30 uses this duration (slots.py:219 fix), so a
+    slot 15:30 is hidden when an 120-min booking starts at 16:00 (15:30+120
+    = 17:30 overlaps 16:00-18:00) but shown for a 60-min booking where
+    15:30+60 = 16:30 still overlaps (also hidden — for shorter windows the
+    30-min grid step is the fallback when min_duration_min=0).
+
+    Returns:
+        InlineKeyboardMarkup — slot picker keyboard ready to render
+        (slot_picker_keyboard_30min for WorkDay path, slot_picker_keyboard
+        for legacy Slot path). Caller renders it directly via
+        callback.message.answer("Выберите время:", reply_markup=keyboard).
+        None — no slots available (workday closed / master doesn't work /
+        all slots booked). Caller shows "no slots" hint and a retry date picker.
+
+    Why keyboard instead of slots list (deviation from plan B.1):
+        Plan B.1 proposed `-> list[Slot] | list[TimeSlot30] | None` with
+        keyboard build in the caller. mypy rejects the union type passed
+        to slot_picker_keyboard_30min (expects list[TimeSlot30]) /
+        slot_picker_keyboard (expects list[Slot]) — list element type is
+        not narrowed by the workday None/not-None check (correlation is
+        runtime, not type-level). Returning the keyboard from the helper
+        encapsulates the type discrimination at the build site — single
+        source of truth, no caller-side cast/assert.
+
+    Branch mirrors _process_selected_date transfer flow (is_slots_path True
+    → workday-only; False → legacy Slot with workday fallback). NOT used by
+    transfer (transfer has its own flow inside _process_selected_date —
+    service is taken from the existing booking snapshot, no service picker).
+    """
+    if is_slots_path:
+        # === /slots workday branch (Этап 5.8b) ===
+        workday = await _select_workday_for_slot(session, master.id, slot_date)
+        if workday is None or not workday.is_active:
+            return None
+        slots_30 = await get_available_slots_30(
+            session,
+            workday,
+            settings.TIMEZONE,
+            min_duration_min=min_duration_min,
+        )
+        if not slots_30:
+            return None
+        return slot_picker_keyboard_30min(slots_30, workday.id)
+
+    # === /book legacy slot branch with WorkDay fallback (5.27) ===
+    slots = await get_available_slots(session, master.id, slot_date)
+    if slots:
+        return slot_picker_keyboard(slots)
+
+    # Legacy slots empty → try WorkDay (openweek writes to work_days, not slots).
+    workday = await _select_workday_for_slot(session, master.id, slot_date)
+    if workday is None or not workday.is_active:
+        return None
+    slots_30 = await get_available_slots_30(
+        session,
+        workday,
+        settings.TIMEZONE,
+        min_duration_min=min_duration_min,
+    )
+    if not slots_30:
+        return None
+    return slot_picker_keyboard_30min(slots_30, workday.id)
+
+
 async def _process_selected_date(
     callback: CallbackQuery,
     state: FSMContext,
     settings: Settings,
     *,
-    selecting_slot_state: State,
+    next_state: State,
     is_transfer: bool,
     slot_date: date,
 ) -> None:
     """Shared body of simple_calendar_cb act=day (stale-keyboard retry) and
     book_date_cb tap (BB-110).
 
-    Fetches master, reads is_slots_path FSM flag, branches on workday vs
-    legacy slot path, renders the slot picker or a retry date selector.
+    Session 5.29 (Task 2 — FSM reorder: услуга ДО слота):
+    - is_transfer=True: unchanged — workday/legacy branching, fetch slots,
+      set next_state=TransferStates.selecting_slot, render slot picker.
+      Service is taken from the existing booking snapshot, no service picker.
+    - is_transfer=False (booking): NEW — fetch services for master's business,
+      set next_state=BookingStates.entering_service, render service picker
+      (or free-text prompt if no services in DB). Slot fetching moved to
+      service_picker_cb/service_msg (after service selection — uses real
+      service.duration_minutes for overlap filter against existing bookings,
+      fixes the 15:30+Стрижка vs 16:00-18:00-Окрашивание overlap bug).
 
-    Retry paths (workday None/closed, no free slots) use _retry_markup —
-    calendar for /transfer, date picker for /book and /slots. Race
+    Transfer retry paths (workday None/closed, no free slots) use _retry_markup
+    — calendar for /transfer, date picker for /book and /slots. Race
     protection: between picker render and tap, all slots may have been
     booked by another client or /closeday may have deactivated the workday.
+    Booking flow has no retry paths here — service picker is always renderable;
+    slot retry happens after service selection (service_picker_cb/service_msg).
     """
     fsm_data = await state.get_data()
     is_slots_path: bool | None = fsm_data.get("is_slots_path")
@@ -362,6 +468,51 @@ async def _process_selected_date(
             await callback.answer()
             return
 
+        if not is_transfer:
+            # === Booking flow (Session 5.29 Task 2): дата → услуга → слот ===
+            # Fetch services for master's business, render service picker.
+            # Slot fetching moved to service_picker_cb/service_msg (after
+            # service selection — uses real service.duration_minutes for
+            # overlap filter against existing bookings, fixes the
+            # 15:30+Стрижка vs 16:00-18:00-Окрашивание overlap bug).
+            from bot.models import Business, Service  # noqa: PLC0415
+
+            stmt_b = select(Business).where(Business.id == master.business_id).limit(1)
+            business = (await session.execute(stmt_b)).scalar_one_or_none()
+            await state.update_data(selected_date=slot_date.isoformat())
+            await state.set_state(next_state)
+            if business is None:
+                # No business → no services → free-text prompt.
+                if callback.message is not None:
+                    await callback.message.answer(
+                        "Какая услуга? (например: стрижка, окрашивание+стрижка)"
+                    )
+                await callback.answer()
+                return
+
+            stmt_s = (
+                select(Service)
+                .where(Service.business_id == business.id, Service.is_active == True)  # noqa: E712
+                .order_by(Service.name)
+            )
+            services = list((await session.execute(stmt_s)).scalars().all())
+            if not services:
+                if callback.message is not None:
+                    await callback.message.answer(
+                        "Какая услуга? (например: стрижка, окрашивание+стрижка)"
+                    )
+                await callback.answer()
+                return
+
+            if callback.message is not None:
+                await callback.message.answer(
+                    "Выберите услугу тапом или напишите свою:",
+                    reply_markup=service_picker_keyboard(services),
+                )
+            await callback.answer()
+            return
+
+        # === Transfer flow (unchanged): workday/legacy branching, slot picker ===
         if is_slots_path:
             # === /slots workday branch (Этап 5.8b) ===
             # Fetch WorkDay for (master_id, slot_date). If None → master doesn't
@@ -376,8 +527,11 @@ async def _process_selected_date(
                     await callback.message.answer(
                         "Мастер не работает в этот день. Выберите другую дату:",
                         reply_markup=await _retry_markup(
-                            session, master, settings,
-                            is_transfer=is_transfer, is_slots_path=is_slots_path,
+                            session,
+                            master,
+                            settings,
+                            is_transfer=is_transfer,
+                            is_slots_path=is_slots_path,
                         ),
                     )
                 await callback.answer()
@@ -387,8 +541,11 @@ async def _process_selected_date(
                     await callback.message.answer(
                         "День закрыт мастером. Выберите другую дату:",
                         reply_markup=await _retry_markup(
-                            session, master, settings,
-                            is_transfer=is_transfer, is_slots_path=is_slots_path,
+                            session,
+                            master,
+                            settings,
+                            is_transfer=is_transfer,
+                            is_slots_path=is_slots_path,
                         ),
                     )
                 await callback.answer()
@@ -399,6 +556,9 @@ async def _process_selected_date(
             # Session 5.27 BUG2: pass min_duration_min=SERVICE_DEFAULT_DURATION_MIN
             # so slots that don't fit a default 60-min booking are hidden —
             # prevents misleading BookingOutsideWorkDayError at confirm.
+            # NB: transfer uses SERVICE_DEFAULT_DURATION_MIN (snapshot's
+            # service duration is not re-applied here — same overlap-bug as
+            # admin_move, NOT fixed in this task; see slots.py:219 comment).
             slots_30 = await get_available_slots_30(
                 session,
                 workday,
@@ -410,14 +570,17 @@ async def _process_selected_date(
                     await callback.message.answer(
                         "На эту дату нет свободного времени. Выберите другую дату:",
                         reply_markup=await _retry_markup(
-                            session, master, settings,
-                            is_transfer=is_transfer, is_slots_path=is_slots_path,
+                            session,
+                            master,
+                            settings,
+                            is_transfer=is_transfer,
+                            is_slots_path=is_slots_path,
                         ),
                     )
                 await callback.answer()
                 return
             await state.update_data(selected_date=slot_date.isoformat())
-            await state.set_state(selecting_slot_state)
+            await state.set_state(next_state)
             if callback.message is not None:
                 await callback.message.answer(
                     "Выберите новое время:" if is_transfer else "Выберите время:",
@@ -447,7 +610,7 @@ async def _process_selected_date(
                 )
                 if slots_30:
                     await state.update_data(selected_date=slot_date.isoformat())
-                    await state.set_state(selecting_slot_state)
+                    await state.set_state(next_state)
                     if callback.message is not None:
                         await callback.message.answer(
                             "Выберите новое время:" if is_transfer else "Выберите время:",
@@ -462,8 +625,11 @@ async def _process_selected_date(
                     await callback.message.answer(
                         "День закрыт мастером. Выберите другую дату:",
                         reply_markup=await _retry_markup(
-                            session, master, settings,
-                            is_transfer=is_transfer, is_slots_path=is_slots_path,
+                            session,
+                            master,
+                            settings,
+                            is_transfer=is_transfer,
+                            is_slots_path=is_slots_path,
                         ),
                     )
                 await callback.answer()
@@ -472,14 +638,17 @@ async def _process_selected_date(
                 await callback.message.answer(
                     "На эту дату нет свободных слотов. Выберите другую дату:",
                     reply_markup=await _retry_markup(
-                        session, master, settings,
-                        is_transfer=is_transfer, is_slots_path=is_slots_path,
+                        session,
+                        master,
+                        settings,
+                        is_transfer=is_transfer,
+                        is_slots_path=is_slots_path,
                     ),
                 )
             await callback.answer()
             return
         await state.update_data(selected_date=slot_date.isoformat())
-        await state.set_state(selecting_slot_state)
+        await state.set_state(next_state)
         if callback.message is not None:
             await callback.message.answer(
                 "Выберите новое время:" if is_transfer else "Выберите время:",
@@ -514,14 +683,16 @@ async def _handle_simple_calendar(
     callback: CallbackQuery,
     callback_data: SimpleCalendarCallback,
     state: FSMContext,
-    selecting_slot_state: State,
+    next_state: State,
     is_transfer: bool,
 ) -> None:
     """Shared logic for booking + transfer SimpleCalendar handlers.
 
     Branches on callback_data.act to call callback.answer() only when lib has
-    not already answered (F1 fix). For act=day: fetches slots, transitions FSM
-    to selecting_slot. For act=cancel: clears FSM state.
+    not already answered (F1 fix). For act=day: delegates to
+    _process_selected_date which sets next_state (entering_service for booking
+    since Session 5.29 Task 2; selecting_slot for transfer). For act=cancel:
+    clears FSM state.
     """
     settings = get_settings()
 
@@ -557,7 +728,7 @@ async def _handle_simple_calendar(
             callback,
             state,
             settings,
-            selecting_slot_state=selecting_slot_state,
+            next_state=next_state,
             is_transfer=is_transfer,
             slot_date=slot_date,
         )
@@ -598,19 +769,19 @@ async def simple_calendar_cb(
 ) -> None:
     """SimpleCalendar navigation + day select for booking flow (cmd_book).
 
-    Session 5.28: only reachable via stale keyboards from before the 5.28
-    deploy (BB-110 replaced the calendar with the flat date picker for
-    /book and /slots). New clients go through book_date_cb. The act=day
-    branch delegates to _process_selected_date which uses _retry_markup
-    (NEW date picker for /book and /slots, calendar for /transfer) — so
-    stale-keyboard taps upgrade the UX in-place: any retry re-renders the
-    picker instead of re-showing the month grid.
+    Session 5.29 (Task 2): only reachable via stale keyboards from before the
+    5.29 deploy (BB-110 replaced the calendar with the flat date picker for
+    /book and /slots; Task 2 moved slot fetching to service_picker_cb). New
+    clients go through book_date_cb. The act=day branch delegates to
+    _process_selected_date which sets next_state=entering_service (booking
+    flow renders service picker first, slot picker after service selection).
+    Stale-keyboard taps upgrade the UX in-place via _retry_markup.
     """
     await _handle_simple_calendar(
         callback=callback,
         callback_data=callback_data,
         state=state,
-        selecting_slot_state=BookingStates.selecting_slot,
+        next_state=BookingStates.entering_service,
         is_transfer=False,
     )
 
@@ -624,13 +795,15 @@ async def book_date_cb(
     callback_data: BookDateCallbackData,
     state: FSMContext,
 ) -> None:
-    """Date picker tap → fetch slots for that date (Session 5.28 — BB-110).
+    """Date picker tap → fetch services for that date (Session 5.28 — BB-110,
+    Session 5.29 Task 2 — FSM reorder).
 
     Parses ISO work_date, delegates to _process_selected_date (same body
     the stale-keyboard simple_calendar_cb act=day uses) — single source of
-    truth for the slot-fetch branches. is_transfer=False (the picker is
-    /book and /slots only; /transfer keeps SimpleCalendar via the
-    transfer_simple_calendar_cb handler).
+    truth for the service-fetch branches (booking) / slot-fetch branches
+    (transfer). is_transfer=False → next_state=entering_service (renders
+    service picker; slot picker moved to service_picker_cb). is_transfer via
+    TransferStates.selecting_date + transfer_simple_calendar_cb is unaffected.
 
     Defensive parse: callback_data could be tampered (Telegram allows users
     to send arbitrary callback_data). date.fromisoformat raises ValueError
@@ -649,7 +822,7 @@ async def book_date_cb(
         callback,
         state,
         settings,
-        selecting_slot_state=BookingStates.selecting_slot,
+        next_state=BookingStates.entering_service,
         is_transfer=False,
         slot_date=slot_date,
     )
@@ -690,7 +863,24 @@ async def slot_cb(
     callback_data: BookSlotCallbackData,
     state: FSMContext,
 ) -> None:
-    """User selected a slot — save slot_id, ask for client name."""
+    """User selected a slot — save slot_id, ask for client name.
+
+    Defensive: service_title should be set by service_picker_cb/service_msg
+    before selecting_slot. State corruption (e.g. in-flight session carried
+    over from pre-5.29 flow with selecting_slot+slot_id but no service_title)
+    → state.clear + retry hint, no stale entering_name state.
+    Checked BEFORE set_state(entering_name) so defensive-clear path does
+    not leave a stale entering_name state in FSM (Session 5.29 Task 2, W2).
+    """
+    data = await state.get_data()
+    if not data.get("service_title"):
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer(
+                "❌ Данные потеряны. Начните заново через /book или /slots"
+            )
+        await callback.answer()
+        return
     await state.update_data(slot_id=str(callback_data.slot_id))
     await state.set_state(BookingStates.entering_name)
     if callback.message is not None:
@@ -714,6 +904,12 @@ async def slot_30_cb(
     but a malicious/tampered callback could carry out-of-range start_minute.
     Range 0-1439 (00:00 - 23:59). Reject → state.clear() + hint, no crash.
 
+    Defensive: service_title should be set by service_picker_cb/service_msg
+    before selecting_slot. State corruption (e.g. in-flight session carried
+    over from pre-5.29 flow) → state.clear + retry hint, no stale entering_name.
+    Checked BEFORE set_state(entering_name) so defensive-clear path does
+    not leave a stale entering_name state in FSM (Session 5.29 Task 2, W2).
+
     Registration BEFORE no_state_callback_fallback (router order — registered
     top-down, callback dispatch first-match). Same StateFilter(selecting_slot)
     as slot_cb but distinct CallbackData prefix (book_slot_30 vs book_slot) —
@@ -724,6 +920,15 @@ async def slot_30_cb(
         await state.clear()
         if callback.message is not None:
             await callback.message.answer("❌ Ошибка выбора времени. Начните заново через /slots")
+        await callback.answer()
+        return
+    data = await state.get_data()
+    if not data.get("service_title"):
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer(
+                "❌ Данные потеряны. Начните заново через /book или /slots"
+            )
         await callback.answer()
         return
     await state.update_data(
@@ -741,13 +946,23 @@ async def slot_30_cb(
 # ============================================================
 @router.message(StateFilter(BookingStates.entering_name))
 async def name_msg(message: Message, state: FSMContext) -> None:
-    """User typed client name — save, ask for service.
+    """User typed client name — save, render confirmation summary (Session
+    5.29 Task 2 — FSM reorder: услуга ДО слота).
 
-    Session 5.27 FEAT: if active services exist in DB → show inline picker
-    (tap-to-select). Otherwise → fall back to free-text prompt (legacy).
-    Service list is scoped to the master's business (single-master MVP:
-    ADMIN_ID → Master → Business.id), filtered by is_active=True, sorted
-    by name (predictable order for the user).
+    Session 5.29: name_msg now renders the booking summary (moved from
+    service_msg/service_picker_cb which used to set confirming after service
+    selection). New flow: date → service → slot → name → confirm. The summary
+    rendering branches on /slots (workday_id + start_minute) vs /book (slot_id)
+    — XOR by construction (slot_30_cb writes workday_id+start_minute, slot_cb
+    writes slot_id; only one of the two flows reaches entering_name).
+
+    Service picker was moved to _process_selected_date (entering_service is
+    set right after date selection — service picker renders immediately,
+    user taps/types service, then slot picker renders, then slot_cb/slot_30_cb
+    set entering_name, user types name → name_msg renders summary).
+
+    Defensive: if workday_id/slot_id missing in FSM (state corruption) →
+    state.clear + retry hint.
     """
     name = message.text.strip() if message.text else ""
     if not name:
@@ -758,42 +973,78 @@ async def name_msg(message: Message, state: FSMContext) -> None:
         return
 
     await state.update_data(client_name=name)
-    await state.set_state(BookingStates.entering_service)
 
+    data = await state.get_data()
     settings = get_settings()
-    async with async_session_factory() as session:
-        from sqlalchemy import select
-
-        from bot.models import Business, Master, Service
-
-        stmt_m = select(Master).where(Master.telegram_id == settings.ADMIN_ID).limit(1)
-        master = (await session.execute(stmt_m)).scalar_one_or_none()
-        if master is None:
-            # No master row yet (single-master MVP, but admin hasn't run /start
-            # or DB was wiped) → no business → no services → legacy text path.
-            await message.answer("Какая услуга? (например: стрижка, окрашивание+стрижка)")
-            return
-
-        stmt_b = select(Business).where(Business.id == master.business_id).limit(1)
-        business = (await session.execute(stmt_b)).scalar_one_or_none()
-        if business is None:
-            await message.answer("Какая услуга? (например: стрижка, окрашивание+стрижка)")
-            return
-
-        stmt_s = (
-            select(Service)
-            .where(Service.business_id == business.id, Service.is_active == True)  # noqa: E712
-            .order_by(Service.name)
-        )
-        services = list((await session.execute(stmt_s)).scalars().all())
-
-    if not services:
-        await message.answer("Какая услуга? (например: стрижка, окрашивание+стрижка)")
+    workday_id_str = data.get("workday_id")
+    slot_id_str = data.get("slot_id")
+    service_title = data.get("service_title")
+    if not service_title:
+        # Defensive: should be set by service_picker_cb/service_msg before
+        # selecting_slot → entering_name. State corruption if missing.
+        # Checked BEFORE set_state(confirming) so defensive-clear path does
+        # not leave a stale confirming state in FSM (Session 5.29 Task 2).
+        await state.clear()
+        await message.answer("❌ Данные потеряны. Начните заново через /book или /slots")
         return
 
+    async with async_session_factory() as session:
+        if workday_id_str is not None:
+            # === /slots workday path (Этап 5.8b) ===
+            start_minute = data.get("start_minute")
+            if start_minute is None:
+                await state.clear()
+                await message.answer("❌ Ошибка: время не выбрано. Начните заново через /slots")
+                return
+            if not isinstance(start_minute, int) or not (0 <= start_minute <= 1439):
+                await state.clear()
+                await message.answer("❌ Ошибка времени. Начните заново через /slots")
+                return
+            stmt = select(WorkDay).where(WorkDay.id == UUID(workday_id_str))
+            workday = (await session.execute(stmt)).scalar_one_or_none()
+            if workday is None:
+                await state.clear()
+                await message.answer("❌ Рабочий день не найден. Начните заново через /slots")
+                return
+            start_time_local = dt_time(start_minute // 60, start_minute % 60)
+            start_at = _build_start_at_from_workday(workday, start_time_local, settings.TIMEZONE)
+            summary = _format_booking_summary_from_start_at(
+                start_at=start_at,
+                client_name=name,
+                service_title=service_title,
+                business_timezone=settings.TIMEZONE,
+            )
+        elif slot_id_str:
+            # === /book legacy slot path ===
+            slot_stmt = select(Slot).where(Slot.id == UUID(slot_id_str))
+            slot = (await session.execute(slot_stmt)).scalar_one_or_none()
+            if slot is None:
+                await state.clear()
+                await message.answer("❌ Слот не найден. Начните заново через /book")
+                return
+
+            from bot.keyboards.client import _format_booking_summary  # noqa: PLC0415
+
+            summary = _format_booking_summary(
+                slot=slot,
+                client_name=name,
+                service_title=service_title,
+                business_timezone=settings.TIMEZONE,
+            )
+        else:
+            # Neither workday_id nor slot_id — state corruption.
+            await state.clear()
+            await message.answer("❌ Данные потеряны. Начните заново через /book или /slots")
+            return
+
+    # All defensive checks passed — commit to confirming state. Placed
+    # AFTER checks so defensive-clear paths do NOT leave a stale confirming
+    # state in FSM (Session 5.29 Task 2).
+    await state.set_state(BookingStates.confirming)
+
     await message.answer(
-        "Выберите услугу тапом или напишите свою:",
-        reply_markup=service_picker_keyboard(services),
+        f"Подтвердите запись:\n\n{summary}",
+        reply_markup=confirm_keyboard(),
     )
 
 
@@ -810,31 +1061,59 @@ async def service_picker_cb(
     state: FSMContext,
 ) -> None:
     """User tapped a service from the inline picker — save service_id +
-    service_title (= Service.name from DB), jump to confirming, render summary.
+    service_title (= Service.name from DB), fetch slots filtered by
+    service.duration_minutes, transition to selecting_slot, render slot picker.
 
-    Reuses the same summary rendering logic as service_msg (workday_id path
-    OR slot_id path, XOR contract). The only difference vs service_msg:
-    service_id is set (string of UUID) in FSM data, which confirm_cb later
-    passes to BookingCreate.service_id → _build_end_at uses
-    service.duration_minutes instead of SERVICE_DEFAULT_DURATION_MIN.
+    Session 5.29 (Task 2 — FSM reorder): moved from "service → confirming"
+    to "service → selecting_slot". Slot fetching uses the REAL service
+    duration (not SERVICE_DEFAULT_DURATION_MIN) so the overlap filter
+    (slots.py:219 fix) hides slots that would collide with existing bookings
+    of any duration (fixes 15:30+Стрижка vs 16:00-18:00-Окрашивание bug).
 
     Defensive: re-SELECT Service by id (callback_data could be stale/tampered
-    — the inline keyboard was built from a DB snapshot at name_msg time, but
-    master could have archived the service between name_msg and tap). If
-    service deleted or archived → fall back to text input (legacy path):
-    keep state in entering_service, ask for service manually. This avoids
-    a dead-end (user tapped a button that no longer resolves).
+    — the inline keyboard was built from a DB snapshot at _process_selected_date
+    time, but master could have archived the service between picker render
+    and tap). If service deleted or archived → fall back to text input (legacy
+    path): keep state in entering_service, ask for service manually. This
+    avoids a dead-end (user tapped a button that no longer resolves).
+
+    Defensive: if selected_date missing in FSM (state corruption after bot
+    restart with MemoryStorage) → state.clear + retry hint (NEW edge case
+    from critic finding 4, Session 5.29).
     """
     settings = get_settings()
-    async with async_session_factory() as session:
-        from sqlalchemy import select
+    fsm_data = await state.get_data()
+    selected_date_str: str | None = fsm_data.get("selected_date")
+    is_slots_path: bool | None = fsm_data.get("is_slots_path")
+    if not selected_date_str:
+        # State corruption: entering_service without selected_date means
+        # _process_selected_date never ran (FSM persisted across restart,
+        # bot was killed mid-flow, MemoryStorage lost data). Cannot fetch
+        # slots without a date — abort cleanly.
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer(
+                "❌ Данные потеряны. Начните заново через /book или /slots"
+            )
+        await callback.answer()
+        return
 
-        from bot.models import Service
+    try:
+        slot_date = date.fromisoformat(selected_date_str)
+    except ValueError:
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer("❌ Ошибка даты. Начните заново через /book или /slots")
+        await callback.answer()
+        return
+
+    async with async_session_factory() as session:
+        from bot.models import Service  # noqa: PLC0415
 
         stmt = select(Service).where(Service.id == callback_data.service_id)
         service = (await session.execute(stmt)).scalar_one_or_none()
         if service is None or not service.is_active:
-            # Service was archived/deleted between name_msg and tap.
+            # Service was archived/deleted between picker render and tap.
             # Stay in entering_service, ask for free-text input.
             if callback.message is not None:
                 await callback.message.answer(
@@ -848,79 +1127,57 @@ async def service_picker_cb(
             service_id=str(service.id),
             service_title=service.name,
         )
-        await state.set_state(BookingStates.confirming)
 
-        data = await state.get_data()
-        workday_id_str = data.get("workday_id")
-        slot_id_str = data.get("slot_id")
+        master = await _select_master(session, settings)
+        if master is None:
+            await state.clear()
+            if callback.message is not None:
+                await callback.message.answer(
+                    "❌ Не удалось найти мастера. Обратитесь к администратору."
+                )
+            await callback.answer()
+            return
 
-        # Branch on workday vs slot path (XOR — same as service_msg).
-        if workday_id_str is not None:
-            start_minute = data.get("start_minute")
-            if start_minute is None:
-                await state.clear()
-                if callback.message is not None:
-                    await callback.message.answer(
-                        "❌ Ошибка: время не выбрано. Начните заново через /slots"
-                    )
-                await callback.answer()
-                return
-            if not isinstance(start_minute, int) or not (0 <= start_minute <= 1439):
-                await state.clear()
-                if callback.message is not None:
-                    await callback.message.answer("❌ Ошибка времени. Начните заново через /slots")
-                await callback.answer()
-                return
-            start_time_local = dt_time(start_minute // 60, start_minute % 60)
-            wd_stmt = select(WorkDay).where(WorkDay.id == UUID(workday_id_str))
-            workday = (await session.execute(wd_stmt)).scalar_one_or_none()
-            if workday is None:
-                await state.clear()
-                if callback.message is not None:
-                    await callback.message.answer(
-                        "❌ Рабочий день не найден. Начните заново через /slots"
-                    )
-                await callback.answer()
-                return
-            start_at = _build_start_at_from_workday(workday, start_time_local, settings.TIMEZONE)
-            summary = _format_booking_summary_from_start_at(
-                start_at=start_at,
-                client_name=data["client_name"],
-                service_title=service.name,
-                business_timezone=settings.TIMEZONE,
-            )
-        else:
-            # Legacy /book slot path
-            if not slot_id_str:
-                await state.clear()
-                if callback.message is not None:
-                    await callback.message.answer(
-                        "❌ Ошибка: слот не выбран. Начните заново через /book"
-                    )
-                await callback.answer()
-                return
-            slot_stmt = select(Slot).where(Slot.id == UUID(slot_id_str))
-            slot = (await session.execute(slot_stmt)).scalar_one_or_none()
-            if slot is None:
-                await state.clear()
-                if callback.message is not None:
-                    await callback.message.answer("❌ Слот не найден. Начните заново через /book")
-                await callback.answer()
-                return
-            from bot.keyboards.client import _format_booking_summary
-
-            summary = _format_booking_summary(
-                slot=slot,
-                client_name=data["client_name"],
-                service_title=service.name,
-                business_timezone=settings.TIMEZONE,
-            )
-
-    if callback.message is not None:
-        await callback.message.answer(
-            f"Подтвердите запись:\n\n{summary}",
-            reply_markup=confirm_keyboard(),
+        keyboard = await _fetch_slot_picker_for_service(
+            session,
+            master,
+            slot_date,
+            settings,
+            is_slots_path=bool(is_slots_path),
+            min_duration_min=service.duration_minutes,
         )
+        if keyboard is None:
+            # No slots for this service duration on this date — retry date picker.
+            # Stay in entering_service is wrong (no slots); roll back to
+            # selecting_date so user picks another date. Clear service_id/title
+            # too — the new date fetch will render a fresh service picker.
+            await state.update_data(
+                service_id=None,
+                service_title=None,
+                selected_date=None,
+            )
+            await state.set_state(BookingStates.selecting_date)
+            if callback.message is not None:
+                await callback.message.answer(
+                    f"На эту дату нет окна под услугу «{service.name}» "
+                    f"({service.duration_minutes} мин). Выберите другую дату:",
+                    reply_markup=await _retry_markup(
+                        session,
+                        master,
+                        settings,
+                        is_transfer=False,
+                        is_slots_path=is_slots_path,
+                    ),
+                )
+            await callback.answer()
+            return
+
+        await state.set_state(BookingStates.selecting_slot)
+        if callback.message is not None:
+            await callback.message.answer(
+                "Выберите время:",
+                reply_markup=keyboard,
+            )
     await callback.answer()
 
 
@@ -948,7 +1205,20 @@ async def service_custom_cb(callback: CallbackQuery, state: FSMContext) -> None:
 # ============================================================
 @router.message(StateFilter(BookingStates.entering_service))
 async def service_msg(message: Message, state: FSMContext) -> None:
-    """User typed service — save, show confirmation with summary."""
+    """User typed free-text service — save, fetch slots filtered by
+    SERVICE_DEFAULT_DURATION_MIN, transition to selecting_slot, render slot picker.
+
+    Session 5.29 (Task 2 — FSM reorder): moved from "service → confirming"
+    to "service → selecting_slot". Free-text services don't have a known
+    duration in DB → fallback to SERVICE_DEFAULT_DURATION_MIN (60) for the
+    overlap filter. The user-visible consequence: a free-text "стрижка" gets
+    a 60-min filter, which is more permissive than a tapped "Стрижка" service
+    (also 60 min in DB) — no UX difference for the default case.
+
+    Defensive: if selected_date missing in FSM (state corruption after bot
+    restart with MemoryStorage) → state.clear + retry hint (NEW edge case
+    from critic finding 4, Session 5.29).
+    """
     service = message.text.strip() if message.text else ""
     if not service:
         await message.answer("Услуга не может быть пустой. Введите услугу:")
@@ -957,81 +1227,65 @@ async def service_msg(message: Message, state: FSMContext) -> None:
         await message.answer("Услуга слишком длинная (макс. 255 символов). Введите короче:")
         return
 
-    await state.update_data(service_title=service, service_id=None)
-    await state.set_state(BookingStates.confirming)
-
-    # Render summary — branch on /slots (workday_id) vs /book (slot_id).
-    # Этап 5.8b: two paths share confirming state; slot_30_cb writes workday_id
-    # + start_minute, slot_cb writes slot_id. XOR by construction — only one
-    # of the two flows reaches confirming state.
-    data = await state.get_data()
     settings = get_settings()
+    fsm_data = await state.get_data()
+    selected_date_str: str | None = fsm_data.get("selected_date")
+    is_slots_path: bool | None = fsm_data.get("is_slots_path")
+    if not selected_date_str:
+        await state.clear()
+        await message.answer("❌ Данные потеряны. Начните заново через /book или /slots")
+        return
+
+    try:
+        slot_date = date.fromisoformat(selected_date_str)
+    except ValueError:
+        await state.clear()
+        await message.answer("❌ Ошибка даты. Начните заново через /book или /slots")
+        return
+
+    await state.update_data(service_title=service, service_id=None)
+
     async with async_session_factory() as session:
-        from sqlalchemy import select
+        master = await _select_master(session, settings)
+        if master is None:
+            await state.clear()
+            await message.answer("❌ Не удалось найти мастера. Обратитесь к администратору.")
+            return
 
-        workday_id_str = data.get("workday_id")
-        slot_id_str = data.get("slot_id")
-
-        if workday_id_str is not None:
-            # === /slots workday path (Этап 5.8b) ===
-            # W2 (5.27 code-review iter): range check ДО DB SELECT — не тратим
-            # DB-вызов на заведомо невалидный start_minute. Унифицировано с
-            # service_picker_cb (client.py:554-571).
-            start_minute = data.get("start_minute")
-            if start_minute is None:
-                await state.clear()
-                await message.answer("❌ Ошибка: время не выбрано. Начните заново через /slots")
-                return
-            # Range 0-1439 guaranteed by slot_30_cb, but defensive against
-            # corrupted FSM storage (e.g. persisted across upgrade).
-            if not isinstance(start_minute, int) or not (0 <= start_minute <= 1439):
-                await state.clear()
-                await message.answer("❌ Ошибка времени. Начните заново через /slots")
-                return
-            stmt = select(WorkDay).where(WorkDay.id == UUID(workday_id_str))
-            workday = (await session.execute(stmt)).scalar_one_or_none()
-            if workday is None:
-                await state.clear()
-                await message.answer("❌ Рабочий день не найден. Начните заново через /slots")
-                return
-            start_time_local = dt_time(start_minute // 60, start_minute % 60)
-            start_at = _build_start_at_from_workday(workday, start_time_local, settings.TIMEZONE)
-            summary = _format_booking_summary_from_start_at(
-                start_at=start_at,
-                client_name=data["client_name"],
-                service_title=service,
-                business_timezone=settings.TIMEZONE,
+        keyboard = await _fetch_slot_picker_for_service(
+            session,
+            master,
+            slot_date,
+            settings,
+            is_slots_path=bool(is_slots_path),
+            min_duration_min=settings.SERVICE_DEFAULT_DURATION_MIN,
+        )
+        if keyboard is None:
+            # No slots for default duration on this date — retry date picker.
+            await state.update_data(
+                service_id=None,
+                service_title=None,
+                selected_date=None,
             )
-        else:
-            # === /book legacy slot path ===
-            if not slot_id_str:
-                await state.clear()
-                await message.answer("❌ Ошибка: слот не выбран. Начните заново через /book")
-                return
-
-            # Slot.id is Uuid column — convert str to UUID to avoid AttributeError
-            # on SQLite (Uuid.bind_processor calls value.hex, str.hex doesn't exist)
-            # and TypeError on Postgres.
-            slot_stmt = select(Slot).where(Slot.id == UUID(slot_id_str))
-            slot = (await session.execute(slot_stmt)).scalar_one_or_none()
-            if slot is None:
-                await state.clear()
-                await message.answer("❌ Слот не найден. Начните заново через /book")
-                return
-
-            from bot.keyboards.client import _format_booking_summary
-
-            summary = _format_booking_summary(
-                slot=slot,
-                client_name=data["client_name"],
-                service_title=service,
-                business_timezone=settings.TIMEZONE,
+            await state.set_state(BookingStates.selecting_date)
+            await message.answer(
+                f"На эту дату нет окна под услугу «{service}» "
+                f"({settings.SERVICE_DEFAULT_DURATION_MIN} мин). Выберите другую дату:",
+                reply_markup=await _retry_markup(
+                    session,
+                    master,
+                    settings,
+                    is_transfer=False,
+                    is_slots_path=is_slots_path,
+                ),
             )
+            return
 
-    await message.answer(
-        f"Подтвердите запись:\n\n{summary}",
-        reply_markup=confirm_keyboard(),
-    )
+        await state.set_state(BookingStates.selecting_slot)
+        await message.answer(
+            "Выберите время:",
+            reply_markup=keyboard,
+        )
 
 
 # ============================================================
@@ -1605,7 +1859,7 @@ async def transfer_simple_calendar_cb(
         callback=callback,
         callback_data=callback_data,
         state=state,
-        selecting_slot_state=TransferStates.selecting_slot,
+        next_state=TransferStates.selecting_slot,
         is_transfer=True,
     )
 

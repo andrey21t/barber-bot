@@ -1586,20 +1586,23 @@ def _patch_process_selection(
 
 
 @pytest.mark.asyncio
-async def test_simple_calendar_cb_day_select_happy_shows_slot_picker(
+async def test_simple_calendar_cb_day_select_happy_shows_service_picker(
     session_factory: Any,
     patched_session_factory: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """simple_calendar_cb act=day, in-range, slots exist →
-    state.update_data(selected_date) + set_state(selecting_slot) + slot picker.
+    """Session 5.29 Task 2 — FSM reorder: simple_calendar_cb act=day, in-range,
+    services exist → state.update_data(selected_date) + set_state(entering_service)
+    + service picker (NOT slot picker — slot picker moved to service_picker_cb
+    after service selection, fixes 15:30+Стрижка vs 16:00-18:00-Окрашивание bug).
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
+        await _seed_service(session, ctx, name="Стрижка", duration_minutes=60)
+        await _seed_service(session, ctx, name="Окрашивание", duration_minutes=120)
         target_date = (datetime.now(UTC) + timedelta(days=1)).date()
-        slot = Slot(master_id=ctx["master_id"], slot_date=target_date, slot_hour=14, status="open")
-        session.add(slot)
-        await session.commit()
+        # No Slot seeded — booking flow no longer fetches slots on date-select
+        # (slots are fetched in service_picker_cb AFTER service selection).
 
     bot = AsyncMock()
     cb = MagicMock(spec=CallbackQuery)
@@ -1619,12 +1622,58 @@ async def test_simple_calendar_cb_day_select_happy_shows_slot_picker(
     state.update_data.assert_awaited()
     assert state.update_data.call_args.kwargs.get("selected_date") == target_date.isoformat()
     state.set_state.assert_awaited_once()
-    assert state.set_state.call_args.args[0] == BookingStates.selecting_slot
+    assert state.set_state.call_args.args[0] == BookingStates.entering_service
 
     text = _answer_text(cb.message)
-    assert "Выберите время" in text
+    assert "Выберите услугу" in text
     reply_markup = _answer_reply_markup(cb.message)
     assert isinstance(reply_markup, InlineKeyboardMarkup)
+    flat_texts = [btn.text for row in reply_markup.inline_keyboard for btn in row]
+    assert "Стрижка" in flat_texts
+    assert "Окрашивание" in flat_texts
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_simple_calendar_cb_day_select_no_services_falls_back_to_text_prompt(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session 5.29 Task 2 — FSM reorder: simple_calendar_cb act=day, in-range,
+    master + business exist but NO active services in DB → entering_service +
+    free-text prompt 'Какая услуга?' (no inline keyboard).
+
+    Single-master MVP edge case: master hasn't created any services yet → user
+    types service name as before (legacy path preserved). Slot fetching uses
+    SERVICE_DEFAULT_DURATION_MIN (60) for the overlap filter.
+    """
+    async with session_factory() as session:
+        await _seed_full_stack(session)  # master + business, NO services
+
+    target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+    target_dt = datetime.combine(target_date, time(12, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
+    state = _make_state()
+    await client_handlers.simple_calendar_cb(cb, callback_data, state)
+
+    state.update_data.assert_awaited()
+    assert state.update_data.call_args.kwargs.get("selected_date") == target_date.isoformat()
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.entering_service
+    text = _answer_text(cb.message)
+    assert "Какая услуга" in text
+    assert _answer_reply_markup(cb.message) is None, (
+        "no services in DB → no inline keyboard, legacy text prompt"
+    )
     cb.answer.assert_awaited()
 
 
@@ -1658,42 +1707,6 @@ async def test_simple_calendar_cb_day_select_master_not_found_clears_state(
     assert "Не удалось найти мастера" in _answer_text(cb.message)
     cb.answer.assert_awaited()
     state.set_state.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_simple_calendar_cb_day_select_no_slots_shows_retry(
-    session_factory: Any,
-    patched_session_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """simple_calendar_cb act=day, in-range, master exists, NO open slots →
-    'На эту дату нет свободных слотов...' + calendar_keyboard retry.
-    FSM NOT advanced.
-    """
-
-    async with session_factory() as session:
-        await _seed_full_stack(session)  # master exists, but no slots seeded
-
-    target_date = (datetime.now(UTC) + timedelta(days=30)).date()
-    target_dt = datetime.combine(target_date, time(12, 0))
-    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
-
-    bot = AsyncMock()
-    cb = MagicMock(spec=CallbackQuery)
-    cb.from_user = _make_user(111222333)
-    cb.message = _make_message(111222333, text="<unused>")
-    cb.answer = AsyncMock()
-    cb.bot = bot
-    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
-
-    state = _make_state()
-    await client_handlers.simple_calendar_cb(cb, callback_data, state)
-
-    assert "нет свободных слотов" in _answer_text(cb.message)
-    assert isinstance(_answer_reply_markup(cb.message), InlineKeyboardMarkup)
-    state.set_state.assert_not_awaited()
-    state.update_data.assert_not_awaited()
-    cb.answer.assert_awaited()
 
 
 @pytest.mark.asyncio
@@ -1978,6 +1991,9 @@ async def test_slot_cb_saves_slot_id_and_asks_for_name(
     callback_data = BookSlotCallbackData(slot_id=slot_id)
 
     state = _make_state()
+    # service_title set by service_picker_cb/service_msg BEFORE selecting_slot
+    # (Session 5.29 Task 2, W2 defensive check in slot_cb).
+    state.get_data = AsyncMock(return_value={"service_title": "Стрижка"})
     await client_handlers.slot_cb(cb, callback_data, state)
 
     state.update_data.assert_awaited_once()
@@ -2032,26 +2048,52 @@ async def test_name_msg_too_long_name_rejected(
 
 
 @pytest.mark.asyncio
-async def test_name_msg_happy_saves_and_asks_for_service(
+async def test_name_msg_happy_renders_summary_slot_path(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """T5a: name_msg (client.py:183-185) — happy: name ok →
-    state.update_data(client_name) + set_state(entering_service) + 'Какая услуга?'
+    """Session 5.29 Task 2 — FSM reorder: name_msg (slot path) — happy: name ok,
+    slot_id + service_title in state → state.update_data(client_name) +
+    set_state(confirming) + summary via _format_booking_summary + confirm_keyboard.
+
+    Pre-5.29 name_msg asked for service (entering_service); now it renders the
+    booking summary (logic moved here from service_msg/service_picker_cb which
+    used to set confirming after service selection — service selection moved
+    BEFORE slot selection in the new flow: date → service → slot → name).
     """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = Slot(
+            master_id=ctx["master_id"],
+            slot_date=target_date,
+            slot_hour=14,
+            status="open",
+        )
+        session.add(slot)
+        await session.commit()
+        slot_id = slot.id
+
     msg = _make_message(user_id=111222333, text="Паша")
-    msg.text = "Паша"
     state = _make_state()
+    await state.update_data(
+        slot_id=str(slot_id),
+        service_title="Стрижка",
+    )
 
     await client_handlers.name_msg(msg, state)
 
-    state.update_data.assert_awaited_once()
+    state.update_data.assert_awaited()
     assert state.update_data.call_args.kwargs.get("client_name") == "Паша"
     state.set_state.assert_awaited_once()
-    assert state.set_state.call_args.args[0] == BookingStates.entering_service
+    assert state.set_state.call_args.args[0] == BookingStates.confirming
 
     text = _answer_text(msg)
-    assert "Какая услуга" in text
+    assert "Подтвердите запись" in text
+    assert "Паша" in text
+    assert "Стрижка" in text
+    reply_markup = _answer_reply_markup(msg)
+    assert reply_markup is not None, "name_msg must render confirm_keyboard"
 
 
 @pytest.mark.asyncio
@@ -2094,62 +2136,41 @@ async def test_service_msg_too_long_service_rejected(
 
 
 @pytest.mark.asyncio
-async def test_service_msg_slot_id_missing_in_state_clears(
+async def test_service_msg_selected_date_missing_clears_state(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """T5a: service_msg (client.py:208-211) — state has no 'slot_id' key (FSM
-    corruption or stale state) → message.answer('❌ Ошибка: слот не выбран...')
-    + state.clear (abort).
+    """Session 5.29 Task 2 — FSM reorder: service_msg defensive — selected_date
+    missing in FSM (state corruption after bot restart with MemoryStorage) →
+    state.clear + 'Данные потеряны' + abort. Replaces the pre-5.29
+    slot_id_missing check (service_msg no longer reads slot_id — slots are
+    fetched AFTER service selection via _fetch_slot_picker_for_service).
     """
     msg = _make_message(user_id=111222333, text="Стрижка")
     msg.text = "Стрижка"
-
-    # State with client_name but NO slot_id (simulates corrupted FSM)
     state = _make_state()
-    await state.update_data(client_name="Паша")  # populate state, no slot_id
+    # No selected_date in state (corrupted).
+    await state.update_data(client_name="Паша")
 
     await client_handlers.service_msg(msg, state)
 
-    text = _answer_text(msg)
-    assert "слот не выбран" in text
     state.clear.assert_awaited_once()
+    text = _answer_text(msg)
+    assert "Данные потеряны" in text or "Начните заново" in text
 
 
 @pytest.mark.asyncio
-async def test_service_msg_slot_not_found_clears(
+async def test_service_msg_happy_shows_slot_picker(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """T5a: service_msg (client.py:222-226) — slot_id in state but no Slot row
-    in DB (slot was deleted between steps) → message.answer('Слот не найден...')
-    + state.clear (abort).
-    """
-    async with session_factory() as session:
-        await _seed_full_stack(session)  # master exists, no slot
+    """Session 5.29 Task 2 — FSM reorder: service_msg happy — free-text service
+    + selected_date in state + Slot rows exist → set_state(selecting_slot) +
+    slot picker keyboard (NOT confirmation — slot picker moved here from
+    service_picker_cb/service_msg confirming logic; summary moved to name_msg).
 
-    msg = _make_message(user_id=111222333, text="Стрижка")
-    msg.text = "Стрижка"
-
-    state = _make_state()
-    fake_slot_id = UUID("00000000-0000-0000-0000-000000000001")
-    await state.update_data(client_name="Паша", slot_id=str(fake_slot_id))
-
-    await client_handlers.service_msg(msg, state)
-
-    text = _answer_text(msg)
-    assert "Слот не найден" in text
-    state.clear.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_service_msg_happy_shows_confirmation(
-    session_factory: Any,
-    patched_session_factory: Any,
-) -> None:
-    """T5a: service_msg (client.py:230-240) — happy: slot exists in DB →
-    state.update_data(service_title) + set_state(confirming) + confirmation
-    message with summary + confirm_keyboard.
+    Slot fetching uses SERVICE_DEFAULT_DURATION_MIN (60) for the overlap filter
+    (free-text services don't have a known duration in DB).
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
@@ -2162,25 +2183,28 @@ async def test_service_msg_happy_shows_confirmation(
         )
         session.add(slot)
         await session.commit()
-        slot_id = slot.id
 
     msg = _make_message(user_id=111222333, text="Стрижка")
-    msg.text = "Стрижка"
-
     state = _make_state()
-    await state.update_data(client_name="Паша", slot_id=str(slot_id))
+    await state.update_data(selected_date=target_date.isoformat())
 
     await client_handlers.service_msg(msg, state)
 
     state.update_data.assert_awaited()
-    assert state.update_data.call_args.kwargs.get("service_title") == "Стрижка"
+    saved_kwargs = state.update_data.call_args.kwargs
+    assert saved_kwargs.get("service_title") == "Стрижка"
+    assert saved_kwargs.get("service_id") is None, (
+        "free-text service must reset service_id=None (no Service row bound)"
+    )
     state.set_state.assert_awaited_once()
-    assert state.set_state.call_args.args[0] == BookingStates.confirming
+    assert state.set_state.call_args.args[0] == BookingStates.selecting_slot
 
     text = _answer_text(msg)
-    assert "Подтвердите запись" in text
+    assert "Выберите время" in text
     reply_markup = _answer_reply_markup(msg)
-    assert reply_markup is not None, "happy service_msg must show confirm_keyboard"
+    assert isinstance(reply_markup, InlineKeyboardMarkup), (
+        "service_msg happy must render slot picker keyboard"
+    )
 
 
 # ============================================================
@@ -3032,12 +3056,14 @@ async def test_cmd_slots_excludes_legacy_only_dates(
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
         # Legacy open slot for tomorrow (slot_hour=14).
-        session.add(Slot(
-            master_id=ctx["master_id"],
-            slot_date=tomorrow,
-            slot_hour=14,
-            status="open",
-        ))
+        session.add(
+            Slot(
+                master_id=ctx["master_id"],
+                slot_date=tomorrow,
+                slot_hour=14,
+                status="open",
+            )
+        )
         await session.commit()
 
     msg = _make_message(user_id=111222333, text="/slots")
@@ -3047,220 +3073,6 @@ async def test_cmd_slots_excludes_legacy_only_dates(
 
     state.set_state.assert_not_awaited()  # empty → no FSM entered
     assert "нет свободных дат" in _answer_text(msg).lower()
-
-
-@pytest.mark.asyncio
-async def test_simple_calendar_cb_slots_path_shows_30min_slot_picker(
-    session_factory: Any,
-    patched_session_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Этап 5.8b: /slots path — calendar day-select with active WorkDay →
-    get_available_slots_30 returns TimeSlot30 list → slot_picker_keyboard_30min
-    with BookSlot30CallbackData callback_data (NOT legacy slot picker).
-    """
-    async with session_factory() as session:
-        ctx = await _seed_full_stack(session)
-        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
-        await _seed_workday(
-            session, ctx, work_date=target_date, start_time=time(10, 0), end_time=time(12, 0)
-        )
-
-    target_dt = datetime.combine(target_date, time(11, 0))
-    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
-
-    bot = AsyncMock()
-    cb = MagicMock(spec=CallbackQuery)
-    cb.from_user = _make_user(111222333)
-    cb.message = _make_message(111222333, text="<unused>")
-    cb.answer = AsyncMock()
-    cb.bot = bot
-    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
-
-    state = _make_state()
-    # cmd_slots sets is_slots_path=True before calendar is opened
-    await state.update_data(is_slots_path=True)
-    await client_handlers.simple_calendar_cb(cb, callback_data, state)
-
-    state.update_data.assert_awaited()
-    assert state.update_data.call_args.kwargs.get("selected_date") == target_date.isoformat()
-    state.set_state.assert_awaited_once()
-    assert state.set_state.call_args.args[0] == BookingStates.selecting_slot
-
-    text = _answer_text(cb.message)
-    assert "Выберите время" in text
-    reply_markup = _answer_reply_markup(cb.message)
-    assert isinstance(reply_markup, InlineKeyboardMarkup)
-    # 30-min picker has BookSlot30CallbackData on buttons (prefix book_slot_30),
-    # NOT legacy BookSlotCallbackData (prefix book_slot).
-    rows = reply_markup.inline_keyboard
-    assert rows, "30-min picker must have buttons"
-    first_cb = rows[0][0].callback_data
-    assert first_cb is not None, "callback_data must be set on slot buttons"
-    assert first_cb.startswith("book_slot_30:"), (
-        f"workday-path callback must use BookSlot30CallbackData, got {first_cb!r}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_simple_calendar_cb_slots_path_no_workday_shows_hint(
-    session_factory: Any,
-    patched_session_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Этап 5.8b: /slots path, no WorkDay for date → 'Мастер не работает в этот
-    день. /book для записи по часам.' (NOT generic 'нет свободных слотов').
-    FSM stays in selecting_date (no slot picker shown).
-    """
-    async with session_factory() as session:
-        await _seed_full_stack(session)  # master exists, no WorkDay seeded
-
-    target_date = (datetime.now(UTC) + timedelta(days=30)).date()
-    target_dt = datetime.combine(target_date, time(12, 0))
-    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
-
-    cb = MagicMock(spec=CallbackQuery)
-    cb.from_user = _make_user(111222333)
-    cb.message = _make_message(111222333, text="<unused>")
-    cb.answer = AsyncMock()
-    cb.bot = AsyncMock()
-    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
-
-    state = _make_state()
-    await state.update_data(is_slots_path=True)
-    await client_handlers.simple_calendar_cb(cb, callback_data, state)
-
-    text = _answer_text(cb.message)
-    assert "не работает в этот день" in text
-    state.set_state.assert_not_awaited()
-    cb.answer.assert_awaited()
-
-
-@pytest.mark.asyncio
-async def test_simple_calendar_cb_slots_path_inactive_workday_shows_hint(
-    session_factory: Any,
-    patched_session_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Этап 5.8b: /slots path, WorkDay exists but is_active=False (master
-    closed the day via /closeday) → 'День закрыт мастером.' + calendar retry.
-    """
-    async with session_factory() as session:
-        ctx = await _seed_full_stack(session)
-        target_date = (datetime.now(UTC) + timedelta(days=2)).date()
-        await _seed_workday(session, ctx, work_date=target_date, is_active=False)
-
-    target_dt = datetime.combine(target_date, time(12, 0))
-    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
-
-    cb = MagicMock(spec=CallbackQuery)
-    cb.from_user = _make_user(111222333)
-    cb.message = _make_message(111222333, text="<unused>")
-    cb.answer = AsyncMock()
-    cb.bot = AsyncMock()
-    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
-
-    state = _make_state()
-    await state.update_data(is_slots_path=True)
-    await client_handlers.simple_calendar_cb(cb, callback_data, state)
-
-    text = _answer_text(cb.message)
-    assert "День закрыт мастером" in text
-    state.set_state.assert_not_awaited()
-    cb.answer.assert_awaited()
-
-
-@pytest.mark.asyncio
-async def test_simple_calendar_cb_book_path_fallback_to_workday(
-    session_factory: Any,
-    patched_session_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Session 5.27: /book legacy path — slots empty but active WorkDay exists
-    → fallback to 30-min slot picker (BookSlot30CallbackData). Regression for
-    bug discovered in production: /openweek writes to work_days only, /book
-    only reads slots → clients couldn't book days opened via /openweek.
-    """
-    async with session_factory() as session:
-        ctx = await _seed_full_stack(session)
-        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
-        # Active workday — simulates /openweek / /openday. NO Slot rows.
-        await _seed_workday(
-            session,
-            ctx,
-            work_date=target_date,
-            start_time=time(10, 0),
-            end_time=time(12, 0),
-        )
-
-    target_dt = datetime.combine(target_date, time(11, 0))
-    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
-
-    bot = AsyncMock()
-    cb = MagicMock(spec=CallbackQuery)
-    cb.from_user = _make_user(111222333)
-    cb.message = _make_message(111222333, text="<unused>")
-    cb.answer = AsyncMock()
-    cb.bot = bot
-    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
-
-    state = _make_state()
-    # /book path — is_slots_path=False (cmd_book default).
-    await state.update_data(is_slots_path=False)
-    await client_handlers.simple_calendar_cb(cb, callback_data, state)
-
-    # Fallback kicked in: state advanced, 30-min picker shown.
-    state.update_data.assert_awaited()
-    assert state.update_data.call_args.kwargs.get("selected_date") == target_date.isoformat()
-    state.set_state.assert_awaited_once()
-    assert state.set_state.call_args.args[0] == BookingStates.selecting_slot
-
-    text = _answer_text(cb.message)
-    assert "Выберите время" in text
-    reply_markup = _answer_reply_markup(cb.message)
-    assert isinstance(reply_markup, InlineKeyboardMarkup)
-    rows = reply_markup.inline_keyboard
-    assert rows, "30-min picker must have buttons"
-    first_cb = rows[0][0].callback_data
-    assert first_cb is not None, "callback_data must be set on slot buttons"
-    assert first_cb.startswith("book_slot_30:"), (
-        f"fallback callback must use BookSlot30CallbackData, got {first_cb!r}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_simple_calendar_cb_book_path_fallback_closed_workday_shows_hint(
-    session_factory: Any,
-    patched_session_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Session 5.27: /book legacy path — slots empty AND WorkDay is_active=False
-    → 'День закрыт мастером.' (NOT generic 'нет свободных слотов'). The closed
-    hint is more actionable than the legacy 'нет слотов' message.
-    """
-    async with session_factory() as session:
-        ctx = await _seed_full_stack(session)
-        target_date = (datetime.now(UTC) + timedelta(days=2)).date()
-        await _seed_workday(session, ctx, work_date=target_date, is_active=False)
-
-    target_dt = datetime.combine(target_date, time(12, 0))
-    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
-
-    cb = MagicMock(spec=CallbackQuery)
-    cb.from_user = _make_user(111222333)
-    cb.message = _make_message(111222333, text="<unused>")
-    cb.answer = AsyncMock()
-    cb.bot = AsyncMock()
-    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
-
-    state = _make_state()
-    await state.update_data(is_slots_path=False)
-    await client_handlers.simple_calendar_cb(cb, callback_data, state)
-
-    text = _answer_text(cb.message)
-    assert "День закрыт мастером" in text
-    state.set_state.assert_not_awaited()
-    cb.answer.assert_awaited()
 
 
 @pytest.mark.asyncio
@@ -3281,6 +3093,9 @@ async def test_slot_30_cb_saves_workday_id_start_minute() -> None:
     )
 
     state = _make_state()
+    # service_title set by service_picker_cb/service_msg BEFORE selecting_slot
+    # (Session 5.29 Task 2, W2 defensive check in slot_30_cb).
+    state.get_data = AsyncMock(return_value={"service_title": "Стрижка"})
     await client_handlers.slot_30_cb(cb, callback_data, state)
 
     update_kwargs = state.update_data.call_args.kwargs
@@ -3308,6 +3123,59 @@ async def test_slot_30_cb_out_of_range_clears_state() -> None:
     state.clear.assert_awaited_once()
     assert "Ошибка выбора времени" in _answer_text(cb.message)
     state.set_state.assert_not_awaited()
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_slot_cb_missing_service_title_clears_state() -> None:
+    """Session 5.29 Task 2 W2: slot_cb, service_title missing in state
+    (state corruption from in-flight session carried over from pre-5.29 flow)
+    → state.clear + 'Данные потеряны' + callback.answer. Defensive check BEFORE
+    set_state(entering_name) so no stale entering_name state.
+    """
+    from bot.keyboards.client import BookSlotCallbackData
+
+    slot_id = UUID("12345678-1234-5678-1234-567812345678")
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = AsyncMock()
+    callback_data = BookSlotCallbackData(slot_id=slot_id)
+
+    state = _make_state()
+    # No service_title — simulates state corruption.
+    state.get_data = AsyncMock(return_value={})
+    await client_handlers.slot_cb(cb, callback_data, state)
+
+    state.clear.assert_awaited_once()
+    assert "Данные потеряны" in _answer_text(cb.message)
+    state.set_state.assert_not_awaited()
+    state.update_data.assert_not_awaited()
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_slot_30_cb_missing_service_title_clears_state() -> None:
+    """Session 5.29 Task 2 W2: slot_30_cb, service_title missing in state
+    (state corruption) → state.clear + 'Данные потеряны' + callback.answer.
+    Defensive check after range check, BEFORE set_state(entering_name).
+    """
+    workday_id = uuid4()
+    cb, callback_data = _make_slot_30_callback(
+        workday_id=workday_id,
+        start_minute=630,  # 10:30 — valid range
+    )
+
+    state = _make_state()
+    # No service_title — simulates state corruption.
+    state.get_data = AsyncMock(return_value={})
+    await client_handlers.slot_30_cb(cb, callback_data, state)
+
+    state.clear.assert_awaited_once()
+    assert "Данные потеряны" in _answer_text(cb.message)
+    state.set_state.assert_not_awaited()
+    state.update_data.assert_not_awaited()
     cb.answer.assert_awaited()
 
 
@@ -3370,84 +3238,81 @@ async def test_confirm_cb_workday_path_happy_creates_booking(
 
 
 @pytest.mark.asyncio
-async def test_service_msg_workday_path_workday_not_found_clears_state(
+async def test_service_msg_no_slots_for_default_duration_renders_retry(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """Этап 5.8b W1: service_msg workday-path — workday_id in state but WorkDay
-    row deleted (race: master deleted day between service_msg call and user
-    typed service) → state.clear + 'Рабочий день не найден. ... /slots'.
+    """Session 5.29 Task 2 — FSM reorder: service_msg defensive — selected_date
+    in state but no slots available for SERVICE_DEFAULT_DURATION_MIN (workday
+    closed, all slots booked, or no workday) → roll back to selecting_date +
+    'На эту дату нет окна под услугу ...' + retry date picker.
+
+    Replaces pre-5.29 test_service_msg_workday_path_workday_not_found_clears_state
+    (service_msg no longer reads workday_id — slot fetching moved inside
+    _fetch_slot_picker_for_service which returns None for the retry path).
     """
     async with session_factory() as session:
-        ctx = await _seed_full_stack(session)
-        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
-        wd = await _seed_workday(session, ctx, work_date=target_date)
-        workday_id = wd.id
-        # Now delete the WorkDay (simulating race with /closeday cascade or manual
-        # cleanup). Service_msg's SELECT will return None.
-        from sqlalchemy import delete as sa_delete
-
-        await session.execute(sa_delete(WorkDay).where(WorkDay.id == workday_id))
-        await session.commit()
+        await _seed_full_stack(session)  # master + business, NO workday, NO slots
 
     msg = _make_message(user_id=111222333, text="Стрижка")
     state = _make_state()
-    await state.update_data(
-        workday_id=str(workday_id),
-        start_minute=600,
-        client_name="Паша",
-    )
+    target_date = (datetime.now(UTC) + timedelta(days=2)).date()
+    await state.update_data(selected_date=target_date.isoformat())
 
     await client_handlers.service_msg(msg, state)
 
-    state.clear.assert_awaited_once()
-    assert "Рабочий день не найден" in _answer_text(msg)
-    assert "/slots" in _answer_text(msg)
+    # Rolled back to selecting_date, service_id/title/selected_date cleared.
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.selecting_date
+    text = _answer_text(msg)
+    assert "нет окна" in text or "Нет окна" in text
+    assert "другую дату" in text
+    assert isinstance(_answer_reply_markup(msg), InlineKeyboardMarkup)
 
 
 @pytest.mark.asyncio
-async def test_service_msg_workday_path_happy_shows_summary(
+async def test_service_msg_workday_path_shows_slot_picker(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """Этап 5.8b W1: service_msg workday-path happy — workday_id + start_minute
-    in state → fetch WorkDay → _build_start_at_from_workday → summary via
-    _format_booking_summary_from_start_at → 'Подтвердите запись' + confirm_kb.
-    Verifies the summary contains LOCAL-formatted date/time + client_name +
-    service_title (no Slot entity involved).
+    """Session 5.29 Task 2 — FSM reorder: service_msg (workday path) —
+    free-text service + selected_date + active WorkDay → set_state(selecting_slot)
+    + slot_picker_keyboard_30min (NOT confirmation — slot picker moved here
+    from service_msg confirming logic).
+
+    Verifies the 30-min picker uses BookSlot30CallbackData (prefix book_slot_30),
+    not legacy BookSlotCallbackData.
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
         target_date = (datetime.now(UTC) + timedelta(days=1)).date()
-        wd = await _seed_workday(
+        await _seed_workday(
             session,
             ctx,
             work_date=target_date,
             start_time=time(10, 0),
             end_time=time(12, 0),
         )
-        workday_id = wd.id
 
     msg = _make_message(user_id=111222333, text="Стрижка")
     state = _make_state()
-    await state.update_data(
-        workday_id=str(workday_id),
-        start_minute=600,  # 10:00 LOCAL
-        client_name="Паша",
-    )
+    await state.update_data(selected_date=target_date.isoformat(), is_slots_path=True)
 
     await client_handlers.service_msg(msg, state)
 
     state.set_state.assert_awaited_once()
-    assert state.set_state.call_args.args[0] == BookingStates.confirming
+    assert state.set_state.call_args.args[0] == BookingStates.selecting_slot
     text = _answer_text(msg)
-    assert "Подтвердите запись" in text
-    # Summary rendered via _format_booking_summary_from_start_at — uses LOCAL
-    # strftime "%d %B %Y, %H:%M" → "10:00" appears in summary.
-    assert "10:00" in text
-    assert "Паша" in text
-    assert "Стрижка" in text
-    assert isinstance(_answer_reply_markup(msg), InlineKeyboardMarkup)
+    assert "Выберите время" in text
+    reply_markup = _answer_reply_markup(msg)
+    assert isinstance(reply_markup, InlineKeyboardMarkup)
+    rows = reply_markup.inline_keyboard
+    assert rows, "30-min picker must have buttons"
+    first_cb = rows[0][0].callback_data
+    assert first_cb is not None
+    assert first_cb.startswith("book_slot_30:"), (
+        f"workday-path callback must use BookSlot30CallbackData, got {first_cb!r}"
+    )
 
 
 @pytest.mark.asyncio
@@ -3735,114 +3600,120 @@ def _make_string_callback(
 
 
 @pytest.mark.asyncio
-async def test_name_msg_with_services_shows_inline_picker(
+async def test_name_msg_happy_renders_summary_workday_path(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """5.27 FEAT: name_msg with active services in DB → 'Выберите услугу тапом'
-    + inline keyboard with service buttons (service_picker_keyboard).
+    """Session 5.29 Task 2 — FSM reorder: name_msg (workday path) — happy:
+    workday_id + start_minute + service_title in state → set_state(confirming) +
+    summary via _format_booking_summary_from_start_at + confirm_keyboard.
 
-    Verifies:
-    - state.set_state(entering_service) — FSM advances correctly
-    - message.answer called with reply_markup (InlineKeyboardMarkup)
-    - reply_markup contains the seeded service name AND 'Своя услуга' button
+    Verifies summary contains LOCAL-formatted time (10:00 from start_minute=600)
+    + client_name + service_title (no Slot entity involved).
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
-        await _seed_service(session, ctx, name="Стрижка", duration_minutes=60)
-        await _seed_service(session, ctx, name="Окрашивание", duration_minutes=120)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        wd = await _seed_workday(
+            session,
+            ctx,
+            work_date=target_date,
+            start_time=time(10, 0),
+            end_time=time(12, 0),
+        )
+        workday_id = wd.id
 
     msg = _make_message(user_id=111222333, text="Паша")
     state = _make_state()
-
-    await client_handlers.name_msg(msg, state)
-
-    state.update_data.assert_awaited()
-    assert state.update_data.call_args.kwargs.get("client_name") == "Паша"
-    state.set_state.assert_awaited_once()
-    assert state.set_state.call_args.args[0] == BookingStates.entering_service
-
-    text = _answer_text(msg)
-    assert "Выберите услугу тапом" in text
-    reply_markup = _answer_reply_markup(msg)
-    assert isinstance(reply_markup, InlineKeyboardMarkup), (
-        "with services in DB, name_msg must show inline keyboard"
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=600,  # 10:00 LOCAL
+        service_title="Стрижка",
     )
-    flat_texts = [btn.text for row in reply_markup.inline_keyboard for btn in row]
-    assert "Стрижка" in flat_texts
-    assert "Окрашивание" in flat_texts
-    assert any("Своя услуга" in t for t in flat_texts), (
-        "'Своя услуга' fallback button must always be present"
-    )
-
-
-@pytest.mark.asyncio
-async def test_name_msg_no_services_falls_back_to_text_prompt(
-    session_factory: Any,
-    patched_session_factory: Any,
-) -> None:
-    """5.27 FEAT: name_msg with no active services in DB → legacy text prompt
-    'Какая услуга?' (no inline keyboard).
-
-    Single-master MVP edge case: master hasn't created any services yet →
-    user types service name as before (legacy path preserved).
-    """
-    async with session_factory() as session:
-        await _seed_full_stack(session)  # master + business, NO services
-
-    msg = _make_message(user_id=111222333, text="Паша")
-    state = _make_state()
 
     await client_handlers.name_msg(msg, state)
 
     state.set_state.assert_awaited_once()
-    assert state.set_state.call_args.args[0] == BookingStates.entering_service
+    assert state.set_state.call_args.args[0] == BookingStates.confirming
     text = _answer_text(msg)
-    assert "Какая услуга" in text
-    assert _answer_reply_markup(msg) is None, (
-        "no services in DB → no inline keyboard, legacy text prompt"
-    )
+    assert "Подтвердите запись" in text
+    assert "10:00" in text
+    assert "Паша" in text
+    assert "Стрижка" in text
+    assert isinstance(_answer_reply_markup(msg), InlineKeyboardMarkup)
 
 
 @pytest.mark.asyncio
-async def test_name_msg_archived_services_excluded_from_picker(
+async def test_name_msg_no_slot_no_workday_clears_state(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """5.27 FEAT: name_msg filters is_active=True — archived services excluded.
-
-    Service with is_active=False is in DB but picker shows only active ones.
-    If all services archived → fallback to text prompt (no inline keyboard).
+    """Session 5.29 Task 2 — FSM reorder: name_msg defensive — neither slot_id
+    nor workday_id in FSM (state corruption: bot restart mid-flow with
+    MemoryStorage, or user jumped into entering_name via stale keyboard after
+    flow changed underneath) → state.clear + 'Данные потеряны' + abort.
     """
-    async with session_factory() as session:
-        ctx = await _seed_full_stack(session)
-        # Two services: one active, one archived.
-        await _seed_service(session, ctx, name="Стрижка активная", is_active=True)
-        await _seed_service(session, ctx, name="Стрижка архив", is_active=False)
-
     msg = _make_message(user_id=111222333, text="Паша")
     state = _make_state()
+    # Only service_title in state — no workday_id, no slot_id (corrupted).
+    await state.update_data(service_title="Стрижка")
 
     await client_handlers.name_msg(msg, state)
 
-    reply_markup = _answer_reply_markup(msg)
-    assert isinstance(reply_markup, InlineKeyboardMarkup)
-    flat_texts = [btn.text for row in reply_markup.inline_keyboard for btn in row]
-    assert "Стрижка активная" in flat_texts
-    assert "Стрижка архив" not in flat_texts, "archived services must NOT appear in the picker"
+    state.clear.assert_awaited_once()
+    text = _answer_text(msg)
+    assert "Данные потеряны" in text or "Начните заново" in text
+    state.set_state.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_service_picker_cb_happy_saves_and_jumps_to_confirming(
+async def test_name_msg_no_service_title_clears_state(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """5.27 FEAT: service_picker_cb happy — tap a service button →
-    state.update_data(service_id, service_title) + set_state(confirming) +
-    'Подтвердите запись' summary with service.name.
+    """Session 5.29 Task 2 — FSM reorder: name_msg defensive — service_title
+    missing in FSM (state corruption: entering_name reached without going
+    through service_picker_cb/service_msg) → state.clear + retry hint + abort.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = Slot(
+            master_id=ctx["master_id"],
+            slot_date=target_date,
+            slot_hour=14,
+            status="open",
+        )
+        session.add(slot)
+        await session.commit()
+        slot_id = slot.id
 
-    Uses the /book legacy slot path (slot_id set in FSM) — workday path is
-    covered by a separate test below.
+    msg = _make_message(user_id=111222333, text="Паша")
+    state = _make_state()
+    # slot_id set but no service_title (corrupted state).
+    await state.update_data(slot_id=str(slot_id))
+
+    await client_handlers.name_msg(msg, state)
+
+    state.clear.assert_awaited_once()
+    text = _answer_text(msg)
+    assert "Данные потеряны" in text or "Начните заново" in text
+    state.set_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_service_picker_cb_happy_saves_and_jumps_to_selecting_slot(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Session 5.29 Task 2 — FSM reorder: service_picker_cb happy — tap a
+    service button → state.update_data(service_id, service_title) +
+    set_state(selecting_slot) + render slot picker keyboard (was
+    set_state(confirming) + summary render pre-5.29).
+
+    Uses the /book legacy slot path (Slot row in DB, is_slots_path=False).
+    New flow: date → service → slot → name → confirm. Pre-state has only
+    selected_date (set by _process_selected_date when entering_service).
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
@@ -3857,43 +3728,43 @@ async def test_service_picker_cb_happy_saves_and_jumps_to_confirming(
         session.add(slot)
         await session.commit()
         service_id = svc.id
-        slot_id = slot.id
 
     cb, callback_data = _make_service_callback(service_id)
     state = _make_state()
-    await state.update_data(client_name="Паша", slot_id=str(slot_id))
+    await state.update_data(
+        selected_date=target_date.isoformat(),
+        is_slots_path=False,
+    )
 
     await client_handlers.service_picker_cb(cb, callback_data, state)
 
     state.update_data.assert_awaited()
-    # service_id and service_title saved (single update_data call with both)
     saved_kwargs = state.update_data.call_args.kwargs
     assert saved_kwargs.get("service_id") == str(service_id)
     assert saved_kwargs.get("service_title") == "Окрашивание"
     state.set_state.assert_awaited_once()
-    assert state.set_state.call_args.args[0] == BookingStates.confirming
+    assert state.set_state.call_args.args[0] == BookingStates.selecting_slot
 
     text = _answer_text(cb.message)
-    assert "Подтвердите запись" in text
-    assert "Окрашивание" in text
-    assert "Паша" in text
+    assert "Выберите время" in text
     assert isinstance(_answer_reply_markup(cb.message), InlineKeyboardMarkup)
     cb.answer.assert_awaited()
 
 
 @pytest.mark.asyncio
-async def test_service_picker_cb_workday_path_happy_shows_summary(
+async def test_service_picker_cb_workday_path_shows_slot_picker(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """5.27 FEAT: service_picker_cb on /slots workday path — workday_id +
-    start_minute in state → summary via _format_booking_summary_from_start_at.
+    """Session 5.29 Task 2 — FSM reorder: service_picker_cb on /slots workday
+    path — pre-state has selected_date + is_slots_path=True → fetch slots via
+    WorkDay, render slot_picker_keyboard_30min (was summary render pre-5.29).
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
         svc = await _seed_service(session, ctx, name="Окрашивание", duration_minutes=120)
         target_date = (datetime.now(UTC) + timedelta(days=1)).date()
-        wd = await _seed_workday(
+        await _seed_workday(
             session,
             ctx,
             work_date=target_date,
@@ -3901,25 +3772,24 @@ async def test_service_picker_cb_workday_path_happy_shows_summary(
             end_time=time(12, 0),
         )
         service_id = svc.id
-        workday_id = wd.id
 
     cb, callback_data = _make_service_callback(service_id)
     state = _make_state()
     await state.update_data(
-        workday_id=str(workday_id),
-        start_minute=600,  # 10:00 LOCAL
-        client_name="Паша",
+        selected_date=target_date.isoformat(),
+        is_slots_path=True,
     )
 
     await client_handlers.service_picker_cb(cb, callback_data, state)
 
     state.set_state.assert_awaited_once()
-    assert state.set_state.call_args.args[0] == BookingStates.confirming
+    assert state.set_state.call_args.args[0] == BookingStates.selecting_slot
+    saved_kwargs = state.update_data.call_args.kwargs
+    assert saved_kwargs.get("service_id") == str(service_id)
+    assert saved_kwargs.get("service_title") == "Окрашивание"
     text = _answer_text(cb.message)
-    assert "Подтвердите запись" in text
-    assert "Окрашивание" in text
-    assert "10:00" in text  # summary formatted via _format_booking_summary_from_start_at
-    assert "Паша" in text
+    assert "Выберите время" in text
+    assert isinstance(_answer_reply_markup(cb.message), InlineKeyboardMarkup)
 
 
 @pytest.mark.asyncio
@@ -3928,11 +3798,15 @@ async def test_service_picker_cb_service_archived_falls_back_to_text(
     patched_session_factory: Any,
 ) -> None:
     """5.27 FEAT: service_picker_cb defensive — service archived/deleted between
-    name_msg and tap → stay in entering_service + ask text (no dead-end for user).
+    picker render and tap → stay in entering_service + ask text (no dead-end).
 
     Race scenario: master archived the service while user was looking at the
     inline keyboard. service_picker_cb re-SELECTs Service by id and checks
     is_active — archived → fallback to text input (legacy path).
+
+    Session 5.29 Task 2: pre-state now needs selected_date (set by
+    _process_selected_date when entering_service). Without it, the
+    defensive-clear path fires before the archive check.
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
@@ -3943,14 +3817,15 @@ async def test_service_picker_cb_service_archived_falls_back_to_text(
         svc.is_active = False
         await session.commit()
         service_id = svc.id
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
 
     cb, callback_data = _make_service_callback(service_id)
     state = _make_state()
-    await state.update_data(client_name="Паша", slot_id=str(UUID(int=1)))
+    await state.update_data(selected_date=target_date.isoformat())
 
     await client_handlers.service_picker_cb(cb, callback_data, state)
 
-    # State stays in entering_service (NOT advanced to confirming)
+    # State stays in entering_service (NOT advanced to selecting_slot)
     state.set_state.assert_not_awaited()
     # update_data called ONCE only — in our test setup (pre-call). Handler
     # itself did NOT call update_data (no service saved on race fallback).
@@ -3965,14 +3840,18 @@ async def test_service_picker_cb_service_deleted_falls_back_to_text(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """5.27 FEAT: service_picker_cb defensive — service deleted between name_msg
-    and tap (callback_data has stale service_id) → Service row not found →
-    stay in entering_service + ask text.
+    """5.27 FEAT: service_picker_cb defensive — service deleted between picker
+    render and tap (callback_data has stale service_id) → Service row not
+    found → stay in entering_service + ask text.
+
+    Session 5.29 Task 2: pre-state now needs selected_date (set by
+    _process_selected_date when entering_service).
     """
     cb, callback_data = _make_service_callback(UUID(int=42))
     # No DB seed at all — Service SELECT returns None
+    target_date = (datetime.now(UTC) + timedelta(days=1)).date()
     state = _make_state()
-    await state.update_data(client_name="Паша", slot_id=str(UUID(int=1)))
+    await state.update_data(selected_date=target_date.isoformat())
 
     await client_handlers.service_picker_cb(cb, callback_data, state)
 
@@ -3980,6 +3859,197 @@ async def test_service_picker_cb_service_deleted_falls_back_to_text(
     state.update_data.assert_awaited_once()  # only pre-call, no handler calls
     text = _answer_text(cb.message)
     assert "недоступна" in text or "Напишите услугу" in text
+
+
+@pytest.mark.asyncio
+async def test_book_flow_service_before_slot(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session 5.29 Task 2 — NEW unit test: explicit order verification for
+    the FSM reorder (услуга ДО слота). Calls simple_calendar_cb (date pick)
+    → entering_service + service picker; then service_picker_cb (service
+    tap) → selecting_slot + slot picker. Asserts the NEW ordering (pre-5.29
+    flow was date → slot → name → service; this test pins the invariant).
+
+    Integration-level E2E coverage is in test_integration_admin_flows.py
+    (test_booking_flow_with_service_picker_creates_booking); this unit test
+    is a focused invariant pin for the order of state transitions.
+    """
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        svc = await _seed_service(session, ctx, name="Окрашивание", duration_minutes=120)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        # Slot for legacy /book path (so service_picker_cb has slots to render).
+        slot = Slot(
+            master_id=ctx["master_id"],
+            slot_date=target_date,
+            slot_hour=14,
+            status="open",
+        )
+        session.add(slot)
+        await session.commit()
+        service_id = svc.id
+
+    # Step 1: simple_calendar_cb act=day → entering_service + service picker.
+    target_dt = datetime.combine(target_date, time(12, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+    cb_date = MagicMock(spec=CallbackQuery)
+    cb_date.from_user = _make_user(111222333)
+    cb_date.message = _make_message(111222333, text="<unused>")
+    cb_date.answer = AsyncMock()
+    cb_date.bot = AsyncMock()
+    callback_data_date = _make_simple_calendar_callback(SimpleCalAct.day)
+    state = _make_state()
+    await client_handlers.simple_calendar_cb(cb_date, callback_data_date, state)
+
+    assert state.set_state.call_args.args[0] == BookingStates.entering_service, (
+        "5.29 Task 2: date pick → entering_service (was selecting_slot pre-5.29)"
+    )
+    text_after_date = _answer_text(cb_date.message)
+    assert "Выберите услугу" in text_after_date, "service picker shown after date, not slot picker"
+
+    # Step 2: service_picker_cb → selecting_slot + slot picker.
+    cb_svc, callback_data_svc = _make_service_callback(service_id)
+    # Carry selected_date from step 1 (real FSM would persist via update_data).
+    state.set_state.reset_mock()
+    await state.update_data(selected_date=target_date.isoformat(), is_slots_path=False)
+
+    await client_handlers.service_picker_cb(cb_svc, callback_data_svc, state)
+
+    assert state.set_state.call_args.args[0] == BookingStates.selecting_slot, (
+        "5.29 Task 2: service tap → selecting_slot (was confirming pre-5.29)"
+    )
+    text_after_service = _answer_text(cb_svc.message)
+    assert "Выберите время" in text_after_service, "slot picker shown after service, not summary"
+    reply_markup = _answer_reply_markup(cb_svc.message)
+    assert isinstance(reply_markup, InlineKeyboardMarkup)
+
+
+@pytest.mark.asyncio
+async def test_slots_filtered_by_service_duration(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Session 5.29 Task 2 — NEW handler-level test: slot picker rendered by
+    service_picker_cb is filtered by service.duration_minutes via the
+    overlap fix (slots.py:219). With a 120-min booking at 16:00-18:00 and
+    service 'Окрашивание' (120 min), slot 15:30 must NOT appear in the
+    keyboard (15:30 + 120 = 17:30 overlaps 16:00-18:00). Pre-fix: 15:30 + 30
+    = 16:00 == 16:00 (half-open) → shown (BUG → fall at confirm).
+
+    Unit-level overlap guard is in test_slots.py (test_overlap_uses_min_duration_not_30);
+    this test pins the handler-level integration (service_picker_cb →
+    _fetch_slot_picker_for_service → slot_picker_keyboard_30min).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        svc = await _seed_service(session, ctx, name="Окрашивание", duration_minutes=120)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        await _seed_workday(
+            session,
+            ctx,
+            work_date=target_date,
+            start_time=time(10, 0),
+            end_time=time(18, 0),
+        )
+        # Existing booking 16:00-18:00 LOCAL (120 min) — blocks 15:30 slot
+        # for 120-min services, but NOT for 60-min (separate test).
+        booking_start_local = datetime.combine(target_date, time(16, 0))
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=booking_start_local)
+        # _seed_booking creates 60-min booking by default — extend to 120 min
+        # to model Окрашивание end_at (16:00-18:00 LOCAL).
+        booking.end_at = booking.start_at + timedelta(minutes=120)
+        await session.commit()
+        service_id = svc.id
+
+    cb, callback_data = _make_service_callback(service_id)
+    state = _make_state()
+    await state.update_data(
+        selected_date=target_date.isoformat(),
+        is_slots_path=True,  # workday path → slot_picker_keyboard_30min
+    )
+
+    await client_handlers.service_picker_cb(cb, callback_data, state)
+
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.selecting_slot
+    reply_markup = _answer_reply_markup(cb.message)
+    assert isinstance(reply_markup, InlineKeyboardMarkup)
+    flat_texts = [btn.text for row in reply_markup.inline_keyboard for btn in row]
+    assert "15:30" not in flat_texts, (
+        "5.29 Task 2: with 120-min booking 16:00-18:00 + 120-min service, slot "
+        "15:30 must NOT appear (15:30+120=17:30 overlaps 16:00-18:00). Pre-fix: "
+        "15:30+30=16:00 half-open → shown (BUG)."
+    )
+    # Sanity: slots whose service-duration window stays clear of the booking
+    # remain available. 14:00 + 120 = 16:00 (half-open) — no overlap → shown.
+    assert "10:00" in flat_texts
+    assert "13:30" in flat_texts
+    assert "14:00" in flat_texts
+    # 14:30 hidden (14:30+120=16:30 overlaps 16:00-18:00) — same root cause.
+    assert "14:30" not in flat_texts
+
+
+@pytest.mark.asyncio
+async def test_slots_shown_for_short_service(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Session 5.29 Task 2 — NEW handler-level test: short service (60 min)
+    shows slot 14:30 that long service (120 min) hides against the same
+    booking (16:00-18:00). 14:30 + 60 = 15:30 < 16:00 → no overlap → shown.
+    14:30 + 120 = 16:30 overlaps 16:00-18:00 → hidden.
+
+    The user-visible win of the overlap fix: client picking Стрижка (60)
+    sees 14:30 open, while client picking Окрашивание (120) sees it closed —
+    reflecting real booking feasibility, not just grid occupancy.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        svc_short = await _seed_service(session, ctx, name="Стрижка", duration_minutes=60)
+        svc_long = await _seed_service(session, ctx, name="Окрашивание", duration_minutes=120)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        await _seed_workday(
+            session,
+            ctx,
+            work_date=target_date,
+            start_time=time(10, 0),
+            end_time=time(18, 0),
+        )
+        booking_start_local = datetime.combine(target_date, time(16, 0))
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=booking_start_local)
+        booking.end_at = booking.start_at + timedelta(minutes=120)
+        await session.commit()
+
+    # Short service (60) — slot 14:30 available (14:30 + 60 = 15:30 < 16:00).
+    cb_short, cd_short = _make_service_callback(svc_short.id)
+    state_short = _make_state()
+    await state_short.update_data(
+        selected_date=target_date.isoformat(),
+        is_slots_path=True,
+    )
+    await client_handlers.service_picker_cb(cb_short, cd_short, state_short)
+    reply_markup_short = _answer_reply_markup(cb_short.message)
+    flat_short = [btn.text for row in reply_markup_short.inline_keyboard for btn in row]
+    assert "14:30" in flat_short, "Стрижка (60): 14:30 + 60 = 15:30 < 16:00 → available"
+
+    # Long service (120) — slot 14:30 hidden (14:30 + 120 = 16:30 overlaps).
+    cb_long, cd_long = _make_service_callback(svc_long.id)
+    state_long = _make_state()
+    await state_long.update_data(
+        selected_date=target_date.isoformat(),
+        is_slots_path=True,
+    )
+    await client_handlers.service_picker_cb(cb_long, cd_long, state_long)
+    reply_markup_long = _answer_reply_markup(cb_long.message)
+    flat_long = [btn.text for row in reply_markup_long.inline_keyboard for btn in row]
+    assert "14:30" not in flat_long, (
+        "Окрашивание (120): 14:30 + 120 = 16:30 overlaps 16:00-18:00 → hidden"
+    )
 
 
 @pytest.mark.asyncio
@@ -4131,19 +4201,22 @@ async def test_service_msg_clears_stale_service_id_from_state(
     in abandoned flow) → service_msg must reset it to None.
 
     Scenario (regression test for F1 bug):
-    1. User /book → date → slot → name → tap picker (service_id=X set in state,
-       state=confirming)
-    2. User abandons (no ✅, closes bot) — state persists in Postgres storage
-    3. User returns → /book → date → slot → types new name (name_msg overwrites
-       client_name)
-    4. User types "Стрижка" (custom text, NOT picker) → service_msg must
-       OVERWRITE service_id=None (atomic merge in update_data), so confirm_cb
-       doesn't pass stale service_id to BookingCreate.
+    1. User /book → date → tap picker (service_id=X set in state)
+    2. User abandons (no slot picked, closes bot) — state persists in Postgres
+    3. User returns → /book → date → types "Стрижка" (custom text, NOT picker)
+       → service_msg must OVERWRITE service_id=None (atomic merge in
+       update_data), so confirm_cb doesn't pass stale service_id to
+       BookingCreate.
 
     Without the fix: service_msg only sets service_title (dict.update merges),
     stale service_id=X survives → create_booking computes end_at from
     stale Service (e.g. "Окрашивание" duration=120 instead of "Стрижка" 60).
     Silent data correctness bug — user sees correct title but wrong end_at.
+
+    Session 5.29 Task 2: pre-state now needs selected_date (set by
+    _process_selected_date when entering_service). Final state is
+    selecting_slot (was confirming pre-5.29 — service_msg used to render
+    summary; now it renders slot picker).
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
@@ -4165,7 +4238,7 @@ async def test_service_msg_clears_stale_service_id_from_state(
     # Pre-populate STALE service_id (simulates abandoned picker tap from prior flow)
     stale_service_id = UUID("00000000-0000-0000-0000-000000000099")
     await state.update_data(
-        client_name="Паша",
+        selected_date=target_date.isoformat(),
         slot_id=str(slot_id),
         service_id=str(stale_service_id),  # STALE — must be cleared
     )
@@ -4180,7 +4253,7 @@ async def test_service_msg_clears_stale_service_id_from_state(
     )
     assert saved_kwargs.get("service_title") == "Стрижка"
     state.set_state.assert_awaited()
-    assert state.set_state.call_args.args[0] == BookingStates.confirming
+    assert state.set_state.call_args.args[0] == BookingStates.selecting_slot
 
     # F2 fix (code-review iter 2): verify final FSM state (not just kwargs).
     # Without F1 fix, service_msg called update_data(service_title=...) only,
@@ -4243,6 +4316,7 @@ async def test_confirm_cb_workday_path_with_stale_service_id_after_text_input(
     stale_service_id = UUID("00000000-0000-0000-0000-000000000099")
     state = _make_state()
     await state.update_data(
+        selected_date=target_date.isoformat(),
         workday_id=str(workday_id),
         start_minute=600,
         client_name="Паша",

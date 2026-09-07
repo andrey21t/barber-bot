@@ -367,10 +367,7 @@ async def cmd_openday(message: Message, command: CommandObject) -> None:
         start_time = _parse_hhmm(args[1])
         end_time = _parse_hhmm(args[2])
     except ValueError:
-        await message.answer(
-            "❌ Время должно быть ЧЧ:ММ (или ЧЧ.ММ / ЧЧ,ММ). "
-            "Например 11:00 18:00"
-        )
+        await message.answer("❌ Время должно быть ЧЧ:ММ (или ЧЧ.ММ / ЧЧ,ММ). Например 11:00 18:00")
         return
 
     admin_id = _require_admin_or_silent(message)
@@ -1003,9 +1000,7 @@ async def admin_openday_calendar_cb(
         # WorkDayShrinkError on confirm with UUIDs.
         bookings_block = ""
         async with async_session_factory() as session:
-            bookings = await get_bookings_for_date(
-                session, _master_id, tz, work_date
-            )
+            bookings = await get_bookings_for_date(session, _master_id, tz, work_date)
         if bookings:
             lines = []
             for b in bookings:
@@ -1081,9 +1076,7 @@ async def admin_openday_start_msg(message: Message, state: FSMContext) -> None:
     try:
         start_time = _parse_hhmm(text.strip())
     except ValueError:
-        await message.answer(
-            "❌ Формат ЧЧ:ММ (или ЧЧ.ММ / ЧЧ,ММ). Например <code>11:00</code>"
-        )
+        await message.answer("❌ Формат ЧЧ:ММ (или ЧЧ.ММ / ЧЧ,ММ). Например <code>11:00</code>")
         return  # state stays — ask again
 
     await state.update_data(start_time=start_time.isoformat())
@@ -1125,9 +1118,7 @@ async def admin_openday_end_msg(message: Message, state: FSMContext) -> None:
     try:
         end_time = _parse_hhmm(text.strip())
     except ValueError:
-        await message.answer(
-            "❌ Формат ЧЧ:ММ (или ЧЧ.ММ / ЧЧ,ММ). Например <code>18:00</code>"
-        )
+        await message.answer("❌ Формат ЧЧ:ММ (или ЧЧ.ММ / ЧЧ,ММ). Например <code>18:00</code>")
         return  # state stays — ask again
 
     admin_id = _require_admin_or_silent(message)
@@ -1451,17 +1442,11 @@ async def admin_window_confirm_cb(
         # admin_inline_menu даёт свежее меню в этом же сообщении.
         if isinstance(callback.message, Message):
             try:
-                await callback.message.edit_text(
-                    result_text, reply_markup=admin_inline_menu()
-                )
+                await callback.message.edit_text(result_text, reply_markup=admin_inline_menu())
             except TelegramBadRequest:
-                await callback.message.answer(
-                    result_text, reply_markup=admin_inline_menu()
-                )
+                await callback.message.answer(result_text, reply_markup=admin_inline_menu())
         else:
-            await callback.message.answer(
-                result_text, reply_markup=admin_inline_menu()
-            )
+            await callback.message.answer(result_text, reply_markup=admin_inline_menu())
     await callback.answer()
 
 
@@ -1534,9 +1519,7 @@ def _render_openweek_edit_summary(
     for od in sorted(opened_days, key=lambda d: d.weekday):
         day_label = _WEEKDAY_LABELS_HANDLER[od.weekday]
         date_label = date.fromisoformat(od.work_date_iso).strftime("%d.%m")
-        lines.append(
-            f"✅ {day_label} {date_label} {od.start_time_str}–{od.end_time_str}"
-        )
+        lines.append(f"✅ {day_label} {date_label} {od.start_time_str}–{od.end_time_str}")
     return "\n".join(lines)
 
 
@@ -1623,9 +1606,7 @@ async def admin_openweek_edit_cb(
         )
         return
     if not wd.is_active:
-        await callback.answer(
-            "❌ День закрыт. Откройте заново через /openday", show_alert=True
-        )
+        await callback.answer("❌ День закрыт. Откройте заново через /openday", show_alert=True)
         return
 
     workday_id = wd.id
@@ -2687,8 +2668,7 @@ async def admin_openweek_start_cb(
     sentinel = _UUID(int=0)
     if callback.message is not None:
         step2_text = (
-            f"Шаг 2: выберите время окончания окна:\n\n"
-            f"{_openweek_week_header(business_tz)}"
+            f"Шаг 2: выберите время окончания окна:\n\n{_openweek_week_header(business_tz)}"
         )
         step2_kb = admin_window_slot_picker_keyboard(
             workday_id=sentinel,
@@ -2899,9 +2879,7 @@ async def _apply_openweek(
     # Диапазон выборки = выбранная неделя (monday..sunday), НЕ "today + 7 days"
     # (see get_bookings_for_date_range docstring — strict match to header).
     async with async_session_factory() as session:
-        bookings = await get_bookings_for_date_range(
-            session, master_id, tz, monday, sunday
-        )
+        bookings = await get_bookings_for_date_range(session, master_id, tz, monday, sunday)
     bookings_block = ""
     if bookings:
         bookings_block = "\n\n" + _render_bookings("📅 Записи на неделю:", bookings, tz)
@@ -2924,9 +2902,7 @@ async def _render_openweek_result(
     """
     if callback.message is None:
         return
-    reply_markup = (
-        admin_openweek_edit_keyboard(opened_days) if opened_days else admin_inline_menu()
-    )
+    reply_markup = admin_openweek_edit_keyboard(opened_days) if opened_days else admin_inline_menu()
     if isinstance(callback.message, Message):
         try:
             await callback.message.edit_text(result_text, reply_markup=reply_markup)
@@ -3025,10 +3001,7 @@ async def admin_openweek_confirm_cb(
         # НЕ clear state — yes-handler needs picked_start_minute etc.
         new_window = f"{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}"
         existing_str = "\n".join(existing_lines)
-        alert_text = (
-            f"⚠️ Уже есть окно:\n{existing_str}\n\n"
-            f"Перезаписать окно на {new_window}?"
-        )
+        alert_text = f"⚠️ Уже есть окно:\n{existing_str}\n\nПерезаписать окно на {new_window}?"
         if callback.message is not None:
             if isinstance(callback.message, Message):
                 try:
@@ -3525,17 +3498,11 @@ async def admin_closeday_confirm_cb(
         # admin_inline_menu даёт свежее меню в этом же сообщении (UX: не листать вверх).
         if isinstance(callback.message, Message):
             try:
-                await callback.message.edit_text(
-                    summary, reply_markup=admin_inline_menu()
-                )
+                await callback.message.edit_text(summary, reply_markup=admin_inline_menu())
             except TelegramBadRequest:
-                await callback.message.answer(
-                    summary, reply_markup=admin_inline_menu()
-                )
+                await callback.message.answer(summary, reply_markup=admin_inline_menu())
         else:
-            await callback.message.answer(
-                summary, reply_markup=admin_inline_menu()
-            )
+            await callback.message.answer(summary, reply_markup=admin_inline_menu())
     await callback.answer()
 
 
@@ -3596,7 +3563,6 @@ def _openweek_week_header(tz: str) -> str:
     sunday = monday + timedelta(days=6)
     week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
     return f"Неделя <b>{week_range}</b>"
-
 
 
 # ============================================================
