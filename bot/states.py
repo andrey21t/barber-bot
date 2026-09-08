@@ -6,10 +6,17 @@ class BookingStates(StatesGroup):
 
     Порядок: date → service → slot → name → confirm.
     Single-master (BB-001): select_specialist skip'ается.
+
+    Session 5.36 (B.13): entering_name_pre_fill добавлен между selecting_slot
+    и entering_name. Когда у юзера есть from_user.first_name — показываем
+    inline «✅ Да, это я» / «👤 Другое имя». State entering_name_pre_fill ловит
+    только callback (name_pre_fill_yes_cb / name_pre_fill_other_cb), НЕ текст —
+    это разделяет текстовый ввод (entering_name) и callback-выбор (pre_fill).
     """
 
     selecting_date = State()
     selecting_slot = State()
+    entering_name_pre_fill = State()
     entering_name = State()
     entering_service = State()
     confirming = State()

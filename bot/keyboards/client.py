@@ -27,7 +27,12 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from aiogram.filters.callback_data import CallbackData
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram_calendar import SimpleCalendar
 
@@ -569,3 +574,101 @@ def _format_booking_summary_from_start_at(
     local_time = start_at.replace(tzinfo=UTC).astimezone(ZoneInfo(business_timezone))
     formatted = local_time.strftime("%d %B %Y, %H:%M")
     return f"📅 {formatted}\n💇 {service_title}\n👤 {client_name}\n"
+
+
+# ============================================================
+# Session 5.36 (B.13) — Reply keyboard + pre-fill name callbacks
+# ============================================================
+
+# Text labels for the client reply keyboard buttons. Handlers match on
+# F.text == CLIENT_REPLY_BOOK_LABEL / F.text == CLIENT_REPLY_MYBOOKINGS_LABEL
+# (registered in client.py). Master (ADMIN_ID) does NOT see this keyboard —
+# cmd_start branches on settings.ADMIN_ID and shows admin_inline_menu instead.
+CLIENT_REPLY_BOOK_LABEL = "💇 Записаться"
+CLIENT_REPLY_MYBOOKINGS_LABEL = "📋 Мои записи"
+
+
+class NamePreFillYesCallbackData(CallbackData, prefix="name_prefill_yes"):
+    """Pre-fill name: client tapped [✅ Да, это я] (Session 5.36 / B.13).
+
+    No payload — handler reads from_user.first_name from the callback (already
+    shown in the prompt text "Записать на {name}?"). Same pattern as
+    BookConfirmCallbackData (plain prefix, no payload).
+
+    Distinct prefix from booking flow callbacks (book_slot, book_slot_30,
+    book_service, book_date) — aiogram dispatch is exact-prefix match.
+    """
+
+
+class NamePreFillOtherCallbackData(CallbackData, prefix="name_prefill_other"):
+    """Pre-fill name: client tapped [👤 Другое имя] (Session 5.36 / B.13).
+
+    No payload — handler just transitions FSM to entering_name (text input).
+    Same pattern as NamePreFillYesCallbackData.
+
+    Distinct prefix from name_prefill_yes and booking flow callbacks —
+    aiogram dispatch is exact-prefix match.
+    """
+
+
+def client_reply_keyboard() -> ReplyKeyboardMarkup:
+    """Build the always-on reply keyboard for clients (Session 5.36 / B.13).
+
+    Two buttons, always visible at the bottom of the chat (like a phone
+    keyboard — Telegram renders reply keyboard as part of the UI, not inside
+    a message). Solves "client doesn't see where to tap after /start" —
+    buttons are always there, no need to scroll up to the first message.
+
+    Layout: 2 buttons on one row (resize_keyboard=True keeps buttons compact
+    after first tap — Telegram shrinks them to one line by default).
+
+    Args:
+        None — keyboard is static (no DB, no session). Matches the Pure/I-O
+        contract of other keyboard helpers.
+
+    Returns:
+        ReplyKeyboardMarkup with 2 KeyboardButtons:
+        - 💇 Записаться → triggers reply_book_msg (F.text match in client.py)
+        - 📋 Мои записи → triggers reply_mybookings_msg (F.text match)
+
+    NB: NOT shown to master (ADMIN_ID). cmd_start branches: master gets
+    admin_inline_menu + ReplyKeyboardRemove, client gets this reply keyboard.
+    The 2 reply-keyboard handlers (reply_book_msg / reply_mybookings_msg)
+    also guard with `message.from_user.id != settings.ADMIN_ID` as
+    defense-in-depth (in case a stale reply keyboard from a pre-B.13 session
+    lingers on master's device).
+    """
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text=CLIENT_REPLY_BOOK_LABEL),
+                KeyboardButton(text=CLIENT_REPLY_MYBOOKINGS_LABEL),
+            ]
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def name_pre_fill_keyboard(first_name: str) -> InlineKeyboardMarkup:
+    """Build [✅ Да, это я] / [👤 Другое имя] inline keyboard (Session 5.36 / B.13).
+
+    Shown after slot selection when from_user.first_name is non-empty. Lets
+    the client confirm their Telegram profile name in one tap (80% case —
+    booking themselves) OR switch to text input (20% case — booking someone
+    else: child, husband, etc.).
+
+    Args:
+        first_name: the client's Telegram first_name (already shown in the
+            prompt text "Записать на {first_name}?"). NOT stored in callback
+            data — handler reads it from callback.from_user.first_name again
+            (keeps callback_data minimal, avoids stale-name race).
+
+    Returns:
+        InlineKeyboardMarkup with 2 buttons on one row (adjust(2)).
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Да, это я", callback_data=NamePreFillYesCallbackData().pack())
+    builder.button(text="👤 Другое имя", callback_data=NamePreFillOtherCallbackData().pack())
+    builder.adjust(2)
+    return builder.as_markup()

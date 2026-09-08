@@ -49,7 +49,7 @@ from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, ReplyKeyboardRemove
 from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback
 from aiogram_calendar.schemas import SimpleCalAct
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -60,6 +60,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.config import Settings, get_settings
 from bot.db import async_session_factory
 from bot.keyboards.client import (
+    CLIENT_REPLY_BOOK_LABEL,
+    CLIENT_REPLY_MYBOOKINGS_LABEL,
     BookConfirmCallbackData,
     BookDateCallbackData,
     BookServiceCallbackData,
@@ -69,11 +71,15 @@ from bot.keyboards.client import (
     ClientMenuMyBookingsCallbackData,
     MyBookingsCancelCallbackData,
     MyBookingsTransferCallbackData,
+    NamePreFillOtherCallbackData,
+    NamePreFillYesCallbackData,
     _format_booking_summary_from_start_at,
     calendar_keyboard,
+    client_reply_keyboard,
     confirm_keyboard,
     date_picker_keyboard,
     mybookings_keyboard,
+    name_pre_fill_keyboard,
     post_booking_keyboard,
     service_picker_keyboard,
     slot_picker_keyboard,
@@ -130,6 +136,158 @@ def _calendar_range(settings: Settings) -> tuple[datetime, datetime]:
     today_local = datetime.now(tz).replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
     max_local = today_local + timedelta(days=settings.MAX_BOOKING_DAYS_AHEAD)
     return today_local, max_local
+
+
+# ============================================================
+# Session 5.36 (B.13) — Reply keyboard + pre-fill name helpers
+# ============================================================
+def _client_first_name(callback: CallbackQuery) -> str:
+    """Extract a non-empty first_name from callback.from_user, or ''.
+
+    Returns '' (falsy) when:
+    - callback.from_user is None (inaccessible message edge case)
+    - from_user.first_name is None (private accounts without a profile name)
+    - from_user.first_name is empty string
+
+    Caller treats '' as "no pre-fill, fall back to text input" (slot_cb /
+    slot_30_cb). When non-empty, caller shows the [✅ Да, это я] /
+    [👤 Другое имя] inline keyboard in entering_name_pre_fill state.
+
+    NB: strip()'ing the name so whitespace-only ("   ") also falls back to
+    text input — avoids showing "Записать на    ?" with 3 spaces in the prompt.
+    """
+    if callback.from_user is None or callback.from_user.first_name is None:
+        return ""
+    name = callback.from_user.first_name.strip()
+    return name
+
+
+def _html_escape(text: str) -> str:
+    """Escape user-supplied text for safe rendering in Telegram HTML parse mode.
+
+    Used for the pre-fill prompt "Записать на <b>{name}</b>?" — first_name
+    comes from the Telegram profile (user-controlled) and could contain
+    HTML metacharacters (<, >, &). Without escaping, a name like "<script>"
+    would break the <b> tag and render raw HTML.
+
+    Mirror of bot.services.booking html.escape pattern (spec.md:315 —
+    sanitize in service ПЕРЕД INSERT, render in HTML parse mode без
+    повторного escape). Here we escape at render-time only (no DB write)
+    because the name is displayed but NOT persisted on the pre-fill step —
+    persistence happens later in name_msg / name_pre_fill_yes_cb via
+    create_booking which does its own escape.
+    """
+    import html
+
+    return html.escape(text, quote=False)
+
+
+def _is_master(message: Message) -> bool:
+    """Check if the message sender is the master (ADMIN_ID).
+
+    Defense-in-depth for reply keyboard handlers (reply_book_msg /
+    reply_mybookings_msg). Master should never see the client reply keyboard
+    (cmd_start branches on ADMIN_ID), but a stale reply keyboard from a
+    pre-B.13 session could linger on master's device. This guard prevents
+    master from accidentally entering the client booking flow via a stale
+    reply button tap.
+
+    NB: returns False when from_user is None (defensive — treat unknown as
+    non-master, so the reply handlers proceed normally for clients).
+    """
+    if message.from_user is None:
+        return False
+    return message.from_user.id == get_settings().ADMIN_ID
+
+
+async def _restore_reply_keyboard_async(message: Message) -> None:
+    """Send the client reply keyboard back to the user (Session 5.36 / B.13).
+
+    Called from cancel_msg and confirm_cb AFTER the inline-keyboard message
+    was sent. Guarded by _is_master — master does NOT get the client reply
+    keyboard (they have admin_inline_menu).
+
+    The text "👇 Кнопки внизу" is a visual anchor for the reply keyboard
+    appearing below. Without it, Telegram sometimes delays showing the
+    reply keyboard until the next user action; the explicit message forces
+    immediate render.
+
+    NB: this sends a SEPARATE message with the reply keyboard. Telegram
+    forbids combining reply + inline keyboards in one message, so the
+    booking flow's inline buttons (post_booking_keyboard in confirm_cb,
+    /cancel text in cancel_msg) stay in their own messages and this helper
+    adds the reply keyboard in a follow-up. Minor visual noise (2 messages
+    after confirm_cb: "✅ Вы записаны" with inline buttons + "👇 Кнопки внизу"
+    with reply keyboard) but keeps the reply keyboard always visible.
+    """
+    if _is_master(message):
+        return
+    await message.answer("👇 Кнопки внизу", reply_markup=client_reply_keyboard())
+
+
+# ============================================================
+# 0a. reply_book_msg — [💇 Записаться] reply keyboard tap (Session 5.36 / B.13)
+# ============================================================
+@router.message(F.text == CLIENT_REPLY_BOOK_LABEL, StateFilter(None))
+async def reply_book_msg(message: Message, state: FSMContext) -> None:
+    """Client tapped [💇 Записаться] in the always-on reply keyboard.
+
+    Same effect as /book (cmd_book) and client_book_cb (inline /start menu
+    button, kept for stale keyboards from pre-B.13 sessions). Sets
+    BookingStates.selecting_date + is_slots_path=False + shows date picker.
+
+    Master guard (_is_master): master should never see the reply keyboard
+    (cmd_start branches on ADMIN_ID), but a stale keyboard from a pre-B.13
+    session could linger. If master taps it anyway → early return, no FSM
+    entry. This is defense-in-depth — the primary guard is in cmd_start.
+
+    Empty bookable list → text-only empty state (mirrors cmd_book). Non-empty
+    → entering FSM + showing date picker.
+    """
+    if _is_master(message):
+        return
+    settings = get_settings()
+    async with async_session_factory() as session:
+        master = await _select_master(session, settings)
+        if master is None:
+            await message.answer("❌ Не удалось найти мастера. Обратитесь к администратору.")
+            return
+        dates = await get_bookable_dates(
+            session,
+            master.id,
+            settings.TIMEZONE,
+            include_legacy_slots=True,
+            min_duration_min=settings.SERVICE_DEFAULT_DURATION_MIN,
+            days_ahead=settings.MAX_BOOKING_DAYS_AHEAD,
+        )
+    if not dates:
+        await message.answer("Сейчас нет свободных дат для записи. Загляните позже 🙏")
+        return
+    await state.set_state(BookingStates.selecting_date)
+    await state.update_data(is_slots_path=False)
+    today_local = datetime.now(ZoneInfo(settings.TIMEZONE)).date()
+    await message.answer(
+        "📅 Выберите дату записи:",
+        reply_markup=date_picker_keyboard(dates, today=today_local),
+    )
+
+
+# ============================================================
+# 0b. reply_mybookings_msg — [📋 Мои записи] reply keyboard tap (Session 5.36 / B.13)
+# ============================================================
+@router.message(F.text == CLIENT_REPLY_MYBOOKINGS_LABEL, StateFilter(None))
+async def reply_mybookings_msg(message: Message) -> None:
+    """Client tapped [📋 Мои записи] in the always-on reply keyboard.
+
+    Same effect as /mybookings (mybookings_msg) — delegates to the shared
+    _render_mybookings helper. Single source of truth for the list rendering.
+
+    Master guard (_is_master): master should never see the reply keyboard.
+    If master taps a stale button → early return.
+    """
+    if _is_master(message) or message.from_user is None:
+        return
+    await _render_mybookings(message, message.from_user.id)
 
 
 # ============================================================
@@ -894,9 +1052,37 @@ async def slot_cb(
         await callback.answer()
         return
     await state.update_data(slot_id=str(callback_data.slot_id))
-    await state.set_state(BookingStates.entering_name)
-    if callback.message is not None:
-        await callback.message.answer("На чьё имя записываем? (например: Паша, я сам, сын 5 лет)")
+    # Session 5.36 (B.13): pre-fill name branch. If from_user.first_name is
+    # non-empty, show inline [✅ Да, это я] / [👤 Другое имя] instead of the
+    # old text-only prompt. Client taps "Да" → skip entering_name (one tap
+    # less for the 80% case of booking yourself). "Другое имя" → text input
+    # as before (booking child/husband/etc.).
+    first_name = _client_first_name(callback)
+    if first_name:
+        await state.set_state(BookingStates.entering_name_pre_fill)
+        if callback.message is not None:
+            # ReplyKeyboardRemove — reply keyboard мешает текстовому вводу и
+            # занимает экран. Pre-fill state ловит только callback (не текст),
+            # но reply-кнопки все равно убираем для визуальной чистоты — inline
+            # [✅ Да] / [👤 Другое имя] заменяют их на этом шаге.
+            await callback.message.answer(
+                f"Записать на <b>{_html_escape(first_name)}</b>? "
+                "(ваше имя в Telegram)",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            await callback.message.answer(
+                "Выберите:",
+                reply_markup=name_pre_fill_keyboard(first_name),
+            )
+    else:
+        # Fallback: from_user is None OR first_name is None/empty (private
+        # accounts without a profile name). Old text-input flow unchanged.
+        await state.set_state(BookingStates.entering_name)
+        if callback.message is not None:
+            await callback.message.answer(
+                "На чьё имя записываем? (например: Паша, я сам, сын 5 лет)",
+                reply_markup=ReplyKeyboardRemove(),
+            )
     await callback.answer()
 
 
@@ -947,9 +1133,180 @@ async def slot_30_cb(
         workday_id=str(callback_data.workday_id),
         start_minute=start_minute,
     )
+    # Session 5.36 (B.13): pre-fill name branch (mirror slot_cb).
+    first_name = _client_first_name(callback)
+    if first_name:
+        await state.set_state(BookingStates.entering_name_pre_fill)
+        if callback.message is not None:
+            await callback.message.answer(
+                f"Записать на <b>{_html_escape(first_name)}</b>? "
+                "(ваше имя в Telegram)",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            await callback.message.answer(
+                "Выберите:",
+                reply_markup=name_pre_fill_keyboard(first_name),
+            )
+    else:
+        await state.set_state(BookingStates.entering_name)
+        if callback.message is not None:
+            await callback.message.answer(
+                "На чьё имя записываем? (например: Паша, я сам, сын 5 лет)",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+    await callback.answer()
+
+
+# ============================================================
+# 3d. name_pre_fill_yes_cb — [✅ Да, это я] tap (Session 5.36 / B.13)
+# ============================================================
+@router.callback_query(
+    NamePreFillYesCallbackData.filter(),
+    StateFilter(BookingStates.entering_name_pre_fill),
+)
+async def name_pre_fill_yes_cb(
+    callback: CallbackQuery,
+    callback_data: NamePreFillYesCallbackData,
+    state: FSMContext,
+) -> None:
+    """Client confirmed their Telegram first_name — skip text input, go to confirm.
+
+    Reads from_user.first_name (NOT from callback payload — kept minimal,
+    avoids stale-name race). Saves client_name in state data and transitions
+    to confirming. Summary rendering is delegated to name_msg-like logic via
+    a shared helper path: we re-read workday_id/slot_id from state and build
+    the summary the same way name_msg does after text input.
+
+    Defensive: if first_name is missing at this point (race — user revoked
+    profile between slot_cb and this tap), fall back to entering_name text
+    input (no crash, no lost state).
+    """
+    first_name = _client_first_name(callback)
+    if not first_name:
+        # Race: from_user became None OR first_name stripped to empty between
+        # slot_cb (which gated on first_name truthy) and this callback. Fall
+        # back to text input — safer than failing silently.
+        await state.set_state(BookingStates.entering_name)
+        if callback.message is not None:
+            await callback.message.answer(
+                "На чьё имя записываем? (например: Паша, я сам, сын 5 лет)"
+            )
+        await callback.answer()
+        return
+
+    await state.update_data(client_name=first_name)
+    # Transition to confirming + render summary. Reuse the same summary
+    # rendering path as name_msg: read workday_id/slot_id from state, build
+    # summary via _format_booking_summary_from_start_at (workday) or
+    # _format_booking_summary (legacy slot). For DRY, delegate to a shared
+    # helper — but that helper doesn't exist yet (would refactor name_msg).
+    # For B.13 minimal change: inline the summary rendering here, mirroring
+    # name_msg lines 1080-1130. Refactor to shared helper in B.2 (booking.py
+    # split) — keep duplication < 50 lines for now.
+    data = await state.get_data()
+    settings = get_settings()
+    workday_id_str = data.get("workday_id")
+    slot_id_str = data.get("slot_id")
+    service_title = data.get("service_title")
+    if not service_title:
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer(
+                "❌ Данные потеряны. Начните заново через /book или /slots"
+            )
+        await callback.answer()
+        return
+
+    async with async_session_factory() as session:
+        if workday_id_str is not None:
+            start_minute = data.get("start_minute")
+            if (
+                start_minute is None
+                or not isinstance(start_minute, int)
+                or not (0 <= start_minute <= 1439)
+            ):
+                await state.clear()
+                if callback.message is not None:
+                    await callback.message.answer("❌ Ошибка времени. Начните заново через /slots")
+                await callback.answer()
+                return
+            stmt = select(WorkDay).where(WorkDay.id == UUID(workday_id_str))
+            workday = (await session.execute(stmt)).scalar_one_or_none()
+            if workday is None:
+                await state.clear()
+                if callback.message is not None:
+                    await callback.message.answer(
+                    "❌ Рабочий день не найден. Начните заново через /slots"
+                )
+                await callback.answer()
+                return
+            start_time_local = dt_time(start_minute // 60, start_minute % 60)
+            start_at = _build_start_at_from_workday(workday, start_time_local, settings.TIMEZONE)
+            summary = _format_booking_summary_from_start_at(
+                start_at=start_at,
+                client_name=first_name,
+                service_title=service_title,
+                business_timezone=settings.TIMEZONE,
+            )
+        elif slot_id_str:
+            slot_stmt = select(Slot).where(Slot.id == UUID(slot_id_str))
+            slot = (await session.execute(slot_stmt)).scalar_one_or_none()
+            if slot is None:
+                await state.clear()
+                if callback.message is not None:
+                    await callback.message.answer("❌ Слот не найден. Начните заново через /book")
+                await callback.answer()
+                return
+            from bot.keyboards.client import _format_booking_summary  # noqa: PLC0415
+
+            summary = _format_booking_summary(
+                slot=slot,
+                client_name=first_name,
+                service_title=service_title,
+                business_timezone=settings.TIMEZONE,
+            )
+        else:
+            await state.clear()
+            if callback.message is not None:
+                await callback.message.answer(
+                    "❌ Данные потеряны. Начните заново через /book или /slots"
+                )
+            await callback.answer()
+            return
+
+    await state.set_state(BookingStates.confirming)
+    if callback.message is not None:
+        await callback.message.answer(summary, reply_markup=confirm_keyboard())
+    await callback.answer()
+
+
+# ============================================================
+# 3e. name_pre_fill_other_cb — [👤 Другое имя] tap (Session 5.36 / B.13)
+# ============================================================
+@router.callback_query(
+    NamePreFillOtherCallbackData.filter(),
+    StateFilter(BookingStates.entering_name_pre_fill),
+)
+async def name_pre_fill_other_cb(
+    callback: CallbackQuery,
+    callback_data: NamePreFillOtherCallbackData,
+    state: FSMContext,
+) -> None:
+    """Client chose to enter a different name — transition to text input.
+
+    No payload, no state data update — just a state transition from
+    entering_name_pre_fill to entering_name. The text input handler
+    (name_msg) takes over from here, same as the old pre-B.13 flow.
+
+    NB: ReplyKeyboardRemove was already sent in slot_cb/slot_30_cb when
+    entering entering_name_pre_fill, so the reply keyboard is already
+    hidden — no need to send it again here.
+    """
     await state.set_state(BookingStates.entering_name)
     if callback.message is not None:
-        await callback.message.answer("На чьё имя записываем? (например: Паша, я сам, сын 5 лет)")
+        await callback.message.answer(
+            "На чьё имя записываем? (например: Паша, я сам, сын 5 лет)"
+        )
     await callback.answer()
 
 
@@ -1589,6 +1946,14 @@ async def confirm_cb(
             "✅ Вы записаны. Напомню за 24ч и за 1ч.",
             reply_markup=post_booking_keyboard(),
         )
+        # Session 5.36 (B.13): restore client reply keyboard after booking.
+        # ReplyKeyboardRemove was sent in slot_cb/slot_30_cb; now that the
+        # booking is confirmed and state cleared, bring the always-on reply
+        # keyboard back. Skipped for master (they have admin_inline_menu).
+        # Guard: callback.message is Message | InaccessibleMessage — only
+        # Message has .answer(), InaccessibleMessage is for old channel posts.
+        if isinstance(callback.message, Message):
+            await _restore_reply_keyboard_async(callback.message)
     await callback.answer()
 
 
@@ -1616,6 +1981,12 @@ async def cancel_msg(message: Message, state: FSMContext) -> None:
     else:
         hint = "Ввод отменён. /book чтобы начать заново"
     await message.answer(hint)
+    # Session 5.36 (B.13): restore client reply keyboard after /cancel.
+    # ReplyKeyboardRemove was sent in slot_cb/slot_30_cb when entering the
+    # booking flow — now that the user cancelled, bring the always-on reply
+    # keyboard back so they can tap [💇 Записаться] / [📋 Мои записи] again.
+    # Skipped for master (admin_inline_menu is master's UI, not reply keyboard).
+    await _restore_reply_keyboard_async(message)
 
 
 # ============================================================
