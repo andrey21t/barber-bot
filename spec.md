@@ -68,7 +68,7 @@ Telegram-бот для записи к парикмахеру-одиночке: 
 - **Python 3.12**
 - **aiogram 3.x** (НЕ 2.x — см. `.cursor/rules/aiogram-anti-hallucination.mdc`)
 - **SQLAlchemy 2.0 async** + **Alembic** (миграции)
-- **aiosqlite** (dev) → **asyncpg** (prod, Postgres на Render free tier)
+- **aiosqlite** (dev) → **asyncpg** (prod, Postgres на Timeweb VPS)
 - **APScheduler 3.x**: AsyncIOScheduler + SQLAlchemyJobStore (Postgres в проде, MemoryJobStore + on-startup scan в dev SQLite)
 - **aiogram_calendar** (inline календарь для выбора даты)
 - **pydantic-settings** (env config)
@@ -282,7 +282,7 @@ barber-bot/
 ├── .env.example             # BOT_TOKEN=, DATABASE_URL=sqlite+aiosqlite:///./barber.db, ADMIN_ID=, TIMEZONE=Europe/Moscow
 ├── .gitignore               # .env, __pycache__, *.db, .pytest_cache, .venv, alembic/versions/__pycache__/
 ├── pyproject.toml          # aiogram>=3.x, sqlalchemy>=2.0, aiosqlite, asyncpg, apscheduler, alembic, pydantic-settings, psycopg2-binary (для SQLAlchemyJobStore в проде). [project.optional-dependencies].prod = [asyncpg, psycopg2-binary, alembic]
-├── render.yaml              # (создаётся при деплое) web service + Postgres + pre-deploy alembic upgrade
+├── docker-compose.yml       # bot + postgres, деплой на Timeweb VPS через `docker compose up -d --build`
 ├── README.md                # инструкция запуска (для разработчика)
 └── USER_GUIDE.md            # инструкция для Екатерины (для пользователя, НЕ для разработчика)
 ```
@@ -302,7 +302,7 @@ class Settings(BaseSettings):
     REMINDER_24H_BEFORE: int = 24  # часов до записи
     REMINDER_1H_BEFORE: int = 1
     CANCEL_MIN_HOURS: int = 24  # клиент может отменить/перенести за сколько часов до записи
-    MISFIRE_GRACE_TIME: int = 3600  # секунд, Render free tier sleep 15 мин = 900 сек, ставим 3600 (1ч) запас
+    MISFIRE_GRACE_TIME: int = 3600  # секунд, для долгих простоев (deploy, restart контейнера) — ставим 3600 (1ч) запас
     SERVICE_DEFAULT_DURATION_MIN: int = 60  # если service_id NULL (free-text услуга), end_at = start_at + 60 мин
 
     class Config:
@@ -339,7 +339,7 @@ from zoneinfo import ZoneInfo
 # SYNC engine для SQLAlchemyJobStore (pickle не работает с asyncpg)
 sync_engine = create_engine(
     "postgresql+psycopg2://...",  # НЕ asyncpg, НЕ aiosqlite
-    pool_pre_ping=True,    # детектит мёртвые коннекты после Render sleep
+    pool_pre_ping=True,    # детектит мёртвые коннекты после deploy/restart
     pool_recycle=1800,
     pool_size=5, max_overflow=10,
 )
@@ -349,7 +349,7 @@ scheduler = AsyncIOScheduler(
     jobstores={"default": SQLAlchemyJobStore(engine=sync_engine)},
     job_defaults={
         "coalesce": True,           # сворачивает накопленные misfire в один запуск
-        "misfire_grace_time": 3600,  # ⚠️ Render sleep 15 мин = 900 сек → 3600 сек (1ч) даёт запас
+        "misfire_grace_time": 3600,  # ⚠️ для долгих простоев (deploy, restart) → 3600 сек (1ч) даёт запас
         "max_instances": 1,         # не запускать job параллельно
     },
 )
@@ -367,7 +367,7 @@ scheduler = AsyncIOScheduler(
 @dp.startup()
 async def on_startup(bot: Bot):
     # 1. fire_overdue_reminders — записи которые пропустили напоминание пока бот спал
-    #    (Render sleep 15 мин → misfire_grace_time=3600 сек покрывает, но если bot был down > 1ч — теряется)
+    #    (deploy/restart → misfire_grace_time=3600 сек покрывает, но если bot был down > 1ч — теряется)
     overdue = await db.fetch(
         "SELECT * FROM bookings "
         "WHERE status = 'confirmed' "
@@ -390,7 +390,7 @@ async def on_startup(bot: Bot):
 ### Edge cases (из ресёрча BB-014 + critic Pass 2):
 - Рестарт во время отправки → SQLAlchemyJobStore восстанавливает job
 - Бот упал на 30 мин → `coalesce=True` сворачивает misfire в один запуск
-- **Render free tier sleep 15 мин → `misfire_grace_time=3600` (1ч) покрывает**, плюс `pool_pre_ping=True` пересоздаёт dead connection к Postgres
+- **Deploy/restart → `misfire_grace_time=3600` (1ч) покрывает**, плюс `pool_pre_ping=True` пересоздаёт dead connection к Postgres
 - **Бот был down > 1ч → missed jobs теряются**, НО `on_startup → fire_overdue_reminders` сканирует bookings без notifications_log и отправляет пропущенные (UNIQUE guard отбивает дубли)
 - 2 клиента одновременно тапают слот → UNIQUE(slot_id) на SQLite / EXCLUDE на Postgres отбивает дубль
 - Бот упал после INSERT в notifications_log, до send_message → сообщение потеряно (MVP-допущение, прод — двухфазная схема: INSERT с `sent_at=NULL`, UPDATE `sent_at=now()` после send + reaper для зависших)
@@ -416,29 +416,43 @@ async def on_startup(bot: Bot):
   - в service: UPDATE booking (slot_id, start_at, end_at) + UPDATE old slot.status='open' + UPDATE new slot.status='booked' + remove_job старые + add_job новые → INSERT notifications_log(master_transfer) → send мастеру
   - НЕ cancel+new (одна запись, master_transfer осмысленный)
  
-### Prod (когда Екатерина скажет "хочу в прод")
-- Render web service (free tier 90 дней, потом $7/мес)
-- Render Postgres free (90 дней, потом $7/мес)
-- `render.yaml`:
+### Prod (Timeweb VPS, актуальный деплой)
+- Timeweb VPS (Ubuntu 22.04, docker compose)
+- Postgres в docker compose (контейнер `db`, образ `postgres:16-alpine`)
+- `docker-compose.yml` (фактический, см. репо):
   ```yaml
   services:
-    - type: web
-      name: barber-bot
-      env: python
-      buildCommand: pip install -e .[prod]  # requirements.txt НЕ существует; pyproject.toml [project.optional-dependencies].prod
-      startCommand: python -m bot.main
-      envVars:
-        - key: DATABASE_URL
-          fromDatabase: { name: barber-db, property: connectionString }
-        - key: BOT_TOKEN
-          sync: false
-        - key: ADMIN_ID
-          sync: false
-      preDeployCommand: alembic upgrade head
-  databases:
-    - name: barber-db
-      plan: free
+    db:
+      image: postgres:16-alpine
+      restart: unless-stopped
+      environment:
+        POSTGRES_DB: ${POSTGRES_DB}
+        POSTGRES_USER: ${POSTGRES_USER}
+        POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      volumes:
+        - pgdata:/var/lib/postgresql/data
+      ports:
+        - "127.0.0.1:5432:5432"
+      healthcheck:
+        test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+        interval: 5s
+        timeout: 5s
+        retries: 10
+    bot:
+      build: .
+      restart: unless-stopped
+      depends_on:
+        db:
+          condition: service_healthy
+      env_file:
+        - .env
+      network_mode: host
+      environment:
+        DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB}
+  volumes:
+    pgdata:
   ```
+- Деплой: `ssh user@host "cd /opt/barber-bot && git pull && docker compose up -d --build"` (миграции запускаются автоматически — `alembic upgrade head` в `Dockerfile` CMD перед `python -m bot.main`)
 - Alembic миграция 002_postgres_exclude.py: `if dialect == 'postgresql': CREATE EXTENSION btree_gist; ALTER TABLE bookings ADD CONSTRAINT no_overlap EXCLUDE ...`
 
 ## Тесты
@@ -464,7 +478,7 @@ async def on_startup(bot: Bot):
 - [ ] README с инструкцией запуска
 - [ ] USER_GUIDE.md с инструкцией для Екатерины
 - [ ] Скринкаст demo для портфолио
-- [ ] (deferred) Деплой на Render free tier
+- [ ] (deferred) Деплой на Timeweb VPS (уже работает, `docker compose up -d --build` через ssh)
 
 ## Anti-паттерны (что НЕ делать — из ресёрча)
 
@@ -473,7 +487,7 @@ async def on_startup(bot: Bot):
 - ❌ Reply-клавиатура с захардкоженными слотами — inline-кнопки только со свободными слотами
 - ❌ `ADMIN_ID` в `.env` без таблицы `masters` — миграция на multi-master болезненна
 - ❌ Бизнес-логика в handlers — вынести в `services/`
-- ❌ MemoryJobStore на Render без on-startup scan — теряет jobs при cold start
+- ❌ MemoryJobStore без on-startup scan — теряет jobs при cold start (deploy/restart контейнера)
 - ❌ Materialized slots с авто-генерацией по шаблону — НЕ наш кейс (график плавающий)
 - ❌ Aiogram 2.x imports (`from aiogram.dispatcher import Dispatcher` и т.п. — см. `.cursor/rules/aiogram-anti-hallucination.mdc`)
 
@@ -536,12 +550,12 @@ class SessionTimeoutMiddleware(BaseMiddleware):
 ---
 
 ### FSM storage (переживает ли restart бота)
-**Проблема:** В spec указано storage для **scheduler** (Memory vs SQLAlchemyJobStore), но не для **FSM state**. Дефолт aiogram `MemoryStorage` → теряется при restart. Barber-bot MVP на Render free tier — bot рестартит каждые 15 мин на free tier.
+**Проблема:** В spec указано storage для **scheduler** (Memory vs SQLAlchemyJobStore), но не для **FSM state**. Дефолт aiogram `MemoryStorage` → теряется при restart. Barber-bot на Timeweb VPS — bot рестартит при каждом `docker compose up --build` (deploy).
 
 **Варианты:**
-- **A) `MemoryStorage` (дефолт)** — теряется при restart. Если пользователь был посреди FSM → после restart `/book` начнёт с нуля (из-за middleware таймаута это уже так). НО: если Render restartнул bot посреди диалога, и пользователь через 5 сек пишет "Иван" — бот не поймет что это продолжение, будет ошибка.
-- **B) `RedisStorage2`** — state переживает restart. Требует Redis. Render free tier не даёт Redis бесплатно.
-- **C) `PostgresStorage`** — state в той же Postgres что и бизнес-данные. Переживает restart. Render free Postgres даёт 90 дней бесплатно. **Recommended** — единая инфраструктура, без новых зависимостей.
+- **A) `MemoryStorage` (дефолт)** — теряется при restart. Если пользователь был посреди FSM → после restart `/book` начнёт с нуля (из-за middleware таймаута это уже так). НО: если бот рестартнул посреди диалога, и пользователь через 5 сек пишет "Иван" — бот не поймет что это продолжение, будет ошибка.
+- **B) `RedisStorage2`** — state переживает restart. Требует Redis. На Timeweb VPS можно поднять Redis в docker compose, но добавляет зависимость.
+- **C) `PostgresStorage`** — state в той же Postgres что и бизнес-данные. Переживает restart. Postgres на Timeweb VPS уже работает. **Recommended** — единая инфраструктура, без новых зависимостей.
 
 **Рекомендация:** **C** — PostgresStorage (prod) + MemoryStorage (dev). Dev = simple, prod = durable. Тестируется на in-memory SQLite (FSM state в памяти, бизнес-данные в SQLite).
 
