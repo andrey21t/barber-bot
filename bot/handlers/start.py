@@ -5,14 +5,14 @@ from aiogram.types import Message, ReplyKeyboardRemove
 
 from bot.config import get_settings
 from bot.keyboards.admin import admin_inline_menu
-from bot.keyboards.client import client_inline_menu
+from bot.keyboards.client import client_reply_keyboard
 
 router = Router(name="start")
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
-    """Branch: master (ADMIN_ID) gets inline menu, client gets booking menu.
+    """Branch: master (ADMIN_ID) gets inline menu, client gets reply keyboard.
 
     state.clear() в начале — /start как универсальный "fresh start". Без этого
     /start в mid-FSM (admin или booking) показывал бы welcome, но state
@@ -23,10 +23,13 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     Telegram продолжает показывать старые кнопки /addslots /closeslot /today
     /week /services add снизу, даже после перехода на inline menu.
 
-    Client-ветка (2026-09-06 fix): раньше показывали голый текст "Запишитесь
-    командой /book" — клиенты без опыта ботов не понимали что делать и
-    закрывали чат. Теперь показываем inline [💇 Записаться] кнопку → тап
-    стартует /book flow через callback (client_book_cb в client.py).
+    Session 5.36 (B.13): client-ветка переведена с inline single-button на
+    ReplyKeyboardMarkup (2 кнопки: 💇 Записаться / 📋 Мои записи). Reply
+    keyboard всегда видна внизу экрана — клиенту не нужно скроллить вверх к
+    первому сообщению чтобы записаться снова. Inline-клавиатуры (календарь,
+    слоты, подтверждение) остаются в сообщениях внутри booking flow — reply
+    keyboard временно убирается (ReplyKeyboardRemove в slot_cb/slot_30_cb) и
+    восстанавливается при /cancel и после confirm_cb.
 
     TODO Ур. 2.6: extract to role middleware — DB lookup master by telegram_id,
     inject is_master into workflow_data, handler reads flag not settings.ADMIN_ID.
@@ -44,6 +47,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         )
     else:
         await message.answer(
-            "Привет! Я бот для записи к парикмахеру. 👋\nНажмите кнопку, чтобы записаться:",
-            reply_markup=client_inline_menu(),
+            "Привет! Я бот для записи к парикмахеру. 👋\n"
+            "Кнопки внизу — записывайтесь или смотрите свои записи:",
+            reply_markup=client_reply_keyboard(),
         )
