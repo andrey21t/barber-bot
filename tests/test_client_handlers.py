@@ -1982,19 +1982,28 @@ async def test_transfer_simple_calendar_cb_navigation_answers(
 
 
 @pytest.mark.asyncio
-async def test_slot_cb_saves_slot_id_and_asks_for_name(
+async def test_slot_cb_pre_fill_fallback_no_first_name(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """T5a: slot_cb (client.py:154-166) — user picked a slot →
-    state.update_data(slot_id) + set_state(entering_name) + 'На чьё имя записываем?'
+    """T5a (B.13): slot_cb — from_user.first_name is None (private account
+    without a profile name) → fallback to text-input flow:
+    state.update_data(slot_id) + set_state(entering_name) + 'На чьё имя записываем?'.
+
+    B.13 added a pre-fill branch (entering_name_pre_fill) for clients with a
+    non-empty first_name in their Telegram profile. The fallback path here
+    covers the 20% case (private accounts / empty first_name) — pre-B.13
+    behavior unchanged for these users.
     """
     from bot.keyboards.client import BookSlotCallbackData
 
     slot_id = UUID("12345678-1234-5678-1234-567812345678")
     bot = AsyncMock()
     cb = MagicMock(spec=CallbackQuery)
-    cb.from_user = _make_user(111222333)
+    # B.13: first_name="" (empty string) triggers the fallback branch in
+    # slot_cb — _client_first_name strips it to "" which is falsy. Pydantic
+    # rejects first_name=None on User (required field), so use "".
+    cb.from_user = User(id=111222333, is_bot=False, first_name="")
     cb.message = _make_message(111222333, text="<unused>")
     cb.answer = AsyncMock()
     cb.bot = bot
@@ -2559,8 +2568,15 @@ async def test_confirm_cb_happy_creates_booking_and_schedules(
 
     # state.clear + success message
     state.clear.assert_awaited_once()
-    text = _answer_text(cb.message)
-    assert "Вы записаны" in text
+    # B.13: confirm_cb sends 2 messages now — (1) "✅ Вы записаны" with inline
+    # post_booking_keyboard, (2) "👇 Кнопки внизу" with reply keyboard
+    # (via _restore_reply_keyboard_async). Use await_args_list[0] for the
+    # success message — _answer_text returns the LAST call ("👇 Кнопки внизу").
+    assert cb.message.answer.await_count == 2
+    first_text = str(cb.message.answer.await_args_list[0].args[0])
+    assert "Вы записаны" in first_text
+    second_text = str(cb.message.answer.await_args_list[1].args[0])
+    assert "Кнопки внизу" in second_text, "B.13: 2nd message restores reply keyboard"
     cb.answer.assert_awaited()
 
 
@@ -2571,6 +2587,11 @@ async def test_cancel_msg_clears_state_and_answers(
 ) -> None:
     """T5b: cancel_msg (client.py:370-379) — /cancel inside FSM → state.clear()
     BEFORE answer (race) + 'Ввод отменён. /book чтобы начать заново'.
+
+    B.13: cancel_msg now sends a 2nd message ('👇 Кнопки внизу' with reply
+    keyboard) via _restore_reply_keyboard_async — the reply keyboard was
+    hidden in slot_cb/slot_30_cb via ReplyKeyboardRemove when entering the
+    booking flow. Verify both messages via await_args_list.
     """
     msg = _make_message(user_id=111222333, text="/cancel")
     state = _make_state()
@@ -2578,9 +2599,13 @@ async def test_cancel_msg_clears_state_and_answers(
     await client_handlers.cancel_msg(msg, state)
 
     state.clear.assert_awaited_once()
-    text = _answer_text(msg)
-    assert "Ввод отменён" in text
-    assert "/book" in text
+    # B.13: 2 messages — hint + reply keyboard restore.
+    assert msg.answer.await_count == 2
+    first_text = str(msg.answer.await_args_list[0].args[0])
+    assert "Ввод отменён" in first_text
+    assert "/book" in first_text
+    second_text = str(msg.answer.await_args_list[1].args[0])
+    assert "Кнопки внизу" in second_text
 
 
 @pytest.mark.asyncio
@@ -2588,6 +2613,9 @@ async def test_cancel_msg_slots_path_hint_directs_to_slots() -> None:
     """Этап 5.8b W2 (code-review iter 2): cancel_msg при is_slots_path=True в
     state → hint '/slots' (NOT '/book'). User был в /slots flow, нажал /cancel
     из entering_name/entering_service — должен получить retry-cmd для своего flow.
+
+    B.13: cancel_msg sends a 2nd '👇 Кнопки внизу' reply-keyboard restore
+    message — use await_args_list[0] for the hint.
     """
     msg = _make_message(user_id=111222333, text="/cancel")
     state = _make_state()
@@ -2596,10 +2624,13 @@ async def test_cancel_msg_slots_path_hint_directs_to_slots() -> None:
     await client_handlers.cancel_msg(msg, state)
 
     state.clear.assert_awaited_once()
-    text = _answer_text(msg)
-    assert "Ввод отменён" in text
-    assert "/slots" in text
-    assert "/book" not in text, "W2 fix: /slots user must NOT see /book hint"
+    assert msg.answer.await_count == 2
+    first_text = str(msg.answer.await_args_list[0].args[0])
+    assert "Ввод отменён" in first_text
+    assert "/slots" in first_text
+    assert "/book" not in first_text, "W2 fix: /slots user must NOT see /book hint"
+    second_text = str(msg.answer.await_args_list[1].args[0])
+    assert "Кнопки внизу" in second_text
 
 
 @pytest.mark.asyncio
@@ -3143,21 +3174,23 @@ async def test_cmd_slots_excludes_legacy_only_dates(
 
 
 @pytest.mark.asyncio
-async def test_slot_30_cb_saves_workday_id_start_minute() -> None:
-    """Этап 5.8b: slot_30_cb — valid BookSlot30CallbackData → state.update_data
-    (workday_id, start_minute) + set_state(entering_name) + ask name message.
+async def test_slot_30_cb_pre_fill_fallback_no_first_name() -> None:
+    """Этап 5.8b + B.13: slot_30_cb — from_user.first_name is None → fallback
+    to text-input flow (entering_name, NOT entering_name_pre_fill).
 
-    Pre-existing regression: 5.27 commit 9101112 (BUG1 /book fallback) added
-    test_simple_calendar_cb_book_path_fallback_closed_workday_shows_hint which
-    ate the `def` line of this test (3dcb633). Body continued as dead code
-    inside the previous test — pytest never saw it. Restored 2026-08-30 by
-    code-review iter 2 finding F1.
+    Mirrors test_slot_cb_pre_fill_fallback_no_first_name for the workday-path
+    (slot_30_cb). _make_slot_30_callback builds a User with first_name='Test'
+    by default — we override cb.from_user to None first_name for the fallback
+    branch.
     """
     workday_id = uuid4()
     cb, callback_data = _make_slot_30_callback(
         workday_id=workday_id,
         start_minute=630,  # 10:30
     )
+    # B.13: first_name="" (empty string) triggers the fallback branch.
+    # _client_first_name strips to "" (falsy) → entering_name (NOT pre_fill).
+    cb.from_user = User(id=111222333, is_bot=False, first_name="")
 
     state = _make_state()
     # service_title set by service_picker_cb/service_msg BEFORE selecting_slot
@@ -3300,7 +3333,11 @@ async def test_confirm_cb_workday_path_happy_creates_booking(
     cb.bot.send_message.assert_awaited_once()
     schedule_mock.assert_called_once()
     state.clear.assert_awaited_once()
-    assert "Вы записаны" in _answer_text(cb.message)
+    # B.13: 2 messages — (1) "✅ Вы записаны" + post_booking_keyboard,
+    # (2) "👇 Кнопки внизу" + reply keyboard (via _restore_reply_keyboard_async).
+    assert cb.message.answer.await_count == 2
+    assert "Вы записаны" in str(cb.message.answer.await_args_list[0].args[0])
+    assert "Кнопки внизу" in str(cb.message.answer.await_args_list[1].args[0])
     cb.answer.assert_awaited()
 
 
@@ -4605,9 +4642,16 @@ async def test_book_confirm_renders_post_booking_keyboard(
     await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
 
     # success message + reply_markup both present
-    text = _answer_text(cb.message)
-    assert "Вы записаны" in text
-    reply_markup = _answer_reply_markup(cb.message)
+    # B.13: confirm_cb now sends 2 messages — (1) "✅ Вы записаны" with
+    # post_booking_keyboard (inline), (2) "👇 Кнопки внизу" with reply keyboard
+    # (via _restore_reply_keyboard_async). The inline keyboard is on the 1st call.
+    assert cb.message.answer.await_count == 2
+    first_call = cb.message.answer.await_args_list[0]
+    first_text = str(first_call.args[0]) if first_call.args else str(
+        first_call.kwargs.get("text", "")
+    )
+    assert "Вы записаны" in first_text
+    reply_markup = first_call.kwargs.get("reply_markup")
     assert isinstance(reply_markup, InlineKeyboardMarkup), (
         "confirm_cb success MUST attach post_booking_keyboard so client can "
         "tap [📋 Мои записи] or [💇 Ещё запись] (Session 6 — Task 1 UX fix)."
@@ -4780,3 +4824,409 @@ async def test_client_mybookings_cb_from_user_none_early_return() -> None:
     # NEVER awaited (would crash on None user_id resolution inside _render_mybookings).
     cb.answer.assert_awaited_once()
     cb.message.answer.assert_not_awaited()
+
+
+# ============================================================
+# Session 5.36 (B.13) — Reply keyboard + pre-fill name tests
+# ============================================================
+#
+# Coverage (NEXT_SESSION_PROMPT.md B.13 — 8 new tests, of which 2 are
+# slot_cb/slot_30_cb fallback renames above; 7 net-new here):
+# 1. test_slot_cb_pre_fill_yes_path — first_name='Андрей' → pre-fill branch
+# 2. test_reply_book_msg_starts_booking_flow — [💇 Записаться] tap → /book flow
+# 3. test_reply_book_msg_master_guard — master tap → early return
+# 4. test_reply_mybookings_msg_renders_list — [📋 Мои записи] → _render_mybookings
+# 5. test_name_pre_fill_yes_cb_happy_path — [✅ Да, это я] → confirming + summary
+# 6. test_name_pre_fill_other_cb_transitions_to_text_input — [👤 Другое имя] → entering_name
+# 7. test_cancel_msg_restores_reply_keyboard — /cancel → 2nd answer with ReplyKeyboardMarkup
+#
+# Helper notes (kept inline since each test only needs 1-2 mocks):
+# - For pre-fill branch tests, override cb.from_user with a User that has a
+#   non-empty first_name (slot_cb gates on `_client_first_name(callback)` truthy).
+# - For reply_book_msg DB path tests, seed master + active WorkDay tomorrow
+#   (mirrors test_cmd_book_sets_state_and_shows_date_picker:1426-1428).
+# - For _restore_reply_keyboard_async assertions, check await_args_list —
+#   confirm_cb / cancel_msg send the restore as a SEPARATE message AFTER the
+#   primary answer, so last_call shadows it via _answer_text.
+
+
+@pytest.mark.asyncio
+async def test_slot_cb_pre_fill_yes_path(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.13: slot_cb with from_user.first_name='Андрей' (truthy) → pre-fill
+    branch (entering_name_pre_fill, NOT entering_name).
+
+    Verifies the 80% case (client books themselves, has a Telegram profile
+    name). slot_cb sends 2 messages: (1) prompt 'Записать на <b>Андрей</b>?
+    (ваше имя в Telegram)' with ReplyKeyboardRemove (hide reply keyboard),
+    (2) 'Выберите:' with name_pre_fill_keyboard (inline 2 buttons).
+    """
+    from bot.keyboards.client import BookSlotCallbackData, NamePreFillYesCallbackData
+
+    slot_id = UUID("12345678-1234-5678-1234-567812345678")
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    # B.13: non-empty first_name triggers pre-fill branch.
+    cb.from_user = User(id=111222333, is_bot=False, first_name="Андрей")
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = BookSlotCallbackData(slot_id=slot_id)
+
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"service_title": "Стрижка"})
+    await client_handlers.slot_cb(cb, callback_data, state)
+
+    state.update_data.assert_awaited_once()
+    assert state.update_data.call_args.kwargs.get("slot_id") == str(slot_id)
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.entering_name_pre_fill
+
+    # 2 messages: (1) prompt with ReplyKeyboardRemove, (2) 'Выберите:' with inline.
+    assert cb.message.answer.await_count == 2
+    first_call = cb.message.answer.await_args_list[0]
+    first_text = str(first_call.args[0]) if first_call.args else str(
+        first_call.kwargs.get("text", "")
+    )
+    assert "Записать на" in first_text
+    assert "Андрей" in first_text
+    first_rm = first_call.kwargs.get("reply_markup")
+    from aiogram.types import ReplyKeyboardRemove
+
+    assert isinstance(first_rm, ReplyKeyboardRemove), (
+        "1st message must hide reply keyboard (would obstruct inline pre-fill buttons)"
+    )
+    second_call = cb.message.answer.await_args_list[1]
+    second_text = str(second_call.args[0]) if second_call.args else str(
+        second_call.kwargs.get("text", "")
+    )
+    assert second_text == "Выберите:"
+    second_rm = second_call.kwargs.get("reply_markup")
+    from aiogram.types import InlineKeyboardMarkup
+
+    assert isinstance(second_rm, InlineKeyboardMarkup), (
+        "2nd message carries pre-fill inline keyboard"
+    )
+    flat = [btn for row in second_rm.inline_keyboard for btn in row]
+    assert len(flat) == 2, f"pre-fill keyboard has 2 buttons, got {len(flat)}"
+    # [✅ Да, это я] + [👤 Другое имя] — match the NamePreFill* callback data packs.
+    assert flat[0].callback_data is not None, "yes button must carry callback_data"
+    NamePreFillYesCallbackData.unpack(flat[0].callback_data)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reply_book_msg_starts_booking_flow(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.13: client taps [💇 Записаться] in reply keyboard → same flow as /book:
+    selecting_date FSM + is_slots_path=False + date_picker_keyboard.
+
+    Seeded: master + active WorkDay tomorrow → at least 1 bookable date.
+    Mirrors test_cmd_book_sets_state_and_shows_date_picker:1413 but enters via
+    reply keyboard handler (reply_book_msg), not /book command.
+    """
+    from bot.keyboards.client import CLIENT_REPLY_BOOK_LABEL
+
+    tomorrow = (datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=1)).date()
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        await _seed_workday(session, ctx, work_date=tomorrow)
+
+    msg = _make_message(user_id=111222333, text=CLIENT_REPLY_BOOK_LABEL)
+    state = _make_state()
+
+    await client_handlers.reply_book_msg(msg, state)
+
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.selecting_date
+    update_kwargs = state.update_data.call_args.kwargs
+    assert update_kwargs.get("is_slots_path") is False
+
+    msg.answer.assert_awaited_once()
+    text = _answer_text(msg)
+    assert "Выберите дату" in text
+    reply_markup = _answer_reply_markup(msg)
+    assert isinstance(reply_markup, InlineKeyboardMarkup), "date picker is inline keyboard"
+
+@pytest.mark.asyncio
+async def test_reply_book_msg_master_guard(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.13: master (ADMIN_ID) taps [💇 Записаться] reply keyboard button →
+    early return (no FSM, no message answer).
+
+    Defense-in-depth: cmd_start should NOT show the reply keyboard to master
+    (they get admin_inline_menu), but a stale reply keyboard from a pre-B.13
+    session could linger on master's device. The _is_master guard in
+    reply_book_msg prevents master from accidentally entering the client
+    booking flow.
+    """
+    from bot.config import get_settings
+    from bot.keyboards.client import CLIENT_REPLY_BOOK_LABEL
+
+    admin_id = get_settings().ADMIN_ID
+    async with session_factory() as session:
+        await _seed_full_stack(session)  # master + workday not strictly needed
+
+    msg = _make_message(user_id=admin_id, text=CLIENT_REPLY_BOOK_LABEL)
+    state = _make_state()
+
+    await client_handlers.reply_book_msg(msg, state)
+
+    state.set_state.assert_not_awaited()
+    state.update_data.assert_not_awaited()
+    msg.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reply_mybookings_msg_master_guard(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B.13: master (ADMIN_ID) taps [📋 Мои записи] reply keyboard button →
+    early return (no _render_mybookings call). Mirrors reply_book_msg master
+    guard — defense-in-depth against stale reply keyboards on master's device.
+
+    Code-review S2: paired with test_reply_book_msg_master_guard so a future
+    refactor that drops the _is_master guard from reply_mybookings_msg (but
+    keeps it in reply_book_msg) would be caught by this test, not pass silently.
+    """
+    from bot.config import get_settings
+    from bot.keyboards.client import CLIENT_REPLY_MYBOOKINGS_LABEL
+
+    admin_id = get_settings().ADMIN_ID
+    async with session_factory() as session:
+        await _seed_full_stack(session)
+
+    rendered_calls: list[Any] = []
+
+    async def _spy_render(message: Any, user_id: int) -> None:
+        rendered_calls.append((message, user_id))
+
+    monkeypatch.setattr(client_handlers, "_render_mybookings", _spy_render)
+
+    msg = _make_message(user_id=admin_id, text=CLIENT_REPLY_MYBOOKINGS_LABEL)
+
+    await client_handlers.reply_mybookings_msg(msg)
+
+    assert rendered_calls == [], "master must NOT trigger _render_mybookings"
+    msg.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reply_mybookings_msg_renders_list(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B.13: client taps [📋 Мои записи] in reply keyboard → delegates to
+    _render_mybookings (same as /mybookings command).
+
+    Monkeypatches _render_mybookings to a spy to assert the handler routes
+    correctly without coupling to the list-rendering internals (which are
+    covered by test_mybookings_msg_*).
+    """
+    from bot.keyboards.client import CLIENT_REPLY_MYBOOKINGS_LABEL
+
+    rendered_calls: list[tuple[Any, int]] = []
+
+    async def _spy_render(message: Any, user_id: int) -> None:
+        rendered_calls.append((message, user_id))
+
+    monkeypatch.setattr(client_handlers, "_render_mybookings", _spy_render)
+
+    client_tg = 111222333
+    msg = _make_message(user_id=client_tg, text=CLIENT_REPLY_MYBOOKINGS_LABEL)
+
+    await client_handlers.reply_mybookings_msg(msg)
+
+    assert len(rendered_calls) == 1, "reply_mybookings_msg must delegate to _render_mybookings"
+    assert rendered_calls[0][1] == client_tg, "user_id passed to _render_mybookings"
+    assert rendered_calls[0][0] is msg, "message passed to _render_mybookings"
+
+
+@pytest.mark.asyncio
+async def test_name_pre_fill_yes_cb_happy_path(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.13: client taps [✅ Да, это я] → confirm their Telegram first_name as
+    booking name → state.client_name set + entering confirming + summary shown
+    with confirm_keyboard.
+
+    Legacy slot path (slot_id set in state, no workday). Reads slot from DB
+    to render summary via _format_booking_summary (mirrors name_msg). The
+    workday path is symmetric (not tested here — covered by
+    test_confirm_cb_workday_path_happy_creates_booking:3250 for the next step).
+    """
+    from bot.keyboards.client import NamePreFillYesCallbackData
+
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = Slot(
+            master_id=ctx["master_id"],
+            slot_date=target_date,
+            slot_hour=14,
+            status="open",
+        )
+        session.add(slot)
+        await session.commit()
+        slot_id = slot.id
+
+    cb = MagicMock(spec=CallbackQuery)
+    # B.13: pre-fill reads from_user.first_name at confirmation tap time.
+    cb.from_user = User(id=111222333, is_bot=False, first_name="Паша")
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = AsyncMock()
+    callback_data = NamePreFillYesCallbackData()
+
+    state = _make_state()
+    await state.update_data(
+        slot_id=str(slot_id),
+        service_title="Стрижка",
+    )
+
+    await client_handlers.name_pre_fill_yes_cb(cb, callback_data, state)
+
+    # client_name saved from from_user.first_name.
+    update_kwargs = state.update_data.call_args.kwargs
+    assert update_kwargs.get("client_name") == "Паша"
+    state.set_state.assert_awaited()
+    assert state.set_state.call_args.args[0] == BookingStates.confirming
+
+    # Summary message + confirm_keyboard (✅ Подтвердить / ❌ Отмена).
+    text = _answer_text(cb.message)
+    assert "Паша" in text
+    assert "Стрижка" in text
+    reply_markup = _answer_reply_markup(cb.message)
+    assert isinstance(reply_markup, InlineKeyboardMarkup), "summary carries confirm_keyboard"
+    flat = [btn for row in reply_markup.inline_keyboard for btn in row]
+    button_texts = [btn.text for btn in flat]
+    assert any("Подтвердить" in t for t in button_texts)
+    assert any("Отмена" in t for t in button_texts)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_name_pre_fill_other_cb_transitions_to_text_input(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.13: client taps [👤 Другое имя] → state.set_state(entering_name) +
+    'На чьё имя записываем?' prompt (no DB lookup, no state data update).
+
+    The text-input handler (name_msg) takes over from entering_name — same
+    as the pre-B.13 flow. This covers the 20% case (booking child/husband/etc).
+    """
+    from bot.keyboards.client import NamePreFillOtherCallbackData
+
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = User(id=111222333, is_bot=False, first_name="Андрей")
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = AsyncMock()
+    callback_data = NamePreFillOtherCallbackData()
+
+    state = _make_state()
+    await state.set_state(BookingStates.entering_name_pre_fill)
+
+    await client_handlers.name_pre_fill_other_cb(cb, callback_data, state)
+
+    state.set_state.assert_awaited()
+    assert state.set_state.call_args.args[0] == BookingStates.entering_name
+    # No state data update — name_msg will collect client_name from text input.
+    state.update_data.assert_not_awaited()
+    text = _answer_text(cb.message)
+    assert "На чьё имя записываем?" in text
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_name_pre_fill_yes_cb_race_first_name_becomes_empty(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.13 code-review S1: name_pre_fill_yes_cb defensive race fallback —
+    from_user.first_name became empty/None between slot_cb (which gated on
+    truthy first_name) and the [✅ Да, это я] tap. Handler falls back to
+    entering_name (text input) instead of crashing or losing state.
+
+    Race scenario: client opened slot_cb with first_name='Андрей' (truthy),
+    then revoked their Telegram profile name before tapping [✅ Да, это я].
+    Pydantic rejects first_name=None, so we test with first_name='' — same
+    effect via _client_first_name (strip → '' which is falsy).
+    """
+    from bot.keyboards.client import NamePreFillYesCallbackData
+
+    cb = MagicMock(spec=CallbackQuery)
+    # Race: first_name became empty between slot_cb and this tap.
+    cb.from_user = User(id=111222333, is_bot=False, first_name="")
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = AsyncMock()
+    callback_data = NamePreFillYesCallbackData()
+
+    state = _make_state()
+    await state.set_state(BookingStates.entering_name_pre_fill)
+    await state.update_data(service_title="Стрижка")
+
+    await client_handlers.name_pre_fill_yes_cb(cb, callback_data, state)
+
+    # Defensive fallback: transition to entering_name (text input).
+    state.set_state.assert_awaited()
+    assert state.set_state.call_args.args[0] == BookingStates.entering_name
+    # client_name NOT saved (would have written "" — text input will collect it).
+    state_update_kwargs = state.update_data.call_args.kwargs
+    assert "client_name" not in state_update_kwargs
+    text = _answer_text(cb.message)
+    assert "На чьё имя записываем?" in text
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_msg_restores_reply_keyboard(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.13: /cancel inside FSM → state.clear() + hint + reply keyboard restore
+    (via _restore_reply_keyboard_async).
+
+    Verifies the 2-message contract for non-master users: (1) 'Ввод отменён'
+    hint, (2) '👇 Кнопки внизу' with ReplyKeyboardMarkup. Master (ADMIN_ID)
+    would skip the restore (admin_inline_menu is their UI, not reply keyboard).
+    """
+    from aiogram.types import ReplyKeyboardMarkup
+
+    msg = _make_message(user_id=111222333, text="/cancel")
+    state = _make_state()
+
+    await client_handlers.cancel_msg(msg, state)
+
+    state.clear.assert_awaited_once()
+    assert msg.answer.await_count == 2
+    # 1st message: hint
+    first_call = msg.answer.await_args_list[0]
+    first_text = str(first_call.args[0]) if first_call.args else str(
+        first_call.kwargs.get("text", "")
+    )
+    assert "Ввод отменён" in first_text
+    # 2nd message: reply keyboard restore
+    second_call = msg.answer.await_args_list[1]
+    second_text = str(second_call.args[0]) if second_call.args else str(
+        second_call.kwargs.get("text", "")
+    )
+    assert "Кнопки внизу" in second_text
+    second_rm = second_call.kwargs.get("reply_markup")
+    assert isinstance(second_rm, ReplyKeyboardMarkup), (
+        "2nd message must carry the client reply keyboard (B.13 restore contract)"
+    )
+    flat = [btn for row in second_rm.keyboard for btn in row]
+    assert len(flat) == 2, "restored reply keyboard has the 2 client buttons"
