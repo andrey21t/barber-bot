@@ -210,7 +210,15 @@ def _make_text_update(text: str, user_id: int = ADMIN_TG_ID, chat_id: int = ADMI
             message_id=1,
             date=datetime.now(UTC),
             chat=Chat(id=chat_id, type="private"),
-            from_user=User(id=user_id, is_bot=False, first_name="T"),
+            # B.13: first_name="" (empty string) keeps integration tests on the
+            # FALLBACK text-input path — _client_first_name strips to "" (falsy)
+            # → slot_30_cb takes the entering_name branch (text input), not the
+            # pre-fill branch ([✅ Да, это я] inline keyboard). Pydantic rejects
+            # first_name=None (User.first_name is required str). The pre-fill UX
+            # is covered by unit tests in test_client_handlers.py — integration
+            # tests focus on the booking flow + service_id wiring, not on the
+            # name-input UX variant.
+            from_user=User(id=user_id, is_bot=False, first_name=""),
             text=text,
         ),
     )
@@ -222,6 +230,24 @@ def _extract_send_text(bot: Any) -> str:
     """
     text: str = bot.last_text
     return text
+
+
+def _extract_all_send_texts(bot: Any) -> list[str]:
+    """Return text of ALL SendMessage calls in order (B.13 helper).
+
+    confirm_cb now sends 2 SendMessage calls — (1) '✅ Вы записаны' with
+    post_booking_keyboard (inline), (2) '👇 Кнопки внизу' with reply keyboard
+    (via _restore_reply_keyboard_async). `last_text` returns the LAST one
+    ('👇 Кнопки внизу'), but tests need to assert on the FIRST ('Вы записаны').
+    This helper returns both so tests can pick by index or by substring match.
+    """
+    from aiogram.methods import EditMessageText, SendMessage
+
+    return [
+        getattr(c, "text", "") or ""
+        for c in bot.calls
+        if isinstance(c, SendMessage | EditMessageText)
+    ]
 
 
 def _extract_reply_markup(bot: Any) -> Any:
@@ -245,7 +271,8 @@ def _make_callback_update_from_button(
             id="1",
             chat_instance=str(chat_id),
             data=button.callback_data,
-            from_user=User(id=user_id, is_bot=False, first_name="T"),
+            # B.13: first_name="" mirrors _make_text_update (fallback path).
+            from_user=User(id=user_id, is_bot=False, first_name=""),
             message=Message(
                 message_id=message_id,
                 date=datetime.now(UTC),
@@ -658,8 +685,14 @@ async def test_booking_flow_with_service_picker_creates_booking(
         assert confirm_btn is not None, "✅ Подтвердить button on summary"
         bot.reset()
         await dp.feed_update(bot, _make_callback_update_from_button(confirm_btn, user_id=client_tg))
-        step6 = _extract_send_text(bot)
-        assert "Вы записаны" in step6, f"Expected success, got: {step6!r}"
+        # B.13: confirm_cb sends 2 messages — (1) '✅ Вы записаны' with inline
+        # post_booking_keyboard, (2) '👇 Кнопки внизу' with reply keyboard
+        # (via _restore_reply_keyboard_async). last_text returns the LAST one
+        # ('👇 Кнопки внизу'), so check the success text in all sent messages.
+        step6_texts = _extract_all_send_texts(bot)
+        assert any("Вы записаны" in t for t in step6_texts), (
+            f"Expected success message, got: {step6_texts!r}"
+        )
 
         # Verify Booking persisted with correct service_id + duration.
         from bot.models import Booking
@@ -763,7 +796,12 @@ async def test_booking_flow_custom_service_text_uses_default_duration(
         assert confirm_btn is not None
         bot.reset()
         await dp.feed_update(bot, _make_callback_update_from_button(confirm_btn, user_id=client_tg))
-        assert "Вы записаны" in _extract_send_text(bot)
+        # B.13: confirm_cb sends 2 messages — '✅ Вы записаны' (inline) +
+        # '👇 Кнопки внизу' (reply keyboard restore). Check success in all sent.
+        step7_texts = _extract_all_send_texts(bot)
+        assert any("Вы записаны" in t for t in step7_texts), (
+            f"Expected success message, got: {step7_texts!r}"
+        )
 
         # Verify booking: service_id is None, end_at = start + default duration.
         from bot.config import get_settings

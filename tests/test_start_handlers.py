@@ -102,12 +102,17 @@ async def test_cmd_start_admin_shows_welcome_and_inline_menu() -> None:
 
 @pytest.mark.asyncio
 async def test_cmd_start_client_shows_booking_hint() -> None:
-    """/start from non-admin → 'Привет! Я бот для записи...' + inline menu button.
+    """/start from non-admin → welcome text + reply keyboard (Session 5.36 / B.13).
 
-    2026-09-06 fix: client /start now shows inline [💇 Записаться] button
-    instead of bare text "Запишитесь командой /book". Clients without bot
-    experience were closing the chat because they didn't know what to do.
+    B.13: client /start moved from inline single-button menu to a 2-button
+    ReplyKeyboardMarkup (💇 Записаться / 📋 Мои записи) — always-on buttons at
+    the bottom of the chat. Inline-keyboard booking flow (calendar, slots,
+    confirm) is unchanged — reply keyboard is hidden during booking
+    (ReplyKeyboardRemove in slot_cb/slot_30_cb) and restored after /cancel
+    or confirm_cb.
     """
+    from aiogram.types import ReplyKeyboardMarkup
+
     msg = _make_message(user_id=NON_ADMIN_TG_ID)
     state = _make_state()
     await start_handlers.cmd_start(msg, state)
@@ -117,14 +122,45 @@ async def test_cmd_start_client_shows_booking_hint() -> None:
     text = _answer_text(msg)
     assert "Привет" in text
     assert "бот для записи к парикмахеру" in text
-    # 2026-09-06: client gets inline menu with [Записаться] button (NOT bare text)
-    assert "/book" not in text, "client /start must NOT show /book text hint — use inline menu"
+    # B.13: hint text changed — "Кнопки внизу — записывайтесь или смотрите свои записи:"
+    assert "Кнопки внизу" in text, "B.13: client /start must reference the reply keyboard"
+    assert "/book" not in text, "client /start must NOT show /book text hint — use reply keyboard"
     reply_markup = msg.answer.call_args.kwargs.get("reply_markup")
-    assert reply_markup is not None, "client /start must include inline menu"
-    from aiogram.types import InlineKeyboardMarkup
-
-    assert isinstance(reply_markup, InlineKeyboardMarkup), "must be inline keyboard"
-    # Inline menu has at least one button — [💇 Записаться]
-    flat_buttons = [btn for row in reply_markup.inline_keyboard for btn in row]
+    assert reply_markup is not None, "client /start must include reply keyboard"
+    assert isinstance(reply_markup, ReplyKeyboardMarkup), (
+        "B.13: must be reply keyboard (not inline)"
+    )
+    # Reply keyboard has 2 buttons: 💇 Записаться / 📋 Мои записи
+    flat_buttons = [btn for row in reply_markup.keyboard for btn in row]
     assert len(flat_buttons) >= 1
     assert any("Записаться" in btn.text for btn in flat_buttons)
+
+
+@pytest.mark.asyncio
+async def test_cmd_start_client_shows_reply_keyboard_with_2_buttons() -> None:
+    """B.13: client /start reply keyboard has EXACTLY 2 buttons matching
+    CLIENT_REPLY_BOOK_LABEL / CLIENT_REPLY_MYBOOKINGS_LABEL constants.
+
+    Defense-in-depth: handlers (reply_book_msg / reply_mybookings_msg) match
+    on F.text == these constants, so the keyboard must produce the exact same
+    strings — otherwise the buttons would be silent (no handler match).
+    """
+    from aiogram.types import ReplyKeyboardMarkup
+    from bot.keyboards.client import (
+        CLIENT_REPLY_BOOK_LABEL,
+        CLIENT_REPLY_MYBOOKINGS_LABEL,
+    )
+
+    msg = _make_message(user_id=NON_ADMIN_TG_ID)
+    state = _make_state()
+    await start_handlers.cmd_start(msg, state)
+
+    reply_markup = msg.answer.call_args.kwargs.get("reply_markup")
+    assert isinstance(reply_markup, ReplyKeyboardMarkup), "must be reply keyboard"
+    # Flatten the 2D keyboard grid and assert exactly 2 buttons.
+    flat_buttons = [btn for row in reply_markup.keyboard for btn in row]
+    assert len(flat_buttons) == 2, f"expected 2 reply buttons, got {len(flat_buttons)}"
+    button_texts = {btn.text for btn in flat_buttons}
+    assert button_texts == {CLIENT_REPLY_BOOK_LABEL, CLIENT_REPLY_MYBOOKINGS_LABEL}, (
+        f"reply buttons must match handler F.text constants, got {button_texts}"
+    )
