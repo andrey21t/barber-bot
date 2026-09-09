@@ -4134,3 +4134,175 @@ async def test_admin_closeday_cancel_cb_clears_state(
     state.clear.assert_called_once()
     text = callback_answer_text(callback)
     assert "отменено" in text.lower()
+
+
+# ============================================================
+# Session 5.46 (B.10) — phone in /today + /week render
+# _render_bookings: client_phones dict → "📞 +7..." or "без телефона" suffix
+# cmd_today: end-to-end booking with Client.phone set → render shows phone
+# ============================================================
+
+
+def test_render_bookings_with_phone_suffix() -> None:
+    """B.10: _render_bookings(client_phones={client_id: "+79991234567"}) →
+    booking line ends with ", 📞 +79991234567". Phone is rendered RAW (no escape)
+    — normalize_phone + PHONE_PATTERN restrict input to ^\\+?[0-9]{10,15}$.
+    """
+    from typing import cast
+
+    client_id = UUID("11111111-1111-1111-1111-111111111111")
+    bookings = cast(
+        list[Booking],
+        [
+            MagicMock(
+                start_at=datetime(2026, 3, 17, 11, 0, tzinfo=UTC),
+                client_name_snapshot="Паша",
+                service_title_snapshot="Стрижка",
+                client_id=client_id,
+            ),
+        ],
+    )
+
+    result = admin_handlers._render_bookings(
+        "📅 Записи:", bookings, TZ, client_phones={client_id: "+79991234567"}
+    )
+
+    bullet_line = [line for line in result.split("\n") if line.startswith("•")][0]
+    assert "📞 +79991234567" in bullet_line, "phone suffix shown when phone is set"
+
+
+def test_render_bookings_without_phone_shows_bez_telefona() -> None:
+    """B.10: _render_bookings(client_phones={client_id: None}) → booking line
+    ends with ", без телефона" (NOT ", 📞 None"). The 'bez telefona' suffix
+    is rendered when client_phones dict has the client_id key but value is None.
+    """
+    from typing import cast
+
+    client_id = UUID("22222222-2222-2222-2222-222222222222")
+    bookings = cast(
+        list[Booking],
+        [
+            MagicMock(
+                start_at=datetime(2026, 3, 17, 11, 0, tzinfo=UTC),
+                client_name_snapshot="Иван",
+                service_title_snapshot="Стрижка",
+                client_id=client_id,
+            ),
+        ],
+    )
+
+    result = admin_handlers._render_bookings(
+        "📅 Записи:", bookings, TZ, client_phones={client_id: None}
+    )
+
+    bullet_line = [line for line in result.split("\n") if line.startswith("•")][0]
+    assert "без телефона" in bullet_line, "None phone → 'без телефона' suffix"
+    assert "📞 None" not in bullet_line, "no literal 'None' in render"
+    assert "📞" not in bullet_line, "no phone icon when phone is None"
+
+
+def test_render_bookings_client_phones_none_omits_suffix() -> None:
+    """B.10 backwards compat: _render_bookings(client_phones=None) → no phone
+    suffix in the render. Legacy callers (/closeday, etc.) that haven't been
+    updated to pass client_phones still get the old format — phone column
+    omitted entirely, NOT "без телефона".
+    """
+    from typing import cast
+
+    bookings = cast(
+        list[Booking],
+        [
+            MagicMock(
+                start_at=datetime(2026, 3, 17, 11, 0, tzinfo=UTC),
+                client_name_snapshot="Олег",
+                service_title_snapshot="Укладка",
+                client_id=UUID("33333333-3333-3333-3333-333333333333"),
+            ),
+        ],
+    )
+
+    result = admin_handlers._render_bookings("📅 Записи:", bookings, TZ, client_phones=None)
+
+    bullet_line = [line for line in result.split("\n") if line.startswith("•")][0]
+    assert "📞" not in bullet_line, "no phone icon when client_phones=None (legacy callers)"
+    assert "без телефона" not in bullet_line, "no 'без телефона' when caller didn't pass dict"
+
+
+@pytest.mark.asyncio
+async def test_cmd_today_with_client_phone(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.10 end-to-end: /today shows "📞 +7999..." when Client.phone is set.
+    Seed a booking with a Client that has phone='+79991234567', invoke
+    cmd_today → render shows the phone suffix in the bullet line.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        # Set phone on the client (mirror what create_booking would do via
+        # payload.phone — direct UPDATE here, no create_booking needed since
+        # we test the render, not the booking flow).
+        client = ctx["client"]
+        client.phone = "+79991234567"
+        await session.commit()
+
+        # Today's booking at 14:00 Moscow.
+        now_local = datetime.now(ZoneInfo(TZ))
+        today_local_at_14 = now_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        slot = await _seed_slot(
+            session,
+            master_id=ctx["master_id"],
+            slot_date=today_local_at_14.date(),
+            hour=14,
+            status="open",
+        )
+        await _seed_booking(
+            session,
+            ctx=ctx,
+            slot=slot,
+            start_at_utc_naive=_local_to_utc_naive(today_local_at_14),
+            status="confirmed",
+        )
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/today")
+    await admin_handlers.cmd_today(msg)
+
+    text = _answer_text(msg)
+    assert "📞 +79991234567" in text, "phone shown in /today when Client.phone set"
+
+
+@pytest.mark.asyncio
+async def test_cmd_today_without_phone_shows_bez_telefona(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.10 end-to-end: /today shows "без телефона" when Client.phone is None.
+    Mirror of test_cmd_today_with_client_phone, but Client.phone stays None
+    (the conftest default — no fixture value). Render shows "без телефона" suffix.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        # Client.phone stays None (default — no UPDATE)
+        now_local = datetime.now(ZoneInfo(TZ))
+        today_local_at_15 = now_local.replace(hour=15, minute=0, second=0, microsecond=0)
+        slot = await _seed_slot(
+            session,
+            master_id=ctx["master_id"],
+            slot_date=today_local_at_15.date(),
+            hour=15,
+            status="open",
+        )
+        await _seed_booking(
+            session,
+            ctx=ctx,
+            slot=slot,
+            start_at_utc_naive=_local_to_utc_naive(today_local_at_15),
+            status="confirmed",
+        )
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/today")
+    await admin_handlers.cmd_today(msg)
+
+    text = _answer_text(msg)
+    assert "без телефона" in text, "phone=None → 'без телефона' in /today render"
+    assert "📞 None" not in text, "no literal 'None' in render"

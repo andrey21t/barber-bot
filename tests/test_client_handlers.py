@@ -39,7 +39,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, User
+from aiogram.types import CallbackQuery, ContentType, InlineKeyboardMarkup, Message, User
 from aiogram_calendar import SimpleCalendarCallback
 from aiogram_calendar.schemas import SimpleCalAct
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -2071,14 +2071,11 @@ async def test_name_msg_happy_renders_summary_slot_path(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """Session 5.29 Task 2 — FSM reorder: name_msg (slot path) — happy: name ok,
-    slot_id + service_title in state → state.update_data(client_name) +
-    set_state(confirming) + summary via _format_booking_summary + confirm_keyboard.
-
-    Pre-5.29 name_msg asked for service (entering_service); now it renders the
-    booking summary (logic moved here from service_msg/service_picker_cb which
-    used to set confirming after service selection — service selection moved
-    BEFORE slot selection in the new flow: date → service → slot → name).
+    """Session 5.46 (B.10) — name_msg (slot path) — happy: name ok, slot_id +
+    service_title in state → state.update_data(client_name) + set_state(
+    entering_phone) + phone_keyboard prompt. Summary rendering is deferred
+    to phone_msg / share_contact_msg / phone_skip_msg (all converge on
+    confirming + summary + confirm_keyboard via _render_summary_and_set_confirming).
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
@@ -2105,14 +2102,15 @@ async def test_name_msg_happy_renders_summary_slot_path(
     state.update_data.assert_awaited()
     assert state.update_data.call_args.kwargs.get("client_name") == "Паша"
     state.set_state.assert_awaited_once()
-    assert state.set_state.call_args.args[0] == BookingStates.confirming
+    assert state.set_state.call_args.args[0] == BookingStates.entering_phone
 
     text = _answer_text(msg)
-    assert "Подтвердите запись" in text
-    assert "Паша" in text
-    assert "Стрижка" in text
+    assert "Телефон" in text or "📱" in text
+    # phone_keyboard is a ReplyKeyboardMarkup (NOT InlineKeyboardMarkup which
+    # confirm_keyboard uses). Distinct from pre-B.10 confirm flow.
+    from aiogram.types import ReplyKeyboardMarkup
     reply_markup = _answer_reply_markup(msg)
-    assert reply_markup is not None, "name_msg must render confirm_keyboard"
+    assert isinstance(reply_markup, ReplyKeyboardMarkup)
 
 
 @pytest.mark.asyncio
@@ -3708,12 +3706,10 @@ async def test_name_msg_happy_renders_summary_workday_path(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """Session 5.29 Task 2 — FSM reorder: name_msg (workday path) — happy:
-    workday_id + start_minute + service_title in state → set_state(confirming) +
-    summary via _format_booking_summary_from_start_at + confirm_keyboard.
-
-    Verifies summary contains LOCAL-formatted time (10:00 from start_minute=600)
-    + client_name + service_title (no Slot entity involved).
+    """Session 5.46 (B.10) — name_msg (workday path) — happy: workday_id +
+    start_minute + service_title in state → set_state(entering_phone) +
+    phone_keyboard prompt. Summary rendering is deferred to phone_msg /
+    share_contact_msg / phone_skip_msg (deferred to confirming transition).
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
@@ -3738,32 +3734,33 @@ async def test_name_msg_happy_renders_summary_workday_path(
     await client_handlers.name_msg(msg, state)
 
     state.set_state.assert_awaited_once()
-    assert state.set_state.call_args.args[0] == BookingStates.confirming
+    assert state.set_state.call_args.args[0] == BookingStates.entering_phone
     text = _answer_text(msg)
-    assert "Подтвердите запись" in text
-    assert "10:00" in text
-    assert "Паша" in text
-    assert "Стрижка" in text
-    assert isinstance(_answer_reply_markup(msg), InlineKeyboardMarkup)
+    assert "Телефон" in text or "📱" in text
+    from aiogram.types import ReplyKeyboardMarkup
+    assert isinstance(_answer_reply_markup(msg), ReplyKeyboardMarkup)
 
 
 @pytest.mark.asyncio
-async def test_name_msg_no_slot_no_workday_clears_state(
+async def test_render_summary_no_slot_no_workday_clears_state(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """Session 5.29 Task 2 — FSM reorder: name_msg defensive — neither slot_id
-    nor workday_id in FSM (state corruption: bot restart mid-flow with
-    MemoryStorage, or user jumped into entering_name via stale keyboard after
-    flow changed underneath) → state.clear + 'Данные потеряны' + abort.
+    """Session 5.46 (B.10) — _render_summary_and_set_confirming defensive —
+    neither slot_id nor workday_id in FSM (state corruption between
+    entering_name and entering_phone — e.g. Redis flush mid-flow) →
+    state.clear + 'Данные потеряны' + abort. Replaces the pre-B.10
+    test_name_msg_no_slot_no_workday_clears_state (defensive moved from
+    name_msg to _render_summary_and_set_confirming in B.10).
     """
-    msg = _make_message(user_id=111222333, text="Паша")
+    msg = _make_message(user_id=111222333, text="unused")
     state = _make_state()
     # Only service_title in state — no workday_id, no slot_id (corrupted).
-    await state.update_data(service_title="Стрижка")
+    await state.update_data(service_title="Стрижка", client_name="Паша")
 
-    await client_handlers.name_msg(msg, state)
+    ok = await client_handlers._render_summary_and_set_confirming(msg, state, "Паша")
 
+    assert ok is False
     state.clear.assert_awaited_once()
     text = _answer_text(msg)
     assert "Данные потеряны" in text or "Начните заново" in text
@@ -5056,14 +5053,16 @@ async def test_name_pre_fill_yes_cb_happy_path(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """B.13: client taps [✅ Да, это я] → confirm their Telegram first_name as
-    booking name → state.client_name set + entering confirming + summary shown
-    with confirm_keyboard.
+    """B.13 + B.10: client taps [✅ Да, это я] → confirm their Telegram
+    first_name as booking name → state.client_name set + entering
+    entering_phone (B.10 changed: was confirming pre-B.10) + phone_keyboard
+    prompt shown. Summary rendering is deferred to phone_msg /
+    share_contact_msg / phone_skip_msg (B.10 inserted phone step between
+    name and confirm).
 
-    Legacy slot path (slot_id set in state, no workday). Reads slot from DB
-    to render summary via _format_booking_summary (mirrors name_msg). The
-    workday path is symmetric (not tested here — covered by
-    test_confirm_cb_workday_path_happy_creates_booking:3250 for the next step).
+    Legacy slot path (slot_id set in state, no workday). DB lookup removed
+    from name_pre_fill_yes_cb in B.10 — only service_title defensive check
+    remains (slot/workday resolved later in _render_summary_and_set_confirming).
     """
     from bot.keyboards.client import NamePreFillYesCallbackData
 
@@ -5100,18 +5099,19 @@ async def test_name_pre_fill_yes_cb_happy_path(
     update_kwargs = state.update_data.call_args.kwargs
     assert update_kwargs.get("client_name") == "Паша"
     state.set_state.assert_awaited()
-    assert state.set_state.call_args.args[0] == BookingStates.confirming
+    # B.10: now enters entering_phone (was confirming pre-B.10).
+    assert state.set_state.call_args.args[0] == BookingStates.entering_phone
 
-    # Summary message + confirm_keyboard (✅ Подтвердить / ❌ Отмена).
+    # Phone keyboard prompt (NOT summary + confirm_keyboard).
     text = _answer_text(cb.message)
-    assert "Паша" in text
-    assert "Стрижка" in text
+    assert "Телефон" in text or "📱" in text
+    from aiogram.types import ReplyKeyboardMarkup
     reply_markup = _answer_reply_markup(cb.message)
-    assert isinstance(reply_markup, InlineKeyboardMarkup), "summary carries confirm_keyboard"
-    flat = [btn for row in reply_markup.inline_keyboard for btn in row]
+    assert isinstance(reply_markup, ReplyKeyboardMarkup), "phone step uses reply keyboard"
+    flat = [btn for row in reply_markup.keyboard for btn in row]
     button_texts = [btn.text for btn in flat]
-    assert any("Подтвердить" in t for t in button_texts)
-    assert any("Отмена" in t for t in button_texts)
+    assert any("Поделиться" in t for t in button_texts)
+    assert any("Без телефона" in t for t in button_texts)
     cb.answer.assert_awaited()
 
 
@@ -5230,3 +5230,629 @@ async def test_cancel_msg_restores_reply_keyboard(
     )
     flat = [btn for row in second_rm.keyboard for btn in row]
     assert len(flat) == 2, "restored reply keyboard has the 2 client buttons"
+
+
+# ============================================================
+# Session 5.46 (B.10) — phone collection step handlers
+# phone_msg, phone_skip_msg, share_contact_msg, _render_summary_and_set_confirming
+# confirm_cb phone passing — coverage for the new FSM state entering_phone.
+# ============================================================
+
+
+def _make_phone_message(
+    user_id: int = 111222333,
+    *,
+    text: str = "+79991234567",
+) -> MagicMock:
+    """Mock aiogram.Message with text + content_type=text for phone_msg.
+
+    phone_msg reads: message.text (stripped) → normalize_phone. Uses the same
+    spec=Message pattern as _make_message (line 92) — minimal mock, only the
+    fields phone_msg actually touches are populated.
+    """
+    msg = MagicMock(spec=Message)
+    msg.from_user = _make_user(user_id)
+    msg.text = text
+    msg.answer = AsyncMock()
+    msg.content_type = "text"
+    return msg
+
+
+def _make_contact_message(
+    phone_number: str,
+    *,
+    user_id: int = 111222333,
+) -> MagicMock:
+    """Mock aiogram.Message with message.contact populated (TG share button).
+
+    share_contact_msg is dispatched via F.content_type == ContentType.CONTACT —
+    Telegram sends a Message with .contact (Contact instance) holding the
+    user's phone from their TG profile. message.contact.phone_number is the
+    raw phone string (may lack '+' prefix depending on carrier).
+    """
+    from aiogram.types import Contact
+
+    msg = MagicMock(spec=Message)
+    msg.from_user = _make_user(user_id)
+    msg.answer = AsyncMock()
+    msg.content_type = ContentType.CONTACT
+    msg.contact = Contact(
+        phone_number=phone_number,
+        first_name="Test",
+        user_id=user_id,
+    )
+    return msg
+
+
+def _make_confirm_callback(
+    *,
+    user_id: int = 111222333,
+) -> tuple[MagicMock, Any]:
+    """Mock CallbackQuery for confirm_cb (BookConfirmCallbackData filter)."""
+    from bot.keyboards.client import BookConfirmCallbackData
+
+    bot = AsyncMock()
+    bot.send_message = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(user_id)
+    cb.message = _make_message(user_id, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = BookConfirmCallbackData()
+    return cb, callback_data
+
+
+@pytest.mark.asyncio
+async def test_phone_msg_happy_normalizes_and_transitions_to_confirming(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.10 phone_msg happy (workday path): text "+79991234567" → state.client_phone
+    set to normalized value + ReplyKeyboardRemove ("Ок, телефон:") + summary +
+    confirm_keyboard (Inline) + set_state(confirming).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        wd = await _seed_workday(
+            session,
+            ctx,
+            work_date=target_date,
+            start_time=time(10, 0),
+            end_time=time(12, 0),
+        )
+        workday_id = wd.id
+
+    msg = _make_phone_message(text="+79991234567")
+    state = _make_state()
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=600,  # 10:00 LOCAL
+        service_title="Стрижка",
+        client_name="Паша",
+    )
+
+    await client_handlers.phone_msg(msg, state)
+
+    saved = state.update_data.call_args.kwargs
+    # B.10: client_phone is the normalized canonical form.
+    assert saved.get("client_phone") == "+79991234567"
+    state.set_state.assert_awaited()
+    assert state.set_state.call_args.args[0] == BookingStates.confirming
+
+    # 1st message: ReplyKeyboardRemove + "Ок, телефон:"
+    # 2nd message: summary + InlineKeyboardMarkup (confirm_keyboard)
+    assert msg.answer.await_count == 2
+    first_text = str(msg.answer.await_args_list[0].args[0])
+    assert "Ок, телефон" in first_text and "+79991234567" in first_text
+    first_rm = msg.answer.await_args_list[0].kwargs.get("reply_markup")
+    from aiogram.types import ReplyKeyboardRemove
+    assert isinstance(first_rm, ReplyKeyboardRemove), "phone ack removes reply keyboard"
+    second_rm = msg.answer.await_args_list[1].kwargs.get("reply_markup")
+    assert isinstance(second_rm, InlineKeyboardMarkup), "summary carries inline confirm_keyboard"
+
+
+@pytest.mark.asyncio
+async def test_phone_msg_normalizes_8_prefix(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.10 phone_msg 8-prefix (legacy Russian mobile): "89991234567" (11 digits,
+    no +) → normalize_phone → "+79991234567" → state.client_phone set.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        wd = await _seed_workday(
+            session, ctx, work_date=target_date, start_time=time(10, 0), end_time=time(12, 0)
+        )
+        workday_id = wd.id
+
+    msg = _make_phone_message(text="89991234567")
+    state = _make_state()
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=600,
+        service_title="Стрижка",
+        client_name="Паша",
+    )
+
+    await client_handlers.phone_msg(msg, state)
+
+    saved = state.update_data.call_args.kwargs
+    assert saved.get("client_phone") == "+79991234567", "8XXXXXXXXXX → +7XXXXXXXXXX"
+
+
+@pytest.mark.asyncio
+async def test_phone_msg_normalizes_7_prefix(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.10 phone_msg 7-prefix: "79991234567" (11 digits, no +) → normalize_phone
+    → "+79991234567" → state.client_phone set.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        wd = await _seed_workday(
+            session, ctx, work_date=target_date, start_time=time(10, 0), end_time=time(12, 0)
+        )
+        workday_id = wd.id
+
+    msg = _make_phone_message(text="79991234567")
+    state = _make_state()
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=600,
+        service_title="Стрижка",
+        client_name="Паша",
+    )
+
+    await client_handlers.phone_msg(msg, state)
+
+    saved = state.update_data.call_args.kwargs
+    assert saved.get("client_phone") == "+79991234567", "7XXXXXXXXXX → +7XXXXXXXXXX"
+
+
+@pytest.mark.asyncio
+async def test_phone_msg_strips_spaces_dashes_parens(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.10 phone_msg stripping: "+7 (999) 123-45-67" (with spaces, parens, dashes)
+    → normalize_phone strips + RU-keeps → "+79991234567".
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        wd = await _seed_workday(
+            session, ctx, work_date=target_date, start_time=time(10, 0), end_time=time(12, 0)
+        )
+        workday_id = wd.id
+
+    msg = _make_phone_message(text="+7 (999) 123-45-67")
+    state = _make_state()
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=600,
+        service_title="Стрижка",
+        client_name="Паша",
+    )
+
+    await client_handlers.phone_msg(msg, state)
+
+    saved = state.update_data.call_args.kwargs
+    assert saved.get("client_phone") == "+79991234567", "strips whitespace/parens/dashes"
+
+
+@pytest.mark.asyncio
+async def test_phone_msg_invalid_format_retries_without_state_change(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.10 phone_msg invalid: "foo" → normalize_phone returns None → retry
+    message "❌ Неверный формат..." sent. NO state.update_data(client_phone=...)
+    and NO set_state(confirming) — user stays in entering_phone.
+    """
+    msg = _make_phone_message(text="foo")
+    state = _make_state()
+    await state.set_state(BookingStates.entering_phone)
+    await state.update_data(client_name="Паша", service_title="Стрижка")
+
+    await client_handlers.phone_msg(msg, state)
+
+    # No transition to confirming — user retries in entering_phone.
+    state.set_state.assert_awaited_with(BookingStates.entering_phone)  # only the initial set
+    # No client_phone update from this handler invocation.
+    last_update = state.update_data.call_args.kwargs
+    assert "client_phone" not in last_update, "invalid phone must not save client_phone"
+    text = _answer_text(msg)
+    assert "Неверный формат" in text
+    assert "+79991234567" in text  # example in the hint
+
+
+@pytest.mark.asyncio
+async def test_phone_skip_msg_sets_phone_none_and_renders_summary(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.10 phone_skip_msg: F.text == PHONE_SKIP_LABEL → state.client_phone=None
+    + ReplyKeyboardRemove + summary + confirm_keyboard + set_state(confirming).
+
+    Phone=None is the "explicit skip" signal to confirm_cb (vs just missing
+    client_phone key). create_booking's `if payload.phone is not None` guard
+    then skips Client.phone UPDATE — preserves existing phone for repeat bookings.
+    """
+    from bot.keyboards.client import PHONE_SKIP_LABEL
+
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        wd = await _seed_workday(
+            session, ctx, work_date=target_date, start_time=time(10, 0), end_time=time(12, 0)
+        )
+        workday_id = wd.id
+
+    msg = _make_phone_message(text=PHONE_SKIP_LABEL)
+    state = _make_state()
+    await state.set_state(BookingStates.entering_phone)
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=600,
+        service_title="Стрижка",
+        client_name="Паша",
+    )
+
+    await client_handlers.phone_skip_msg(msg, state)
+
+    saved = state.update_data.call_args.kwargs
+    assert saved.get("client_phone") is None, "skip sets client_phone=None (explicit skip)"
+    state.set_state.assert_awaited()
+    assert state.set_state.call_args.args[0] == BookingStates.confirming
+
+    # 1st message: "Ок, без телефона." + ReplyKeyboardRemove
+    # 2nd message: summary + InlineKeyboardMarkup (confirm_keyboard)
+    assert msg.answer.await_count == 2
+    first_text = str(msg.answer.await_args_list[0].args[0])
+    assert "без телефона" in first_text.lower()
+    from aiogram.types import ReplyKeyboardRemove
+    first_rm = msg.answer.await_args_list[0].kwargs.get("reply_markup")
+    assert isinstance(first_rm, ReplyKeyboardRemove)
+    second_rm = msg.answer.await_args_list[1].kwargs.get("reply_markup")
+    assert isinstance(second_rm, InlineKeyboardMarkup)
+
+
+@pytest.mark.asyncio
+async def test_share_contact_msg_happy(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.10 share_contact_msg happy: TG share button → message.contact.phone_number
+    → normalize_phone → state.client_phone + ReplyKeyboardRemove + summary +
+    confirm_keyboard + set_state(confirming).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        wd = await _seed_workday(
+            session, ctx, work_date=target_date, start_time=time(10, 0), end_time=time(12, 0)
+        )
+        workday_id = wd.id
+
+    msg = _make_contact_message(phone_number="+79991234567")
+    state = _make_state()
+    await state.set_state(BookingStates.entering_phone)
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=600,
+        service_title="Стрижка",
+        client_name="Паша",
+    )
+
+    await client_handlers.share_contact_msg(msg, state)
+
+    saved = state.update_data.call_args.kwargs
+    assert saved.get("client_phone") == "+79991234567"
+    state.set_state.assert_awaited()
+    assert state.set_state.call_args.args[0] == BookingStates.confirming
+    assert msg.answer.await_count == 2
+    first_text = str(msg.answer.await_args_list[0].args[0])
+    assert "Ок, телефон" in first_text and "+79991234567" in first_text
+    from aiogram.types import ReplyKeyboardRemove
+    first_rm = msg.answer.await_args_list[0].kwargs.get("reply_markup")
+    assert isinstance(first_rm, ReplyKeyboardRemove)
+    second_rm = msg.answer.await_args_list[1].kwargs.get("reply_markup")
+    assert isinstance(second_rm, InlineKeyboardMarkup)
+
+
+@pytest.mark.asyncio
+async def test_share_contact_msg_missing_contact_retries(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.10 share_contact_msg defensive: message.contact is None (pathological
+    case — TG sent a ContentType.CONTACT message without the contact payload,
+    e.g. malformed update from a third-party client) → retry prompt + NO state
+    change (user stays in entering_phone).
+
+    Defensive guard: aiogram filter F.content_type == ContentType.CONTACT
+    should guarantee message.contact is set, but the explicit check inside
+    share_contact_msg protects against malformed updates that bypass the
+    filter (e.g. a bot framework bug or a manually crafted Update). The check
+    also handles empty phone_number strings.
+    """
+    msg = _make_contact_message(phone_number="+79991234567")
+    # Override: simulate malformed update — contact payload missing.
+    msg.contact = None
+    state = _make_state()
+    await state.set_state(BookingStates.entering_phone)
+    await state.update_data(client_name="Паша", service_title="Стрижка")
+
+    await client_handlers.share_contact_msg(msg, state)
+
+    # No transition to confirming — user retries in entering_phone.
+    state.set_state.assert_awaited_with(BookingStates.entering_phone)
+    last_update = state.update_data.call_args.kwargs
+    assert "client_phone" not in last_update, "missing contact must not save client_phone"
+    text = _answer_text(msg)
+    assert "Не получил телефон" in text or "Введите номер" in text
+
+
+@pytest.mark.asyncio
+async def test_share_contact_msg_unparseable_phone_retries(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.10 share_contact_msg defensive: message.contact.phone_number present
+    but normalize_phone returns None (extremely rare international format
+    outside PHONE_PATTERN range — e.g. 9-digit number from a small carrier)
+    → retry with manual input prompt, no state change.
+    """
+    msg = _make_contact_message(phone_number="+1234567")  # 7 digits — too short
+    state = _make_state()
+    await state.set_state(BookingStates.entering_phone)
+    await state.update_data(client_name="Паша", service_title="Стрижка")
+
+    await client_handlers.share_contact_msg(msg, state)
+
+    state.set_state.assert_awaited_with(BookingStates.entering_phone)
+    last_update = state.update_data.call_args.kwargs
+    assert "client_phone" not in last_update
+    text = _answer_text(msg)
+    assert "Не распознал формат" in text or "Введите номер" in text
+
+
+@pytest.mark.asyncio
+async def test_confirm_cb_passes_phone_to_booking_create(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B.10 confirm_cb: client_phone in state → BookingCreate(phone=client_phone)
+    passed to create_booking. Captures the payload via mock — we don't actually
+    create a booking (the full workday/slot happy path is covered by other
+    confirm_cb tests). We only verify that the phone from entering_phone step
+    is forwarded into BookingCreate.phone.
+    """
+    from bot.schemas import BookingCreate
+
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        await _seed_service(session, ctx, name="Стрижка", duration_minutes=60)
+        wd = await _seed_workday(
+            session, ctx, work_date=target_date, start_time=time(10, 0), end_time=time(12, 0)
+        )
+        workday_id = wd.id
+
+    captured_payloads: list[BookingCreate] = []
+
+    async def _capture_create_booking(
+        session_arg: Any,
+        payload: BookingCreate,
+        **kwargs: Any,
+    ) -> Any:
+        captured_payloads.append(payload)
+        # Return a minimal BookingCreatedData — confirm_cb uses .booking_id and
+        # .start_at and .master_notification_text, all read AFTER this call.
+        from bot.services.booking import BookingCreatedData
+        return BookingCreatedData(
+            booking_id=uuid4(),
+            slot_id=None,
+            master_id=ctx["master_id"],
+            business_id=ctx["business_id"],
+            client_id=ctx["client_id"],
+            start_at=datetime.now(UTC) + timedelta(days=1),
+            end_at=datetime.now(UTC) + timedelta(days=1, hours=1),
+            client_name_snapshot="Паша",
+            service_title_snapshot="Стрижка",
+            master_notification_text="booked",
+        )
+
+    monkeypatch.setattr(client_handlers, "create_booking", _capture_create_booking)
+
+    cb, callback_data = _make_confirm_callback()
+    state = _make_state()
+    await state.set_state(BookingStates.confirming)
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=600,
+        service_title="Стрижка",
+        client_name="Паша",
+        client_phone="+79991234567",
+    )
+
+    await client_handlers.confirm_cb(cb, callback_data, state, AsyncMock())
+
+    assert len(captured_payloads) == 1, "confirm_cb must call create_booking exactly once"
+    payload = captured_payloads[0]
+    assert payload.phone == "+79991234567", "phone from state forwarded to BookingCreate"
+
+
+@pytest.mark.asyncio
+async def test_confirm_cb_passes_phone_none_when_skipped(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B.10 confirm_cb skip path: client_phone=None in state (skip button) →
+    BookingCreate(phone=None) → create_booking's `if payload.phone is not None`
+    guard skips Client.phone UPDATE (preserves existing phone for repeat
+    bookings). This is the contract for "skip doesn't overwrite phone".
+    """
+    from bot.schemas import BookingCreate
+
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        await _seed_service(session, ctx, name="Стрижка", duration_minutes=60)
+        wd = await _seed_workday(
+            session, ctx, work_date=target_date, start_time=time(10, 0), end_time=time(12, 0)
+        )
+        workday_id = wd.id
+
+    captured_payloads: list[BookingCreate] = []
+
+    async def _capture_create_booking(
+        session_arg: Any,
+        payload: BookingCreate,
+        **kwargs: Any,
+    ) -> Any:
+        captured_payloads.append(payload)
+        from bot.services.booking import BookingCreatedData
+        return BookingCreatedData(
+            booking_id=uuid4(),
+            slot_id=None,
+            master_id=ctx["master_id"],
+            business_id=ctx["business_id"],
+            client_id=ctx["client_id"],
+            start_at=datetime.now(UTC) + timedelta(days=1),
+            end_at=datetime.now(UTC) + timedelta(days=1, hours=1),
+            client_name_snapshot="Паша",
+            service_title_snapshot="Стрижка",
+            master_notification_text="booked",
+        )
+
+    monkeypatch.setattr(client_handlers, "create_booking", _capture_create_booking)
+
+    cb, callback_data = _make_confirm_callback()
+    state = _make_state()
+    await state.set_state(BookingStates.confirming)
+    await state.update_data(
+        workday_id=str(workday_id),
+        start_minute=600,
+        service_title="Стрижка",
+        client_name="Паша",
+        client_phone=None,  # skip
+    )
+
+    await client_handlers.confirm_cb(cb, callback_data, state, AsyncMock())
+
+    assert len(captured_payloads) == 1
+    assert captured_payloads[0].phone is None, "skip → BookingCreate.phone=None"
+
+
+@pytest.mark.asyncio
+async def test_phone_msg_bails_out_when_helper_returns_false(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B.10 W1 (qa-code-review fix): phone_msg honours the
+    _render_summary_and_set_confirming return value — if the helper's defensive
+    path triggers (state.clear + "Данные потеряны" already sent), the caller
+    bails out and does NOT proceed. Without the `if not ...: return` guard the
+    user would see both "Ок, телефон: +7999..." AND "❌ Данные потеряны".
+
+    Setup: phone_msg validates the phone OK (state.client_phone set), then
+    calls the helper. We monkeypatch the helper to return False and verify
+    phone_msg returns without further action. The "Ок, телефон:" ack was sent
+    BEFORE the helper call (so it appears regardless), but no summary follows.
+    """
+    msg = _make_phone_message(text="+79991234567")
+    state = _make_state()
+    await state.set_state(BookingStates.entering_phone)
+    await state.update_data(client_name="Паша", service_title="Стрижка")
+
+    helper_called: list[bool] = []
+
+    async def _stub_helper(*args: Any, **kwargs: Any) -> bool:
+        helper_called.append(True)
+        return False  # defensive path triggered (state corruption simulated)
+
+    monkeypatch.setattr(client_handlers, "_render_summary_and_set_confirming", _stub_helper)
+
+    await client_handlers.phone_msg(msg, state)
+
+    # Helper WAS invoked (phone_msg calls it after the phone ack).
+    assert len(helper_called) == 1
+    # state.set_state was called only by the test setup (entering_phone), NOT by
+    # phone_msg (it bailed out before reaching the helper's set_state(confirming)).
+    state.set_state.assert_awaited_once_with(BookingStates.entering_phone)
+    # 1st message: "Ок, телефон: +7999..." ack (sent BEFORE helper call).
+    # 2nd message would have been the summary — but helper returned False
+    # (in real code it sends "❌ Данные потеряны" itself; here stubbed).
+    assert msg.answer.await_count == 1, "phone_msg must not send summary when helper bails"
+
+
+@pytest.mark.asyncio
+async def test_phone_skip_msg_bails_out_when_helper_returns_false(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B.10 W1 (qa-code-review fix): phone_skip_msg honours the helper return
+    value — same contract as test_phone_msg_bails_out_when_helper_returns_false
+    but for the skip path. Verifies all 3 callers (phone_msg, phone_skip_msg,
+    share_contact_msg) consistently bail out on helper False.
+    """
+    from bot.keyboards.client import PHONE_SKIP_LABEL
+
+    msg = _make_phone_message(text=PHONE_SKIP_LABEL)
+    state = _make_state()
+    await state.set_state(BookingStates.entering_phone)
+    await state.update_data(client_name="Паша", service_title="Стрижка")
+
+    helper_called: list[bool] = []
+
+    async def _stub_helper(*args: Any, **kwargs: Any) -> bool:
+        helper_called.append(True)
+        return False
+
+    monkeypatch.setattr(client_handlers, "_render_summary_and_set_confirming", _stub_helper)
+
+    await client_handlers.phone_skip_msg(msg, state)
+
+    assert len(helper_called) == 1
+    state.set_state.assert_awaited_once_with(BookingStates.entering_phone)
+    assert msg.answer.await_count == 1, "phone_skip_msg must not send summary when helper bails"
+
+
+@pytest.mark.asyncio
+async def test_share_contact_msg_bails_out_when_helper_returns_false(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B.10 W1 (qa-code-review fix): share_contact_msg honours the helper
+    return value — same contract as the other two callers. Verifies all 3
+    callers consistently bail out on helper False.
+    """
+    msg = _make_contact_message(phone_number="+79991234567")
+    state = _make_state()
+    await state.set_state(BookingStates.entering_phone)
+    await state.update_data(client_name="Паша", service_title="Стрижка")
+
+    helper_called: list[bool] = []
+
+    async def _stub_helper(*args: Any, **kwargs: Any) -> bool:
+        helper_called.append(True)
+        return False
+
+    monkeypatch.setattr(client_handlers, "_render_summary_and_set_confirming", _stub_helper)
+
+    await client_handlers.share_contact_msg(msg, state)
+
+    assert len(helper_called) == 1
+    state.set_state.assert_awaited_once_with(BookingStates.entering_phone)
+    assert msg.answer.await_count == 1, "share_contact_msg must not send summary when helper bails"
