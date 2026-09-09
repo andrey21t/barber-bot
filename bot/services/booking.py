@@ -12,7 +12,6 @@ Contract (MY-VIBE-RULES.md, spec.md 307-309):
 """
 
 import html
-import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, cast
@@ -368,65 +367,6 @@ async def _select_or_create_client(session: AsyncSession, telegram_id: int) -> C
         result = await session.execute(stmt)
         client = result.scalar_one()
     return client
-
-
-# ============================================================
-# Phone normalization (Session 5.46 / B.10, donor BB-109)
-# ============================================================
-# Pattern: +optional, 10-15 digits. Covers Russian (+7XXXXXXXXXX, 11 digits)
-# AND international numbers (4499912345678, 13 digits). Pattern does NOT
-# enforce country code — normalize_phone handles RU-conversion separately.
-PHONE_PATTERN = re.compile(r"^\+?[0-9]{10,15}$")
-
-
-def normalize_phone(value: str) -> str | None:
-    """Normalize a user-typed phone number to canonical form.
-
-    Donor BB-109 (winnerxxx13/barbershop-telegram-bot, services/booking.py:68-83):
-    - Strip whitespace, parens, dashes: "+7 (999) 123-45-67" → "+79991234567"
-    - Russian conversion:
-      - "8XXXXXXXXXX" (11 digits) → "+7XXXXXXXXXX" (legacy Russian mobile prefix)
-      - "7XXXXXXXXXX" (11 digits)  → "+7XXXXXXXXXX" (without + prefix)
-      - "+7XXXXXXXXXX"             → as-is (already canonical)
-    - Other formats: keep as-is after stripping (international numbers)
-    - Final check: PHONE_PATTERN.fullmatch — rejects too short / too long / non-digits
-
-    Args:
-        value: raw user input (text or message.contact.phone_number from
-            Telegram share button). May contain spaces, parens, dashes, leading +.
-
-    Returns:
-        Normalized phone in canonical form ("+7XXXXXXXXXX" or international
-        like "+44999..."), or None if the input cannot be parsed as a phone.
-
-    Examples:
-        >>> normalize_phone("+79991234567")
-        '+79991234567'
-        >>> normalize_phone("79991234567")
-        '+79991234567'
-        >>> normalize_phone("89991234567")
-        '+79991234567'
-        >>> normalize_phone("+7 (999) 123-45-67")
-        '+79991234567'
-        >>> normalize_phone("8 999 123 45 67")
-        '+79991234567'
-        >>> normalize_phone("foo")
-        None
-        >>> normalize_phone("")
-        None
-        >>> normalize_phone("+4499912345678")
-        '+4499912345678'
-    """
-    compact = re.sub(r"[\s()\-]", "", value.strip())
-    if not compact:
-        return None
-    if compact.startswith("8") and len(compact) == 11:
-        compact = "+7" + compact[1:]   # 8XXXXXXXXXX → +7XXXXXXXXXX
-    elif compact.startswith("7") and len(compact) == 11:
-        compact = "+" + compact        # 7XXXXXXXXXX → +7XXXXXXXXXX
-    if not PHONE_PATTERN.fullmatch(compact):
-        return None
-    return compact
 
 
 async def create_booking(

@@ -597,27 +597,25 @@ async def test_booking_flow_with_service_picker_creates_booking(
     integration_dispatcher: tuple[Dispatcher, MagicMock],
     session_factory: Any,
 ) -> None:
-    """Session 5.27 FEAT E2E (reordered in 5.29 Task 2, phone step in 5.46/B.10):
+    """Session 5.27 FEAT E2E (reordered in 5.29 Task 2; phone step removed 5.50):
     /slots → calendar → service picker (tap 'Окрашивание') → slot picker →
-    name → phone (skip via [⏭ Без телефона]) → ✅ → booking created with
-    service_id set.
+    name → ✅ → booking created with service_id set.
 
-    New flow (Session 5.29 Task 2 — FSM reorder, услуга ДО слота; B.10 added
-    entering_phone between name and confirm):
+    Flow (Session 5.29 Task 2 — FSM reorder, услуга ДО слота; phone step
+    removed in 5.50 — name → confirming directly):
     1. /slots → SimpleCalendar (selecting_date)
     2. tap tomorrow → service picker (entering_service)
     3. tap 'Окрашивание' → slot picker (selecting_slot)
     4. tap 10:00 slot → 'На чьё имя?' (entering_name)
-    5. type name → phone prompt (entering_phone, B.10 — was confirming pre-B.10)
-    5b. tap [⏭ Без телефона] → summary (confirming)
+    5. type name → summary (confirming, phone step removed)
     6. tap ✅ → booking created
 
     Verifies:
     - All handlers dispatch correctly (cmd_slots → simple_calendar_cb →
-      service_picker_cb → slot_30_cb → name_msg → phone_skip_msg → confirm_cb)
+      service_picker_cb → slot_30_cb → name_msg → confirm_cb)
     - service_picker_keyboard shown with both seeded services + 'Своя услуга'
     - Tap service → slot picker filtered by service.duration_minutes (120)
-    - Tap slot → name prompt → type name → phone step → skip → Tap ✅ →
+    - Tap slot → name prompt → type name → Tap ✅ →
       BookingCreate.service_id is the UUID (not None) — _build_end_at uses
       service.duration_minutes
     - Booking persisted to DB with correct service_id, service_title_snapshot,
@@ -727,20 +725,19 @@ async def test_booking_flow_custom_service_text_uses_default_duration(
     integration_dispatcher: tuple[Dispatcher, MagicMock],
     session_factory: Any,
 ) -> None:
-    """5.27 FEAT E2E (reordered in 5.29 Task 2, phone step in 5.46/B.10):
+    """5.27 FEAT E2E (reordered in 5.29 Task 2; phone step removed 5.50):
     /slots → calendar → service picker → '✏️ Своя услуга' → typed text →
-    slot picker → name → phone (skip) → ✅ → booking with service_id=None +
+    slot picker → name → ✅ → booking with service_id=None +
     default duration (SERVICE_DEFAULT_DURATION_MIN).
 
-    New flow (Session 5.29 Task 2 — FSM reorder, услуга ДО слота; B.10 added
-    entering_phone between name and confirm):
+    Flow (Session 5.29 Task 2 — FSM reorder, услуга ДО слота; phone step
+    removed in 5.50 — name → confirming directly):
     1. /slots → SimpleCalendar (selecting_date)
     2. tap tomorrow → service picker (entering_service)
     3. tap '✏️ Своя услуга' → ask for text (still entering_service)
     4. type custom service → slot picker (selecting_slot)
     5. tap 10:00 slot → 'На чьё имя?' (entering_name)
-    5b. type name → phone prompt (entering_phone, B.10)
-    6. tap [⏭ Без телефона] → summary (confirming)
+    6. type name → summary (confirming, phone step removed)
     7. tap ✅ → booking created
 
     Verifies the legacy fallback path: 'Своя услуга' button keeps state in

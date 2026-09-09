@@ -4578,7 +4578,7 @@ async def test_admin_closeday_cancel_cb_clears_state(
 def test_render_bookings_with_phone_suffix() -> None:
     """B.10: _render_bookings(client_phones={client_id: "+79991234567"}) →
     booking line ends with ", 📞 +79991234567". Phone is rendered RAW (no escape)
-    — normalize_phone + PHONE_PATTERN restrict input to ^\\+?[0-9]{10,15}$.
+    — phone column is deprecated (5.50), historical rows are digits+'+' only.
     """
     from typing import cast
 

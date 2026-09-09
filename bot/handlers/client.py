@@ -1380,7 +1380,13 @@ async def _render_summary_and_set_confirming(
 
     Args:
         message: aiogram Message to answer on (text-input path) OR
-            callback.message (callback path). Both expose .answer().
+            callback.message (callback path). Caller MUST ensure this is a
+            real Message (not InaccessibleMessage) — InaccessibleMessage has
+            no .answer() method. name_pre_fill_yes_cb checks
+            `if callback.message is not None` before calling; production
+            path assumes Message. If Telegram ever delivers
+            InaccessibleMessage, .answer() raises AttributeError — caller
+            should add isinstance check if that becomes a real edge case.
         state: FSM context — read workday_id/slot_id/service_title, set
             state to confirming.
         client_name: client name from state (already validated non-empty
@@ -1750,6 +1756,13 @@ async def confirm_cb(
 
     `scheduler` injected from dp["scheduler"] workflow_data (set in bot.main).
     """
+    # W3 (code-review iter 2): early guard — callback.from_user is None in
+    # inaccessible-message edge cases. Mirrors mybookings_cancel_cb /
+    # mybookings_transfer_cb / transfer_slot_30_cb pattern. Without this,
+    # line ~1851 `callback.from_user.id` would raise AttributeError.
+    if callback.from_user is None:
+        await callback.answer()
+        return
     data = await state.get_data()
     slot_id_str = data.get("slot_id")
     workday_id_str = data.get("workday_id")
@@ -1759,7 +1772,8 @@ async def confirm_cb(
     service_id_str = data.get("service_id")  # Session 5.27: tap-to-select path
     # @username from Telegram profile — master taps it to contact client.
     # None if user has no @username (notification shows telegram_id fallback).
-    telegram_username = callback.from_user.username if callback.from_user else None
+    # W3: callback.from_user guaranteed non-None by early guard above.
+    telegram_username = callback.from_user.username
 
     # XOR contract with service_msg: slot_id (legacy /book) XOR
     # (workday_id + start_minute) (workday /slots). Both branches require
