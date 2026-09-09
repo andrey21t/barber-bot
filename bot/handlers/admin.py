@@ -36,7 +36,9 @@ from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback
 from aiogram_calendar.schemas import SimpleCalAct
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from scheduler import remove_jobs_for_booking
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import get_settings
 from bot.db import async_session_factory
@@ -563,13 +565,17 @@ async def cmd_today(message: Message) -> None:
 
     async with async_session_factory() as session:
         bookings = await get_today_bookings(session, master_id, tz)
+        # Session 5.46 (B.10): bulk-fetch client phones for the bookings.
+        # Single SELECT — not N+1 (one query per booking). Phone is an attribute
+        # of Client, not a snapshot in Booking, so we resolve via Client.id.
+        client_phones = await _fetch_client_phones(session, bookings) if bookings else {}
 
     if not bookings:
         await message.answer("На сегодня записей нет.")
         return
 
     await message.answer(
-        _render_bookings("📅 Записи на сегодня:", bookings, tz),
+        _render_bookings("📅 Записи на сегодня:", bookings, tz, client_phones=client_phones),
         reply_markup=admin_today_keyboard(bookings, tz),
     )
 
@@ -591,12 +597,16 @@ async def cmd_week(message: Message) -> None:
 
     async with async_session_factory() as session:
         bookings = await get_all_future_bookings(session, master_id, tz)
+        # Session 5.46 (B.10): bulk-fetch client phones (mirrors cmd_today).
+        client_phones = await _fetch_client_phones(session, bookings) if bookings else {}
 
     if not bookings:
         await message.answer("Ближайших записей нет.")
         return
 
-    await message.answer(_render_bookings("📅 Ближайшие записи:", bookings, tz))
+    await message.answer(
+        _render_bookings("📅 Ближайшие записи:", bookings, tz, client_phones=client_phones)
+    )
 
 
 # ============================================================
@@ -668,13 +678,59 @@ async def cmd_services(message: Message, command: CommandObject) -> None:
 # ============================================================
 # Render helper — shared by /today and /week
 # ============================================================
-def _render_bookings(title: str, bookings: list[Booking], business_timezone: str) -> str:
+async def _fetch_client_phones(
+    session: AsyncSession, bookings: list[Booking]
+) -> dict[UUID, str | None]:
+    """Bulk-fetch Client.phone for a list of bookings (Session 5.46 / B.10).
+
+    Single SELECT — not N+1 (one query per booking). Returns dict
+    {client_id: phone} where phone is str | None. Used by /today and /week
+    render to show "📞 +79991234567" or "без телефона" per booking.
+
+    Args:
+        session: async SQLAlchemy session (caller-managed — same session as
+            the bookings query, so clients are in the same transaction).
+        bookings: list of Booking rows (must have .client_id populated).
+
+    Returns:
+        dict {client_id: phone | None}. Missing Client rows (rare — Client
+        created at booking time and never deleted) → not in dict; renderer
+        treats missing keys as "no phone".
+    """
+    if not bookings:
+        return {}
+    from bot.models import Client
+
+    client_ids = {b.client_id for b in bookings}
+    stmt = select(Client.id, Client.phone).where(Client.id.in_(client_ids))
+    rows = (await session.execute(stmt)).all()
+    return {row[0]: row[1] for row in rows}
+
+
+def _render_bookings(
+    title: str,
+    bookings: list[Booking],
+    business_timezone: str,
+    *,
+    client_phones: dict[UUID, str | None] | None = None,
+) -> str:
     """Render bookings list. client_name_snapshot + service_title_snapshot
     are already html.escape()'d in DB — no re-escape needed.
 
     Newline defense: `html.escape(quote=False)` does NOT strip `\n` (verified
     2026-08-21). A multi-line client_name_snapshot would break list formatting.
     We replace `\n` with space here (display-only, DB stays intact).
+
+    Session 5.46 (B.10): phone column added. If ``client_phones`` dict is
+    provided (caller fetched via _fetch_client_phones), each row shows
+    "📞 +79991234567" or "без телефона". If dict is None (legacy callers
+    that haven't been updated), phone is omitted entirely — backwards
+    compat for /closeday and other callers that don't pass client_phones.
+
+    Phone is rendered RAW (no escape) — it's digits and '+' only, no HTML
+    metacharacters. If a malicious client somehow injected HTML via phone
+    (impossible — normalize_phone + PHONE_PATTERN restricts to ^\\+?[0-9]{10,15}$),
+    html.parse_mode would still treat it as text inside the line (no < >).
     """
     from zoneinfo import ZoneInfo
 
@@ -689,7 +745,13 @@ def _render_bookings(title: str, bookings: list[Booking], business_timezone: str
         # Strip newlines from already-escaped snapshots to preserve list layout
         name = b.client_name_snapshot.replace("\n", " ")
         service = b.service_title_snapshot.replace("\n", " ")
-        lines.append(f"• {when} — {name}, {service}")
+        # Session 5.46 (B.10): phone suffix — "📞 +79991234567" or "без телефона"
+        # (only if client_phones dict was passed by the caller).
+        phone_suffix = ""
+        if client_phones is not None:
+            phone = client_phones.get(b.client_id)
+            phone_suffix = f", 📞 {phone}" if phone else ", без телефона"
+        lines.append(f"• {when} — {name}, {service}{phone_suffix}")
     return "\n".join(lines)
 
 

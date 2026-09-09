@@ -2319,3 +2319,197 @@ async def test_transfer_booking_workday_raises_not_implemented(
     row = (await session.execute(stmt_b)).one()
     assert row.status == "confirmed"
     assert row.slot_id is None
+
+
+# ============================================================
+# normalize_phone — pure unit tests (Session 5.46 / B.10, donor BB-109)
+# ============================================================
+
+
+def test_normalize_phone_unit() -> None:
+    """Session 5.46 (B.10) — normalize_phone edge cases (donor BB-109).
+
+    Pure function (no DB, no async) — covers the docstring examples in
+    bot.services.booking.normalize_phone (services/booking.py:382-429):
+      - canonical RU +7XXXXXXXXXX → as-is
+      - 8XXXXXXXXXX (11 digits, no +) → +7XXXXXXXXXX (legacy Russian mobile)
+      - 7XXXXXXXXXX (11 digits, no +) → +7XXXXXXXXXX
+      - stripping spaces / parens / dashes before validation
+      - international kept as-is (after optional +)
+      - PHONE_PATTERN fullmatch rejects too-short / too-long / non-digits
+      - empty / whitespace-only → None
+    """
+    from bot.services.booking import normalize_phone
+
+    # === Canonical (no transformation) ===
+    assert normalize_phone("+79991234567") == "+79991234567"
+
+    # === RU-conversion: 8 prefix (legacy Russian mobile) ===
+    assert normalize_phone("89991234567") == "+79991234567"
+
+    # === RU-conversion: 7 prefix (without +) ===
+    assert normalize_phone("79991234567") == "+79991234567"
+
+    # === Stripping spaces / parens / dashes ===
+    assert normalize_phone("+7 (999) 123-45-67") == "+79991234567"
+    assert normalize_phone("8 999 123 45 67") == "+79991234567"
+    assert normalize_phone("+7-999-123-45-67") == "+79991234567"
+    assert normalize_phone("(8999)1234567") == "+79991234567"
+
+    # === International (no RU-conversion, kept as-is) ===
+    # NB: international WITH + stays as-is; international WITHOUT + also stays
+    # as-is — only RU 8/7 prefixes (11-digit) trigger RU-conversion to +7.
+    assert normalize_phone("+4499912345678") == "+4499912345678"
+    assert normalize_phone("4499912345678") == "4499912345678"
+
+    # === Invalid — returns None (PHONE_PATTERN fullmatch rejects) ===
+    assert normalize_phone("foo") is None
+    assert normalize_phone("") is None
+    assert normalize_phone("   ") is None
+    # Too short (<10 digits)
+    assert normalize_phone("+7999123") is None
+    # Too long (>15 digits)
+    assert normalize_phone("+79991234567890123") is None
+    # Non-digits in the middle (after stripping)
+    assert normalize_phone("+79abc34567") is None
+    # Just "+" — empty after strip (the regex would catch the bare + too)
+    assert normalize_phone("+") is None
+
+
+def test_normalize_phone_pattern_rejects_edge_cases() -> None:
+    """Session 5.46 (B.10) — PHONE_PATTERN fullmatch corner cases.
+
+    PHONE_PATTERN = ^\\+?[0-9]{10,15}$ — optional +, then 10-15 digits.
+    These inputs probe the boundary precisely:
+      - exactly 10 digits (lower bound)
+      - exactly 15 digits (upper bound)
+      - 9 digits (below lower — rejected)
+      - 16 digits (above upper — rejected)
+      - 11-digit input starting with '7' triggers RU-conversion to 12-char
+        '+7XXXXXXXXXX' which still satisfies the 10-15 range.
+    """
+    from bot.services.booking import normalize_phone
+
+    # Lower bound: 10 digits, no RU-conversion path (doesn't start with 8 or 7
+    # alone with len 11 — starts with +1 → international).
+    assert normalize_phone("+1234567890") == "+1234567890"
+    # Upper bound: 15 digits.
+    assert normalize_phone("+123456789012345") == "+123456789012345"
+
+    # Below lower: 9 digits → None.
+    assert normalize_phone("+12345678") is None
+    # Above upper: 16 digits → None.
+    assert normalize_phone("+1234567890123456") is None
+
+    # 11-digit 7XXXXXXXXXX → RU-conversion to 12-char +7XXXXXXXXXX → still
+    # within 10-15 range (12 chars). Validates the conversion + pattern pipeline.
+    assert normalize_phone("79991234567") == "+79991234567"
+
+
+# ============================================================
+# Session 5.46 (B.10) — phone attribute on Client: create_booking UPDATE guard
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_create_booking_phone_set_on_new_client(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """B.10: create_booking(payload.phone="+7999...") → Client.phone UPDATE'd
+    to the new value. Client starts without a phone (conftest.py:111 default —
+    Client.phone nullable, no fixture value), create_booking sets it via the
+    `if payload.phone is not None` guard at booking.py:583.
+    """
+    workday = seed_data["workday"]
+    payload = BookingCreate(
+        workday_id=workday.id,
+        start_time_local=dt_time(14, 0),
+        client_name="Паша",
+        service_title="Стрижка",
+        service_id=None,
+        phone="+79991234567",
+    )
+
+    await create_booking(
+        session,
+        payload,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=seed_data["client_telegram_id"],
+    )
+
+    # Client.phone UPDATE'd to the payload value.
+    client = (
+        (await session.execute(select(Client).where(Client.id == seed_data["client"].id)))
+        .scalar_one()
+    )
+    assert client.phone == "+79991234567"
+
+
+@pytest.mark.asyncio
+async def test_create_booking_skip_phone_preserves_existing(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """B.10: create_booking(payload.phone=None) on a Client with an existing phone
+    → `if payload.phone is not None` guard (booking.py:583) skips the UPDATE →
+    existing phone is preserved. This is the contract for "skip doesn't overwrite
+    phone" — the 80% case where a repeat client taps Skip on the phone step but
+    already had a phone from a previous booking.
+
+    Setup:
+      1. Pre-set Client.phone via a first booking (phone="+79991234567")
+      2. Second booking on a different time slot with phone=None (skip)
+      3. Assert: Client.phone still == "+79991234567" (NOT None, NOT overwritten)
+    """
+    workday = seed_data["workday"]
+
+    # === Step 1: first booking with phone → Client.phone set to +7999... ===
+    payload1 = BookingCreate(
+        workday_id=workday.id,
+        start_time_local=dt_time(10, 0),
+        client_name="Паша",
+        service_title="Стрижка",
+        service_id=None,
+        phone="+79991234567",
+    )
+    await create_booking(
+        session,
+        payload1,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=seed_data["client_telegram_id"],
+    )
+    client_after_first = (
+        (await session.execute(select(Client).where(Client.id == seed_data["client"].id)))
+        .scalar_one()
+    )
+    assert client_after_first.phone == "+79991234567"
+
+    # === Step 2: second booking with phone=None (skip) ===
+    payload2 = BookingCreate(
+        workday_id=workday.id,
+        start_time_local=dt_time(16, 0),  # different slot, no overlap
+        client_name="Паша",
+        service_title="Стрижка",
+        service_id=None,
+        phone=None,
+    )
+    await create_booking(
+        session,
+        payload2,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=seed_data["client_telegram_id"],
+    )
+
+    # === Step 3: Client.phone preserved (NOT overwritten with None) ===
+    client_after_second = (
+        (await session.execute(select(Client).where(Client.id == seed_data["client"].id)))
+        .scalar_one()
+    )
+    assert client_after_second.phone == "+79991234567", (
+        "skip (payload.phone=None) must not overwrite existing Client.phone — "
+        "guard at booking.py:583 `if payload.phone is not None` skips the UPDATE"
+    )

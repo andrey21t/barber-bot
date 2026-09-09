@@ -597,25 +597,29 @@ async def test_booking_flow_with_service_picker_creates_booking(
     integration_dispatcher: tuple[Dispatcher, MagicMock],
     session_factory: Any,
 ) -> None:
-    """Session 5.27 FEAT E2E (reordered in 5.29 Task 2): /slots → calendar →
-    service picker (tap 'Окрашивание') → slot picker → name → ✅ → booking
-    created with service_id set.
+    """Session 5.27 FEAT E2E (reordered in 5.29 Task 2, phone step in 5.46/B.10):
+    /slots → calendar → service picker (tap 'Окрашивание') → slot picker →
+    name → phone (skip via [⏭ Без телефона]) → ✅ → booking created with
+    service_id set.
 
-    New flow (Session 5.29 Task 2 — FSM reorder, услуга ДО слота):
+    New flow (Session 5.29 Task 2 — FSM reorder, услуга ДО слота; B.10 added
+    entering_phone between name and confirm):
     1. /slots → SimpleCalendar (selecting_date)
     2. tap tomorrow → service picker (entering_service)
     3. tap 'Окрашивание' → slot picker (selecting_slot)
     4. tap 10:00 slot → 'На чьё имя?' (entering_name)
-    5. type name → summary (confirming)
+    5. type name → phone prompt (entering_phone, B.10 — was confirming pre-B.10)
+    5b. tap [⏭ Без телефона] → summary (confirming)
     6. tap ✅ → booking created
 
     Verifies:
     - All handlers dispatch correctly (cmd_slots → simple_calendar_cb →
-      service_picker_cb → slot_30_cb → name_msg → confirm_cb)
+      service_picker_cb → slot_30_cb → name_msg → phone_skip_msg → confirm_cb)
     - service_picker_keyboard shown with both seeded services + 'Своя услуга'
     - Tap service → slot picker filtered by service.duration_minutes (120)
-    - Tap slot → name prompt → Tap ✅ → BookingCreate.service_id is the UUID
-      (not None) — _build_end_at uses service.duration_minutes
+    - Tap slot → name prompt → type name → phone step → skip → Tap ✅ →
+      BookingCreate.service_id is the UUID (not None) — _build_end_at uses
+      service.duration_minutes
     - Booking persisted to DB with correct service_id, service_title_snapshot,
       end_at = start_at + service.duration_minutes
     """
@@ -672,13 +676,24 @@ async def test_booking_flow_with_service_picker_creates_booking(
         step4 = _extract_send_text(bot)
         assert "На чьё имя" in step4, f"Expected name prompt, got: {step4!r}"
 
-        # Step 5: type name → summary with service name (confirming).
+        # Step 5: type name → phone prompt (entering_phone, B.10).
         bot.reset()
         await dp.feed_update(bot, _make_text_update("Паша", user_id=client_tg))
         step5 = _extract_send_text(bot)
-        assert "Подтвердите запись" in step5, f"Expected summary, got: {step5!r}"
-        assert "Окрашивание" in step5, f"Service name in summary, got: {step5!r}"
-        assert "Паша" in step5, f"Client name in summary, got: {step5!r}"
+        assert "Телефон" in step5 or "📱" in step5, (
+            f"B.10: name_msg now → entering_phone (not confirming). Got: {step5!r}"
+        )
+
+        # Step 5b: tap [⏭ Без телефона] → summary (confirming).
+        # Reply keyboard button — Telegram sends a text message with the button
+        # label. _find_button_by_label is for INLINE buttons only; for reply
+        # buttons we feed the text directly (label is known + static).
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("⏭ Без телефона", user_id=client_tg))
+        step5b = _extract_send_text(bot)
+        assert "Подтвердите запись" in step5b, f"Expected summary, got: {step5b!r}"
+        assert "Окрашивание" in step5b, f"Service name in summary, got: {step5b!r}"
+        assert "Паша" in step5b, f"Client name in summary, got: {step5b!r}"
 
         # Step 6: tap ✅ → booking created ('Вы записаны').
         confirm_btn = await _find_button_by_label(bot, "Подтвердить")
@@ -721,17 +736,20 @@ async def test_booking_flow_custom_service_text_uses_default_duration(
     integration_dispatcher: tuple[Dispatcher, MagicMock],
     session_factory: Any,
 ) -> None:
-    """5.27 FEAT E2E (reordered in 5.29 Task 2): /slots → calendar → service
-    picker → '✏️ Своя услуга' → typed text → slot picker → name → ✅ → booking
-    with service_id=None + default duration (SERVICE_DEFAULT_DURATION_MIN).
+    """5.27 FEAT E2E (reordered in 5.29 Task 2, phone step in 5.46/B.10):
+    /slots → calendar → service picker → '✏️ Своя услуга' → typed text →
+    slot picker → name → phone (skip) → ✅ → booking with service_id=None +
+    default duration (SERVICE_DEFAULT_DURATION_MIN).
 
-    New flow (Session 5.29 Task 2 — FSM reorder, услуга ДО слота):
+    New flow (Session 5.29 Task 2 — FSM reorder, услуга ДО слота; B.10 added
+    entering_phone between name and confirm):
     1. /slots → SimpleCalendar (selecting_date)
     2. tap tomorrow → service picker (entering_service)
     3. tap '✏️ Своя услуга' → ask for text (still entering_service)
     4. type custom service → slot picker (selecting_slot)
     5. tap 10:00 slot → 'На чьё имя?' (entering_name)
-    6. type name → summary (confirming)
+    5b. type name → phone prompt (entering_phone, B.10)
+    6. tap [⏭ Без телефона] → summary (confirming)
     7. tap ✅ → booking created
 
     Verifies the legacy fallback path: 'Своя услуга' button keeps state in
@@ -783,9 +801,18 @@ async def test_booking_flow_custom_service_text_uses_default_duration(
         await dp.feed_update(bot, _make_callback_update_from_button(slot_btn, user_id=client_tg))
         assert "На чьё имя" in _extract_send_text(bot)
 
-        # Step 6: type name → summary (confirming).
+        # Step 5b: type name → phone prompt (entering_phone, B.10).
         bot.reset()
         await dp.feed_update(bot, _make_text_update("Паша", user_id=client_tg))
+        step5b = _extract_send_text(bot)
+        assert "Телефон" in step5b or "📱" in step5b, (
+            f"B.10: name_msg now → entering_phone (not confirming). Got: {step5b!r}"
+        )
+
+        # Step 6: tap [⏭ Без телефона] → summary (confirming).
+        # Reply keyboard button — feed text directly (label is static).
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("⏭ Без телефона", user_id=client_tg))
         summary = _extract_send_text(bot)
         assert "Подтвердите запись" in summary
         assert "Борода + стрижка" in summary
