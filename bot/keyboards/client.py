@@ -582,15 +582,6 @@ def _format_booking_summary_from_start_at(
 CLIENT_REPLY_BOOK_LABEL = "💇 Записаться"
 CLIENT_REPLY_MYBOOKINGS_LABEL = "📋 Мои записи"
 
-# Session 5.46 (B.10) — Phone collection reply keyboard labels.
-# Handlers match on F.text == PHONE_SKIP_LABEL (registered in client.py BEFORE
-# phone_msg so the dispatcher routes the skip text here, not into the
-# normalize_phone path). PHONE_SHARE_LABEL is the text on the request_contact
-# button — Telegram sends a Contact object on tap (NOT a text message), so the
-# share button is dispatched via F.content_type == ContentType.CONTACT.
-PHONE_SHARE_LABEL = "📱 Поделиться"
-PHONE_SKIP_LABEL = "⏭ Без телефона"
-
 
 class NamePreFillYesCallbackData(CallbackData, prefix="name_prefill_yes"):
     """Pre-fill name: client tapped [✅ Да, это я] (Session 5.36 / B.13).
@@ -676,49 +667,3 @@ def name_pre_fill_keyboard(first_name: str) -> InlineKeyboardMarkup:
     builder.button(text="👤 Другое имя", callback_data=NamePreFillOtherCallbackData().pack())
     builder.adjust(2)
     return builder.as_markup()
-
-
-# ============================================================
-# Session 5.46 (B.10) — Phone collection reply keyboard
-# ============================================================
-def phone_keyboard() -> ReplyKeyboardMarkup:
-    """Build the phone-share reply keyboard (Session 5.46 / B.10).
-
-    Two buttons on one row:
-    - [📱 Поделиться] with ``request_contact=True`` — Telegram native share.
-      On tap, Telegram sends a Message with ``content_type == ContentType.CONTACT``
-      and ``message.contact.phone_number`` populated. The share_contact_msg
-      handler (client.py) catches it via F.content_type == ContentType.CONTACT
-      + StateFilter(BookingStates.entering_phone).
-    - [⏭ Без телефона] — plain KeyboardButton. On tap, Telegram sends a text
-      message with the button text. The phone_skip_msg handler catches it via
-      F.text == PHONE_SKIP_LABEL (registered BEFORE phone_msg so the dispatcher
-      routes the skip text here, not into the normalize_phone path).
-
-    Layout: 2 buttons on one row (resize_keyboard=True keeps them compact after
-    first tap). is_persistent=True so the keyboard stays visible until the user
-    picks an option (matches client_reply_keyboard from B.13).
-
-    NB: /cancel works from entering_phone via the global cancel_msg handler
-    (StateFilter("*")) — no Cancel button on this keyboard to keep it minimal.
-    The user can always type /cancel or just /cancel through Telegram command
-    autocomplete.
-
-    Args:
-        None — keyboard is static (no DB, no session).
-
-    Returns:
-        ReplyKeyboardMarkup with 2 KeyboardButtons (one row). The Share
-        button has ``request_contact=True``, the Skip button is a plain
-        KeyboardButton.
-    """
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text=PHONE_SHARE_LABEL, request_contact=True),
-                KeyboardButton(text=PHONE_SKIP_LABEL),
-            ]
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-    )

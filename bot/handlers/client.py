@@ -51,8 +51,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State
 from aiogram.types import (
     CallbackQuery,
-    Contact,
-    ContentType,
     InlineKeyboardMarkup,
     Message,
     ReplyKeyboardRemove,
@@ -69,7 +67,6 @@ from bot.db import async_session_factory
 from bot.keyboards.client import (
     CLIENT_REPLY_BOOK_LABEL,
     CLIENT_REPLY_MYBOOKINGS_LABEL,
-    PHONE_SKIP_LABEL,
     BookConfirmCallbackData,
     BookDateCallbackData,
     BookServiceCallbackData,
@@ -88,7 +85,6 @@ from bot.keyboards.client import (
     date_picker_keyboard,
     mybookings_keyboard,
     name_pre_fill_keyboard,
-    phone_keyboard,
     post_booking_keyboard,
     service_picker_keyboard,
     slot_picker_keyboard,
@@ -113,7 +109,6 @@ from bot.services.booking import (
     _select_workday_for_slot,
     cancel_booking,
     create_booking,
-    normalize_phone,
     transfer_booking,
 )
 from bot.services.slots import (
@@ -1195,15 +1190,11 @@ async def name_pre_fill_yes_cb(
     state: FSMContext,
 ) -> None:
     """Client confirmed their Telegram first_name — skip text input, go to
-    entering_phone (Session 5.46 / B.10 — phone collection step inserted
-    between name and confirm).
+    confirming directly (phone step removed — name → confirm).
 
     Reads from_user.first_name (NOT from callback payload — kept minimal,
     avoids stale-name race). Saves client_name in state data and transitions
-    to entering_phone (was confirming pre-B.10). Phone_keyboard is rendered
-    with the prompt — summary rendering is deferred to phone_msg /
-    share_contact_msg / phone_skip_msg, all of which converge on confirming +
-    summary+confirm_keyboard.
+    to confirming via _render_summary_and_set_confirming.
 
     Defensive: if first_name is missing at this point (race — user revoked
     profile between slot_cb and this tap), fall back to entering_name text
@@ -1237,17 +1228,11 @@ async def name_pre_fill_yes_cb(
         await callback.answer()
         return
 
-    # Transition to entering_phone (B.10) — phone_keyboard prompt rendered.
-    # ReplyKeyboardRemove was sent in slot_cb/slot_30_cb when entering
-    # entering_name_pre_fill — reply keyboard already hidden, phone_keyboard
-    # is a fresh reply keyboard for the phone step.
-    await state.set_state(BookingStates.entering_phone)
-    if callback.message is not None:
-        await callback.message.answer(
-            "Телефон для напоминаний (если мастер позвонит).\n"
-            "📱 Поделитесь кнопкой внизу или введите номер:",
-            reply_markup=phone_keyboard(),
-        )
+    # Transition directly to confirming — phone step removed.
+    # _render_summary_and_set_confirming renders summary + confirm_keyboard.
+    if not await _render_summary_and_set_confirming(callback.message, state, first_name):
+        await callback.answer()
+        return
     await callback.answer()
 
 
@@ -1341,23 +1326,13 @@ async def book_back_to_service_cb(callback: CallbackQuery, state: FSMContext) ->
 # ============================================================
 @router.message(StateFilter(BookingStates.entering_name))
 async def name_msg(message: Message, state: FSMContext) -> None:
-    """User typed client name — save, transition to entering_phone (Session
-    5.46 / B.10 — phone collection step inserted between name and confirm).
+    """User typed client name — save, transition to confirming.
 
-    Session 5.29 Task 2 — FSM reorder: услуга ДО слота. Summary rendering
-    MOVED to confirm_cb's render path (phone_msg / share_contact_msg /
-    phone_skip_msg all converge to confirming + summary + confirm_keyboard).
-
-    Session 5.46 (B.10): name_msg now sets entering_phone (was confirming
-    pre-B.10). Renders phone_keyboard (Share + Skip reply buttons) and a
-    prompt asking for phone. Summary is NOT rendered here — phone_msg /
-    share_contact_msg / phone_skip_msg render summary after phone input /
-    skip, when transitioning to confirming.
+    Phone step removed: name → confirming directly (was name → phone → confirm).
+    _render_summary_and_set_confirming renders summary + confirm_keyboard.
 
     Defensive: if workday_id/slot_id missing in FSM (state corruption) →
-    state.clear + retry hint. We DO validate service_title here (needed for
-    summary later — fail fast instead of leaking the corruption to phone_msg
-    which would also need service_title).
+    state.clear + retry hint.
     """
     name = message.text.strip() if message.text else ""
     if not name:
@@ -1372,23 +1347,11 @@ async def name_msg(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     service_title = data.get("service_title")
     if not service_title:
-        # Defensive: should be set by service_picker_cb/service_msg before
-        # selecting_slot → entering_name. State corruption if missing.
-        # Checked BEFORE set_state(entering_phone) so defensive-clear path
-        # does not leave a stale entering_phone state in FSM.
         await state.clear()
         await message.answer("❌ Данные потеряны. Начните заново через /book или /slots")
         return
 
-    # All defensive checks passed — commit to entering_phone state. Placed
-    # AFTER checks so defensive-clear paths do NOT leave a stale entering_phone
-    # state in FSM (mirrors Session 5.29 Task 2 placement for confirming).
-    await state.set_state(BookingStates.entering_phone)
-    await message.answer(
-        "Телефон для напоминаний (если мастер позвонит).\n"
-        "📱 Поделитесь кнопкой внизу или введите номер:",
-        reply_markup=phone_keyboard(),
-    )
+    await _render_summary_and_set_confirming(message, state, name)
 
 
 # ============================================================
@@ -1401,11 +1364,8 @@ async def _render_summary_and_set_confirming(
 ) -> bool:
     """Render booking summary + set state to confirming. Returns True on success.
 
-    Shared by phone_msg / share_contact_msg / phone_skip_msg — all three
-    converge on entering_phone → confirming. Replaces the inline summary
-    rendering that used to live in name_msg + name_pre_fill_yes_cb (B.13
-    known tech debt ~50 lines × 2 — B.10 has 3 callers, so this helper
-    pays off immediately).
+    Called by name_msg and name_pre_fill_yes_cb after name is set — renders
+    summary + confirm_keyboard and transitions to confirming.
 
     Reads workday_id / slot_id / service_title from state. Branches on path
     (workday / legacy slot) and builds summary via _format_booking_summary
@@ -1413,7 +1373,7 @@ async def _render_summary_and_set_confirming(
     sends summary + confirm_keyboard via message.answer.
 
     Defensive: if service_title / slot_id / workday_id missing (state
-    corruption between entering_name and entering_phone — e.g. Redis
+    corruption — e.g. Redis
     flush mid-flow), state.clear + retry hint. Returns False — caller
     should NOT proceed further (e.g. skip callback.answer() — already
     answered by retry hint).
@@ -1495,144 +1455,6 @@ async def _render_summary_and_set_confirming(
         reply_markup=confirm_keyboard(),
     )
     return True
-
-
-# ============================================================
-# 5c. phone_skip_msg — [⏭ Без телефона] tap (Session 5.46 / B.10)
-# ============================================================
-# NB: Registered BEFORE phone_msg so F.text == PHONE_SKIP_LABEL routes here,
-# NOT into the normalize_phone path. aiogram dispatch order = registration
-# order within the same router — both handlers match F.text + StateFilter
-# (entering_phone), but the first match wins.
-@router.message(F.text == PHONE_SKIP_LABEL, StateFilter(BookingStates.entering_phone))
-async def phone_skip_msg(message: Message, state: FSMContext) -> None:
-    """Client tapped [⏭ Без телефона] — skip phone, transition to confirming.
-
-    Sets client_phone=None in state data (signal to confirm_cb that phone was
-    explicitly skipped, not just missing). Renders summary + confirm_keyboard
-    via _render_summary_and_set_confirming.
-
-    Phone is NOT updated on Client in this path — confirm_cb passes
-    payload.phone=None to create_booking, and service.py's `if payload.phone
-    is not None` guard skips the UPDATE (preserves existing phone for repeat
-    bookings where the user had entered a phone before but skipped this time).
-    """
-    await state.update_data(client_phone=None)
-    data = await state.get_data()
-    client_name = data.get("client_name")
-    if not client_name:
-        # Defensive: client_name should be set by name_msg / pre_fill_yes_cb
-        # upstream. If missing — state corruption, retry.
-        await state.clear()
-        await message.answer("❌ Данные потеряны. Начните заново через /book или /slots")
-        return
-    # ReplyKeyboardRemove — phone_keyboard no longer needed, summary +
-    # confirm_keyboard is inline (no reply keyboard). Reply keyboard will
-    # be restored after confirm_cb (B.13 _restore_reply_keyboard_async).
-    await message.answer("Ок, без телефона.", reply_markup=ReplyKeyboardRemove())
-    # B.10 W1 (qa-code-review): honor the helper's contract — bail out if the
-    # defensive path triggered (state.clear + "Данные потеряны" already sent).
-    # Without this guard the user would see both "Ок, без телефона." AND
-    # "❌ Данные потеряны" — misleading UX in the rare state-corruption case.
-    if not await _render_summary_and_set_confirming(message, state, client_name):
-        return
-
-
-# ============================================================
-# 5d. phone_msg — text input (Session 5.46 / B.10)
-# ============================================================
-@router.message(F.text, StateFilter(BookingStates.entering_phone))
-async def phone_msg(message: Message, state: FSMContext) -> None:
-    """Client typed a phone number — normalize, save, transition to confirming.
-
-    Uses bot.services.booking.normalize_phone (donor BB-109) for RU-conversion:
-    8XXXXXXXXXX / 7XXXXXXXXXX → +7XXXXXXXXXX, +7XXXXXXXXXX → as-is, international
-    kept as-is. Invalid input → retry (no state change, no transition).
-
-    On success: state.update_data(client_phone=normalized) + render summary +
-    confirm_keyboard via _render_summary_and_set_confirming.
-
-    NB: Registered AFTER phone_skip_msg so [⏭ Без телефона] tap is routed
-    to skip handler (text match on PHONE_SKIP_LABEL wins over generic F.text
-    because skip is registered first — aiogram dispatch order = registration
-    order within the same router).
-    """
-    raw = message.text.strip() if message.text else ""
-    if not raw:
-        await message.answer("Введите телефон или нажмите «⏭ Без телефона»:")
-        return
-    normalized = normalize_phone(raw)
-    if normalized is None:
-        await message.answer(
-            "❌ Неверный формат. Пример: +79991234567, 79991234567, 89991234567.\n"
-            "Или нажмите «⏭ Без телефона»."
-        )
-        return
-    await state.update_data(client_phone=normalized)
-    data = await state.get_data()
-    client_name = data.get("client_name")
-    if not client_name:
-        await state.clear()
-        await message.answer("❌ Данные потеряны. Начните заново через /book или /slots")
-        return
-    await message.answer(
-        f"Ок, телефон: {normalized}",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    # B.10 W1 (qa-code-review): honor the helper's contract — bail out on
-    # defensive clear (see phone_skip_msg for the same guard rationale).
-    if not await _render_summary_and_set_confirming(message, state, client_name):
-        return
-
-
-# ============================================================
-# 5e. share_contact_msg — TG native share button (Session 5.46 / B.10)
-# ============================================================
-@router.message(F.content_type == ContentType.CONTACT, StateFilter(BookingStates.entering_phone))
-async def share_contact_msg(message: Message, state: FSMContext) -> None:
-    """Client tapped [📱 Поделиться] (request_contact=True) — Telegram sent
-    a Message with message.contact populated.
-
-    Reads message.contact.phone_number, normalizes via normalize_phone (TG
-    may send without '+' prefix depending on the carrier), saves to state,
-    transitions to confirming via _render_summary_and_set_confirming.
-
-    Defensive: message.contact is guaranteed by aiogram filter
-    (F.content_type == ContentType.CONTACT), but phone_number could still be
-    empty in pathological cases — treat as retry.
-
-    NB: Telegram's share button sends the user's OWN phone from their TG
-    profile, not arbitrary input. If normalize_phone returns None on a TG-
-    provided number (extremely rare, but possible for international numbers
-    outside the PHONE_PATTERN range) — retry with manual input prompt.
-    """
-    contact: Contact | None = message.contact
-    if contact is None or not contact.phone_number:
-        await message.answer(
-            "❌ Не получил телефон. Введите номер вручную или нажмите «⏭ Без телефона»:"
-        )
-        return
-    normalized = normalize_phone(contact.phone_number)
-    if normalized is None:
-        await message.answer(
-            "❌ Не распознал формат. Введите номер вручную (например, +79991234567):"
-        )
-        return
-    await state.update_data(client_phone=normalized)
-    data = await state.get_data()
-    client_name = data.get("client_name")
-    if not client_name:
-        await state.clear()
-        await message.answer("❌ Данные потеряны. Начните заново через /book или /slots")
-        return
-    await message.answer(
-        f"Ок, телефон: {normalized}",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    # B.10 W1 (qa-code-review): honor the helper's contract — bail out on
-    # defensive clear (see phone_skip_msg for the same guard rationale).
-    if not await _render_summary_and_set_confirming(message, state, client_name):
-        return
 
 
 # ============================================================
@@ -1935,9 +1757,9 @@ async def confirm_cb(
     client_name = data.get("client_name")
     service_title = data.get("service_title")
     service_id_str = data.get("service_id")  # Session 5.27: tap-to-select path
-    # Session 5.46 (B.10): phone from entering_phone step. None if user
-    # tapped Skip — preserved as None (service skips Client.phone UPDATE).
-    client_phone = data.get("client_phone")
+    # @username from Telegram profile — master taps it to contact client.
+    # None if user has no @username (notification shows telegram_id fallback).
+    telegram_username = callback.from_user.username if callback.from_user else None
 
     # XOR contract with service_msg: slot_id (legacy /book) XOR
     # (workday_id + start_minute) (workday /slots). Both branches require
@@ -2007,7 +1829,7 @@ async def confirm_cb(
                 client_name=client_name,
                 service_title=service_title,
                 service_id=UUID(service_id_str) if service_id_str else None,
-                phone=client_phone,
+                telegram_username=telegram_username,
             )
         else:
             # === /book legacy slot path ===
@@ -2017,7 +1839,7 @@ async def confirm_cb(
                 client_name=client_name,
                 service_title=service_title,
                 service_id=UUID(service_id_str) if service_id_str else None,
-                phone=client_phone,
+                telegram_username=telegram_username,
             )
 
         try:
