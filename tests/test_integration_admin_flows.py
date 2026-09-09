@@ -676,24 +676,15 @@ async def test_booking_flow_with_service_picker_creates_booking(
         step4 = _extract_send_text(bot)
         assert "На чьё имя" in step4, f"Expected name prompt, got: {step4!r}"
 
-        # Step 5: type name → phone prompt (entering_phone, B.10).
+        # Step 5: type name → summary (confirming, phone step removed).
         bot.reset()
         await dp.feed_update(bot, _make_text_update("Паша", user_id=client_tg))
         step5 = _extract_send_text(bot)
-        assert "Телефон" in step5 or "📱" in step5, (
-            f"B.10: name_msg now → entering_phone (not confirming). Got: {step5!r}"
+        assert "Подтвердите запись" in step5, (
+            f"name_msg → confirming (summary). Got: {step5!r}"
         )
-
-        # Step 5b: tap [⏭ Без телефона] → summary (confirming).
-        # Reply keyboard button — Telegram sends a text message with the button
-        # label. _find_button_by_label is for INLINE buttons only; for reply
-        # buttons we feed the text directly (label is known + static).
-        bot.reset()
-        await dp.feed_update(bot, _make_text_update("⏭ Без телефона", user_id=client_tg))
-        step5b = _extract_send_text(bot)
-        assert "Подтвердите запись" in step5b, f"Expected summary, got: {step5b!r}"
-        assert "Окрашивание" in step5b, f"Service name in summary, got: {step5b!r}"
-        assert "Паша" in step5b, f"Client name in summary, got: {step5b!r}"
+        assert "Окрашивание" in step5
+        assert "Паша" in step5
 
         # Step 6: tap ✅ → booking created ('Вы записаны').
         confirm_btn = await _find_button_by_label(bot, "Подтвердить")
@@ -801,22 +792,15 @@ async def test_booking_flow_custom_service_text_uses_default_duration(
         await dp.feed_update(bot, _make_callback_update_from_button(slot_btn, user_id=client_tg))
         assert "На чьё имя" in _extract_send_text(bot)
 
-        # Step 5b: type name → phone prompt (entering_phone, B.10).
+        # Step 5b: type name → summary (confirming, phone step removed).
         bot.reset()
         await dp.feed_update(bot, _make_text_update("Паша", user_id=client_tg))
         step5b = _extract_send_text(bot)
-        assert "Телефон" in step5b or "📱" in step5b, (
-            f"B.10: name_msg now → entering_phone (not confirming). Got: {step5b!r}"
+        assert "Подтвердите запись" in step5b, (
+            f"name_msg → confirming (summary). Got: {step5b!r}"
         )
-
-        # Step 6: tap [⏭ Без телефона] → summary (confirming).
-        # Reply keyboard button — feed text directly (label is static).
-        bot.reset()
-        await dp.feed_update(bot, _make_text_update("⏭ Без телефона", user_id=client_tg))
-        summary = _extract_send_text(bot)
-        assert "Подтвердите запись" in summary
-        assert "Борода + стрижка" in summary
-        assert "Паша" in summary
+        assert "Борода + стрижка" in step5b
+        assert "Паша" in step5b
 
         # Step 7: tap ✅.
         confirm_btn = await _find_button_by_label(bot, "Подтвердить")

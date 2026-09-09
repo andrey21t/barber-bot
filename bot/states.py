@@ -4,7 +4,7 @@ from aiogram.fsm.state import State, StatesGroup
 class BookingStates(StatesGroup):
     """FSM states для booking flow (spec.md 221-227).
 
-    Порядок: date → service → slot → name → phone → confirm.
+    Порядок: date → service → slot → name → confirm.
     Single-master (BB-001): select_specialist skip'ается.
 
     Session 5.36 (B.13): entering_name_pre_fill добавлен между selecting_slot
@@ -12,22 +12,12 @@ class BookingStates(StatesGroup):
     inline «✅ Да, это я» / «👤 Другое имя». State entering_name_pre_fill ловит
     только callback (name_pre_fill_yes_cb / name_pre_fill_other_cb), НЕ текст —
     это разделяет текстовый ввод (entering_name) и callback-выбор (pre_fill).
-
-    Session 5.46 (B.10): entering_phone добавлен между entering_name и
-    confirming. После ввода имени (text или pre-fill yes) пользователь видит
-    reply keyboard с [📱 Поделиться] (request_contact=True, native TG share)
-    и [⏭ Без телефона]. State ловит: текст (phone_msg нормализует), Contact
-    (share_contact_msg — message.contact.phone_number), skip text
-    (phone_skip_msg). Phone НЕ обязательный — skip продолжит booking с
-    phone=None. Skip не перезаписывает уже сохранённый phone в Client (для
-    repeat bookings — сохранённый phone остаётся).
     """
 
     selecting_date = State()
     selecting_slot = State()
     entering_name_pre_fill = State()
     entering_name = State()
-    entering_phone = State()
     entering_service = State()
     confirming = State()
 

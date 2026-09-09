@@ -2819,19 +2819,18 @@ def test_normalize_phone_pattern_rejects_edge_cases() -> None:
 
 
 # ============================================================
-# Session 5.46 (B.10) — phone attribute on Client: create_booking UPDATE guard
+# @username in master notification (phone step removed)
 # ============================================================
 
 
 @pytest.mark.asyncio
-async def test_create_booking_phone_set_on_new_client(
+async def test_create_booking_username_in_notification(
     session: AsyncSession,
     seed_data: dict[str, Any],
 ) -> None:
-    """B.10: create_booking(payload.phone="+7999...") → Client.phone UPDATE'd
-    to the new value. Client starts without a phone (conftest.py:111 default —
-    Client.phone nullable, no fixture value), create_booking sets it via the
-    `if payload.phone is not None` guard at booking.py:583.
+    """@username passed to BookingCreate → master notification includes @username.
+
+    Master taps @username to contact client via Telegram.
     """
     workday = seed_data["workday"]
     payload = BookingCreate(
@@ -2840,10 +2839,10 @@ async def test_create_booking_phone_set_on_new_client(
         client_name="Паша",
         service_title="Стрижка",
         service_id=None,
-        phone="+79991234567",
+        telegram_username="pasha_ivanov",
     )
 
-    await create_booking(
+    result = await create_booking(
         session,
         payload,
         business_id=seed_data["business_id"],
@@ -2851,77 +2850,33 @@ async def test_create_booking_phone_set_on_new_client(
         telegram_id=seed_data["client_telegram_id"],
     )
 
-    # Client.phone UPDATE'd to the payload value.
-    client = (
-        (await session.execute(select(Client).where(Client.id == seed_data["client"].id)))
-        .scalar_one()
-    )
-    assert client.phone == "+79991234567"
+    assert "@pasha_ivanov" in result.master_notification_text
+    assert "📞" not in result.master_notification_text
 
 
 @pytest.mark.asyncio
-async def test_create_booking_skip_phone_preserves_existing(
+async def test_create_booking_no_username_shows_telegram_id(
     session: AsyncSession,
     seed_data: dict[str, Any],
 ) -> None:
-    """B.10: create_booking(payload.phone=None) on a Client with an existing phone
-    → `if payload.phone is not None` guard (booking.py:583) skips the UPDATE →
-    existing phone is preserved. This is the contract for "skip doesn't overwrite
-    phone" — the 80% case where a repeat client taps Skip on the phone step but
-    already had a phone from a previous booking.
-
-    Setup:
-      1. Pre-set Client.phone via a first booking (phone="+79991234567")
-      2. Second booking on a different time slot with phone=None (skip)
-      3. Assert: Client.phone still == "+79991234567" (NOT None, NOT overwritten)
-    """
+    """No @username (None) → notification shows telegram_id as fallback."""
     workday = seed_data["workday"]
-
-    # === Step 1: first booking with phone → Client.phone set to +7999... ===
-    payload1 = BookingCreate(
+    payload = BookingCreate(
         workday_id=workday.id,
-        start_time_local=dt_time(10, 0),
-        client_name="Паша",
+        start_time_local=dt_time(15, 0),
+        client_name="Аноним",
         service_title="Стрижка",
         service_id=None,
-        phone="+79991234567",
-    )
-    await create_booking(
-        session,
-        payload1,
-        business_id=seed_data["business_id"],
-        master_id=seed_data["master_id"],
-        telegram_id=seed_data["client_telegram_id"],
-    )
-    client_after_first = (
-        (await session.execute(select(Client).where(Client.id == seed_data["client"].id)))
-        .scalar_one()
-    )
-    assert client_after_first.phone == "+79991234567"
-
-    # === Step 2: second booking with phone=None (skip) ===
-    payload2 = BookingCreate(
-        workday_id=workday.id,
-        start_time_local=dt_time(16, 0),  # different slot, no overlap
-        client_name="Паша",
-        service_title="Стрижка",
-        service_id=None,
-        phone=None,
-    )
-    await create_booking(
-        session,
-        payload2,
-        business_id=seed_data["business_id"],
-        master_id=seed_data["master_id"],
-        telegram_id=seed_data["client_telegram_id"],
+        telegram_username=None,
     )
 
-    # === Step 3: Client.phone preserved (NOT overwritten with None) ===
-    client_after_second = (
-        (await session.execute(select(Client).where(Client.id == seed_data["client"].id)))
-        .scalar_one()
+    result = await create_booking(
+        session,
+        payload,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=123456789,
     )
-    assert client_after_second.phone == "+79991234567", (
-        "skip (payload.phone=None) must not overwrite existing Client.phone — "
-        "guard at booking.py:583 `if payload.phone is not None` skips the UPDATE"
-    )
+
+    assert "123456789" in result.master_notification_text
+    assert "@pasha" not in result.master_notification_text

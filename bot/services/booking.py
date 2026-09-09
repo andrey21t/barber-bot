@@ -572,17 +572,6 @@ async def create_booking(
 
     client = await _select_or_create_client(session, telegram_id)
 
-    # Session 5.46 (B.10): persist phone on Client (attribute of Client, NOT a
-    # snapshot in Booking — /today renders the CURRENT phone, not at booking
-    # time). Defensive: only UPDATE if payload.phone is not None — skip path
-    # does NOT overwrite an existing phone in Client (preserves phone for
-    # repeat bookings where the user skipped phone input this time but had
-    # entered it before). SQLAlchemy dirty tracking — assigning to the mapped
-    # attribute marks the row for UPDATE in the same transaction as Booking INSERT
-    # (atomic: booking INSERT + phone UPDATE commit together).
-    if payload.phone is not None:
-        client.phone = payload.phone
-
     # Multi-client capacity check (Этап 5.5, B1 fix): acquire advisory lock + count
     # overlapping active bookings AFTER _select_or_create_client (rollback-prone
     # above) but BEFORE Booking INSERT (line below). workday_id/capacity captured
@@ -668,13 +657,16 @@ async def create_booking(
     # Format notification text for master (rendered in HTML parse mode, no re-escape needed)
     local_time = start_at.astimezone(ZoneInfo(business_tz))
     formatted_time = local_time.strftime("%d %B %Y, %H:%M")
-    # Session 5.46 (B.10): add phone line if client has one. Phone is the
-    # CURRENT client.phone (just set above from payload.phone) — not a snapshot.
-    # Rendered raw (no escape) — phone is digits/+ only, no HTML metacharacters.
-    phone_line = f"📞 {client.phone}\n" if client.phone else ""
+    # @username for master notification — master taps @username to contact client.
+    # Fallback: telegram_id (int) if no @username (hidden/not set).
+    if payload.telegram_username:
+        contact_line = f"👤 {escaped_name} (@{payload.telegram_username})\n"
+    else:
+        contact_line = f"👤 {escaped_name} (ID: {telegram_id})\n"
     master_text = (
-        f"Новая запись:\n📅 {formatted_time}\n👤 {escaped_name}\n💇 {escaped_service}\n"
-        f"{phone_line}"
+        f"Новая запись:\n📅 {formatted_time}\n"
+        f"{contact_line}"
+        f"💇 {escaped_service}\n"
     ).rstrip("\n")
 
     return BookingCreatedData(

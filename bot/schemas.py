@@ -29,11 +29,11 @@ class BookingCreate(BaseModel):
     Note: client_id intentionally absent — service resolves client by telegram_id
     via _select_or_create_client(telegram_id) (booking.py:101-112).
 
-    Session 5.46 (B.10): phone field added. Optional (None = client skipped phone
-    input). Service updates Client.phone AFTER _select_or_create_client — only
-    if payload.phone is not None (skip does not overwrite an existing phone
-    in Client for repeat bookings). Phone is an attribute of Client, NOT a
-    snapshot in Booking — /today renders the current phone (not at booking time).
+    telegram_username: str | None = None — @username from Telegram profile
+    (callback.from_user.username). Passed to master notification so master can
+    tap the @username to contact the client. None if user has no @username
+    (hidden or not set) — notification shows telegram_id as fallback.
+    NOT persisted on Client (usernames change, read fresh each booking).
     """
 
     model_config = ConfigDict(frozen=True)
@@ -44,7 +44,7 @@ class BookingCreate(BaseModel):
     client_name: str = Field(min_length=1, max_length=255)
     service_title: str = Field(min_length=1, max_length=255)
     service_id: UUID | None = None
-    phone: str | None = None
+    telegram_username: str | None = None
 
     @model_validator(mode="after")
     def _validate_slot_xor_workday(self) -> "BookingCreate":
