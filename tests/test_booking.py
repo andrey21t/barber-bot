@@ -24,7 +24,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from bot.models import Booking, Business, Client, Master, NotificationLog, Slot
+from bot.models import Booking, Business, Client, Master, NotificationLog, Slot, WorkDay
 from bot.schemas import BookingCreate
 from bot.services.booking import (
     BookingAlreadyCancelledError,
@@ -2267,23 +2267,98 @@ async def test_cancel_booking_workday_no_slot_update(
 
 
 @pytest.mark.asyncio
-async def test_transfer_booking_workday_raises_not_implemented(
+async def test_transfer_workday_to_workday_happy_path(
     session: AsyncSession,
     seed_data: dict[str, Any],
 ) -> None:
-    """Этап 5.8a — transfer workday-only booking (slot_id=None) raises
-    NotImplementedError (booking.py:919-923 guard). WorkDay transfer = 5.9 scope
-    (admin_move_booking — separate service, no client_id pin, no 24h rule).
+    """B.1 — workday-only booking (slot_id=None) transferred to new WorkDay slot.
 
-    Guard fires BEFORE step 4 (24h rule), step 5 (SELECT new_slot) — so any
-    new_slot_id is fine (it's never reached). Pattern mirror test_transfer_booking_*
-    setup but slot_id=None booking (workday path).
+    Source: workday-only booking (created via /slots, slot_id=None).
+    Destination: new WorkDay slot (new_workday_id + new_start_time_local).
+    Expected: UPDATE booking (status='transferred', slot_id stays None, start_at=new),
+    NO old slot to release (slot_id=None), NotificationLog master_transfer,
+    scheduler remove+schedule, TransferResult.new_slot_id=None.
+    """
+    workday = seed_data["workday"]
+    payload = await _make_workday_payload(workday.id, start_time_local=dt_time(14, 30))
+    result = await create_booking(
+        session,
+        payload,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=seed_data["client_telegram_id"],
+    )
+    assert result.slot_id is None
+    booking_id = result.booking_id
+    old_start_at = result.start_at
 
-    Coverage of booking.py:919-923:
-      - SELECT booking (step 1-3) returns workday-only booking (slot_id=None)
-      - status != 'cancelled' → falls through
-      - Guard `if booking.slot_id is None: raise NotImplementedError(...)`
-      - 5.9 scope (admin_move_booking) — separate service without client_id pin
+    # Create a second WorkDay 5 days ahead for destination.
+    dest_date = (datetime.now(UTC) + timedelta(days=5)).date()
+    dest_workday = WorkDay(
+        master_id=seed_data["master_id"],
+        work_date=dest_date,
+        start_time=dt_time(10, 0),
+        end_time=dt_time(20, 0),
+        max_concurrent_clients=1,
+        is_active=True,
+    )
+    session.add(dest_workday)
+    await session.commit()
+
+    mock_scheduler = _mock_scheduler()
+    ref = datetime.now(UTC) - timedelta(days=10)
+
+    transfer_result = await transfer_booking(
+        session,
+        booking_id=booking_id,
+        new_slot_id=None,
+        client_id=seed_data["client"].id,
+        scheduler=mock_scheduler,
+        now_utc=ref,
+        new_workday_id=dest_workday.id,
+        new_start_time_local=dt_time(16, 0),
+    )
+
+    assert isinstance(transfer_result, TransferResult)
+    assert transfer_result.new_slot_id is None
+    assert transfer_result.old_slot_id is None
+    assert transfer_result.old_start_at == old_start_at.replace(tzinfo=UTC)
+    assert transfer_result.new_start_at != old_start_at.replace(tzinfo=UTC)
+    assert transfer_result.master_notification_text.startswith("Перенос:")
+    assert "→" in transfer_result.master_notification_text
+
+    # DB: booking transferred, slot_id still None, start_at updated.
+    await session.rollback()
+    stmt_b = select(Booking).where(Booking.id == booking_id)
+    booking_after = (await session.execute(stmt_b)).scalar_one()
+    assert booking_after.status == "transferred"
+    assert booking_after.slot_id is None
+    assert booking_after.start_at != old_start_at
+
+    # NotificationLog master_transfer.
+    stmt_n = select(NotificationLog).where(
+        NotificationLog.booking_id == booking_id,
+        NotificationLog.kind == "master_transfer",
+    )
+    notif_rows = (await session.execute(stmt_n)).scalars().all()
+    assert len(notif_rows) == 1
+
+    # Scheduler: remove + schedule called.
+    expected_remove = {f"remind_24h_{booking_id}", f"remind_1h_{booking_id}"}
+    actual_remove = {call.args[0] for call in mock_scheduler.remove_job.call_args_list}
+    assert actual_remove == expected_remove
+
+
+@pytest.mark.asyncio
+async def test_transfer_workday_to_slot_cross_path(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """B.1 — workday-only booking (slot_id=None) transferred to legacy Slot destination.
+
+    Source: workday-only booking (slot_id=None). Destination: legacy Slot (new_slot_id).
+    Expected: existing slot-path runs (steps 7s-13), no old slot to release (old_slot_id=None),
+    new slot booked to 'booked', TransferResult.new_slot_id = new_slot.id.
     """
     workday = seed_data["workday"]
     payload = await _make_workday_payload(workday.id, start_time_local=dt_time(14, 30))
@@ -2297,28 +2372,365 @@ async def test_transfer_booking_workday_raises_not_implemented(
     assert result.slot_id is None
     booking_id = result.booking_id
 
-    # transfer_booking requires new_slot_id — guard fires BEFORE _select_open_slot
-    # (step 5), so any UUID is fine (never reached). Use seed_data["slot"].id for
-    # semantic clarity (would-be destination in 5.9 admin_move_booking).
-    new_slot_id = seed_data["slot"].id
+    new_slot = await _make_open_slot(session, seed_data, days_ahead=5, hour_local=15)
+    new_slot_id = new_slot.id
 
-    with pytest.raises(NotImplementedError, match="WorkDay transfer is 5.9 scope"):
+    mock_scheduler = _mock_scheduler()
+    ref = datetime.now(UTC) - timedelta(days=10)
+
+    transfer_result = await transfer_booking(
+        session,
+        booking_id=booking_id,
+        new_slot_id=new_slot_id,
+        client_id=seed_data["client"].id,
+        scheduler=mock_scheduler,
+        now_utc=ref,
+    )
+
+    assert transfer_result.old_slot_id is None
+    assert transfer_result.new_slot_id == new_slot_id
+
+    # DB: booking transferred, slot_id = new_slot_id (cross-path: None → slot).
+    await session.rollback()
+    stmt_b2 = select(Booking).where(Booking.id == booking_id)
+    booking_after = (await session.execute(stmt_b2)).scalar_one()
+    assert booking_after.status == "transferred"
+    assert booking_after.slot_id == new_slot_id
+
+    # New slot is 'booked'.
+    stmt_s2 = select(Slot.status).where(Slot.id == new_slot_id)
+    assert (await session.execute(stmt_s2)).scalar_one() == "booked"
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_to_workday_cross_path(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """B.1 — legacy slot booking transferred to WorkDay destination.
+
+    Source: slot-based booking (slot_id not None). Destination: WorkDay slot.
+    Expected: workday-path runs, old slot released to 'open', booking.slot_id → None.
+    """
+    booking = await _seed_confirmed_booking(session, seed_data)
+    booking_id = booking.id
+    old_slot_id = booking.slot_id
+    assert old_slot_id is not None
+
+    dest_date = (datetime.now(UTC) + timedelta(days=5)).date()
+    dest_workday = WorkDay(
+        master_id=seed_data["master_id"],
+        work_date=dest_date,
+        start_time=dt_time(10, 0),
+        end_time=dt_time(20, 0),
+        max_concurrent_clients=1,
+        is_active=True,
+    )
+    session.add(dest_workday)
+    await session.commit()
+
+    mock_scheduler = _mock_scheduler()
+    ref = datetime.now(UTC) - timedelta(days=10)
+
+    transfer_result = await transfer_booking(
+        session,
+        booking_id=booking_id,
+        new_slot_id=None,
+        client_id=seed_data["client"].id,
+        scheduler=mock_scheduler,
+        now_utc=ref,
+        new_workday_id=dest_workday.id,
+        new_start_time_local=dt_time(16, 0),
+    )
+
+    assert transfer_result.old_slot_id == old_slot_id
+    assert transfer_result.new_slot_id is None
+
+    # DB: booking transferred, slot_id=None (unified workday destination).
+    await session.rollback()
+    stmt_b3 = select(Booking).where(Booking.id == booking_id)
+    booking_after = (await session.execute(stmt_b3)).scalar_one()
+    assert booking_after.status == "transferred"
+    assert booking_after.slot_id is None
+
+    # Old slot released to 'open'.
+    stmt_s3 = select(Slot.status).where(Slot.id == old_slot_id)
+    assert (await session.execute(stmt_s3)).scalar_one() == "open"
+
+
+@pytest.mark.asyncio
+async def test_transfer_workday_xor_validation_both_passed(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """B.1 — XOR validation: both new_slot_id AND new_workday_id → ValueError."""
+    workday = seed_data["workday"]
+    payload = await _make_workday_payload(workday.id, start_time_local=dt_time(14, 30))
+    result = await create_booking(
+        session,
+        payload,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=seed_data["client_telegram_id"],
+    )
+    booking_id = result.booking_id
+    new_slot = await _make_open_slot(session, seed_data, days_ahead=5, hour_local=15)
+
+    with pytest.raises(ValueError, match="Exactly one required"):
         await transfer_booking(
             session,
             booking_id=booking_id,
-            new_slot_id=new_slot_id,
+            new_slot_id=new_slot.id,
+            client_id=seed_data["client"].id,
+            scheduler=_mock_scheduler(),
+            now_utc=datetime.now(UTC) - timedelta(days=10),
+            new_workday_id=workday.id,
+            new_start_time_local=dt_time(16, 0),
+        )
+
+
+@pytest.mark.asyncio
+async def test_transfer_workday_xor_validation_neither_passed(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """B.1 — XOR validation: neither new_slot_id nor new_workday_id → ValueError."""
+    workday = seed_data["workday"]
+    payload = await _make_workday_payload(workday.id, start_time_local=dt_time(14, 30))
+    result = await create_booking(
+        session,
+        payload,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=seed_data["client_telegram_id"],
+    )
+    booking_id = result.booking_id
+
+    with pytest.raises(ValueError, match="Exactly one required"):
+        await transfer_booking(
+            session,
+            booking_id=booking_id,
+            new_slot_id=None,
             client_id=seed_data["client"].id,
             scheduler=_mock_scheduler(),
             now_utc=datetime.now(UTC) - timedelta(days=10),
         )
 
-    # Booking unchanged — guard fired before any UPDATE (status='confirmed',
-    # slot_id=None preserved, not overwritten with new_slot_id).
-    await session.rollback()
-    stmt_b = select(Booking.status, Booking.slot_id).where(Booking.id == booking_id)
-    row = (await session.execute(stmt_b)).one()
-    assert row.status == "confirmed"
-    assert row.slot_id is None
+
+@pytest.mark.asyncio
+async def test_transfer_workday_deadline_expired(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """B.1 — 24h rule: now >= old_start_at - CANCEL_MIN_HOURS → CancelTooLateError."""
+    workday = seed_data["workday"]
+    payload = await _make_workday_payload(workday.id, start_time_local=dt_time(14, 30))
+    result = await create_booking(
+        session,
+        payload,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=seed_data["client_telegram_id"],
+    )
+    booking_id = result.booking_id
+
+    dest_date = (datetime.now(UTC) + timedelta(days=5)).date()
+    dest_workday = WorkDay(
+        master_id=seed_data["master_id"],
+        work_date=dest_date,
+        start_time=dt_time(10, 0),
+        end_time=dt_time(20, 0),
+        max_concurrent_clients=1,
+        is_active=True,
+    )
+    session.add(dest_workday)
+    await session.commit()
+
+    # ref = start_at - 1 hour → past deadline (start_at - 24h).
+    # start_at is tomorrow 14:30 MSK = 11:30 UTC. deadline = 11:30 - 24h = today 11:30 UTC.
+    # ref = 10:30 UTC (past deadline) → CancelTooLateError.
+    old_start_at = result.start_at
+    ref = old_start_at.replace(tzinfo=UTC) - timedelta(hours=1)
+    with pytest.raises(CancelTooLateError):
+        await transfer_booking(
+            session,
+            booking_id=booking_id,
+            new_slot_id=None,
+            client_id=seed_data["client"].id,
+            scheduler=_mock_scheduler(),
+            now_utc=ref,
+            new_workday_id=dest_workday.id,
+            new_start_time_local=dt_time(16, 0),
+        )
+
+
+@pytest.mark.asyncio
+async def test_transfer_workday_not_owner(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """B.1 — not owner: booking belongs to another client → BookingNotFoundError."""
+    workday = seed_data["workday"]
+    payload = await _make_workday_payload(workday.id, start_time_local=dt_time(14, 30))
+    result = await create_booking(
+        session,
+        payload,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=seed_data["client_telegram_id"],
+    )
+    booking_id = result.booking_id
+
+    dest_date = (datetime.now(UTC) + timedelta(days=5)).date()
+    dest_workday = WorkDay(
+        master_id=seed_data["master_id"],
+        work_date=dest_date,
+        start_time=dt_time(10, 0),
+        end_time=dt_time(20, 0),
+        max_concurrent_clients=1,
+        is_active=True,
+    )
+    session.add(dest_workday)
+    await session.commit()
+
+    other_client_id = uuid4()
+    with pytest.raises(BookingNotFoundError):
+        await transfer_booking(
+            session,
+            booking_id=booking_id,
+            new_slot_id=None,
+            client_id=other_client_id,
+            scheduler=_mock_scheduler(),
+            now_utc=datetime.now(UTC) - timedelta(days=10),
+            new_workday_id=dest_workday.id,
+            new_start_time_local=dt_time(16, 0),
+        )
+
+
+@pytest.mark.asyncio
+async def test_transfer_workday_cancelled_booking(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """B.1 — cancelled booking → BookingAlreadyCancelledError (defensive)."""
+    workday = seed_data["workday"]
+    payload = await _make_workday_payload(workday.id, start_time_local=dt_time(14, 30))
+    result = await create_booking(
+        session,
+        payload,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=seed_data["client_telegram_id"],
+    )
+    booking_id = result.booking_id
+
+    # Cancel the booking first.
+    await cancel_booking(
+        session,
+        booking_id=booking_id,
+        client_id=seed_data["client"].id,
+        scheduler=_mock_scheduler(),
+    )
+
+    dest_date = (datetime.now(UTC) + timedelta(days=5)).date()
+    dest_workday = WorkDay(
+        master_id=seed_data["master_id"],
+        work_date=dest_date,
+        start_time=dt_time(10, 0),
+        end_time=dt_time(20, 0),
+        max_concurrent_clients=1,
+        is_active=True,
+    )
+    session.add(dest_workday)
+    await session.commit()
+
+    with pytest.raises(BookingAlreadyCancelledError):
+        await transfer_booking(
+            session,
+            booking_id=booking_id,
+            new_slot_id=None,
+            client_id=seed_data["client"].id,
+            scheduler=_mock_scheduler(),
+            now_utc=datetime.now(UTC) - timedelta(days=10),
+            new_workday_id=dest_workday.id,
+            new_start_time_local=dt_time(16, 0),
+        )
+
+
+@pytest.mark.asyncio
+async def test_transfer_workday_inactive_workday(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """B.1 — destination WorkDay is_active=False → WorkDayInactiveError."""
+    from bot.services.booking import WorkDayInactiveError
+
+    workday = seed_data["workday"]
+    payload = await _make_workday_payload(workday.id, start_time_local=dt_time(14, 30))
+    result = await create_booking(
+        session,
+        payload,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=seed_data["client_telegram_id"],
+    )
+    booking_id = result.booking_id
+
+    dest_date = (datetime.now(UTC) + timedelta(days=5)).date()
+    dest_workday = WorkDay(
+        master_id=seed_data["master_id"],
+        work_date=dest_date,
+        start_time=dt_time(10, 0),
+        end_time=dt_time(20, 0),
+        max_concurrent_clients=1,
+        is_active=False,
+    )
+    session.add(dest_workday)
+    await session.commit()
+
+    with pytest.raises(WorkDayInactiveError):
+        await transfer_booking(
+            session,
+            booking_id=booking_id,
+            new_slot_id=None,
+            client_id=seed_data["client"].id,
+            scheduler=_mock_scheduler(),
+            now_utc=datetime.now(UTC) - timedelta(days=10),
+            new_workday_id=dest_workday.id,
+            new_start_time_local=dt_time(16, 0),
+        )
+
+
+@pytest.mark.asyncio
+async def test_transfer_workday_not_found(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """B.1 — destination WorkDay doesn't exist → WorkDayNotFoundError."""
+    from bot.services.booking import WorkDayNotFoundError
+
+    workday = seed_data["workday"]
+    payload = await _make_workday_payload(workday.id, start_time_local=dt_time(14, 30))
+    result = await create_booking(
+        session,
+        payload,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=seed_data["client_telegram_id"],
+    )
+    booking_id = result.booking_id
+
+    with pytest.raises(WorkDayNotFoundError):
+        await transfer_booking(
+            session,
+            booking_id=booking_id,
+            new_slot_id=None,
+            client_id=seed_data["client"].id,
+            scheduler=_mock_scheduler(),
+            now_utc=datetime.now(UTC) - timedelta(days=10),
+            new_workday_id=uuid4(),
+            new_start_time_local=dt_time(16, 0),
+        )
 
 
 # ============================================================

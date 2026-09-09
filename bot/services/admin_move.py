@@ -44,6 +44,8 @@ from bot.services.booking import (
     BookingNotFoundError,
     SlotAlreadyBookedError,
     SlotInPastError,
+    WorkDayInactiveError,
+    WorkDayNotFoundError,
     _acquire_advisory_lock,
     _build_end_at,
     _build_start_at_from_workday,
@@ -55,19 +57,6 @@ from bot.services.booking import (
 
 if TYPE_CHECKING:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-
-class WorkDayNotFoundError(Exception):
-    """Raised when new_workday_id does not exist in DB (admin picked a date without WorkDay)."""
-
-
-class WorkDayInactiveError(Exception):
-    """Raised when destination WorkDay exists but is_active=False (closed day).
-
-    Distinct from BookingOutsideWorkDayError (window bounds violation) — inactive
-    means the master explicitly closed the day; the window bounds may still be
-    valid but booking is rejected by policy.
-    """
 
 
 @dataclass

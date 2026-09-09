@@ -85,8 +85,6 @@ from bot.services.admin import (
 )
 from bot.services.admin_move import (
     AdminMoveResult,
-    WorkDayInactiveError,
-    WorkDayNotFoundError,
     admin_move_booking,
 )
 from bot.services.booking import (
@@ -97,6 +95,8 @@ from bot.services.booking import (
     SlotAlreadyBookedError,
     SlotInPastError,
     WorkDayCapacityExceededError,
+    WorkDayInactiveError,
+    WorkDayNotFoundError,
 )
 from bot.services.slots import (
     SlotAlreadyExistsError,

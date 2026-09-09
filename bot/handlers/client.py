@@ -2460,9 +2460,15 @@ async def mybookings_transfer_cb(
             await callback.answer()
             return
 
-    # Save booking_id in FSM (state.set_state AFTER save — order is safe because
-    # state.update_data doesn't trigger handlers, set_state does).
-    await state.update_data(transfer_booking_id=str(callback_data.booking_id))
+    # Save booking_id + is_slots_path in FSM (B.1: is_slots_path=True so
+    # _process_selected_date enters workday branch (line 684) for transfer flow
+    # → renders BookSlot30CallbackData picker instead of legacy slot picker).
+    # state.set_state AFTER save — order is safe because state.update_data
+    # doesn't trigger handlers, set_state does).
+    await state.update_data(
+        transfer_booking_id=str(callback_data.booking_id),
+        is_slots_path=True,
+    )
     await state.set_state(TransferStates.selecting_date)
     if callback.message is not None:
         await callback.message.answer(
@@ -2617,6 +2623,170 @@ async def transfer_slot_cb(
         # Render client confirmation using result.new_start_at (UTC) → LOCAL.
         # new_start_at is aware UTC (transfer_booking returns aware); convert to
         # business tz for display (same pattern as cancel_booking:380).
+        from zoneinfo import ZoneInfo
+
+        new_local = result.new_start_at.astimezone(ZoneInfo(settings.TIMEZONE))
+        when = new_local.strftime("%d %b %Y, %H:%M")
+        await callback.message.answer(f"✅ Запись перенесена на {when}. Мастер уведомлён.")
+    await callback.answer()
+
+
+# ============================================================
+# 13b. transfer_slot_30_cb — user picked a 30-min WorkDay slot → call transfer_booking (B.1)
+# ============================================================
+@router.callback_query(BookSlot30CallbackData.filter(), StateFilter(TransferStates.selecting_slot))
+async def transfer_slot_30_cb(
+    callback: CallbackQuery,
+    callback_data: BookSlot30CallbackData,
+    state: FSMContext,
+    scheduler: AsyncIOScheduler,
+) -> None:
+    """User selected a 30-min WorkDay slot for transfer — call transfer_booking workday-path.
+
+    B.1 workday-path: converts BookSlot30CallbackData (workday_id + start_minute)
+    to transfer_booking(new_workday_id=..., new_start_time_local=dt_time(...)).
+
+    start_minute → dt_time conversion: dt_time(start_minute // 60, start_minute % 60)
+    (mirror slot_30_cb:1991, admin_move_confirm_cb:2632).
+
+    Error mapping (mirror transfer_slot_cb + workday-specific exceptions):
+      BookingNotFoundError            → "Запись не найдена"
+      BookingAlreadyCancelledError    → "Запись уже отменена"
+      CancelTooLateError              → "❌ Перенос возможен только за 24+ часов"
+      BookingAlreadyTransferredError  → "❌ Запись уже перенесена (конкурентный запрос)"
+      SlotAlreadyBookedError           → "😔 Это время только что заняли"
+      SlotInPastError                 → "❌ Это время уже прошло"
+      WorkDayNotFoundError            → "❌ Этот день не найден"
+      WorkDayInactiveError            → "❌ День закрыт мастером"
+      BookingOutsideWorkDayError      → "❌ Время вне рабочего дня мастера"
+      WorkDayCapacityExceededError    → "❌ Нет мест на это время"
+
+    `scheduler` injected from dp["scheduler"] workflow_data (same as transfer_slot_cb).
+    state.clear() BEFORE service call (race condition, same as transfer_slot_cb).
+    """
+    from datetime import time as dt_time
+
+    from sqlalchemy import select
+
+    from bot.models import Client
+    from bot.services.booking import (
+        BookingAlreadyCancelledError,
+        BookingAlreadyTransferredError,
+        BookingNotFoundError,
+        BookingOutsideWorkDayError,
+        CancelTooLateError,
+        SlotAlreadyBookedError,
+        SlotInPastError,
+        WorkDayCapacityExceededError,
+        WorkDayInactiveError,
+        WorkDayNotFoundError,
+    )
+
+    if callback.from_user is None:
+        await callback.answer()
+        return
+
+    # Defensive range check (mirror slot_30_cb:1127).
+    start_minute = callback_data.start_minute
+    if not (0 <= start_minute <= 1439):
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer("❌ Ошибка выбора времени. /mybookings чтобы начать")
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    booking_id_str = data.get("transfer_booking_id")
+    if not booking_id_str:
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer("❌ Данные потеряны. /mybookings чтобы начать")
+        await callback.answer()
+        return
+
+    settings = get_settings()
+    async with async_session_factory() as session:
+        stmt_c = select(Client).where(Client.telegram_id == callback.from_user.id)
+        client = (await session.execute(stmt_c)).scalar_one_or_none()
+        if client is None:
+            await callback.answer("У вас нет записей")
+            return
+
+        # state.clear() BEFORE service call (race condition).
+        await state.clear()
+        new_start_time_local = dt_time(start_minute // 60, start_minute % 60)
+        try:
+            result: TransferResult = await transfer_booking(
+                session,
+                UUID(booking_id_str),
+                None,  # new_slot_id — None for workday path
+                client.id,
+                scheduler,
+                new_workday_id=callback_data.workday_id,
+                new_start_time_local=new_start_time_local,
+            )
+        except BookingNotFoundError:
+            await callback.answer("Запись не найдена")
+            return
+        except BookingAlreadyCancelledError:
+            await callback.answer("Запись уже отменена")
+            return
+        except CancelTooLateError:
+            if callback.message is not None:
+                await callback.message.answer("❌ Перенос возможен только за 24+ часов до записи")
+            await callback.answer()
+            return
+        except BookingAlreadyTransferredError:
+            if callback.message is not None:
+                await callback.message.answer(
+                    "❌ Запись уже перенесена (конкурентный запрос). "
+                    "/mybookings чтобы увидеть актуальный список"
+                )
+            await callback.answer()
+            return
+        except SlotAlreadyBookedError:
+            if callback.message is not None:
+                await callback.message.answer(
+                    "😔 Это время только что заняли. /mybookings чтобы выбрать другое"
+                )
+            await callback.answer()
+            return
+        except SlotInPastError:
+            if callback.message is not None:
+                await callback.message.answer("❌ Это время уже прошло.")
+            await callback.answer()
+            return
+        except WorkDayNotFoundError:
+            if callback.message is not None:
+                await callback.message.answer("❌ Этот день не найден. Выберите другую дату")
+            await callback.answer()
+            return
+        except WorkDayInactiveError:
+            if callback.message is not None:
+                await callback.message.answer("❌ День закрыт мастером. Выберите другую дату")
+            await callback.answer()
+            return
+        except BookingOutsideWorkDayError:
+            if callback.message is not None:
+                await callback.message.answer(
+                    "❌ Время вне рабочего дня мастера. Выберите другое время"
+                )
+            await callback.answer()
+            return
+        except WorkDayCapacityExceededError:
+            if callback.message is not None:
+                await callback.message.answer("❌ Нет мест на это время. Выберите другое")
+            await callback.answer()
+            return
+
+        # Send master notification (Pure/IO — service prepared text, handler sends).
+        if callback.bot is not None:
+            await callback.bot.send_message(
+                chat_id=settings.ADMIN_ID,
+                text=result.master_notification_text,
+            )
+
+    if callback.message is not None:
         from zoneinfo import ZoneInfo
 
         new_local = result.new_start_at.astimezone(ZoneInfo(settings.TIMEZONE))

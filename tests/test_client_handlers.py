@@ -3548,16 +3548,15 @@ async def test_confirm_cb_workday_path_capacity_exceeded_clears_state(
 
 
 @pytest.mark.asyncio
-async def test_mybookings_keyboard_hides_transfer_for_workday_only_booking(
+async def test_mybookings_keyboard_shows_transfer_for_workday_only_booking(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """Этап 5.8b Gap 5: mybookings_keyboard — booking with slot_id=None
-    (workday-only, post-migration 006) must NOT show [🔄 Перенести] button.
-    Transfer flow expects slot_id (legacy /book path) and would fail with
-    AttributeError on a workday-only booking. Keyboard hides the button instead.
+    """B.1: mybookings_keyboard — booking with slot_id=None (workday-only) now
+    shows [🔄 Перенести] button (transfer_booking workday-path implemented).
 
-    Booking with slot_id SET (legacy /book path) keeps [🔄 Перенести] as before.
+    Previously (Этап 5.8b Gap 5) the button was hidden because transfer_booking
+    raised NotImplementedError for workday-only bookings. B.1 removed that guard.
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
@@ -3603,7 +3602,6 @@ async def test_mybookings_keyboard_hides_transfer_for_workday_only_booking(
         session.add(booking_legacy)
         await session.commit()
 
-        # Re-fetch with fresh session to detach from identity map.
         booking_workday_id = booking_workday.id
         booking_legacy_id = booking_legacy.id
 
@@ -3613,12 +3611,12 @@ async def test_mybookings_keyboard_hides_transfer_for_workday_only_booking(
         booking_wd = (await session.execute(wd_stmt)).scalar_one()
         booking_lg = (await session.execute(legacy_stmt)).scalar_one()
 
-        # Workday-only booking: slot_id is None → transfer hidden.
+        # Workday-only booking: transfer button NOW shown (B.1).
         kb_wd = mybookings_keyboard([booking_wd])
         rows_wd = kb_wd.inline_keyboard
         flat_texts_wd = [btn.text for row in rows_wd for btn in row]
-        assert not any("Перенести" in t for t in flat_texts_wd), (
-            "workday-only booking (slot_id=None) must hide transfer button"
+        assert any("Перенести" in t for t in flat_texts_wd), (
+            "workday-only booking (slot_id=None) must show transfer button (B.1)"
         )
         # Cancel still offered (cancel_booking supports slot_id=None).
         assert any("Отменить" in t for t in flat_texts_wd), (
