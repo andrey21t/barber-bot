@@ -18,10 +18,11 @@ Contract (spec.md 200-213, 307-309):
 
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from typing import NamedTuple
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.models import Booking, Service, WorkDay
@@ -333,3 +334,134 @@ async def get_active_bookings_for_workday(
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+# ============================================================
+# Service CRUD helpers — B.11 (list + soft delete)
+# ============================================================
+
+
+async def list_services(
+    session: AsyncSession,
+    business_id: UUID,
+) -> list[Service]:
+    """Active services for a business, ordered by created_at.
+
+    Soft-deleted (is_active=False) are excluded — they remain in DB for
+    Booking history integrity (Booking.service_id FK nullable + service_title_snapshot
+    catches the actual name at booking time).
+    """
+    stmt = (
+        select(Service)
+        .where(
+            Service.business_id == business_id,
+            Service.is_active.is_(True),
+        )
+        .order_by(Service.created_at)
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+class ServiceDeactivationResult(NamedTuple):
+    """Outcome of deactivate_service — handler renders from this.
+
+    Fields:
+        found: services matching the name (active or not) — for "not found" detection.
+        deactivated: services actually flipped True → False in this call.
+        blocked_bookings: count of active bookings on the would-be-deactivated
+            services (non-zero means the operation was rejected).
+        already_inactive: services that were already is_active=False (idempotent case).
+    """
+
+    found: list[Service]
+    deactivated: list[Service]
+    blocked_bookings: int
+    already_inactive: list[Service]
+
+
+async def deactivate_service(
+    session: AsyncSession,
+    business_id: UUID,
+    name: str,
+) -> ServiceDeactivationResult:
+    """Soft-delete services by name (no name uniqueness — see admin.py:13).
+
+    Contract:
+    - If no Service rows match (active OR inactive) → found=[], deactivated=[],
+      blocked_bookings=0, already_inactive=[] → handler renders "не найдена".
+    - If matches exist:
+      1. Count active bookings (status in confirmed/transferred) on the ACTIVE
+         matches. If > 0 → reject: deactivated=[], blocked_bookings=N.
+      2. If 0 active bookings: UPDATE is_active=False for ACTIVE matches.
+         already_inactive = matches that were already is_active=False (idempotent).
+
+    Name normalization mirrors cmd_services add (handlers/admin.py:644): caller
+    passes raw name, service compares against Service.name as stored. Underscore-
+    to-space decode happens in the handler (single source of truth for arg parsing).
+
+    Strip whitespace to mirror create_service (admin.py:243) — without this, a
+    service created as "Стрижка_" (stored as "Стрижка" after strip) cannot be
+    deleted by the same spelling ("/services del Стрижка_" → "Стрижка " → no
+    match). Caller-handler boundary keeps the raw arg; service normalizes.
+    """
+    name = name.strip()
+    stmt = select(Service).where(
+        Service.business_id == business_id,
+        Service.name == name,
+    )
+    found = list((await session.execute(stmt)).scalars().all())
+
+    if not found:
+        return ServiceDeactivationResult(
+            found=[], deactivated=[], blocked_bookings=0, already_inactive=[]
+        )
+
+    active = [s for s in found if s.is_active]
+    already_inactive = [s for s in found if not s.is_active]
+
+    if not active:
+        # All matches already soft-deleted — idempotent.
+        return ServiceDeactivationResult(
+            found=found,
+            deactivated=[],
+            blocked_bookings=0,
+            already_inactive=already_inactive,
+        )
+
+    # Active bookings on the to-be-deactivated services (future OR past —
+    # spec keeps history bookings visible via snapshot, but we block ANY
+    # active-status booking to avoid orphaned confirmed bookings the master
+    # would lose track of). See plan v3.3 B.11 DoD: "Сначала отмените записи".
+    active_ids = [s.id for s in active]
+    count_stmt = (
+        select(func.count())
+        .select_from(Booking)
+        .where(
+            Booking.service_id.in_(active_ids),
+            Booking.status.in_(("confirmed", "transferred")),
+        )
+    )
+    blocked = int((await session.execute(count_stmt)).scalar_one())
+
+    if blocked > 0:
+        return ServiceDeactivationResult(
+            found=found,
+            deactivated=[],
+            blocked_bookings=blocked,
+            already_inactive=already_inactive,
+        )
+
+    await session.execute(
+        update(Service)
+        .where(Service.id.in_(active_ids))
+        .values(is_active=False)
+    )
+    await session.commit()
+
+    return ServiceDeactivationResult(
+        found=found,
+        deactivated=active,
+        blocked_bookings=0,
+        already_inactive=already_inactive,
+    )
