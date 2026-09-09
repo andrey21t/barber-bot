@@ -691,6 +691,21 @@ async def _process_selected_date(
             # between picker render and tap).
             workday = await _select_workday_for_slot(session, master.id, slot_date)
             if workday is None:
+                # W2 fallback: no WorkDay — try legacy slots (mirror /book branch
+                # fallback at line 765). Migration 005 converted all Slot → WorkDay,
+                # but edge-case masters without WorkDay or stale Slot rows are
+                # handled here. Legacy slots → BookSlotCallbackData → transfer_slot_cb.
+                slots = await get_available_slots(session, master.id, slot_date)
+                if slots:
+                    await state.update_data(selected_date=slot_date.isoformat())
+                    await state.set_state(next_state)
+                    if callback.message is not None:
+                        await callback.message.answer(
+                            "Выберите новое время:" if is_transfer else "Выберите время:",
+                            reply_markup=slot_picker_keyboard(slots, show_back=not is_transfer),
+                        )
+                    await callback.answer()
+                    return
                 if callback.message is not None:
                     await callback.message.answer(
                         "Мастер не работает в этот день. Выберите другую дату:",
@@ -2608,6 +2623,18 @@ async def transfer_slot_cb(
         except SlotNotAvailableError:
             if callback.message is not None:
                 await callback.message.answer("❌ Слот недоступен.")
+            await callback.answer()
+            return
+        except BookingOutsideWorkDayError:
+            if callback.message is not None:
+                await callback.message.answer(
+                    "❌ Время вне рабочего дня мастера. Выберите другое время"
+                )
+            await callback.answer()
+            return
+        except WorkDayCapacityExceededError:
+            if callback.message is not None:
+                await callback.message.answer("❌ Нет мест на это время. Выберите другое")
             await callback.answer()
             return
 
