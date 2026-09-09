@@ -894,6 +894,19 @@ class BookingAlreadyTransferredError(Exception):
     """
 
 
+class WorkDayNotFoundError(Exception):
+    """Raised when new_workday_id does not exist in DB (user picked a date without WorkDay)."""
+
+
+class WorkDayInactiveError(Exception):
+    """Raised when destination WorkDay exists but is_active=False (closed day).
+
+    Distinct from BookingOutsideWorkDayError (window bounds violation) — inactive
+    means the master explicitly closed the day; the window bounds may still be
+    valid but booking is rejected by policy.
+    """
+
+
 @dataclass(frozen=True)
 class TransferResult:
     """Result of transfer_booking — passed to handler for Telegram I/O.
@@ -902,14 +915,15 @@ class TransferResult:
     Carries both old and new start_at so the handler can render "X → Y" in
     master and client messages (spec.md 318: "Перенос: ... → ...").
 
-    Этап 5.8a: old_slot_id Optional — workday-only bookings (slot_id=None)
-    поднимают NotImplementedError на transfer (booking.py:817 guard, до build
-    TransferResult). Тип defensive — happy path всегда non-None.
+    B.1: new_slot_id Optional — workday-path destination has no Slot row
+    (slot_id=None, booking via WorkDay + start_time_local). Slot-path keeps
+    new_slot_id non-None. Handler reads master_notification_text + new_start_at
+    for rendering, NOT new_slot_id — Optional is safe.
     """
 
     booking_id: UUID
     old_slot_id: UUID | None
-    new_slot_id: UUID
+    new_slot_id: UUID | None
     master_id: UUID
     business_id: UUID
     client_name_snapshot: str
@@ -922,18 +936,27 @@ class TransferResult:
 async def transfer_booking(
     session: AsyncSession,
     booking_id: UUID,
-    new_slot_id: UUID,
+    new_slot_id: UUID | None,
     client_id: UUID,
     scheduler: AsyncIOScheduler,
     *,
     now_utc: datetime | None = None,
+    new_workday_id: UUID | None = None,
+    new_start_time_local: time | None = None,
 ) -> TransferResult:
-    """Transfer booking to a new slot (spec.md 41, 318, 408-409).
+    """Transfer booking to a new slot OR workday (spec.md 41, 318, 408-409).
+
+    Two code paths (XOR — exactly one required):
+      - Slot path: new_slot_id set → legacy slot-based transfer (existing)
+      - Workday path: new_workday_id + new_start_time_local set → B.1 workday transfer
+
+    B.1 workday-path mirrors admin_move_booking (admin_move.py:93) but WITH
+    client_id pin and 24h rule (client-initiated, not admin-initiated).
 
     Atomic within one transaction:
       - UPDATE booking SET status='transferred', slot_id, start_at, end_at
-      - UPDATE old slot SET status='open' (release old)
-      - UPDATE new slot SET status='booked' WHERE status='open' (race protection)
+      - UPDATE old slot SET status='open' (release old, IF old_slot_id not None)
+      - UPDATE new slot SET status='booked' WHERE status='open' (slot-path only)
       - INSERT notifications_log(master_transfer) — SAVEPOINT idempotency
 
     Scheduler side-effects (AFTER commit, like cancel_booking):
@@ -946,62 +969,57 @@ async def transfer_booking(
     booking.start_at; winner UPDATEs (status, slot_id, start_at, end_at); loser's
     UPDATE WHERE start_at=<old value from SELECT> no longer matches (winner
     already changed start_at) → rowcount=0 → BookingAlreadyTransferredError.
-    This is the invariant that distinguishes transfer from cancel: cancel uses
-    status IN ('confirmed','transferred') alone (idempotent on double-cancel
-    because second UPDATE WHERE status='cancelled' returns 0), but transfer
-    needs the start_at pin because status stays IN ('confirmed','transferred')
-    after the winner's UPDATE.
 
     Re-transfer (status='transferred' → transfer again) is allowed: the
     status IN ('confirmed','transferred') clause accepts 'transferred' too.
 
     `now_utc` injected for tests (production uses datetime.now(UTC)).
 
-    Steps:
-      1. SELECT booking WHERE id=? AND client_id=? (ownership + existence)
-      2. If None → BookingNotFoundError
-      3. If status='cancelled' → BookingAlreadyCancelledError (defensive)
-      4. If now >= start_at - CANCEL_MIN_HOURS → CancelTooLateError (24h rule)
-      5. SELECT new slot WHERE id=? AND status='open' (race protection)
-         - If closed/not found → SlotNotAvailableError
-         - If status='booked' → SlotAlreadyBookedError (reuse)
-      6. Build new_start_at (UTC) + new_end_at (default duration)
-      7. If new_start_at <= now → SlotInPastError
-      8. UPDATE booking SET status='transferred', slot_id, start_at, end_at
-         WHERE id=? AND client_id=? AND status IN ('confirmed','transferred')
-         AND start_at=<captured at SELECT> — rowcount check (concurrent race)
-      9. UPDATE old slot SET status='open' WHERE id=<old slot_id>
-     10. UPDATE new slot SET status='booked' WHERE id=? AND status='open'
-         — rowcount check (race protection, like create_booking:184-196)
-     11. INSERT NotificationLog(master_transfer) — SAVEPOINT idempotency
-     12. Build TransferResult (old + new start_at for "X → Y" message)
-     13. commit
-     14. remove_jobs_for_booking + schedule_for_booking (AFTER commit)
-     15. Return TransferResult
+    Steps (slot-path / workday-path differences marked):
+      1. XOR validation: exactly one of new_slot_id / new_workday_id required
+      2. SELECT booking WHERE id=? AND client_id=? (ownership + existence)
+      3. If None → BookingNotFoundError
+      4. If status='cancelled' → BookingAlreadyCancelledError (defensive)
+      5. If now >= start_at - CANCEL_MIN_HOURS → CancelTooLateError (24h rule)
+      6. Capture old_slot_id + old_start_at BEFORE UPDATE (SQLAlchemy mutates)
+      [SLOT]  7s. SELECT new slot WHERE id=? AND status='open' (race protection)
+      [WD]    7w. SELECT new WorkDay WHERE id=? → WorkDayNotFoundError / WorkDayInactiveError
+      8. Build new_start_at (UTC) + new_end_at (default duration)
+         [SLOT] from slot.slot_hour | [WD] from workday + start_time_local
+      9. If new_start_at <= now → SlotInPastError (real now, NOT injected ref)
+     10. Capacity check: [SLOT] via slot's WorkDay | [WD] via new_workday directly
+     11. UPDATE booking SET status='transferred', slot_id, start_at, end_at
+         WHERE id=? AND client_id=? AND status IN (...) AND start_at=old — rowcount
+         [SLOT] slot_id=new_slot.id | [WD] slot_id=None
+     12. Release OLD slot IF old_slot_id is not None (workday-only source: skip)
+     [SLOT] 13. UPDATE new slot SET status='booked' WHERE status='open' — rowcount
+     14. INSERT NotificationLog(master_transfer) — SAVEPOINT idempotency
+     15. Build TransferResult (old + new start_at for "X → Y" message)
+         [SLOT] new_slot_id=new_slot.id | [WD] new_slot_id=None
+     16. commit
+     17. remove_jobs_for_booking + schedule_for_booking (AFTER commit)
+     18. Return TransferResult
     """
     settings = get_settings()
     ref = now_utc or datetime.now(UTC)
 
-    # Step 1-3: SELECT booking with ownership + status check.
+    # Step 1: XOR validation — exactly one of new_slot_id / new_workday_id required.
+    has_slot = new_slot_id is not None
+    has_workday = new_workday_id is not None and new_start_time_local is not None
+    if has_slot == has_workday:
+        raise ValueError(
+            f"Exactly one required: new_slot_id XOR (new_workday_id + new_start_time_local). "
+            f"got new_slot_id={new_slot_id}, new_workday_id={new_workday_id}, "
+            f"new_start_time_local={new_start_time_local}"
+        )
+
+    # Step 2-4: SELECT booking with ownership + status check.
     stmt_b = select(Booking).where(Booking.id == booking_id, Booking.client_id == client_id)
     booking = (await session.execute(stmt_b)).scalar_one_or_none()
     if booking is None:
         raise BookingNotFoundError(f"Booking {booking_id} not found for client {client_id}")
     if booking.status == "cancelled":
         raise BookingAlreadyCancelledError(f"Booking {booking_id} is cancelled, cannot transfer")
-
-    # Этап 5.8a guard: workday-only bookings (slot_id is None) не могут
-    # переноситься через transfer_booking — это slot-based API (требует
-    # new_slot_id, _select_open_slot, UPDATE Slot.status). WorkDay transfer
-    # = 5.9 scope (admin_move_booking — отдельный сервис без 24h rule и без
-    # client_id pin). User-facing behavior: handler ловит NotImplementedError
-    # (5.8b — добавим в transfer_slot_cb except list) ИЛИ mybookings_keyboard
-    # hide-transfer-button для workday-only bookings (5.8b — Gap 5).
-    if booking.slot_id is None:
-        raise NotImplementedError(
-            f"WorkDay transfer is 5.9 scope — admin_move_booking. "
-            f"Booking {booking_id} has slot_id=None (WorkDay-only)"
-        )
 
     # Step 4: 24h rule (same as cancel_booking). Cross-DB aware-aware comparison:
     # old_start_at is naive on SQLite / aware UTC on Postgres. Inject tzinfo=UTC
@@ -1018,55 +1036,91 @@ async def transfer_booking(
             f"now={ref} >= transfer_deadline={cancel_deadline} for booking {booking_id}"
         )
 
-    # Step 5: SELECT new slot — re-use create_booking's _select_open_slot helper.
-    # It raises SlotClosedError (slot not found OR closed) or SlotAlreadyBookedError
-    # (slot already booked). Caller (handler) maps these to user-facing messages.
-    new_slot = await _select_open_slot(session, new_slot_id)
-
-    # Step 6: Build new_start_at (UTC) from new_slot.slot_hour (LOCAL in business tz).
+    # Step 5-7: SELECT destination + build new_start_at (branched: slot vs workday).
     business_tz = await _select_business_timezone(session, booking.business_id)
-    new_start_at = _build_start_at(new_slot, business_tz)
 
-    # Step 7: new_start_at must be in the future (re-use SlotInPastError).
-    # Uses real datetime.now(UTC), NOT injected `ref` — semantic: the new slot
-    # must be after the REAL current time (booking a slot in the past relative
-    # to now is always wrong, regardless of `ref` which only controls the 24h
-    # rule check for the OLD booking's start_at). Mixing ref here would break
-    # tests that inject ref in far past to bypass 24h rule (e.g. test_slot_in_past).
-    if new_start_at <= datetime.now(UTC):
-        raise SlotInPastError(f"New slot {new_slot_id} start_at={new_start_at} is in the past")
+    if has_workday:
+        # === WORKDAY PATH (B.1) — mirror admin_move.py:181-194 ===
+        # Step 7w: SELECT WorkDay by id → WorkDayNotFoundError / WorkDayInactiveError.
+        assert new_workday_id is not None  # type narrowing for mypy
+        stmt_w = select(WorkDay).where(WorkDay.id == new_workday_id)
+        new_workday = (await session.execute(stmt_w)).scalar_one_or_none()
+        if new_workday is None:
+            raise WorkDayNotFoundError(f"WorkDay {new_workday_id} not found")
+        if not new_workday.is_active:
+            raise WorkDayInactiveError(
+                f"WorkDay {new_workday_id} is inactive (closed day) — cannot transfer booking there"
+            )
 
-    # Look up service for end_at duration (booking.service_id may be None — fallback to default).
-    service = await _select_service(session, booking.service_id)
-    new_end_at = _build_end_at(new_start_at, service, settings.SERVICE_DEFAULT_DURATION_MIN)
+        # Step 8w: Build new_start_at (UTC) from workday + start_time_local.
+        assert new_start_time_local is not None  # type narrowing for mypy
+        new_start_at = _build_start_at_from_workday(new_workday, new_start_time_local, business_tz)
 
-    # Multi-client capacity check on NEW slot (Этап 5.5, B2 fix): SELECT WorkDay
-    # for (new_slot.master_id, new_slot.slot_date). Validate + acquire advisory
-    # lock + count overlapping active bookings BEFORE UPDATE booking (line 833).
-    # Without this, a concurrent create_booking on the new slot could slip through
-    # the EXCLUDE drop (migration 005) and double-book the slot window.
-    # Backwards compat: no WorkDay → skip (legacy slot-only data).
-    new_slot_master_id = new_slot.master_id
-    new_slot_date = new_slot.slot_date
-    new_workday = await _select_workday_for_slot(session, new_slot_master_id, new_slot_date)
-    if new_workday is not None:
+        # Step 9w: past check (shared with slot path — real now, NOT injected ref).
+        if new_start_at <= datetime.now(UTC):
+            raise SlotInPastError(
+                f"New workday slot start_at={new_start_at} is in the past (transfer)"
+            )
+
+        # Step 10w: service end_at + capacity check (mirror admin_move:193-219).
+        service = await _select_service(session, booking.service_id)
+        new_end_at = _build_end_at(new_start_at, service, settings.SERVICE_DEFAULT_DURATION_MIN)
         _validate_booking_within_workday(new_workday, new_start_at, new_end_at, business_tz)
-        new_workday_id = new_workday.id
-        new_workday_capacity = new_workday.max_concurrent_clients
-        await _acquire_advisory_lock(session, new_slot_master_id, new_slot_date)
+        await _acquire_advisory_lock(session, booking.master_id, new_workday.work_date)
         await _check_multi_client_capacity(
             session,
-            workday_id=new_workday_id,
-            capacity=new_workday_capacity,
-            master_id=new_slot_master_id,
+            workday_id=new_workday.id,
+            capacity=new_workday.max_concurrent_clients,
+            master_id=booking.master_id,
             start_at=new_start_at,
             end_at=new_end_at,
             excluded_booking_id=booking_id,
         )
+        # Workday-path: no Slot to SELECT/book. slot_id_for_update = None.
+        slot_id_for_update: UUID | None = None
+        new_slot_id_for_result: UUID | None = None
+    else:
+        # === SLOT PATH (existing, unchanged) ===
+        # Step 7s: SELECT new slot — re-use create_booking's _select_open_slot helper.
+        assert new_slot_id is not None  # type narrowing for mypy
+        new_slot = await _select_open_slot(session, new_slot_id)
 
-    # Step 8: UPDATE booking with start_at-in-WHERE for concurrent-transfer race protection.
+        # Step 8s: Build new_start_at (UTC) from new_slot.slot_hour (LOCAL in business tz).
+        new_start_at = _build_start_at(new_slot, business_tz)
+
+        # Step 9s: past check (shared).
+        if new_start_at <= datetime.now(UTC):
+            raise SlotInPastError(f"New slot {new_slot_id} start_at={new_start_at} is in the past")
+
+        # Step 10s: service end_at + capacity check (existing logic).
+        service = await _select_service(session, booking.service_id)
+        new_end_at = _build_end_at(new_start_at, service, settings.SERVICE_DEFAULT_DURATION_MIN)
+        new_slot_master_id = new_slot.master_id
+        new_slot_date = new_slot.slot_date
+        new_workday_lookup = await _select_workday_for_slot(
+            session, new_slot_master_id, new_slot_date
+        )
+        if new_workday_lookup is not None:
+            _validate_booking_within_workday(
+                new_workday_lookup, new_start_at, new_end_at, business_tz
+            )
+            await _acquire_advisory_lock(session, new_slot_master_id, new_slot_date)
+            await _check_multi_client_capacity(
+                session,
+                workday_id=new_workday_lookup.id,
+                capacity=new_workday_lookup.max_concurrent_clients,
+                master_id=new_slot_master_id,
+                start_at=new_start_at,
+                end_at=new_end_at,
+                excluded_booking_id=booking_id,
+            )
+        slot_id_for_update = new_slot.id
+        new_slot_id_for_result = new_slot.id
+
+    # Step 11: UPDATE booking with start_at-in-WHERE for concurrent-transfer race protection.
     # Loser's WHERE clause `start_at = <old_start_at captured at SELECT>` fails after
     # winner's UPDATE changed start_at → rowcount=0 → BookingAlreadyTransferredError.
+    # [SLOT] slot_id=new_slot.id | [WD] slot_id=None (unified workday destination).
     upd_b = (
         update(Booking)
         .where(
@@ -1077,7 +1131,7 @@ async def transfer_booking(
         )
         .values(
             status="transferred",
-            slot_id=new_slot.id,
+            slot_id=slot_id_for_update,  # None for workday-path, new_slot.id for slot-path
             start_at=new_start_at,  # aware UTC; SQLAlchemy variant strips tzinfo on SQLite bind
             end_at=new_end_at,
         )
@@ -1088,11 +1142,11 @@ async def transfer_booking(
         # EXCLUDE constraint (Postgres): new tstzrange(start_at, end_at) overlaps
         # another active booking (confirmed/transferred) for same master.
         # SQLite не имеет EXCLUDE — UNIQUE(slot_id) handles only same-slot case,
-        # но это безопасно (SQLite dev, надёжность через UNIQUE + service-layer checks).
+        # but это безопасно (SQLite dev, надёжность через UNIQUE + service-layer checks).
         # Map to existing SlotAlreadyBookedError — пользователь видит "слот занят".
         await session.rollback()
         raise SlotAlreadyBookedError(
-            f"Transfer to slot {new_slot.id} overlaps existing booking (EXCLUDE constraint)"
+            "Transfer overlaps existing booking (EXCLUDE constraint or capacity race)"
         ) from exc
     if cast("CursorResult[Any]", res_b).rowcount == 0:
         # rowcount=0 means WHERE clause didn't match — three possible causes:
@@ -1101,9 +1155,7 @@ async def transfer_booking(
         #      BookingAlreadyCancelledError
         #   3. Concurrent booking deletion (rare in MVP — no DELETE in current code)
         # Re-SELECT to disambiguate: if status='cancelled' → cancel race; otherwise
-        # (status='transferred' OR booking gone) → transfer race. Without this
-        # re-check, concurrent cancel would surface as "Запись уже перенесена" —
-        # misleading (user sees the booking is gone, not transferred).
+        # (status='transferred' OR booking gone) → transfer race.
         await session.rollback()
         recheck = await session.execute(select(Booking.status).where(Booking.id == booking_id))
         current_status = recheck.scalar_one_or_none()
@@ -1116,30 +1168,40 @@ async def transfer_booking(
             "(concurrent transfer — winner's UPDATE already committed)"
         )
 
-    # Step 9: Release OLD slot → 'open' (idempotent: if new_slot == old_slot,
-    # step 10 below re-bumps it back to 'booked'). Use captured old_slot_id —
-    # booking.slot_id was mutated by step 8 UPDATE to new_slot.id.
-    upd_old_slot = update(Slot).where(Slot.id == old_slot_id).values(status="open")
-    await session.execute(upd_old_slot)
+    # Step 12: Release OLD slot → 'open' IF old_slot_id is not None (B.1 critic 🔴3 fix).
+    # Workday-only source (slot_id is None) → no legacy slot to release, skip.
+    # Slot-path: use captured old_slot_id — booking.slot_id was mutated by step 11 UPDATE.
+    # Idempotent: if new_slot == old_slot (slot-path in-place), step 13 re-bumps to 'booked'.
+    if old_slot_id is not None:
+        upd_old_slot = update(Slot).where(Slot.id == old_slot_id).values(status="open")
+        await session.execute(upd_old_slot)
 
-    # Step 10: Book NEW slot — SQLite race protection (UPDATE WHERE status='open' + rowcount).
-    # Pattern from create_booking:184-196. If slot was taken between SELECT (step 5)
+    # Step 13: Book NEW slot — SLOT PATH ONLY (workday-path has no Slot row).
+    # SQLite race protection (UPDATE WHERE status='open' + rowcount).
+    # Pattern from create_booking:184-196. If slot was taken between SELECT (step 7s)
     # and UPDATE (here) → rowcount=0 → rollback → SlotAlreadyBookedError.
-    upd_new_slot = (
-        update(Slot).where(Slot.id == new_slot.id, Slot.status == "open").values(status="booked")
-    )
-    res_new_slot = await session.execute(upd_new_slot)
-    if cast("CursorResult[Any]", res_new_slot).rowcount == 0:
-        await session.rollback()
-        # Use function parameter `new_slot_id` (immutable UUID), NOT `new_slot.id`.
-        # After session.rollback() above, `new_slot` instance attributes are
-        # expired → `new_slot.id` would trigger lazy load → MissingGreenlet
-        # (B3 fix — same pattern as B1 in create_booking).
-        raise SlotAlreadyBookedError(
-            f"New slot {new_slot_id} was taken/closed between SELECT and UPDATE"
+    if has_workday:
+        # Workday-path: skip — no Slot to book. Capacity check (step 10w) is the safety net.
+        pass
+    else:
+        assert new_slot is not None  # type narrowing — slot-path guarantees
+        upd_new_slot = (
+            update(Slot)
+            .where(Slot.id == new_slot.id, Slot.status == "open")
+            .values(status="booked")
         )
+        res_new_slot = await session.execute(upd_new_slot)
+        if cast("CursorResult[Any]", res_new_slot).rowcount == 0:
+            await session.rollback()
+            # Use function parameter `new_slot_id` (immutable UUID), NOT `new_slot.id`.
+            # After session.rollback() above, `new_slot` instance attributes are
+            # expired → `new_slot.id` would trigger lazy load → MissingGreenlet
+            # (B3 fix — same pattern as B1 in create_booking).
+            raise SlotAlreadyBookedError(
+                f"New slot {new_slot_id} was taken/closed between SELECT and UPDATE"
+            )
 
-    # Step 11: NotificationLog master_transfer — SAVEPOINT idempotency (booking.py:198-212 pattern).
+    # Step 14: NotificationLog master_transfer — SAVEPOINT idempotency (booking.py:198-212 pattern).
     log_entry = NotificationLog(booking_id=booking.id, kind="master_transfer")
     try:
         async with session.begin_nested():
@@ -1149,12 +1211,12 @@ async def transfer_booking(
         # Already logged — idempotent. Savepoint rolled back, log_entry expunged.
         pass
 
-    # Step 12: Build master notification text "Перенос: <old> → <new>" (spec.md 318).
+    # Step 15: Build master notification text "Перенос: <old> → <new>" (spec.md 318).
     # Use snapshots (already html.escape'd in DB) for client/service lines.
     # old_start_at is naive UTC (SQLite stores naive); explicitly mark as UTC before
     # astimezone — otherwise Python interprets naive as system-local TZ (Mac default
     # Europe/Moscow would render wrong old time; Render TZ=UTC is correct by accident).
-    # new_start_at is already aware UTC (built by _build_start_at).
+    # new_start_at is already aware UTC (built by _build_start_at / _build_start_at_from_workday).
     old_local_time = old_start_at.replace(tzinfo=UTC).astimezone(ZoneInfo(business_tz))
     new_local_time = new_start_at.astimezone(ZoneInfo(business_tz))
     old_formatted = old_local_time.strftime("%d %B %Y, %H:%M")
@@ -1168,7 +1230,7 @@ async def transfer_booking(
     result = TransferResult(
         booking_id=booking.id,
         old_slot_id=old_slot_id,
-        new_slot_id=new_slot.id,
+        new_slot_id=new_slot_id_for_result,
         master_id=booking.master_id,
         business_id=booking.business_id,
         client_name_snapshot=booking.client_name_snapshot,
@@ -1180,15 +1242,15 @@ async def transfer_booking(
         master_notification_text=master_text,
     )
 
-    # Step 13: commit booking UPDATE + 2 slot UPDATEs + NotificationLog atomically.
+    # Step 16: commit booking UPDATE + slot UPDATEs (if any) + NotificationLog atomically.
     await session.commit()
 
-    # Step 14: scheduler side-effects AFTER commit (atomic: commit fail → jobs remain,
+    # Step 17: scheduler side-effects AFTER commit (atomic: commit fail → jobs remain,
     # booking still active at OLD start_at with old reminders). remove_jobs_for_booking
     # uses suppress(Exception) internally — idempotent. schedule_for_booking uses
     # replace_existing=True — idempotent (safe to call after remove_jobs).
     remove_jobs_for_booking(scheduler, booking_id)
     schedule_for_booking(scheduler, booking_id, new_start_at)
 
-    # Step 15: return result (handler sends master notification + client confirmation).
+    # Step 18: return result (handler sends master notification + client confirmation).
     return result

@@ -489,12 +489,10 @@ def mybookings_keyboard(
     and transfer share the same 24h window (spec.md 41 — "отмена (>24ч) или перенос
     (>24ч)"), so one cancelable list drives both buttons.
 
-    Этап 5.8b — Gap 5 fix (PLANS.md:263, :245): workday-only bookings
-    (b.slot_id is None, created via /slots workday path) НЕ показывают [🔄 Перенести]
-    кнопку — `transfer_booking` raises NotImplementedError (booking.py:920, 5.9 scope
-    admin_move_booking). Hide-transfer prevents silent failure: user видит только
-    [Отменить], не получает unhandled NotImplementedError при тапе.
-    adjust(2) → uneven rows для workday-only (1 кнопка в ряду) — aiogram handles.
+    B.1: workday-only bookings (b.slot_id is None) now show [🔄 Перенести] —
+    transfer_booking workday-path implemented (booking.py, B.1). Button always
+    shown for all cancelable bookings (slot-based and workday-based).
+    adjust(2) → even rows (2 buttons per booking).
     """
     tz = ZoneInfo(business_timezone)
     builder = InlineKeyboardBuilder()
@@ -508,13 +506,10 @@ def mybookings_keyboard(
             text=f"❌ Отменить {when}",
             callback_data=MyBookingsCancelCallbackData(booking_id=b.id).pack(),
         )
-        # Gap 5 fix: skip [🔄 Перенести] для workday-only bookings (slot_id is None).
-        # transfer_booking raises NotImplementedError (booking.py:920, 5.9 scope).
-        if b.slot_id is not None:
-            builder.button(
-                text=f"🔄 Перенести {when}",
-                callback_data=MyBookingsTransferCallbackData(booking_id=b.id).pack(),
-            )
+        builder.button(
+            text=f"🔄 Перенести {when}",
+            callback_data=MyBookingsTransferCallbackData(booking_id=b.id).pack(),
+        )
     builder.adjust(2)  # 2 buttons per row: [Отменить] [Перенести] for each booking
     return builder.as_markup()
 
