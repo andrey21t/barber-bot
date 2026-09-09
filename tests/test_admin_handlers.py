@@ -1033,20 +1033,27 @@ async def test_cmd_services_no_args_shows_format_hint(
 
 
 @pytest.mark.asyncio
-async def test_cmd_services_wrong_first_arg_shows_format(
+async def test_cmd_services_unknown_sub_shows_format(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """'services list' (args[0] != 'add') → format hint (MVP only supports 'add')."""
+    """/services unknown_sub (args[0] not in {add,list,del}) → format hint.
+
+    Renamed from test_cmd_services_wrong_first_arg_shows_format (B.11): 'list' and
+    'del' are now valid sub-commands, so we use a truly unknown sub to test the
+    fallback format hint branch.
+    """
     async with session_factory() as session:
         await _seed_admin_stack(session)
 
-    msg = _make_message(user_id=ADMIN_TG_ID, text="/services list")
-    await admin_handlers.cmd_services(msg, _make_command("list"))
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services unknown_sub")
+    await admin_handlers.cmd_services(msg, _make_command("unknown_sub"))
 
     text = _answer_text(msg)
-    assert "Формат:" in text
+    assert "Формат" in text
     assert "/services add" in text
+    assert "/services list" in text
+    assert "/services del" in text
 
 
 @pytest.mark.asyncio
@@ -1140,6 +1147,431 @@ async def test_cmd_services_service_validation_error_from_create_service(
 
     text = _answer_text(msg)
     assert "service name must not be empty" in text
+
+
+# ============================================================
+# cmd_services — B.11: /services list + /services del
+# (8 new tests; 1 existing test adapted — see test_cmd_services_unknown_sub_shows_format)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_cmd_services_list_empty(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """/services list без активных услуг → 'У вас нет активных услуг'."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services list")
+    await admin_handlers.cmd_services(msg, _make_command("list"))
+
+    text = _answer_text(msg)
+    assert "У вас нет активных услуг" in text
+    assert "/services add" in text
+
+
+@pytest.mark.asyncio
+async def test_cmd_services_list_with_services(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """/services list с 3 услугами → 'Услуги (3):\\n1. ...\\n2. ...\\n3. ...'."""
+    async with session_factory() as session:
+        seed = await _seed_admin_stack(session)
+        for name, duration in (("Стрижка", 60), ("Окрашивание", 120), ("Укладка", 30)):
+            session.add(
+                Service(
+                    business_id=seed["business_id"],
+                    name=name,
+                    duration_minutes=duration,
+                    is_active=True,
+                )
+            )
+        await session.commit()
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services list")
+    await admin_handlers.cmd_services(msg, _make_command("list"))
+
+    text = _answer_text(msg)
+    assert "Услуги (3):" in text
+    assert "1. Стрижка — 60 мин" in text
+    assert "2. Окрашивание — 120 мин" in text
+    assert "3. Укладка — 30 мин" in text
+    # price nullable → no ₽ suffix
+    assert "₽" not in text
+
+
+@pytest.mark.asyncio
+async def test_cmd_services_list_excludes_inactive(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """/services list не показывает soft-deleted (is_active=False)."""
+    async with session_factory() as session:
+        seed = await _seed_admin_stack(session)
+        session.add(
+            Service(
+                business_id=seed["business_id"],
+                name="Активная",
+                duration_minutes=60,
+                is_active=True,
+            )
+        )
+        session.add(
+            Service(
+                business_id=seed["business_id"],
+                name="Удалённая",
+                duration_minutes=45,
+                is_active=False,
+            )
+        )
+        await session.commit()
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services list")
+    await admin_handlers.cmd_services(msg, _make_command("list"))
+
+    text = _answer_text(msg)
+    assert "Услуги (1):" in text
+    assert "Активная" in text
+    assert "Удалённая" not in text
+
+
+@pytest.mark.asyncio
+async def test_cmd_services_del_happy_no_bookings(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """/services del Стрижка — нет active bookings → UPDATE is_active=False, '✅ Услуга удалена'."""
+    async with session_factory() as session:
+        seed = await _seed_admin_stack(session)
+        svc = Service(
+            business_id=seed["business_id"], name="Стрижка", duration_minutes=60, is_active=True
+        )
+        session.add(svc)
+        await session.commit()
+        svc_id = svc.id
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services del Стрижка")
+    await admin_handlers.cmd_services(msg, _make_command("del Стрижка"))
+
+    text = _answer_text(msg)
+    assert "✅ Услуга удалена" in text
+    assert "Стрижка" in text
+
+    async with session_factory() as verify:
+        svc_after = (await verify.execute(select(Service).where(Service.id == svc_id))).scalar_one()
+        assert svc_after.is_active is False
+
+
+@pytest.mark.asyncio
+async def test_cmd_services_del_blocked_with_active_bookings(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """/services del с active bookings → '❌ Сначала отмените N запись/записи/записей'."""
+    async with session_factory() as session:
+        seed = await _seed_admin_stack(session)
+        svc = Service(
+            business_id=seed["business_id"], name="Стрижка", duration_minutes=60, is_active=True
+        )
+        session.add(svc)
+        await session.flush()
+        # 2 active bookings + 1 cancelled (cancelled must NOT block).
+        for status in ("confirmed", "transferred", "cancelled"):
+            session.add(
+                Booking(
+                    business_id=seed["business_id"],
+                    master_id=seed["master_id"],
+                    client_id=seed["client_id"],
+                    service_id=svc.id,
+                    service_title_snapshot="Стрижка",
+                    service_price_snapshot=None,
+                    client_name_snapshot="Паша",
+                    start_at=datetime(2026, 10, 1, 12, 0, tzinfo=UTC),
+                    end_at=datetime(2026, 10, 1, 13, 0, tzinfo=UTC),
+                    status=status,
+                )
+            )
+        await session.commit()
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services del Стрижка")
+    await admin_handlers.cmd_services(msg, _make_command("del Стрижка"))
+
+    text = _answer_text(msg)
+    assert "Сначала отмените" in text
+    assert "2 запис" in text  # 2 → "2 записи"
+    assert "Стрижка" in text
+
+    async with session_factory() as verify:
+        svc_after = (await verify.execute(select(Service))).scalar_one()
+        assert svc_after.is_active is True  # NOT deactivated
+
+
+@pytest.mark.asyncio
+async def test_cmd_services_del_not_found(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """/services del Неизвестная → '❌ Услуга «Неизвестная» не найдена'."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services del Неизвестная")
+    await admin_handlers.cmd_services(msg, _make_command("del Неизвестная"))
+
+    text = _answer_text(msg)
+    assert "не найдена" in text
+    assert "Неизвестная" in text
+
+
+@pytest.mark.asyncio
+async def test_cmd_services_del_already_inactive_idempotent(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """/services del Удалённая — уже is_active=False → 'ℹ️ Услуга «X» уже удалена'."""
+    async with session_factory() as session:
+        seed = await _seed_admin_stack(session)
+        session.add(
+            Service(
+                business_id=seed["business_id"],
+                name="Удалённая",
+                duration_minutes=45,
+                is_active=False,
+            )
+        )
+        await session.commit()
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services del Удалённая")
+    await admin_handlers.cmd_services(msg, _make_command("del Удалённая"))
+
+    text = _answer_text(msg)
+    assert "уже удалена" in text
+    assert "Удалённая" in text
+    assert "✅" not in text
+
+
+@pytest.mark.asyncio
+async def test_cmd_services_del_no_name_shows_format(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """/services del без аргумента имени → format hint '❌ Формат: /services del НАЗВАНИЕ'."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services del")
+    await admin_handlers.cmd_services(msg, _make_command("del"))
+
+    text = _answer_text(msg)
+    assert "Формат" in text
+    assert "/services del" in text
+
+
+@pytest.mark.asyncio
+async def test_cmd_services_del_underscore_decodes_to_space(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """/services del Стрижка_мужская → name 'Стрижка мужская' (mirror of add)."""
+    async with session_factory() as session:
+        seed = await _seed_admin_stack(session)
+        session.add(
+            Service(
+                business_id=seed["business_id"],
+                name="Стрижка мужская",
+                duration_minutes=60,
+                is_active=True,
+            )
+        )
+        await session.commit()
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services del Стрижка_мужская")
+    await admin_handlers.cmd_services(msg, _make_command("del Стрижка_мужская"))
+
+    text = _answer_text(msg)
+    assert "✅ Услуга удалена" in text
+    assert "Стрижка мужская" in text
+
+
+@pytest.mark.asyncio
+async def test_cmd_services_del_strip_matches_create_normalization(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """W1 fix (code-review B.11): 'Стрижка_' (created) → stored 'Стрижка' (strip)
+    → '/services del Стрижка_' must find it (deactivate_service now strips name
+    too, mirroring create_service admin.py:243).
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+        # add via 'Стрижка_' — handler replaces '_' with ' ', create_service strips
+        msg_add = _make_message(user_id=ADMIN_TG_ID, text="/services add Стрижка_ 60")
+        await admin_handlers.cmd_services(msg_add, _make_command("add Стрижка_ 60"))
+        # verify stored as "Стрижка" (stripped)
+        svc = (await session.execute(select(Service))).scalar_one()
+        assert svc.name == "Стрижка"
+        assert svc.is_active is True
+
+    # delete via the SAME spelling the user used to add — must succeed.
+    msg_del = _make_message(user_id=ADMIN_TG_ID, text="/services del Стрижка_")
+    await admin_handlers.cmd_services(msg_del, _make_command("del Стрижка_"))
+
+    text = _answer_text(msg_del)
+    assert "✅ Услуга удалена" in text, f"expected success, got: {text!r}"
+
+    async with session_factory() as verify:
+        svc_after = (await verify.execute(select(Service))).scalar_one()
+        assert svc_after.is_active is False
+
+
+@pytest.mark.asyncio
+async def test_cmd_services_del_aggregate_block_with_duplicate_names(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """S2 (code-review B.11): 2 active services with same name 'Стрижка'.
+    Service A has 1 active booking, Service B has 0 → aggregate block-check
+    blocks BOTH (no partial deactivation).
+    """
+    async with session_factory() as session:
+        seed = await _seed_admin_stack(session)
+        svc_a = Service(
+            business_id=seed["business_id"], name="Стрижка", duration_minutes=60, is_active=True
+        )
+        svc_b = Service(
+            business_id=seed["business_id"], name="Стрижка", duration_minutes=45, is_active=True
+        )
+        session.add_all([svc_a, svc_b])
+        await session.flush()
+        # Only svc_a has an active booking.
+        session.add(
+            Booking(
+                business_id=seed["business_id"],
+                master_id=seed["master_id"],
+                client_id=seed["client_id"],
+                service_id=svc_a.id,
+                service_title_snapshot="Стрижка",
+                service_price_snapshot=None,
+                client_name_snapshot="Паша",
+                start_at=datetime(2026, 10, 1, 12, 0, tzinfo=UTC),
+                end_at=datetime(2026, 10, 1, 13, 0, tzinfo=UTC),
+                status="confirmed",
+            )
+        )
+        await session.commit()
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services del Стрижка")
+    await admin_handlers.cmd_services(msg, _make_command("del Стрижка"))
+
+    text = _answer_text(msg)
+    assert "Сначала отмените" in text
+    assert "1 запис" in text  # 1 → "запись"
+
+    async with session_factory() as verify:
+        stmt = select(Service).order_by(Service.created_at)
+        svcs = list((await verify.execute(stmt)).scalars().all())
+        assert len(svcs) == 2
+        # Both blocked — neither deactivated.
+        assert all(s.is_active for s in svcs)
+
+
+@pytest.mark.asyncio
+async def test_cmd_services_del_multiple_same_name_no_bookings_deactivates_all(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """S4 (code-review B.11): 2 active services 'Стрижка', no bookings → both
+    deactivated, handler shows 'Удалено услуг: 2' (plural branch).
+    """
+    async with session_factory() as session:
+        seed = await _seed_admin_stack(session)
+        for _ in range(2):
+            session.add(
+                Service(
+                    business_id=seed["business_id"],
+                    name="Стрижка",
+                    duration_minutes=60,
+                    is_active=True,
+                )
+            )
+        await session.commit()
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services del Стрижка")
+    await admin_handlers.cmd_services(msg, _make_command("del Стрижка"))
+
+    text = _answer_text(msg)
+    assert "Удалено услуг: 2" in text
+    assert "Стрижка" in text
+
+    async with session_factory() as verify:
+        svcs = list((await verify.execute(select(Service))).scalars().all())
+        assert len(svcs) == 2
+        assert all(not s.is_active for s in svcs)
+
+
+@pytest.mark.parametrize(
+    ("n_bookings", "expected_word"),
+    [
+        (1, "запись"),
+        (2, "записи"),
+        (3, "записи"),
+        (4, "записи"),
+        (5, "записей"),
+        (11, "записей"),
+        (21, "запись"),
+        (22, "записи"),
+        (25, "записей"),
+        (101, "запись"),
+        (111, "записей"),
+        (121, "запись"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_cmd_services_del_plural_form(
+    session_factory: Any,
+    patched_session_factory: Any,
+    n_bookings: int,
+    expected_word: str,
+) -> None:
+    """S3 (code-review B.11): Russian plural form 'запись/записи/записей' by
+    count n. Validates edge cases n=1, 5, 11, 21, 22, 101, 111, 121 where
+    the formula has boundaries (n%10, n%100).
+    """
+    async with session_factory() as session:
+        seed = await _seed_admin_stack(session)
+        svc = Service(
+            business_id=seed["business_id"], name="Стрижка", duration_minutes=60, is_active=True
+        )
+        session.add(svc)
+        await session.flush()
+        # Create n_bookings confirmed bookings — all on svc.id.
+        for i in range(n_bookings):
+            session.add(
+                Booking(
+                    business_id=seed["business_id"],
+                    master_id=seed["master_id"],
+                    client_id=seed["client_id"],
+                    service_id=svc.id,
+                    service_title_snapshot="Стрижка",
+                    service_price_snapshot=None,
+                    client_name_snapshot="Паша",
+                    start_at=datetime(2026, 10, 1, 12, 0, tzinfo=UTC) + timedelta(hours=i),
+                    end_at=datetime(2026, 10, 1, 13, 0, tzinfo=UTC) + timedelta(hours=i),
+                    status="confirmed",
+                )
+            )
+        await session.commit()
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/services del Стрижка")
+    await admin_handlers.cmd_services(msg, _make_command("del Стрижка"))
+
+    text = _answer_text(msg)
+    assert f"{n_bookings} {expected_word}" in text, (
+        f"plural form mismatch for n={n_bookings}: expected '{expected_word}', got: {text!r}"
+    )
 
 
 # ============================================================

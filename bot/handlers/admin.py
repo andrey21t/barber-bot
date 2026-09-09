@@ -75,11 +75,13 @@ from bot.keyboards.admin import (
 from bot.models import Booking, Service, WorkDay
 from bot.services.admin import (
     create_service,
+    deactivate_service,
     get_active_bookings_for_workday,
     get_all_future_bookings,
     get_bookings_for_date,
     get_bookings_for_date_range,
     get_today_bookings,
+    list_services,
 )
 from bot.services.admin_move import (
     AdminMoveResult,
@@ -610,30 +612,58 @@ async def cmd_week(message: Message) -> None:
 
 
 # ============================================================
-# 5. /services add <name> <duration_min>
+# 5. /services — add | list | del  (B.11: list + del added)
 # ============================================================
 @router.message(Command("services"), StateFilter(None))
 async def cmd_services(message: Message, command: CommandObject) -> None:
-    """Add a service: `services add Стрижка 60`.
+    """Manage services: `services add NAME DURATION` | `services list` | `services del NAME`.
+
+    Sub-commands:
+        add NAME DURATION_MIN   — create a service (Session 5.10: price убран, озвучивается в чате)
+        list                    — список активных услуг мастера (B.11)
+        del NAME                — soft delete (UPDATE is_active=False, не DELETE из БД —
+                                  history bookings сохраняются через snapshot). Защита:
+                                  отказ, если есть active bookings (B.11 DoD).
 
     Note: name with spaces NOT supported in this MVP (no quotes parsing).
     Use single-word name or replace spaces with underscores: "Стрижка_мужская".
+    Underscore→space decode mirrors between add and del (single source of truth).
 
-    Price убран в Session 5.10 — мастер озвучивает цену отдельно в чате.
-    Service.price остаётся nullable в БД для будущего использования.
+    Service.price остаётся nullable в БД для будущего использования (Session 5.10).
     """
     if not _is_admin(message):
         return
 
     args = (command.args or "").split()
-    if not args or args[0] != "add":
-        await message.answer(
-            "Формат: <code>/services add НАЗВАНИЕ ДЛИТЕЛЬНОСТЬ_МИН</code>\n"
-            "Пример: <code>/services add Стрижка 60</code>\n"
-            "Внимание: название без пробелов (замените на _)"
-        )
+    if not args:
+        await _services_format_hint(message)
         return
 
+    sub = args[0]
+    if sub == "add":
+        await _services_add(message, args)
+    elif sub == "list":
+        await _services_list(message)
+    elif sub == "del":
+        await _services_del(message, args)
+    else:
+        await _services_format_hint(message)
+
+
+async def _services_format_hint(message: Message) -> None:
+    """Reusable format hint for /services — shared by no-args and unknown-sub."""
+    await message.answer(
+        "Формат:\n"
+        "<code>/services add НАЗВАНИЕ ДЛИТЕЛЬНОСТЬ_МИН</code> — добавить услугу\n"
+        "<code>/services list</code> — список услуг\n"
+        "<code>/services del НАЗВАНИЕ</code> — удалить услугу\n"
+        "\n"
+        "Внимание: название без пробелов (замените на _)"
+    )
+
+
+async def _services_add(message: Message, args: list[str]) -> None:
+    """Sub-command: add NAME DURATION_MIN. (extracted from old cmd_services body.)"""
     if len(args) != 3:
         await message.answer(
             "❌ Нужно 2 параметра: НАЗВАНИЕ ДЛИТЕЛЬНОСТЬ_МИН\n"
@@ -673,6 +703,110 @@ async def cmd_services(message: Message, command: CommandObject) -> None:
         f"⏱ {service.duration_minutes} мин",
         reply_markup=admin_inline_menu(),
     )
+
+
+async def _services_list(message: Message) -> None:
+    """Sub-command: list active services for the master's business (B.11)."""
+    admin_id = _require_admin_or_silent(message)
+    assert admin_id is not None
+    resolved = await _resolve_master_and_business(admin_id)
+    if resolved is None:
+        await message.answer("❌ Мастер не найден")
+        return
+    _master_id, business_id, _tz = resolved
+
+    async with async_session_factory() as session:
+        services = await list_services(session, business_id)
+
+    if not services:
+        await message.answer(
+            "У вас нет активных услуг.\n"
+            "Добавьте: <code>/services add Стрижка 60</code>",
+            reply_markup=admin_inline_menu(),
+        )
+        return
+
+    lines = [f"Услуги ({len(services)}):"]
+    for idx, svc in enumerate(services, start=1):
+        # price nullable (Session 5.10): omit if None, show formatted if set.
+        price_part = ""
+        if svc.price is not None:
+            price_part = f", {svc.price}₽"
+        name_esc = html.escape(svc.name, quote=False)
+        lines.append(f"{idx}. {name_esc} — {svc.duration_minutes} мин{price_part}")
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=admin_inline_menu(),
+    )
+
+
+async def _services_del(message: Message, args: list[str]) -> None:
+    """Sub-command: soft-delete services by name (B.11).
+
+    No name uniqueness (admin.py:13): if multiple active services share the
+    name, we deactivate all of them in one call (block-check is aggregate).
+    Idempotent on already-inactive services.
+    """
+    if len(args) != 2:
+        await message.answer(
+            "❌ Формат: <code>/services del НАЗВАНИЕ</code>\n"
+            "Пример: <code>/services del Стрижка</code>\n"
+            "(название без пробелов, _ = пробел)"
+        )
+        return
+
+    name = args[1].replace("_", " ")
+
+    admin_id = _require_admin_or_silent(message)
+    assert admin_id is not None
+    resolved = await _resolve_master_and_business(admin_id)
+    if resolved is None:
+        await message.answer("❌ Мастер не найден")
+        return
+    _master_id, business_id, _tz = resolved
+
+    async with async_session_factory() as session:
+        result = await deactivate_service(session, business_id, name)
+
+    if not result.found:
+        await message.answer(
+            f"❌ Услуга «{html.escape(name, quote=False)}» не найдена",
+            reply_markup=admin_inline_menu(),
+        )
+        return
+
+    if result.blocked_bookings > 0:
+        # Plural form — Russian "запись/записи/записей" by count.
+        n = result.blocked_bookings
+        word = "запись" if n % 10 == 1 and n % 100 != 11 else (
+            "записи" if 2 <= n % 10 <= 4 and (n % 100 < 10 or n % 100 >= 20) else "записей"
+        )
+        await message.answer(
+            f"❌ Сначала отмените {n} {word} на услугу «{html.escape(name, quote=False)}»",
+            reply_markup=admin_inline_menu(),
+        )
+        return
+
+    if not result.deactivated and result.already_inactive:
+        await message.answer(
+            f"ℹ️ Услуга «{html.escape(name, quote=False)}» уже удалена",
+            reply_markup=admin_inline_menu(),
+        )
+        return
+
+    # One or more services deactivated in this call.
+    count = len(result.deactivated)
+    if count == 1:
+        await message.answer(
+            f"✅ Услуга удалена: {html.escape(name, quote=False)}",
+            reply_markup=admin_inline_menu(),
+        )
+    else:
+        await message.answer(
+            f"✅ Удалено услуг: {count} («{html.escape(name, quote=False)}»)",
+            reply_markup=admin_inline_menu(),
+        )
 
 
 # ============================================================
