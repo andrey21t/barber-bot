@@ -84,9 +84,13 @@ def mock_scheduler() -> MagicMock:
     return MagicMock(spec=AsyncIOScheduler)
 
 
-def _make_user(user_id: int) -> User:
-    """Build a minimal aiogram User (required fields per Bot API)."""
-    return User(id=user_id, is_bot=False, first_name="Test")
+def _make_user(user_id: int, username: str | None = None) -> User:
+    """Build a minimal aiogram User (required fields per Bot API).
+
+    `username` defaults to None — mirrors Telegram users without @username.
+    Tests that verify @username propagation should pass username explicitly.
+    """
+    return User(id=user_id, is_bot=False, first_name="Test", username=username)
 
 
 def _make_message(
@@ -2226,14 +2230,19 @@ async def test_service_msg_happy_shows_slot_picker(
 def _make_confirm_callback(
     *,
     user_id: int = 111222333,
+    username: str | None = None,
 ) -> tuple[MagicMock, Any]:
-    """Mock CallbackQuery for confirm_cb (BookConfirmCallbackData filter)."""
+    """Mock CallbackQuery for confirm_cb (BookConfirmCallbackData filter).
+
+    `username` — Telegram @username (None for users without one). Tests that
+    verify @username propagation in confirm_cb should pass a non-None value.
+    """
     from bot.keyboards.client import BookConfirmCallbackData
 
     bot = AsyncMock()
     bot.send_message = AsyncMock()
     cb = MagicMock(spec=CallbackQuery)
-    cb.from_user = _make_user(user_id)
+    cb.from_user = _make_user(user_id, username=username)
     cb.message = _make_message(user_id, text="<unused>")
     cb.answer = AsyncMock()
     cb.bot = bot
@@ -2569,6 +2578,70 @@ async def test_confirm_cb_happy_creates_booking_and_schedules(
     second_text = str(cb.message.answer.await_args_list[1].args[0])
     assert "Кнопки внизу" in second_text, "B.13: 2nd message restores reply keyboard"
     cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_cb_propagates_username_to_create_booking(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """W5 (code-review iter 2): confirm_cb propagates callback.from_user.username
+    to BookingCreate.telegram_username. Without this test, all confirm_cb
+    unit-tests ran with username=None (default in _make_user) — only the
+    fallback (telegram_id) path was exercised at handler level.
+
+    Setup: _make_confirm_callback(username="pasha_ivanov") → cb.from_user has
+    @username. Monkeypatch create_booking to capture the BookingCreate payload
+    it received. Assert payload.telegram_username == "pasha_ivanov".
+
+    Service-level coverage exists (test_create_booking_username_in_notification
+    in test_booking.py:2827), but that tests the service, not the handler's
+    extraction of from_user.username → BookingCreate. This test closes that gap.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = Slot(
+            master_id=ctx["master_id"],
+            slot_date=target_date,
+            slot_hour=14,
+            status="open",
+        )
+        session.add(slot)
+        await session.commit()
+        slot_id = slot.id
+
+    captured_payload: list[Any] = []
+
+    async def _capture_create(_session: Any, payload: Any, **kwargs: Any) -> Any:
+        captured_payload.append(payload)
+        fake = MagicMock()
+        fake.booking_id = UUID("00000000-0000-0000-0000-000000000003")
+        fake.start_at = datetime.now(UTC) + timedelta(days=1)
+        fake.master_notification_text = "Новая запись: Паша (@pasha_ivanov)"
+        return fake
+
+    monkeypatch.setattr(client_handlers, "create_booking", _capture_create)
+    schedule_mock = MagicMock()
+    monkeypatch.setattr(client_handlers, "schedule_for_booking", schedule_mock)
+
+    cb, callback_data = _make_confirm_callback(username="pasha_ivanov")
+    state = _make_state()
+    await state.update_data(
+        slot_id=str(slot_id),
+        client_name="Паша",
+        service_title="Стрижка",
+    )
+    scheduler = MagicMock(spec=AsyncIOScheduler)
+
+    await client_handlers.confirm_cb(cb, callback_data, state, scheduler)
+
+    assert len(captured_payload) == 1, "create_booking called once"
+    assert captured_payload[0].telegram_username == "pasha_ivanov", (
+        "W5: confirm_cb must propagate callback.from_user.username → "
+        "BookingCreate.telegram_username"
+    )
 
 
 @pytest.mark.asyncio

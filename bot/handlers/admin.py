@@ -862,9 +862,9 @@ def _render_bookings(
     compat for /closeday and other callers that don't pass client_phones.
 
     Phone is rendered RAW (no escape) — it's digits and '+' only, no HTML
-    metacharacters. If a malicious client somehow injected HTML via phone
-    (impossible — normalize_phone + PHONE_PATTERN restricts to ^\\+?[0-9]{10,15}$),
-    html.parse_mode would still treat it as text inside the line (no < >).
+    metacharacters. Phone column is deprecated (phone step removed in 5.50,
+    existing rows were normalized by the former normalize_phone gatekeeper).
+    html.parse_mode would still treat any text inside the line as text (no < >).
     """
     from zoneinfo import ZoneInfo
 
