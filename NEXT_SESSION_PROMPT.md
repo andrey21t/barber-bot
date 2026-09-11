@@ -1,57 +1,60 @@
 # NEXT_SESSION_PROMPT — barber-bot, handoff после сессии 5.54
 
-## Текущее состояние (актуально на 2026-09-11, ~10:50 UTC)
+## Текущее состояние (актуально на 2026-09-11, ~12:35 UTC)
 
-**Origin/main:** docs-коммит 5.54 (README-worker + этот handoff). Код продакшена не менялся: **прод живёт на `ad3dbe0`** (код 5.53) + `.env` с включённым прокси (env не в git).
+**Origin/main:** `ccdc60d` (5.54 docs) + offsite-backup script (этот коммит). Прод живёт на коде `ad3dbe0` (5.53) + `.env` с прокси.
 **VPS:** `VPS_HOST_FROM_CRED_FILE`, бот `@My_Barber_hair_bot` работает **через Cloudflare Worker proxy** с 2026-09-11 10:33 UTC.
-**Гейты:** ruff ✅ · mypy 0 · pytest 550 passed, 2 skipped (5.53, код не менялся в 5.54 — только docs/infra).
+**Гейты:** ruff ✅ · mypy 0 · pytest 550 passed, 2 skipped (код 5.53, не менялся в 5.54 — только docs/infra).
 
-## ГЛАВНОЕ СОБЫТИЕ 5.54: Worker proxy ЗАДЕПЛОЕН И ВКЛЮЧЁН НА ПРОДЕ
+## Что сделано в 5.54
 
-### Что было и что сделано
+### 1. Worker proxy — ЗАДЕПЛОЕН, ВКЛЮЧЁН, СТАБИЛЕН (2 часа, 0 обрывов)
 
-- Воркер **не был задеплоен** (деплой числился за владельцем) — но wrangler-сессия на Mac жива, код и README готовы с 5.53. Ассистент задеплоил сам по README-плану.
-- **Субдомен workers.dev аккаунта не существовал** (первый воркер аккаунта). `wrangler subdomain` не существует — регистрация через CF API: `PUT /accounts/<id>/workers/subdomain` body `{"subdomain":"mybarber-hair-bot"}` (Bearer = oauth_token из `~/Library/Preferences/.wrangler/config/default.toml`). Edge-сертификат выпускается ~1-2 мин — до него TLS handshake failure (не пугаться, просто подождать).
-- **Воркер:** `https://telegram-proxy.mybarber-hair-bot.workers.dev`, имя `telegram-proxy`, secret `WORKER_SECRET`. **URL+SECRET сохранены** в `~/.config/opencode/references/barber-bot-deploy-credentials.md` (WORKER_URL / WORKER_SECRET) — НЕ коммитить.
-- Проверено с VPS: getMe через воркер `{"ok":true}`, wrong-secret → 404 (гвард работает), ~0.19s.
-- **Включение на VPS:** `/opt/barber-bot/.env` → `TELEGRAM_API_BASE_URL=<WORKER_URL>/<WORKER_SECRET>` + `docker compose up -d --force-recreate bot` (без build — образ не менялся). Лог подтвердил: `Telegram API via proxy`.
+- Воркер не был задеплоен (деплой числился за владельцем). Ассистент задеплоил сам — wrangler-сессия на Mac жива, код готов с 5.53.
+- **Нюанс деплоя:** субдомен workers.dev аккаунта не существовал (первый воркер). `wrangler subdomain` не существует — регистрация через CF API: `PUT /accounts/<id>/workers/subdomain` body `{"subdomain":"mybarber-hair-bot"}` (Bearer = oauth_token из `~/Library/Preferences/.wrangler/config/default.toml`). Edge-сертификат выпускается ~1-2 мин — до него TLS handshake failure.
+- **Воркер:** `https://telegram-proxy.mybarber-hair-bot.workers.dev`, secret `WORKER_SECRET`. URL+SECRET в `~/.config/opencode/references/barber-bot-deploy-credentials.md` (WORKER_URL / WORKER_SECRET).
+- **Включение:** VPS `.env` → `TELEGRAM_API_BASE_URL=<WORKER_URL>/<WORKER_SECRET>` + `docker compose up -d --force-recreate bot`. Лог: `Telegram API via proxy`.
+- **Замер обрывов:**
+  - ДО прокси (тот же день): бот упал НАСМЕРТЬ в 10:20:03 — aiohttp TimeoutError убил процесс (policy `unless-stopped` поднял в 10:20:05). Плюс 2 обрыва за 11 мин до этого.
+  - ПОСЛЕ включения (10:33): **2 часа long polling через CF — 0 обрывов, 0 рестартов.** Обновления обрабатываются за 106-113ms. Лог чистый.
+- **Откат:** убрать `TELEGRAM_API_BASE_URL` из `.env` + `docker compose up -d --force-recreate bot` → бот вернётся на прямой api.telegram.org.
+- `deploy/README-worker.md` обновлён: статус «задеплоено» + нюанс с субдоменом.
 
-### Замер обрывов (главная метрика жалобы №1 «медленный старт»)
+### 2. Оффсайт-копия бэкапов — Mac scp-pull, ГОТОВО
 
-- **До прокси (тот же день):** бот упал НАСМЕРТЬ в 10:20:03 — aiohttp TimeoutError к api.telegram.org убил процесс (policy `unless-stopped` поднял в 10:20:05, Restarts=1). Плюс 2 обрыва за 11 мин до этого. Это живое подтверждение диагноза 5.51 в реальном времени.
-- **После включения (10:33):** 10 минут long polling через CF (~20+ запросов) — **0 обрывов, 0 рестартов**. Лог чистый.
-- **Мониторинг продолжать:** сутки-двое `docker logs --since <t> barber-bot-bot-1 | grep -ciE 'reset by peer|timeout error'` + `docker inspect barber-bot-bot-1 --format '{{.RestartCount}}'` (должен замереть). CF free tier: 100k req/day, у нас ~3k — запас 30x.
+- R2 заблокирован (нужен dashboard enablement — платёжка). Ассистент развернул Mac scp-pull — работает сразу, без dashboard.
+- **`scripts/offsite-backup.sh`** в репо: sshpass scp новых dump'ов с VPS → `~/barber-bot-backups/`, retention 7 дней. Пароль читается из `~/.config/opencode/references/barber-bot-deploy-credentials.md` (не в репо).
+- **Тест пройден:** dump `barber_2026-09-11_1007.dump` (28K) скачан с VPS, локально в `~/barber-bot-backups/`.
+- **launchd:** `~/Library/LaunchAgents/com.barber.offsite-backup.plist` — ежедневно 06:30 MSK (03:30 UTC, синхронно с VPS cron). Загружен в launchctl.
+- **SSH key:** не заработал — приватный ключ запаролен, `/dev/tty` недоступен в opencode → sshpass с password-auth как fallback (работает, проверено). Если владельцев когда-то введёт passphrase в интерактивном терминале — можно перейти на key-auth, скрипт уже совместим (sshpass fallback не нужен).
+- **Ограничение:** Mac должен быть включён в 06:30 MSK. Если выключен — dump пропускается, следующий запуск подберёт (скрипт не качает дубликаты). R2 остаётся как future upgrade когда владелец активирует R2 в dashboard.
 
-### Откат (если что-то пойдёт не так)
+### 3. Backup cron на VPS — состояние НОРМА
 
-Убрать `TELEGRAM_API_BASE_URL` из `.env` + `docker compose up -d --force-recreate bot` → бот вернётся на прямой api.telegram.org. Код не менять (feature flag).
-
-## Backup cron — состояние НОРМА, первый автозапуск ещё не наступил
-
-Cron `30 3 * * *` установлен сегодня в 10:18 UTC. Скрипт `scripts/backup.sh` на месте, ручной dump от restore-теста лежит в `backups/` (26KB). `/var/log/barber_backup.log` ЕЩЁ НЕ СУЩЕСТВУЕТ — это не баг: лог появится после первого срабатывания cron **2026-09-12 03:30 UTC**. Первое, что сделать в следующей сессии: проверить, что ночной dump прошёл (файл в `/opt/barber-bot/backups/`, строки в логе).
+Cron `30 3 * * *` установлен. Первый автозапуск: **2026-09-12 03:30 UTC**. `/var/log/barber_backup.log` ещё не существует — появится после первого срабатывания. Первое в следующей сессии: проверить, что ночной dump прошёл.
 
 ## НЕЗАКРЫТЫЕ ЗАДАЧИ (в порядке приоритета)
 
-### 1. Smoke-тест юзером (ЖДЁМ ОБРАТНОЙ СВЯЗИ — чек-лист 5.52)
+### 1. Проверка первого ночного backup-цикла (сессия 5.55, 2026-09-12)
 
-Владелец должен прогнать в @My_Barber_hair_bot чек-лист (полный список — в git-истории handoff 5.53 `a19b3df`, кратко):
+- VPS: `tail /var/log/barber_backup.log` + `ls /opt/barber-bot/backups/` — cron отработал?
+- Mac: `ls ~/barber-bot-backups/` + `tail ~/barber-bot-backups/launchd.log` — offsite pull сработал?
+- Если оба зелёные — оффсайт-копия закрывает one-way door.
+
+### 2. Smoke-тест юзером (ЖДём обратной связи — чек-лист 5.52)
+
+Владелец должен прогнать в @My_Barber_hair_bot:
 - `/book` → «Своя услуга» НЕТ, только услуги мастера; текст вместо тапа → подсказка + СВЕЖИЙ пикер
 - Под «Вы записаны» inline-кнопок НЕТ; клавиатуры шагов гаснут при переходе
 - «❌ Отмена» на подтверждении и /cancel — гасят ✅/❌ и реально отменяют (в т.ч. на шаге услуги/имени)
 - Любой текст без активной записи → «Начните запись через /book»; «Нет свободных дат/слотов» — не крутит спиннер вечно
-
-### 2. Оффсайт-копия бэкапов (РЕШЕНИЕ ВЛАДЕЛЬЦА, ассистент реализует любой выбор)
-
-Dump'ы только на VPS — потеря VPS = потеря бэкапов. Варианты:
-- **Cloudflare R2 (рекомендую — CF-аккаунт уже активно используется воркером, free 10GB):** `wrangler r2 bucket create barber-backups` + upload. Реализация: rclone на VPS с R2 token (S3-compatible) ИЛИ cron с Mac (scp с VPS → `wrangler r2 object put`).
-- **Mac pull:** scp/rsync dump'ов на Mac по cron — 2 строки, но Mac должен быть включён.
-- Любой S3.
+- **Через прокси бот должен отвечать быстро** — если всё ещё тупит на /book, смотреть не сеть (DB, воркер CF, рендер)
 
 ### 3. Фоновое
 
 - После суток-двух стабильного прокси: сравнить счётчики обрывов до/после, зафиксировать в README-worker.md.
-- Передача бота Екатерине: `ADMIN_ID` в `.env` на VPS (сейчас ID владельца — он сам тестирует). On-behalf booking — когда Екатерина начнёт работать.
-- Тот же smoke-чеклист теперь проверяет и «медленный старт» — если через прокси бот всё равно тупит на /book, смотреть в другую сторону (не сеть: DB, воркер CF, рендер).
+- R2 как future upgrade: активировать в CF dashboard → `wrangler r2 bucket create barber-backups` → заменить sshpass scp на rclone/curl PUT to R2 (VPS-сторона, Mac не нужен).
+- Передача бота Екатерине: `ADMIN_ID` в `.env` на VPS. On-behalf booking — когда Екатерина начнёт работать.
 
 ## Как деплоить
 
@@ -59,7 +62,7 @@ Dump'ы только на VPS — потеря VPS = потеря бэкапов
 BARBER_PASS=$(grep -E '^PASS:' ~/.config/opencode/references/barber-bot-deploy-credentials.md | sed 's/^PASS: //')
 sshpass -p "$BARBER_PASS" ssh root@VPS_HOST_FROM_CRED_FILE
 cd /opt/barber-bot && git pull && docker compose up -d --build
-docker logs --tail 20 barber-bot-bot-1   # smoke-check: "Run polling" + "Telegram API via proxy"
+docker logs --tail 20 barber-bot-bot-1   # "Run polling" + "Telegram API via proxy"
 ```
 
 Миграции применяются автоматически (контейнер стартует через `alembic upgrade head && python -m bot.main`).
