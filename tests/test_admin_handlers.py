@@ -39,7 +39,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from aiogram.filters import CommandObject
-from aiogram.types import Message, User
+from aiogram.types import InlineKeyboardMarkup, Message, User
 from bot.config import get_settings
 from bot.handlers import admin as admin_handlers
 from bot.models import Booking, Business, Client, Master, Service, Slot
@@ -3833,6 +3833,196 @@ async def test_openweek_confirm_alert_marks_closed_days(
     assert "Пн 07.09 10:00–19:00 (закрыт)" in text, f"Closed day should be marked; got: {text!r}"
     assert "Ср 09.09 10:00–19:00 (закрыт)" not in text, (
         f"Active day should NOT have (закрыт) suffix; got: {text!r}"
+    )
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_confirm_alert_all_closed_reopen_text(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.60 P1: all selected existing days are closed → alert 'День закрыт.
+    Открыть заново' + button '✅ Да, открыть' (NOT 'перезаписать').
+
+    Setup: Mon 07.09 and Wed 09.09 both closed (is_active=False). Select both.
+    Confirm with new window 09:00–18:00. Expected: alert title 'День закрыт',
+    action text 'Открыть заново на 09:00–18:00?', confirm button labeled
+    '✅ Да, открыть'. callback_data stays 'admin_openweek_overwrite_yes' so
+    yes-handler logic is unchanged.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        await _seed_workday(
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
+            is_active=False,
+        )
+        await _seed_workday(
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 9).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
+            is_active=False,
+        )
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_openweek_confirm"
+    state = _make_mock_state(
+        {
+            "picked_start_minute": 540,
+            "picked_end_minute": 1080,
+            "selected_weekdays": [0, 2],
+            "business_tz": TZ,
+        }
+    )
+
+    await admin_handlers.admin_openweek_confirm_cb(callback, state)
+
+    state.clear.assert_not_called()
+    text = callback_answer_text(callback)
+    assert "День закрыт" in text, f"All-closed alert should say 'День закрыт'; got: {text!r}"
+    assert "Открыть заново на 09:00–18:00" in text, (
+        f"All-closed alert should propose re-open; got: {text!r}"
+    )
+    assert "Перезаписать" not in text, (
+        f"All-closed alert must NOT say 'Перезаписать'; got: {text!r}"
+    )
+    # Verify confirm button label — extract from edit_text or answer reply_markup.
+    args, kwargs = callback.message.edit_text.call_args or callback.message.answer.call_args
+    reply_markup = kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
+    assert isinstance(reply_markup, InlineKeyboardMarkup), "Should have overwrite keyboard"
+    button_texts = [btn.text for row in reply_markup.inline_keyboard for btn in row]
+    assert "✅ Да, открыть" in button_texts, (
+        f"Confirm button should say '✅ Да, открыть'; got: {button_texts}"
+    )
+    assert "✅ Да, перезаписать" not in button_texts, (
+        f"All-closed must NOT show 'перезаписать' button; got: {button_texts}"
+    )
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_confirm_alert_mixed_open_and_overwrite_text(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.60 P1: mixed (some closed, some active) → alert 'Часть дней закрыта,
+    часть открыта' + button '✅ Да, открыть/перезаписать'.
+
+    Setup: Mon 07.09 closed, Wed 09.09 active. Select both. Confirm 09–18.
+    Expected: alert 'Часть дней закрыта, часть открыта', action 'Открыть
+    закрытые и перезаписать активные на 09:00–18:00?', button '✅ Да,
+    открыть/перезаписать'.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        await _seed_workday(
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
+            is_active=False,
+        )
+        await _seed_workday(
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 9).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
+            is_active=True,
+        )
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_openweek_confirm"
+    state = _make_mock_state(
+        {
+            "picked_start_minute": 540,
+            "picked_end_minute": 1080,
+            "selected_weekdays": [0, 2],
+            "business_tz": TZ,
+        }
+    )
+
+    await admin_handlers.admin_openweek_confirm_cb(callback, state)
+
+    state.clear.assert_not_called()
+    text = callback_answer_text(callback)
+    assert "Часть дней закрыта, часть открыта" in text, (
+        f"Mixed alert should explain both states; got: {text!r}"
+    )
+    assert "Открыть закрытые и перезаписать активные на 09:00–18:00" in text, (
+        f"Mixed alert should propose both actions; got: {text!r}"
+    )
+    # Verify button label.
+    args, kwargs = callback.message.edit_text.call_args or callback.message.answer.call_args
+    reply_markup = kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
+    assert isinstance(reply_markup, InlineKeyboardMarkup), "Should have overwrite keyboard"
+    button_texts = [btn.text for row in reply_markup.inline_keyboard for btn in row]
+    assert "✅ Да, открыть/перезаписать" in button_texts, (
+        f"Mixed button should say '✅ Да, открыть/перезаписать'; got: {button_texts}"
+    )
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_confirm_alert_all_active_button_text_unchanged(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.60 P1 backward compat: all selected existing days active → button
+    '✅ Да, перезаписать' (default, unchanged). Guards against regression
+    of the original overwrite flow when no closed days are involved.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        await _seed_workday(
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
+            is_active=True,
+        )
+        await _seed_workday(
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 9).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
+            is_active=True,
+        )
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.data = "admin_openweek_confirm"
+    state = _make_mock_state(
+        {
+            "picked_start_minute": 540,
+            "picked_end_minute": 1080,
+            "selected_weekdays": [0, 2],
+            "business_tz": TZ,
+        }
+    )
+
+    await admin_handlers.admin_openweek_confirm_cb(callback, state)
+
+    state.clear.assert_not_called()
+    text = callback_answer_text(callback)
+    assert "Уже есть окно" in text, f"All-active alert keeps current title; got: {text!r}"
+    assert "Перезаписать окно на 09:00–18:00" in text, (
+        f"All-active alert keeps current action; got: {text!r}"
+    )
+    args, kwargs = callback.message.edit_text.call_args or callback.message.answer.call_args
+    reply_markup = kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
+    assert isinstance(reply_markup, InlineKeyboardMarkup), "Should have overwrite keyboard"
+    button_texts = [btn.text for row in reply_markup.inline_keyboard for btn in row]
+    assert "✅ Да, перезаписать" in button_texts, (
+        f"All-active keeps 'перезаписать' button; got: {button_texts}"
     )
 
 
