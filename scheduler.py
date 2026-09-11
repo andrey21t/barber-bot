@@ -183,7 +183,10 @@ async def send_reminder(booking_id: UUID, kind: str, bot: Any = None) -> None:
         # a master name with <, >, & would fail Telegram HTML parse → TelegramBadRequest
         # → UNIQUE(booking_id,kind) blocks retry forever (silent reminder loss).
         service = booking.service_title_snapshot
-        master_name = html.escape(master.name, quote=False)
+        # .replace("\n", " ") — mirrors admin.py:881 + keyboards/admin.py:215 pattern
+        # for client_name_snapshot/service_title_snapshot: display-only newline
+        # squash prevents multi-line reminder if master.name has \n (future /addmaster).
+        master_name = html.escape(master.name, quote=False).replace("\n", " ")
         if kind == "remind_24h":
             text = f"Напоминаю: завтра в {time_str} — 💇 {service}, мастер {master_name}"
         elif kind == "remind_1h":
