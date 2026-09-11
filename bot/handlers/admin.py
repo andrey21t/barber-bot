@@ -73,6 +73,7 @@ from bot.keyboards.admin import (
     admin_window_slot_picker_keyboard,
     render_booked_header,
 )
+from bot.keyboards.client import client_book_kb
 from bot.models import Booking, Service, WorkDay
 from bot.services.admin import (
     create_service,
@@ -2709,6 +2710,7 @@ async def admin_move_confirm_cb(
                 await callback.bot.send_message(
                     chat_id=result.client_telegram_id,
                     text=client_text,
+                    reply_markup=client_book_kb(),
                 )
             except TelegramRetryAfter as e:
                 # Flood control — retry once after retry_after (mirror scheduler.py:192-201).
@@ -2723,6 +2725,7 @@ async def admin_move_confirm_cb(
                     await callback.bot.send_message(
                         chat_id=result.client_telegram_id,
                         text=client_text,
+                        reply_markup=client_book_kb(),
                     )
                 except (TelegramBadRequest, TelegramRetryAfter):
                     logger.warning(
@@ -3692,7 +3695,11 @@ async def admin_closeday_confirm_cb(
         )
         if callback.bot is not None:
             try:
-                await callback.bot.send_message(chat_id=client.telegram_id, text=client_text)
+                await callback.bot.send_message(
+                    chat_id=client.telegram_id,
+                    text=client_text,
+                    reply_markup=client_book_kb(),
+                )
                 notified_count += 1
             except TelegramRetryAfter as e:
                 # Flood control — retry once after retry_after (mirror scheduler.py:192-201).

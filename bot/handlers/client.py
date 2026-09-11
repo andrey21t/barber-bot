@@ -90,6 +90,7 @@ from bot.keyboards.client import (
     NamePreFillYesCallbackData,
     _format_booking_summary_from_start_at,
     calendar_keyboard,
+    client_book_kb,
     client_reply_keyboard,
     confirm_keyboard,
     date_picker_keyboard,
@@ -2366,7 +2367,10 @@ async def mybookings_cancel_cb(
             )
 
     if callback.message is not None:
-        await callback.message.answer("✅ Запись отменена. Мастер уведомлён.")
+        await callback.message.answer(
+            "✅ Запись отменена. Мастер уведомлён.",
+            reply_markup=client_book_kb(),
+        )
     await callback.answer()
 
 
