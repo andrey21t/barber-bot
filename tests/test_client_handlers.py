@@ -2104,8 +2104,16 @@ async def test_name_msg_happy_renders_summary_slot_path(
 
     await client_handlers.name_msg(msg, state)
 
-    state.update_data.assert_awaited()
-    assert state.update_data.call_args.kwargs.get("client_name") == "Паша"
+    # W3 (5.51): update_data is now called TWICE — (1) client_name by
+    # name_msg, (2) summary_msg_id by _render_summary_and_set_confirming.
+    # `call_args` returns the LAST call — merge kwargs across all calls.
+    saved_kwargs: dict[str, Any] = {}
+    for call in state.update_data.await_args_list:
+        saved_kwargs.update(call.kwargs)
+    assert saved_kwargs.get("client_name") == "Паша"
+    assert saved_kwargs.get("summary_msg_id") is not None, (
+        "W3: summary message id must be saved for cancel_msg keyboard strip"
+    )
     state.set_state.assert_awaited_once()
     assert state.set_state.call_args.args[0] == BookingStates.confirming
 
@@ -2631,6 +2639,114 @@ async def test_cancel_msg_slots_path_hint_directs_to_slots() -> None:
     assert "/book" not in first_text, "W2 fix: /slots user must NOT see /book hint"
     second_text = str(msg.answer.await_args_list[1].args[0])
     assert "Кнопки внизу" in second_text
+
+
+@pytest.mark.asyncio
+async def test_cancel_msg_transfer_state_hint_directs_to_mybookings() -> None:
+    """Review W2 (5.51): /cancel во время TransferStates. Transfer пишет в FSM
+    transfer_booking_id + is_slots_path=True (B.1) — без ветки по transfer
+    пользователь получал бы '/slots' хинт вместо возврата к своим записям.
+    """
+    msg = _make_message(user_id=111222333, text="/cancel")
+    state = _make_state()
+    await state.update_data(
+        transfer_booking_id="00000000-0000-0000-0000-000000000001",
+        is_slots_path=True,
+    )
+
+    await client_handlers.cancel_msg(msg, state)
+
+    state.clear.assert_awaited_once()
+    first_text = str(msg.answer.await_args_list[0].args[0])
+    assert "Перенос отменён" in first_text
+    assert "/mybookings" in first_text
+    assert "/slots" not in first_text, "W2: transfer user must see /mybookings, not /slots"
+
+
+@pytest.mark.asyncio
+async def test_cancel_msg_strips_confirm_keyboard_from_summary_message() -> None:
+    """Review W3 (5.51): /cancel из confirming должен погасить ✅/❌ клавиатуру
+    на summary-сообщении. _render_summary_and_set_confirming сохраняет
+    summary_msg_id в FSM; cancel_msg читает его ДО state.clear и зовёт
+    bot.edit_message_reply_markup(reply_markup=None).
+    """
+    msg = _make_message(user_id=111222333, text="/cancel")
+    msg.bot = AsyncMock()
+    msg.chat = MagicMock(id=111222333)
+    state = _make_state()
+    await state.update_data(summary_msg_id=42, is_slots_path=False)
+
+    await client_handlers.cancel_msg(msg, state)
+
+    state.clear.assert_awaited_once()
+    msg.bot.edit_message_reply_markup.assert_awaited_once()
+    kwargs = msg.bot.edit_message_reply_markup.await_args.kwargs
+    assert kwargs.get("message_id") == 42
+    assert kwargs.get("reply_markup") is None, "summary ✅/❌ keyboard must be stripped"
+
+
+@pytest.mark.asyncio
+async def test_cancel_msg_without_summary_msg_id_skips_edit() -> None:
+    """W3 guard: если summary_msg_id в state нет (не confirming-флоу, /
+    cancel из selecting_date и т.п.) — bot.edit_message_reply_markup НЕ
+    вызывается (нечего гасить, сообщения с клавиатурой может не быть).
+    """
+    msg = _make_message(user_id=111222333, text="/cancel")
+    msg.bot = AsyncMock()
+    state = _make_state()
+
+    await client_handlers.cancel_msg(msg, state)
+
+    msg.bot.edit_message_reply_markup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_no_state_callback_fallback_strips_dead_keyboard() -> None:
+    """Review W1 (5.51): no_state_callback_fallback — тап по кнопке без
+    живого хендлера (stale пикер после session timeout / рестарта бота).
+    Без strip каждый повторный тап снова даёт alert навсегда. Фикс: гасить
+    клавиатуру тапнутого сообщения + alert.
+    """
+    cb = _make_string_callback("some_stale_prefix")
+    cb.message = _make_message(111222333, text="<unused>")
+
+    await client_handlers.no_state_callback_fallback(cb)
+
+    cb.message.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
+    cb.answer.assert_awaited_once()
+    alert_kwargs = cb.answer.await_args.kwargs
+    assert alert_kwargs.get("show_alert") is True
+
+
+@pytest.mark.asyncio
+async def test_cancel_flow_cb_transfer_state_hint_directs_to_mybookings(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Review W2 (5.51): stale ❌ Отмена, тапнутая во время TransferStates —
+    cancel_flow_cb (StateFilter('*')) чистит transfer-FSM. Хинт должен быть
+    '/mybookings' (пользователь переносил запись из списка), а НЕ '/slots'
+    (is_slots_path=True заливается transfer-флоу по B.1).
+    """
+    cb = _make_string_callback("book_cancel")
+    state = _make_state()
+    await state.update_data(
+        transfer_booking_id="00000000-0000-0000-0000-000000000001",
+        is_slots_path=True,
+    )
+
+    await client_handlers.cancel_flow_cb(cb, state)
+
+    state.clear.assert_awaited_once()
+    # Two answers: (1) hint, (2) '👇 Кнопки внизу' reply-keyboard restore —
+    # assert on the FIRST one (hint), _answer_text returns the last.
+    assert cb.message.answer.await_count == 2
+    first_text = str(cb.message.answer.await_args_list[0].args[0])
+    assert "Перенос отменён" in first_text
+    assert "/mybookings" in first_text
+    assert "/slots" not in first_text, "W2: transfer user must see /mybookings, not /slots"
+    # Клавиатура тапнутого сообщения погашена + reply keyboard восстановлена.
+    cb.message.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
 
 
 @pytest.mark.asyncio
@@ -4957,8 +5073,15 @@ async def test_name_pre_fill_yes_cb_happy_path(
 
     await client_handlers.name_pre_fill_yes_cb(cb, callback_data, state)
 
-    update_kwargs = state.update_data.call_args.kwargs
+    # W3 (5.51): update_data called twice (client_name + summary_msg_id) —
+    # merge kwargs across all calls instead of reading the last one.
+    update_kwargs: dict[str, Any] = {}
+    for call in state.update_data.await_args_list:
+        update_kwargs.update(call.kwargs)
     assert update_kwargs.get("client_name") == "Паша"
+    assert update_kwargs.get("summary_msg_id") is not None, (
+        "W3: summary message id must be saved for cancel_msg keyboard strip"
+    )
     state.set_state.assert_awaited()
     assert state.set_state.call_args.args[0] == BookingStates.confirming
 
