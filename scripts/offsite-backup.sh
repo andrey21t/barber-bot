@@ -7,7 +7,6 @@
 set -euo pipefail
 
 CRED_FILE="$HOME/.config/opencode/references/barber-bot-deploy-credentials.md"
-VPS_HOST="VPS_HOST_FROM_CRED_FILE"
 VPS_USER="root"
 REMOTE_DIR="/opt/barber-bot/backups"
 LOCAL_DIR="$HOME/barber-bot-backups"
@@ -18,9 +17,10 @@ if [[ ! -f "$CRED_FILE" ]]; then
     exit 1
 fi
 
+VPS_HOST=$(grep -E '^HOST:' "$CRED_FILE" | sed 's/^HOST: //')
 VPS_PASS=$(grep -E '^PASS:' "$CRED_FILE" | sed 's/^PASS: //')
-if [[ -z "$VPS_PASS" ]]; then
-    echo "[$(date)] FATAL: no PASS in $CRED_FILE" >&2
+if [[ -z "$VPS_PASS" || -z "$VPS_HOST" ]]; then
+    echo "[$(date)] FATAL: no HOST/PASS in $CRED_FILE" >&2
     exit 1
 fi
 
