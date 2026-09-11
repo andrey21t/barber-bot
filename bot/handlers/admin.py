@@ -2966,7 +2966,6 @@ async def admin_openweek_end_cb(
     picked_end_minute = callback_data.start_minute
     await state.update_data(picked_end_minute=picked_end_minute)
     await state.set_state(AdminStates.opening_week_days)
-    await state.update_data(selected_weekdays=[])
 
     start_time = dt_time(int(picked_start_minute) // 60, int(picked_start_minute) % 60)
     end_time = dt_time(picked_end_minute // 60, picked_end_minute % 60)
@@ -2979,13 +2978,23 @@ async def admin_openweek_end_cb(
     sunday = monday + timedelta(days=6)
     week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
 
+    # 5.60 P2 — кешируем past_weekdays в state на входе в шаг 3. Не меняется
+    # в течение openweek flow (monday зафиксирован), поэтому toggle handler
+    # (admin_openweek_days_cb) читает из state без перевычисления.
+    today_local = datetime.now(ZoneInfo(business_tz)).date()
+    past_weekdays = _past_weekdays_for_week(monday, today_local)
+    await state.update_data(
+        selected_weekdays=[],
+        past_weekdays=sorted(past_weekdays),
+    )
+
     if callback.message is not None:
         step3_text = (
             f"Шаг 3: выберите дни недели (тап → ✅).\n\n"
             f"Окно: <b>{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}</b>\n"
             f"Неделя <b>{week_range}</b>"
         )
-        step3_kb = admin_week_days_keyboard(set())
+        step3_kb = admin_week_days_keyboard(set(), past_weekdays=past_weekdays)
         # edit_text заменяет picker Шага 2 на days keyboard в том же сообщении —
         # старая клавиатура исчезает, нельзя тапнуть две таблицы одновременно.
         if isinstance(callback.message, Message):
@@ -3033,7 +3042,13 @@ async def admin_openweek_days_cb(
     await state.update_data(selected_weekdays=selected)
 
     if callback.message is not None:
-        new_kb = admin_week_days_keyboard(set(selected))
+        # 5.60 P2 — past_weekdays из state (закеширован в admin_openweek_end_cb
+        # на входе в шаг 3). frozenset для O(1) lookup в keyboard loop.
+        past_wd_storage: list[int] = list(data.get("past_weekdays", []))
+        new_kb = admin_week_days_keyboard(
+            set(selected),
+            past_weekdays=frozenset(past_wd_storage),
+        )
         if isinstance(callback.message, Message):
             try:
                 await callback.message.edit_reply_markup(reply_markup=new_kb)
@@ -3821,6 +3836,22 @@ def _current_week_monday(tz: str) -> date:
     if today_local.weekday() == 6:  # Вс → следующая неделя
         monday += timedelta(days=7)
     return monday
+
+
+def _past_weekdays_for_week(monday: date, today_local: date) -> frozenset[int]:
+    """Return set of weekday ints (0=Mon..6=Sun) whose work_date < today_local.
+
+    For each weekday 0..6, work_date = monday + timedelta(days=weekday). Past
+    days get ` ❌` suffix on admin_week_days_keyboard (5.60 P2 — variant A).
+    callback_data stays unchanged so admin can still tap → toggle; past days
+    are filtered in _apply_openweek:3079-3081 with "❌ прошедшая дата" fail line.
+
+    Sunday-rule: when monday is next week (sunday today), monday > today_local
+    → all 7 days are future → returns empty set. No past days to mark.
+    """
+    return frozenset(
+        wd for wd in range(7) if (monday + timedelta(days=wd)) < today_local
+    )
 
 
 def _openweek_week_header(tz: str) -> str:

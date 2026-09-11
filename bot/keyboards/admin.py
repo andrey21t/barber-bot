@@ -565,17 +565,28 @@ _WEEKDAY_LABELS: tuple[str, ...] = (
 )
 
 
-def admin_week_days_keyboard(selected: set[int]) -> InlineKeyboardMarkup:
-    """7 toggle-кнопок дней недели + «✅ Открыть» + «❌ Отмена» (Session 5.26).
+def admin_week_days_keyboard(
+    selected: set[int],
+    past_weekdays: frozenset[int] = frozenset(),
+) -> InlineKeyboardMarkup:
+    """7 toggle-кнопок дней недели + «✅ Открыть» + «❌ Отмена» (Session 5.26;
+    5.60 P2 — past_weekdays parameter for ❌ suffix on past days).
 
     Args:
         selected: set of weekday ints (0=Mon..6=Sun) currently toggled ON.
             Toggle handler updates this set in FSM state and re-renders keyboard.
+        past_weekdays: frozenset of weekday ints whose work_date < today_local.
+            Past days get ` ❌` suffix on label (variant A — minimal fix).
+            callback_data stays unchanged so admin can still tap → toggle
+            (apply filters past days at /openweek confirm: admin.py:3079-3081).
+            Default empty for backward compat (no past days in fresh week).
 
     Layout: 7 weekday buttons (1 row, adjust(7) compresses to ≤8/row Telegram
     inline limit 8 buttons/row), then [✅ Открыть] + [❌ Отмена] row.
 
     Selected weekdays помечены ✅ prefix; unselected — без prefix.
+    Past weekdays дополнительно помечены ` ❌` suffix — визуальный сигнал
+    «tap ничего не даст в apply» (хотя toggle всё ещё работает визуально).
     «✅ Открыть» callback_data="admin_openweek_confirm" (string).
     «❌ Отмена» callback_data="admin_openweek_cancel" (string).
     """
@@ -583,8 +594,9 @@ def admin_week_days_keyboard(selected: set[int]) -> InlineKeyboardMarkup:
     for weekday in range(7):
         label = _WEEKDAY_LABELS[weekday]
         prefix = "✅ " if weekday in selected else ""
+        past_suffix = " ❌" if weekday in past_weekdays else ""
         builder.button(
-            text=f"{prefix}{label}",
+            text=f"{prefix}{label}{past_suffix}",
             callback_data=AdminOpenWeekCallbackData(weekday=weekday).pack(),
         )
     builder.button(text="✅ Открыть", callback_data="admin_openweek_confirm")
