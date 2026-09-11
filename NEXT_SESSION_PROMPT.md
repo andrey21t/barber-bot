@@ -1,103 +1,155 @@
-# NEXT_SESSION_PROMPT — barber-bot, handoff after session 5.56
+# NEXT_SESSION_PROMPT — barber-bot, session 5.57
 
-## Текущее состояние (актуально на 2026-09-11, ~15:00 UTC)
+## Контекст
 
-**Origin/main:** `92dcada` + history rewrite (5.56 docs commit без VPS IP leak). Бот на проде работает на коде `92dcada`.
-**VPS:** `VPS_HOST_FROM_CRED_FILE` (см. `~/.config/opencode/references/barber-bot-deploy-credentials.md`), бот `@My_Barber_hair_bot` задеплоен 14:59 UTC, контейнер `barber-bot-bot-1` запущен, `Telegram API via proxy` confirmed в логах, `Run polling for bot @My_Barber_hair_bot` ✓.
-**Гейты:** ruff ✅ · mypy 0 · pytest 551 passed / 2 skipped (550 baseline + 1 regression test для F1+W2).
+Продолжаем работу над барбер-ботом (~/PycharmProjects/barber-bot). Прочитай
+NEXT_SESSION_PROMPT.md в корне репо — там handoff после 5.56 (human-readable
+reminders + F1/W2 fixes, force-push rewrite истории от IP-leak).
 
-## Что сделано в 5.56
+**main:** `875d0c7` (5.56: human-readable reminders + html.escape master.name +
+newline-squash + pre-push hook с generic IP regex)
+**VPS:** задеплоен `92dcada` в 14:59 UTC 11 сен. W2 fix (.replace("\n"," ")) в
+`875d0c7` НЕ на проде (только .md + scheduler.py:186) — подхватится при
+следующем docker compose up --build. Не критично (мастер "Ekaterina" без \n).
+**Гейты:** ruff ✅ · mypy ✅ · pytest 551 passed / 2 skipped
 
-### 1. Human-readable reminder text (feat, основная задача сессии)
+## Задачи на сессию 5.57
 
-Reminder-сообщения теперь содержат контекст ЧТО за запись:
-- `remind_24h`: `Напоминаю: завтра в HH:MM — 💇 <service>, мастер <name>`
-- `remind_1h`:  `Через час в HH:MM — 💇 <service>, мастер <name>`
+### 1. Валидация скриншотов из прошлой сессии (ВАЖНО — проверь код против фактов)
 
-Раньше приходило только "Напоминаю: завтра в 14:00" — клиент не понимал что за запись.
+В прошлой сессии (5.56) юзер прислал скриншоты bot @My_Barber_hair_bot.
+Ассистент сопоставил с БД (notifications_log, apscheduler_jobs, bookings):
 
-scheduler.py:
-- Добавлен JOIN к Master (Booking.master_id == Master.id) в SELECT для send_reminder
-- `service = booking.service_title_snapshot` (уже html.escape()'d в DB по booking.py:511)
-- `master_name = master.name`
+| Скриншот | Тип | Время отправки | Деплой 14:59 UTC | Вердикт |
+|---|---|---|---|---|
+| "Через час: 15:30" | remind_1h для 47bf8c59 | 11:30 UTC (14:30 MSK) | ДО деплоя | OLD формат ✓ |
+| "Напоминаю: завтра в 15:30" | remind_24h для 47bf8c59 | 13:40 UTC (16:40 MSK) | ДО деплоя | OLD формат ✓ |
+| "Новая запись: 13 сентября, 12:30, Olesya, Мелирование" | master_new для 1481976a | 14:18 UTC (17:18 MSK) | ДО деплоя | OLD (5.56 master_new не менял) |
 
-### 2. F1 security fix (code-review 5.56, CRITICAL)
+Все 3 напоминания на скриншотах — старый формат (отправлены ДО деплоя нового
+кода). **Первый NEW-формат придёт:**
+- Сб 12.09 12:00 MSK: remind_1h "Через час в 13:00 — 💇 Окрашивание, мастер Ekaterina"
+- Сб 12.09 12:30 MSK: remind_24h "Напоминаю: завтра в 12:30 — 💇 Мелирование, мастер Ekaterina"
 
-`master.name` НЕ был escape'd, но бот использует `parse_mode=ParseMode.HTML` по умолчанию
-(main.py:104). Если имя мастера содержит `<`/`>`/`&`:
-→ TelegramBadRequest ("can't parse entities")
-→ log_notification UNIQUE(booking_id, kind) блокирует retry навсегда
-→ **silent reminder loss** (комментарий в scheduler.py:163-164 объясняет почему UNIQUE блокирует retry).
+**Задача:** проверить логи на проде — пришли ли NEW-формат напоминания.
+```bash
+sshpass -p "$BARBER_PASS" ssh ... root@VPS 'docker logs --since 24h barber-bot-bot-1 2>&1' | rg "send_reminder|executed"
+```
+И проверить notifications_log:
+```sql
+SELECT * FROM notifications_log WHERE sent_at > '2026-09-12 00:00' ORDER BY sent_at DESC;
+```
+Если NEW-формат пришёл — ✅ live-тест пройден. Если OLD-формат — проверить
+что контейнер реально на коде 875d0c7 (docker inspect image → created date).
 
-Фикс: `master_name = html.escape(master.name, quote=False).replace("\n", " ")` (scheduler.py:186)
-— mirrors паттерн booking.py:510-511 для client_name_snapshot. `.replace("\n", " ")` —
-mirrors admin.py:881 + keyboards/admin.py:215 для display-only newline squash (W2 fix).
-S1 (явный `parse_mode=ParseMode.HTML` на send_message) НЕ добавлен — bot-level default
-достаточен и consistent с кодабазой.
+### 2. Admin reply keyboard — ГЛАВНАЯ задача сессии
 
-Regression test: `test_send_reminder_escapes_master_name_html_metachars`
-(test_scheduler.py:387-441) — UPDATE Master.name = "A & B <b>" через SQL
-(симулирует будущий /addmaster или DB-side edit), assertions:
-- escaped "A &amp; B &lt;b&gt;" in text
-- raw "A & B <b>" NOT in text
-- **verified: FAIL без фикса, PASS с фиксом**
+**Проблема:** Ekaterina (telegram_id=461355056) — мастер/админ, но видит
+reply keyboard "Записаться" / "Мои записи" как обычный клиент. При этом у
+неё есть booking "Окрашивание и стрижка, Андрей" — она тестировала как
+клиент в собственной системе.
 
-### 3. Дополнительно: 3 теста updated под новый формат напоминаний
+**Вопрос:** должен ли бот определять что telegram_id=461355056 это
+мастер/админ и показывать admin-кнопки ("Сегодня", "Записания",
+"Настройки") вместо client-кнопок?
 
-- `test_on_startup_scan_phase_1_sends_overdue` — assertions на 💇/мастер
-- `test_send_reminder_happy_path` — добавлены 💇/мастер assertions (раньше только startswith)
-- `test_send_reminder_timezone_utc_to_moscow` — strict match обновлён под новый формат
+**Что изучить:**
+- `bot/handlers/start.py` — как бот определяет admin vs client (по
+  `settings.admin_id`? по `Master.telegram_id`?)
+- `bot/handlers/client.py:216 _restore_reply_keyboard_async` — где
+  вызывается, для кого
+- `bot/keyboards/client.py` — reply keyboard "Записаться"/"Мои записи"
+- `bot/keyboards/admin.py` — admin keyboard, когда показывается
+- `bot/config.py` — есть ли `ADMIN_ID` в settings
+- Если мастер и клиент — один и тот же telegram_id (Ekaterina тестировала
+  как клиент), как бот должен различать контексты?
 
-### Verification flow (по MY-VIBE-RULES.md)
+**Гипотезы для проверки:**
+1. `ADMIN_ID` не задан в `.env` → бот не знает кто админ → все видят
+   client keyboard
+2. `ADMIN_ID` задан, но проверка только в `/start` / admin handlers, а
+   reply keyboard восстанавливается для всех без проверки
+3. `ADMIN_ID` = telegram_id Ekaterina, но она хочет И клиентский доступ
+   (бронировать за себя) И admin-доступ — нужен гибридный режим
 
-1. Реализация (scheduler.py + 3 теста)
-2. ruff ✅ / mypy ✅ / pytest 550 (baseline)
-3. Code-reviewer subagent (1st pass) → LBTM (F1 critical)
-4. Fix F1 (html.escape master.name) + regression test
-5. ruff ✅ / mypy ✅ / pytest 551 (+1 regression)
-6. Code-reviewer subagent (2nd pass) → LGTM (scope закрыт, adjacent render-sites safe)
-7. Commit `92dcada` (feat+fix+test в одном, 87 insertions / 12 deletions)
-8. Push to origin/main ✓
-9. Deploy to VPS (docker compose up -d --build) ✓
-10. Bot running on new code, "Telegram API via proxy" confirmed ✓
+**Варианты решения (обсудить с юзером перед реализацией):**
+- A: admin видит ТОЛЬКО admin-кнопки (не может бронировать как клиент)
+- B: admin видит admin-кнопки + "Записаться" (гибрид)
+- C: admin выбирает режим командой `/admin` / `/client` (переключатель)
+- D: оставить как есть — admin использует `/today` `/week` команды без
+  reply keyboard, reply keyboard только для клиентов (но тогда зачем
+  она показывается admin?)
 
-## НЕЗАКРЯТЫЕ ЗАДАЧИ (в порядке приоритета)
+### 3. Live-тест reminder NEW-формата (если ещё не пришёл)
 
-### 1. Проверка первого ночного backup-цикла (сессия 5.55, 2026-09-12 morning)
+Если на момент сессии напоминания на NEW-формате ещё не пришли — создать
+тестовую запись:
+- Через бота: `/book` → дата завтра+2 дня → слот → услуга → подтвердить
+  → wait для remind_24h (если старт через 25h) или remind_1h (если через 1h+)
+- Или через БД напрямую (быстрее, но не проверяет UX-путь):
+```sql
+INSERT INTO bookings (...) VALUES (..., start_at=NOW()+interval '2 hours', ...);
+-- Затем через python код: schedule_for_booking(booking_id)
+```
 
-Cron `30 3 * * *` на VPS запускается в 03:30 UTC. Лог `/var/log/barber_backup.log`
-появится после первого срабатывания.
-- VPS: `tail /var/log/barber_backup.log` + `ls /opt/barber-bot/backups/`
-- Mac: `ls ~/barber-bot-backups/` + `tail ~/barber-bot-backups/launchd.log`
-- Если оба зелёные — offsite-копия закрывает one-way door.
+### 4. Проверка ночного backup (если ещё не проверена)
 
-### 2. Smoke-тест юзером (ЖДём обратной связи — чек-лист 5.52)
+Cron `30 3 * * *` на VPS + launchd 06:30 MSK на Mac.
+```bash
+# VPS
+sshpass ... ssh root@VPS 'tail /var/log/barber_backup.log && ls -la /opt/barber-bot/backups/'
+# Mac
+ls -la ~/barber-bot-backups/ && tail ~/barber-bot-backups/launchd.log
+```
 
-Владелец должен прогнать в @My_Barber_hair_bot:
-- `/book` → «Своя услуга» НЕТ, только услуги мастера; текст вместо тапа → подсказка + СВЕЖИЙ пикер
-- Под «Вы записаны» inline-кнопок НЕТ; клавиатуры шагов гаснут при переходе
-- «❌ Отмена» на подтверждении и /cancel — гасят ✅/❌ и реально отменяют (в т.ч. на шаге услуги/имени)
-- Любой текст без активной записи → «Начните запись через /book»; «Нет свободных дат/слотов» — не крутит спиннер вечно
-- Через прокси бот должен отвечать быстро
+### 5. Coverage gaps (опционально, если будет время)
 
-### 3. Live-тест нового reminder-формата (5.56)
+Покрытие 78% total. Ключевые gaps:
+- `bot/handlers/admin.py` 65% (644 строки) — admin-функции, low priority
+  (single-user, ты сам админ)
+- `bot/handlers/client.py` 75% (252 строки) — `transfer_slot_30_cb` 130
+  строк полностью непокрыт
+- `scheduler.py` 89% — edge-cases (TelegramAPIError handler, network errors)
 
-Создать запись с start_at = завтра + 25h (чтобы сработал remind_24h через час)
-или tomorrow+45min (чтобы сработал remind_1h). Проверить что:
-- Текст содержит "💇 <service>, мастер <name>" (а не просто "Напоминаю: завтра в HH:MM")
-- Если в имени мастера есть спецсимволы (&, <, >) — текст приходит корректно
-  (html.escape работает в проде, regression test подтверждает)
-- Если пришёл raw "A & B <b>" без escape — F1 regression, откатить коммит 92dcada
+Принцип: покрываем по risk-priority, не ради 100%. Critical path
+(бронирование, напоминания) — обязательно. Admin — low priority. Dead
+code (legacy slots fallback) — лучше удалить, не покрывать.
 
-### 4. Фоновое
+## Данные для расследования admin keyboard
 
-- После суток-двух стабильного прокси: сравнить счётчики обрывов до/после (данные
-  собраны в handoff 5.54 — 0 обрывов за 2 часа после прокси vs 1 насмерть + 2
-  обрыва за 11 мин до).
-- R2 как future upgrade: активировать в CF dashboard → `wrangler r2 bucket create
-  barber-backups` → заменить sshpass scp на rclone/curl PUT to R2.
-- Передача бота Екатерине: `ADMIN_ID` в `.env` на VPS. On-behalf booking —
-  когда Екатерина начнёт работать.
+### DB state (на 2026-09-11 15:50 UTC)
+
+```
+masters:
+  id=eaee30b1..., name="Ekaterina", telegram_id=461355056
+
+bookings (upcoming):
+  1481976a | 2026-09-13 09:30 UTC | Мелирование | client_tg=1156374642 (Olesya)
+  aff076c5 | 2026-09-12 14:30 UTC | Окрашивание  | client_tg=1156374642 (Olesya)
+  a95de5b7 | 2026-09-12 12:30 UTC | Мелирование  | client_tg=1156374642 (Olesya)
+  283ff705 | 2026-09-12 10:00 UTC | Окрашивание  | client_tg=1156374642 (Olesya)
+  47bf8c59 | 2026-09-11 12:30 UTC | Окрашивание и стрижка | client_tg=461355056 (Ekaterina!)
+  c97a5833 | 2026-09-13 12:30 UTC | под ноль     | client_tg=213896615
+
+notifications_log (last 5):
+  23 | aff076c5 remind_24h | 14:30 UTC
+  22 | 1481976a master_new | 14:18 UTC
+  21 | 47bf8c59 remind_24h | 13:40 UTC
+  20 | a95de5b7 remind_24h | 12:30 UTC
+  19 | 47bf8c59 remind_1h  | 11:30 UTC
+```
+
+Ekaterina (telegram_id=461355056) имеет booking 47bf8c59 как CLIENT.
+Значит она тестировала бронирование через бот от своего имени. Это и
+вызывает вопрос: она видит client reply keyboard потому что она клиент
+в системе, или потому что бот не distinguishes admin от client?
+
+### apscheduler_jobs (7 active)
+
+Все job'ы — remind_1h или remind_24h для upcoming bookings. Оrphan-записи
+от выполненных DateTrigger'ов НЕ чистятся APScheduler'ом из PostgreSQL
+jobstore (мусор накапливается). Не критично, но можно добавить cleanup
+в on_startup_scan (future task).
 
 ## Как деплоить
 
@@ -105,30 +157,18 @@ Cron `30 3 * * *` на VPS запускается в 03:30 UTC. Лог `/var/log
 CRED=~/.config/opencode/references/barber-bot-deploy-credentials.md
 VPS_HOST=$(grep -E '^HOST:' $CRED | sed 's/^HOST: //')
 BARBER_PASS=$(grep -E '^PASS:' $CRED | sed 's/^PASS: //')
-# SSH по умолчанию пытается publickey, потом задержка на password fallback —
-# PreferredAuthentications=password + PubkeyAuthentication=no пропускает publickey.
 sshpass -p "$BARBER_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
   -o PreferredAuthentications=password -o PubkeyAuthentication=no \
   root@$VPS_HOST 'cd /opt/barber-bot && git pull && docker compose up -d --build && \
   docker logs --tail 20 barber-bot-bot-1' 2>&1 | tail -30
 ```
 
-Миграции применяются автоматически (контейнер стартует через `alembic upgrade head && python -m bot.main`).
+## Правила сессии
 
-## Правила сессии (напоминание)
-
-- **MY-VIBE-RULES.md** — dev-режим: deep-analysis на нетривиальное → реализация → verify (pytest/ruff/mypy) → code-review subagent → коммит свободный (личный репо)
-- **Креды VPS и воркер-секрет НЕ коммитить** — живут в `~/.config/opencode/references/barber-bot-deploy-credentials.md`
-- **VPS-диагностику делать самому** через sshpass (не просить юзера вводить команды)
-- Code-reviewer subagent: если вернул пустой результат 2+ раза — REVIEW_UNAVAILABLE, фиксировать в коммит-месседже, детерминированные проверки делать самому
-- **SSH sshpass нюанс:** нужно `-o PreferredAuthentications=password -o PubkeyAuthentication=no` — иначе ssh пытается publickey (с локальными ~/.ssh ключами), тратит 30-60s на fallback, выглядит как timeout. Запомнить для следующей сессии.
-
-## Потенциальные риски (для следующей сессии)
-
-- **F1 escape риск:** если появится `/addmaster` handler с input validation для `Master.name`,
-  нужно добавить валидацию (reject `<`, `>`, `&`) — F1 escape на render — это только render-side,
-  не input-side. Defense-in-depth нужен на input (code-review W2 finding).
-- **Master JOIN риск:** INNER JOIN на Master в send_reminder — если booking.master_id IS NULL,
-  reminder не отправится. Models.py:57 — `master_id: nullable=False` → контракт БД защищает.
-  Но если кто-то добавит booking без master_id в код — silent data loss. Код review H1 (подтверждено):
-  Master создаётся только через DB seed, `/addmaster` handler нет в коде.
+- MY-VIBE-RULES.md — dev-режим: deep-analysis → реализация → verify →
+  code-review → коммит свободный (личный репо)
+- Креды VPS НЕ коммитить — в `~/.config/opencode/references/barber-bot-deploy-credentials.md`
+- VPS-диагностику делать самому через sshpass
+- Pre-push: IP regex теперь в hook'е — любые IP-адреса в коммитах заблокированы
+- **Перед admin keyboardChanges** — обсудить с юзером вариант решения
+  (A/B/C/D выше), не начинать реализацию без согласия
