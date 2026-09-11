@@ -623,11 +623,15 @@ async def test_schedule_for_booking_skips_past_due_remind_24h(
 async def test_schedule_for_booking_within_grace_keeps_past_due_remind_1h(
     scheduler: AsyncIOScheduler,
 ) -> None:
-    """Borderline grace: client books 30m before start → remind_1h_at is 30m in
-    the past. 30m < grace (1h=3600s) → APScheduler fires immediately on add →
-    keep the job. remind_24h_at is 23h30m in the past (>> grace) → skip.
-    Verifies that the skip threshold matches APScheduler misfire logic (strict
-    `past > grace`), not `past >= grace`.
+    """Within grace window: client books 30m before start → remind_1h_at is 30m
+    in the past. 30m < grace (1h=3600s) → APScheduler fires immediately on add
+    → keep the job. remind_24h_at is 23h30m in the past (>> grace) → skip.
+
+    Verifies the "keep within grace window" path (scheduler.py:287
+    `if remind_1h_at >= cutoff` is True when past < grace). Note: this test
+    sits at mid-grace (30m of 1h), NOT at the boundary — see
+    `test_schedule_for_booking_boundary_remind_1h_eq_cutoff_keeps` for the
+    strict-`>=` contract verification (past == grace).
     """
     _start_scheduler(scheduler)
 
@@ -640,6 +644,44 @@ async def test_schedule_for_booking_within_grace_keeps_past_due_remind_1h(
     assert scheduler.get_job(f"remind_1h_{booking_id}") is not None
 
     scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_schedule_for_booking_boundary_remind_1h_eq_cutoff_keeps(
+    scheduler: AsyncIOScheduler,
+) -> None:
+    """Boundary contract: remind_1h_at == cutoff exactly → keep (strict `>=`).
+
+    Sets `start_at = now` (frozen) so:
+        remind_1h_at  = start_at - 1h = now - 1h = cutoff (now - grace)
+        remind_24h_at = start_at - 24h = now - 24h << cutoff → skip
+
+    The `>=` operator in scheduler.py:287 keeps the job at the boundary
+    (`remind_1h_at >= cutoff` is True when equal). A regression that flips
+    `>=` to `>` would skip the job here — this test catches it.
+
+    Without freeze_time the boundary is racy: `datetime.now(UTC)` is called
+    twice (test side and `schedule_for_booking` internals at scheduler.py:260),
+    and microsecond drift could push `remind_1h_at` just past `cutoff`.
+    freeze_time pins both reads to the same instant → deterministic boundary.
+    """
+    with freeze_time("2026-01-15T12:00:00Z"):
+        _start_scheduler(scheduler)
+
+        booking_id = uuid4()
+        start_at = datetime.now(UTC)  # == cutoff + 1h exactly (frozen)
+
+        schedule_for_booking(scheduler, booking_id, start_at)
+
+        # Boundary: remind_1h_at == cutoff → keep (contract: >=, not >)
+        assert scheduler.get_job(f"remind_1h_{booking_id}") is not None, (
+            "remind_1h_at == cutoff must keep the job (scheduler.py:287 uses >=, "
+            "regression to > would skip here)"
+        )
+        # remind_24h_at = now - 24h, cutoff = now - 1h → skip (well past grace)
+        assert scheduler.get_job(f"remind_24h_{booking_id}") is None
+
+        scheduler.shutdown(wait=False)
 
 
 @pytest.mark.asyncio
@@ -747,13 +789,14 @@ async def test_send_reminder_retry_after_exhausted(
     await_count==2 + sleep called once — the test couldn't tell which log path
     ran.
     """
+    from aiogram import Bot
     from aiogram.exceptions import TelegramRetryAfter
 
     _start_scheduler(scheduler)
     booking_start = datetime.now(UTC) - timedelta(hours=12)
     booking = await _seed_booking(session, booking_start)
 
-    mock_bot = AsyncMock()
+    mock_bot = AsyncMock(spec_set=Bot)
     method = MagicMock()
     retry_exc = TelegramRetryAfter(method=method, message="flood", retry_after=1)
     mock_bot.send_message.side_effect = [retry_exc, retry_exc]
@@ -795,13 +838,14 @@ async def test_send_reminder_generic_telegram_api_error(
     at line 224, "chat issue"). Both produce await_count==1 — without caplog
     the test couldn't tell which except clause ran.
     """
+    from aiogram import Bot
     from aiogram.exceptions import TelegramAPIError
 
     _start_scheduler(scheduler)
     booking_start = datetime.now(UTC) - timedelta(hours=12)
     booking = await _seed_booking(session, booking_start)
 
-    mock_bot = AsyncMock()
+    mock_bot = AsyncMock(spec_set=Bot)
     method = MagicMock()
     mock_bot.send_message.side_effect = TelegramAPIError(
         method=method, message="internal server error"
