@@ -928,6 +928,111 @@ async def test_cmd_week_shows_far_future_booking_beyond_7_days(
     assert "Паша" in text, f"Far-future booking must appear (no 7-day limit); got: {text!r}"
 
 
+# ============================================================
+# 5.60 P3 — admin_week_cb: edit_text vs answer (variant A)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_admin_week_cb_state_none_uses_edit_text(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.60 P3 (variant A): state is None (admin in main menu) → edit_text
+    replaces menu message with «Ближайшие записи» in same message. Avoids
+    chat clutter — old «Ближайшие записи» doesn't accumulate as sediment.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    state = _make_mock_state({})
+    state.get_state = AsyncMock(return_value=None)
+
+    await admin_handlers.admin_week_cb(callback, state)
+
+    # edit_text called (preferred path), answer NOT called (no fallback needed).
+    assert callback.message.edit_text.called, "edit_text should be called when state is None"
+    assert not callback.message.answer.called, (
+        "answer must NOT be called when edit_text succeeds"
+    )
+    args, _ = callback.message.edit_text.call_args
+    text = str(args[0])
+    assert "Ближайших записей нет" in text, (
+        f"No bookings seeded → empty message; got: {text!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_admin_week_cb_state_active_uses_answer(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.60 P3 (variant A): state is not None (admin mid-flow, e.g.
+    opening_week_days) → answer in new message. Avoids replacing flow
+    message (step 3 keyboard) with «Ближайшие записи» — admin keeps the
+    flow keyboard visible and can continue toggling days.
+    """
+    from bot.states import AdminStates
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    state = _make_mock_state({})
+    state.get_state = AsyncMock(return_value=AdminStates.opening_week_days)
+
+    await admin_handlers.admin_week_cb(callback, state)
+
+    # answer called (mid-flow path), edit_text NOT called.
+    assert callback.message.answer.called, (
+        "answer should be called when state is active (mid-flow)"
+    )
+    assert not callback.message.edit_text.called, (
+        "edit_text must NOT be called mid-flow — would replace flow keyboard"
+    )
+    args, _ = callback.message.answer.call_args
+    text = str(args[0])
+    assert "Ближайших записей нет" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_week_cb_edit_text_falls_back_to_answer_on_bad_request(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.60 P3 (variant A): state is None but edit_text raises
+    TelegramBadRequest (message older than 48h or deleted) → answer in new
+    message as fallback. No silent failure — admin still gets the list.
+    """
+    from aiogram.exceptions import TelegramBadRequest
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    # Force edit_text to raise — simulates >48h or deleted message.
+    # TelegramBadRequest requires (method, message) — pass MagicMock as method.
+    bad_request = TelegramBadRequest(
+        method=MagicMock(),
+        message="Bad Request: message to edit not found",
+    )
+    callback.message.edit_text = AsyncMock(side_effect=bad_request)
+    state = _make_mock_state({})
+    state.get_state = AsyncMock(return_value=None)
+
+    await admin_handlers.admin_week_cb(callback, state)
+
+    # Both called: edit_text attempted (raised), answer fallback succeeds.
+    assert callback.message.edit_text.called, "edit_text should be attempted first"
+    assert callback.message.answer.called, (
+        "answer fallback should be called after TelegramBadRequest"
+    )
+    args, _ = callback.message.answer.call_args
+    text = str(args[0])
+    assert "Ближайших записей нет" in text
+
+
 @pytest.mark.asyncio
 async def test_cmd_week_ignores_past_bookings(
     session_factory: Any,
