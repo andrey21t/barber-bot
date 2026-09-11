@@ -412,7 +412,10 @@ async def test_send_reminder_escapes_master_name_html_metachars(
     from bot.models import Master
     from sqlalchemy import update
 
-    unsafe_name = "A & B <b>"
+    # Two unsafe scenarios in one: HTML metacharacters + newline.
+    # html.escape(quote=False) handles & < >; .replace("\n", " ") handles newline
+    # (mirrors admin.py:881 pattern for client_name_snapshot).
+    unsafe_name = "A & B <b>\nSecondLine"
     await session.execute(
         update(Master).where(Master.id == booking.master_id).values(name=unsafe_name)
     )
@@ -428,11 +431,13 @@ async def test_send_reminder_escapes_master_name_html_metachars(
     assert mock_bot.send_message.await_count == 1
     _, text = mock_bot.send_message.await_args.args
     # Escaped form — html.escape(name, quote=False) replaces & < > but not " '.
-    expected_escaped = "A &amp; B &lt;b&gt;"
+    # Newline replaced with space → single-line reminder (admin.py:881 pattern).
+    expected_escaped = "A &amp; B &lt;b&gt; SecondLine"
     assert expected_escaped in text, (
-        f"Expected escaped master name {expected_escaped!r} in reminder, got {text!r}. "
+        f"Expected escaped+squashed master name {expected_escaped!r} in reminder, got {text!r}. "
         "If you see raw '& B <b>' — F1 regression: master.name NOT escape'd → "
-        "TelegramBadRequest on parse_mode=HTML → silent reminder loss."
+        "TelegramBadRequest on parse_mode=HTML → silent reminder loss. "
+        "If you see '\\n' — W2 regression: newline NOT squashed → multi-line reminder."
     )
     # Ensure raw metacharacters are NOT present (only escaped forms).
     assert "A & B <b>" not in text, (

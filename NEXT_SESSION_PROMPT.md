@@ -1,45 +1,75 @@
-# NEXT_SESSION_PROMPT — barber-bot, handoff после сессии 5.54
+# NEXT_SESSION_PROMPT — barber-bot, handoff after session 5.56
 
-## Текущее состояние (актуально на 2026-09-11, ~12:35 UTC)
+## Текущее состояние (актуально на 2026-09-11, ~15:00 UTC)
 
-**Origin/main:** `ccdc60d` (5.54 docs) + offsite-backup script (этот коммит). Прод живёт на коде `ad3dbe0` (5.53) + `.env` с прокси.
-**VPS:** `VPS_HOST_FROM_CRED_FILE`, бот `@My_Barber_hair_bot` работает **через Cloudflare Worker proxy** с 2026-09-11 10:33 UTC.
-**Гейты:** ruff ✅ · mypy 0 · pytest 550 passed, 2 skipped (код 5.53, не менялся в 5.54 — только docs/infra).
+**Origin/main:** `92dcada` + history rewrite (5.56 docs commit без VPS IP leak). Бот на проде работает на коде `92dcada`.
+**VPS:** `VPS_HOST_FROM_CRED_FILE` (см. `~/.config/opencode/references/barber-bot-deploy-credentials.md`), бот `@My_Barber_hair_bot` задеплоен 14:59 UTC, контейнер `barber-bot-bot-1` запущен, `Telegram API via proxy` confirmed в логах, `Run polling for bot @My_Barber_hair_bot` ✓.
+**Гейты:** ruff ✅ · mypy 0 · pytest 551 passed / 2 skipped (550 baseline + 1 regression test для F1+W2).
 
-## Что сделано в 5.54
+## Что сделано в 5.56
 
-### 1. Worker proxy — ЗАДЕПЛОЕН, ВКЛЮЧЁН, СТАБИЛЕН (2 часа, 0 обрывов)
+### 1. Human-readable reminder text (feat, основная задача сессии)
 
-- Воркер не был задеплоен (деплой числился за владельцем). Ассистент задеплоил сам — wrangler-сессия на Mac жива, код готов с 5.53.
-- **Нюанс деплоя:** субдомен workers.dev аккаунта не существовал (первый воркер). `wrangler subdomain` не существует — регистрация через CF API: `PUT /accounts/<id>/workers/subdomain` body `{"subdomain":"mybarber-hair-bot"}` (Bearer = oauth_token из `~/Library/Preferences/.wrangler/config/default.toml`). Edge-сертификат выпускается ~1-2 мин — до него TLS handshake failure.
-- **Воркер:** `https://telegram-proxy.mybarber-hair-bot.workers.dev`, secret `WORKER_SECRET`. URL+SECRET в `~/.config/opencode/references/barber-bot-deploy-credentials.md` (WORKER_URL / WORKER_SECRET).
-- **Включение:** VPS `.env` → `TELEGRAM_API_BASE_URL=<WORKER_URL>/<WORKER_SECRET>` + `docker compose up -d --force-recreate bot`. Лог: `Telegram API via proxy`.
-- **Замер обрывов:**
-  - ДО прокси (тот же день): бот упал НАСМЕРТЬ в 10:20:03 — aiohttp TimeoutError убил процесс (policy `unless-stopped` поднял в 10:20:05). Плюс 2 обрыва за 11 мин до этого.
-  - ПОСЛЕ включения (10:33): **2 часа long polling через CF — 0 обрывов, 0 рестартов.** Обновления обрабатываются за 106-113ms. Лог чистый.
-- **Откат:** убрать `TELEGRAM_API_BASE_URL` из `.env` + `docker compose up -d --force-recreate bot` → бот вернётся на прямой api.telegram.org.
-- `deploy/README-worker.md` обновлён: статус «задеплоено» + нюанс с субдоменом.
+Reminder-сообщения теперь содержат контекст ЧТО за запись:
+- `remind_24h`: `Напоминаю: завтра в HH:MM — 💇 <service>, мастер <name>`
+- `remind_1h`:  `Через час в HH:MM — 💇 <service>, мастер <name>`
 
-### 2. Оффсайт-копия бэкапов — Mac scp-pull, ГОТОВО
+Раньше приходило только "Напоминаю: завтра в 14:00" — клиент не понимал что за запись.
 
-- R2 заблокирован (нужен dashboard enablement — платёжка). Ассистент развернул Mac scp-pull — работает сразу, без dashboard.
-- **`scripts/offsite-backup.sh`** в репо: sshpass scp новых dump'ов с VPS → `~/barber-bot-backups/`, retention 7 дней. Пароль читается из `~/.config/opencode/references/barber-bot-deploy-credentials.md` (не в репо).
-- **Тест пройден:** dump `barber_2026-09-11_1007.dump` (28K) скачан с VPS, локально в `~/barber-bot-backups/`.
-- **launchd:** `~/Library/LaunchAgents/com.barber.offsite-backup.plist` — ежедневно 06:30 MSK (03:30 UTC, синхронно с VPS cron). Загружен в launchctl.
-- **SSH key:** не заработал — приватный ключ запаролен, `/dev/tty` недоступен в opencode → sshpass с password-auth как fallback (работает, проверено). Если владельцев когда-то введёт passphrase в интерактивном терминале — можно перейти на key-auth, скрипт уже совместим (sshpass fallback не нужен).
-- **Ограничение:** Mac должен быть включён в 06:30 MSK. Если выключен — dump пропускается, следующий запуск подберёт (скрипт не качает дубликаты). R2 остаётся как future upgrade когда владелец активирует R2 в dashboard.
+scheduler.py:
+- Добавлен JOIN к Master (Booking.master_id == Master.id) в SELECT для send_reminder
+- `service = booking.service_title_snapshot` (уже html.escape()'d в DB по booking.py:511)
+- `master_name = master.name`
 
-### 3. Backup cron на VPS — состояние НОРМА
+### 2. F1 security fix (code-review 5.56, CRITICAL)
 
-Cron `30 3 * * *` установлен. Первый автозапуск: **2026-09-12 03:30 UTC**. `/var/log/barber_backup.log` ещё не существует — появится после первого срабатывания. Первое в следующей сессии: проверить, что ночной dump прошёл.
+`master.name` НЕ был escape'd, но бот использует `parse_mode=ParseMode.HTML` по умолчанию
+(main.py:104). Если имя мастера содержит `<`/`>`/`&`:
+→ TelegramBadRequest ("can't parse entities")
+→ log_notification UNIQUE(booking_id, kind) блокирует retry навсегда
+→ **silent reminder loss** (комментарий в scheduler.py:163-164 объясняет почему UNIQUE блокирует retry).
 
-## НЕЗАКРЫТЫЕ ЗАДАЧИ (в порядке приоритета)
+Фикс: `master_name = html.escape(master.name, quote=False).replace("\n", " ")` (scheduler.py:186)
+— mirrors паттерн booking.py:510-511 для client_name_snapshot. `.replace("\n", " ")` —
+mirrors admin.py:881 + keyboards/admin.py:215 для display-only newline squash (W2 fix).
+S1 (явный `parse_mode=ParseMode.HTML` на send_message) НЕ добавлен — bot-level default
+достаточен и consistent с кодабазой.
 
-### 1. Проверка первого ночного backup-цикла (сессия 5.55, 2026-09-12)
+Regression test: `test_send_reminder_escapes_master_name_html_metachars`
+(test_scheduler.py:387-441) — UPDATE Master.name = "A & B <b>" через SQL
+(симулирует будущий /addmaster или DB-side edit), assertions:
+- escaped "A &amp; B &lt;b&gt;" in text
+- raw "A & B <b>" NOT in text
+- **verified: FAIL без фикса, PASS с фиксом**
 
-- VPS: `tail /var/log/barber_backup.log` + `ls /opt/barber-bot/backups/` — cron отработал?
-- Mac: `ls ~/barber-bot-backups/` + `tail ~/barber-bot-backups/launchd.log` — offsite pull сработал?
-- Если оба зелёные — оффсайт-копия закрывает one-way door.
+### 3. Дополнительно: 3 теста updated под новый формат напоминаний
+
+- `test_on_startup_scan_phase_1_sends_overdue` — assertions на 💇/мастер
+- `test_send_reminder_happy_path` — добавлены 💇/мастер assertions (раньше только startswith)
+- `test_send_reminder_timezone_utc_to_moscow` — strict match обновлён под новый формат
+
+### Verification flow (по MY-VIBE-RULES.md)
+
+1. Реализация (scheduler.py + 3 теста)
+2. ruff ✅ / mypy ✅ / pytest 550 (baseline)
+3. Code-reviewer subagent (1st pass) → LBTM (F1 critical)
+4. Fix F1 (html.escape master.name) + regression test
+5. ruff ✅ / mypy ✅ / pytest 551 (+1 regression)
+6. Code-reviewer subagent (2nd pass) → LGTM (scope закрыт, adjacent render-sites safe)
+7. Commit `92dcada` (feat+fix+test в одном, 87 insertions / 12 deletions)
+8. Push to origin/main ✓
+9. Deploy to VPS (docker compose up -d --build) ✓
+10. Bot running on new code, "Telegram API via proxy" confirmed ✓
+
+## НЕЗАКРЯТЫЕ ЗАДАЧИ (в порядке приоритета)
+
+### 1. Проверка первого ночного backup-цикла (сессия 5.55, 2026-09-12 morning)
+
+Cron `30 3 * * *` на VPS запускается в 03:30 UTC. Лог `/var/log/barber_backup.log`
+появится после первого срабатывания.
+- VPS: `tail /var/log/barber_backup.log` + `ls /opt/barber-bot/backups/`
+- Mac: `ls ~/barber-bot-backups/` + `tail ~/barber-bot-backups/launchd.log`
+- Если оба зелёные — offsite-копия закрывает one-way door.
 
 ### 2. Smoke-тест юзером (ЖДём обратной связи — чек-лист 5.52)
 
@@ -48,21 +78,39 @@ Cron `30 3 * * *` установлен. Первый автозапуск: **202
 - Под «Вы записаны» inline-кнопок НЕТ; клавиатуры шагов гаснут при переходе
 - «❌ Отмена» на подтверждении и /cancel — гасят ✅/❌ и реально отменяют (в т.ч. на шаге услуги/имени)
 - Любой текст без активной записи → «Начните запись через /book»; «Нет свободных дат/слотов» — не крутит спиннер вечно
-- **Через прокси бот должен отвечать быстро** — если всё ещё тупит на /book, смотреть не сеть (DB, воркер CF, рендер)
+- Через прокси бот должен отвечать быстро
 
-### 3. Фоновое
+### 3. Live-тест нового reminder-формата (5.56)
 
-- После суток-двух стабильного прокси: сравнить счётчики обрывов до/после, зафиксировать в README-worker.md.
-- R2 как future upgrade: активировать в CF dashboard → `wrangler r2 bucket create barber-backups` → заменить sshpass scp на rclone/curl PUT to R2 (VPS-сторона, Mac не нужен).
-- Передача бота Екатерине: `ADMIN_ID` в `.env` на VPS. On-behalf booking — когда Екатерина начнёт работать.
+Создать запись с start_at = завтра + 25h (чтобы сработал remind_24h через час)
+или tomorrow+45min (чтобы сработал remind_1h). Проверить что:
+- Текст содержит "💇 <service>, мастер <name>" (а не просто "Напоминаю: завтра в HH:MM")
+- Если в имени мастера есть спецсимволы (&, <, >) — текст приходит корректно
+  (html.escape работает в проде, regression test подтверждает)
+- Если пришёл raw "A & B <b>" без escape — F1 regression, откатить коммит 92dcada
+
+### 4. Фоновое
+
+- После суток-двух стабильного прокси: сравнить счётчики обрывов до/после (данные
+  собраны в handoff 5.54 — 0 обрывов за 2 часа после прокси vs 1 насмерть + 2
+  обрыва за 11 мин до).
+- R2 как future upgrade: активировать в CF dashboard → `wrangler r2 bucket create
+  barber-backups` → заменить sshpass scp на rclone/curl PUT to R2.
+- Передача бота Екатерине: `ADMIN_ID` в `.env` на VPS. On-behalf booking —
+  когда Екатерина начнёт работать.
 
 ## Как деплоить
 
 ```bash
-BARBER_PASS=$(grep -E '^PASS:' ~/.config/opencode/references/barber-bot-deploy-credentials.md | sed 's/^PASS: //')
-sshpass -p "$BARBER_PASS" ssh root@VPS_HOST_FROM_CRED_FILE
-cd /opt/barber-bot && git pull && docker compose up -d --build
-docker logs --tail 20 barber-bot-bot-1   # "Run polling" + "Telegram API via proxy"
+CRED=~/.config/opencode/references/barber-bot-deploy-credentials.md
+VPS_HOST=$(grep -E '^HOST:' $CRED | sed 's/^HOST: //')
+BARBER_PASS=$(grep -E '^PASS:' $CRED | sed 's/^PASS: //')
+# SSH по умолчанию пытается publickey, потом задержка на password fallback —
+# PreferredAuthentications=password + PubkeyAuthentication=no пропускает publickey.
+sshpass -p "$BARBER_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+  -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+  root@$VPS_HOST 'cd /opt/barber-bot && git pull && docker compose up -d --build && \
+  docker logs --tail 20 barber-bot-bot-1' 2>&1 | tail -30
 ```
 
 Миграции применяются автоматически (контейнер стартует через `alembic upgrade head && python -m bot.main`).
@@ -73,3 +121,14 @@ docker logs --tail 20 barber-bot-bot-1   # "Run polling" + "Telegram API via pro
 - **Креды VPS и воркер-секрет НЕ коммитить** — живут в `~/.config/opencode/references/barber-bot-deploy-credentials.md`
 - **VPS-диагностику делать самому** через sshpass (не просить юзера вводить команды)
 - Code-reviewer subagent: если вернул пустой результат 2+ раза — REVIEW_UNAVAILABLE, фиксировать в коммит-месседже, детерминированные проверки делать самому
+- **SSH sshpass нюанс:** нужно `-o PreferredAuthentications=password -o PubkeyAuthentication=no` — иначе ssh пытается publickey (с локальными ~/.ssh ключами), тратит 30-60s на fallback, выглядит как timeout. Запомнить для следующей сессии.
+
+## Потенциальные риски (для следующей сессии)
+
+- **F1 escape риск:** если появится `/addmaster` handler с input validation для `Master.name`,
+  нужно добавить валидацию (reject `<`, `>`, `&`) — F1 escape на render — это только render-side,
+  не input-side. Defense-in-depth нужен на input (code-review W2 finding).
+- **Master JOIN риск:** INNER JOIN на Master в send_reminder — если booking.master_id IS NULL,
+  reminder не отправится. Models.py:57 — `master_id: nullable=False` → контракт БД защищает.
+  Но если кто-то добавит booking без master_id в код — silent data loss. Код review H1 (подтверждено):
+  Master создаётся только через DB seed, `/addmaster` handler нет в коде.
