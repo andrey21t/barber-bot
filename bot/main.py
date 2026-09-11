@@ -38,7 +38,7 @@ from bot.handlers.admin import router as admin_router
 from bot.handlers.client import router as client_router
 from bot.handlers.start import router as start_router
 from bot.middlewares.session_timeout import SessionTimeoutMiddleware
-from bot.session import CorpAiohttpSession
+from bot.session import build_session
 
 logger = logging.getLogger(__name__)
 
@@ -102,8 +102,16 @@ async def main() -> None:
     bot = Bot(
         token=settings.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-        session=CorpAiohttpSession(),
+        session=build_session(),
     )
+    # Session 5.53: log the API routing mode — direct vs Worker proxy
+    # (TELEGRAM_API_BASE_URL feature flag; see bot/session.py build_session).
+    if settings.TELEGRAM_API_BASE_URL.strip():
+        logger.info(
+            "Telegram API via proxy: %s", settings.TELEGRAM_API_BASE_URL.strip()
+        )
+    else:
+        logger.info("Telegram API: direct api.telegram.org")
     dp = Dispatcher(
         storage=_build_fsm_storage(settings),
         # Explicit SimpleEventIsolation (code-review W4 fix) — aiogram default

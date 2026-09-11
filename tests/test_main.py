@@ -2,7 +2,7 @@
 
 Coverage target: bot/main.py 0% → ~93% (44 stmts, 3 lines `if __name__` block excluded).
 
-Pattern: unittest.mock.patch bot.main.{Bot,Dispatcher,CorpAiohttpSession,scheduler,
+Pattern: unittest.mock.patch bot.main.{Bot,Dispatcher,build_session,scheduler,
 on_startup_scan,setup_logging} → call main() → assert wiring interactions.
 
 Avoids real aiogram Bot construction (would attempt network) and real
@@ -81,7 +81,7 @@ async def test_main_wires_routers_middleware_hooks_and_polls(
 
     monkeypatch.setattr("bot.main.Bot", mock_bot_class)
     monkeypatch.setattr("bot.main.Dispatcher", mock_dp_class)
-    monkeypatch.setattr("bot.main.CorpAiohttpSession", mock_session_class)
+    monkeypatch.setattr("bot.main.build_session", lambda: mock_session_class)
     monkeypatch.setattr("bot.main.scheduler", mock_scheduler)
     monkeypatch.setattr("bot.main.setup_logging", mock_setup_logging)
 
@@ -91,7 +91,8 @@ async def test_main_wires_routers_middleware_hooks_and_polls(
     mock_bot_class.assert_called_once()
     bot_kwargs = mock_bot_class.call_args.kwargs
     assert "token" in bot_kwargs
-    assert bot_kwargs["session"] is mock_session_class.return_value
+    # build_session() is patched to return mock_session_class itself.
+    assert bot_kwargs["session"] is mock_session_class
 
     mock_dp_class.assert_called_once()
     dp_kwargs = mock_dp_class.call_args.kwargs
@@ -139,7 +140,7 @@ async def test_main_finally_closes_session_on_polling_error(
 
     monkeypatch.setattr("bot.main.Bot", MagicMock(return_value=mock_bot_instance))
     monkeypatch.setattr("bot.main.Dispatcher", MagicMock(return_value=mock_dp_instance))
-    monkeypatch.setattr("bot.main.CorpAiohttpSession", MagicMock())
+    monkeypatch.setattr("bot.main.build_session", MagicMock())
     monkeypatch.setattr("bot.main.scheduler", MagicMock())
     monkeypatch.setattr("bot.main.setup_logging", MagicMock())
 
@@ -160,7 +161,7 @@ async def test_main_registers_on_startup_and_on_shutdown_callbacks(
 
     monkeypatch.setattr("bot.main.Bot", MagicMock(return_value=mock_bot_instance))
     monkeypatch.setattr("bot.main.Dispatcher", MagicMock(return_value=mock_dp_instance))
-    monkeypatch.setattr("bot.main.CorpAiohttpSession", MagicMock())
+    monkeypatch.setattr("bot.main.build_session", MagicMock())
     monkeypatch.setattr("bot.main.scheduler", MagicMock())
     monkeypatch.setattr("bot.main.setup_logging", MagicMock())
 
