@@ -631,3 +631,21 @@ def name_pre_fill_keyboard(first_name: str) -> InlineKeyboardMarkup:
     builder.button(text="👤 Другое имя", callback_data=NamePreFillOtherCallbackData().pack())
     builder.adjust(2)
     return builder.as_markup()
+
+
+def client_book_kb() -> InlineKeyboardMarkup:
+    """Inline keyboard: [💇 Записаться] — rebooking entry point.
+
+    Session 5.59: attached to cancellation/move notifications (self-cancel,
+    closeday, admin_move) so the client can immediately rebook with one tap
+    instead of manually typing /book. Reuses ClientMenuBookCallbackData —
+    same handler (client_book_cb) as the /start inline menu button.
+
+    UX: after a booking is cancelled/moved, the client's motivation to
+    rebook is highest. A tap goes straight to date_picker (same flow as
+    /book), reducing churn and reducing "запись потеряна" complaints.
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💇 Записаться", callback_data=ClientMenuBookCallbackData().pack())
+    builder.adjust(1)
+    return builder.as_markup()
