@@ -3246,6 +3246,139 @@ async def test_admin_openweek_days_cb_deselect_existing_weekday(
     assert data["selected_weekdays"] == [0, 4]
 
 
+# ============================================================
+# 5.60 P2 — past weekdays marked with ❌ on /openweek step 3 keyboard
+# ============================================================
+
+
+def test_past_weekdays_for_week_returns_past_only() -> None:
+    """5.60 P2 helper: returns weekday ints whose work_date < today_local.
+
+    Friday 11.09 (monday=07.09) → Пн-Чт (07-10.09) are past, Пт-Вс future.
+    Sunday today → all 7 days of current week are past.
+    Monday today → no past days (today is the first day of the work week).
+    """
+    from datetime import date
+
+    from bot.handlers.admin import _past_weekdays_for_week
+
+    # Friday 11.09 — Пн-Чт past, Пт-Вс future.
+    monday = date(2026, 9, 7)
+    today = date(2026, 9, 11)
+    assert _past_weekdays_for_week(monday, today) == frozenset({0, 1, 2, 3})
+
+    # Sunday 13.09 — Пн-Сб (07-12.09) past, Вс (13.09) is today, not past.
+    today_sunday = date(2026, 9, 13)
+    assert _past_weekdays_for_week(monday, today_sunday) == frozenset({0, 1, 2, 3, 4, 5})
+
+    # Monday 07.09 (today = monday) — no past days.
+    today_monday = date(2026, 9, 7)
+    assert _past_weekdays_for_week(monday, today_monday) == frozenset()
+
+
+def test_admin_week_days_keyboard_marks_past_days_with_x() -> None:
+    """5.60 P2: keyboard adds ' ❌' suffix for past_weekdays. ✅ prefix stays
+    for selected days (variant A — admin can still tap → toggle, callback_data
+    preserved; _apply_openweek:3079-3081 filters past days at confirm step).
+    """
+    from bot.keyboards.admin import AdminOpenWeekCallbackData, admin_week_days_keyboard
+
+    kb = admin_week_days_keyboard({0, 2}, past_weekdays=frozenset({0, 1, 2, 3}))
+    buttons = [btn for row in kb.inline_keyboard for btn in row]
+    labels = [btn.text for btn in buttons]
+
+    # Past days (Пн-Чт) get ❌ suffix. Selected days also get ✅ prefix.
+    assert "✅ Пн ❌" in labels, f"Selected past day Mon; got: {labels}"
+    assert "Вт ❌" in labels, f"Unselected past day Tue; got: {labels}"
+    assert "✅ Ср ❌" in labels, f"Selected past day Wed; got: {labels}"
+    assert "Чт ❌" in labels, f"Unselected past day Thu; got: {labels}"
+    # Future days (Пт, Сб, Вс) — no ❌ suffix.
+    assert "Пт" in labels, f"Fri is future; got: {labels}"
+    assert "Пт ❌" not in labels, f"Fri must NOT have ❌; got: {labels}"
+    assert "✅ Пт" not in labels, f"Fri not selected; got: {labels}"
+    assert "Сб" in labels
+    assert "Вс" in labels
+
+    # Variant A invariant: all 7 weekday buttons keep callback_data (toggle
+    # works on past days too, filtering happens later in _apply_openweek).
+    weekday_buttons = buttons[:7]
+    for wd in range(7):
+        cb_data_str = weekday_buttons[wd].callback_data
+        assert cb_data_str is not None, f"callback_data missing for weekday {wd}"
+        unpacked = AdminOpenWeekCallbackData.unpack(cb_data_str)
+        assert unpacked.weekday == wd, (
+            f"callback_data must encode weekday={wd}; got: {unpacked.weekday}"
+        )
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-11 14:00:00", tz_offset=0)  # Friday UTC 14:00 → Moscow 17:00
+async def test_admin_openweek_end_cb_caches_past_weekdays_in_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.60 P2: end_cb caches past_weekdays in state on entry to step 3.
+    Friday 11.09 → monday=07.09, past_weekdays=[0,1,2,3] (Пн-Чт 07-10.09).
+    Toggle handler reads from state without recomputing (monday is fixed).
+    """
+    from uuid import UUID as _UUID
+
+    from bot.keyboards.admin import AdminWindowSlot30CallbackData
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    sentinel = _UUID(int=0)
+    cb_data = AdminWindowSlot30CallbackData(workday_id=sentinel, start_minute=1080)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state({"business_tz": TZ, "picked_start_minute": 600})
+
+    await admin_handlers.admin_openweek_end_cb(callback, cb_data, state)
+
+    data = _state_all_updates(state)
+    assert data["past_weekdays"] == [0, 1, 2, 3], (
+        f"Friday 11.09 → Пн-Чт past; got: {data.get('past_weekdays')}"
+    )
+    assert data["selected_weekdays"] == []
+
+
+@pytest.mark.asyncio
+async def test_admin_openweek_days_cb_passes_past_weekdays_to_keyboard(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.60 P2: days_cb reads past_weekdays from state and passes to keyboard.
+    Tap on weekday=4 (Fri, not past) → re-render with past_weekdays from state
+    (Пн-Чт past). Past days get ❌ suffix, Fri gets ✅ prefix (selected).
+    """
+    from bot.keyboards.admin import AdminOpenWeekCallbackData
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cb_data = AdminOpenWeekCallbackData(weekday=4)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_reply_markup = AsyncMock()
+    state = _make_mock_state(
+        {
+            "selected_weekdays": [],
+            "past_weekdays": [0, 1, 2, 3],
+        }
+    )
+
+    await admin_handlers.admin_openweek_days_cb(callback, cb_data, state)
+
+    assert callback.message.edit_reply_markup.called, "Should re-render keyboard"
+    args, kwargs = callback.message.edit_reply_markup.call_args
+    reply_markup = kwargs.get("reply_markup")
+    assert reply_markup is not None, "Expected reply_markup"
+    buttons = [btn for row in reply_markup.inline_keyboard for btn in row]
+    labels = [btn.text for btn in buttons]
+    assert "Пн ❌" in labels, f"Past Mon gets ❌ suffix; got: {labels}"
+    assert "✅ Пт" in labels, f"Fri selected via toggle; got: {labels}"
+    assert "Пт ❌" not in labels, f"Fri is future, no ❌; got: {labels}"
+
+
 @pytest.mark.asyncio
 async def test_admin_openweek_confirm_cb_no_days_keeps_state(
     session_factory: Any,
