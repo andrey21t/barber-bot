@@ -5455,3 +5455,126 @@ async def test_restore_reply_keyboard_async_master_gets_admin_menu(
     )
     assert len(flat_texts) == 7, "admin_inline_menu has 7 buttons (layout 2+2+2+1)"
 
+
+# ============================================================
+# 5.57 — transfer_slot_30_cb (workday-path) — coverage gap closure
+# ============================================================
+# 130 lines / 0% coverage (NEXT_SESSION_PROMPT.md:108-117). Critical path
+# (client переносит запись на 30-min slot из WorkDay). Mirror of transfer_slot_cb
+# (slot-path) — 9 тестов уже есть. MIN coverage: happy path + defensive range
+# check. Error branches (10 exception'ов) mirror transfer_slot_cb error
+# branches (tests #16-25) — низкий priority (single-user, same service).
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_30_cb_happy_path(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+) -> None:
+    """5.57: transfer_slot_30_cb (workday-path) — user picked 30-min WorkDay
+    slot for transfer → transfer_booking succeeds, master notified, client
+    gets "✅ Запись перенесена на ...".
+
+    Mirror of test_transfer_slot_cb_happy_path (line 888) but for the
+    workday-path (BookSlot30CallbackData with workday_id + start_minute,
+    NOT BookSlotCallbackData with slot_id). Service called with
+    new_workday_id + new_start_time_local=dt_time(h, m), new_slot_id=None.
+
+    Pre-populates state with transfer_booking_id (as if mybookings_transfer_cb
+    + transfer_date_cb ran). Seeded: booking on slot (transfer source) +
+    active WorkDay tomorrow 10:00-18:00 (transfer target).
+    """
+
+    tomorrow = (datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=1)).date()
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        # Booking to transfer — start in 3 days (well beyond 24h cancel window).
+        future_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=3)
+        future_local = future_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=future_local)
+        booking_id = booking.id
+        # Target WorkDay — tomorrow 10:00-18:00 (active).
+        workday = await _seed_workday(session, ctx, work_date=tomorrow)
+        workday_id = workday.id
+
+    cb, callback_data = _make_slot_30_callback(
+        workday_id=workday_id,
+        start_minute=15 * 60,  # 15:00 local
+    )
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_30_cb(cb, callback_data, state, mock_scheduler)
+
+    # Master notification sent (text starts with "Перенос:" per transfer_booking).
+    cb.bot.send_message.assert_called_once()
+    sent_kwargs = cb.bot.send_message.call_args.kwargs
+    assert sent_kwargs["text"].startswith("Перенос:"), (
+        "master notification must start with 'Перенос:' (transfer_booking contract)"
+    )
+    assert sent_kwargs["chat_id"] == 461355056  # ADMIN_ID
+
+    # Client gets confirmation.
+    cb.message.answer.assert_awaited()
+    text = _answer_text(cb.message)
+    assert "✅ Запись перенесена" in text, f"expected transfer confirmation, got {text!r}"
+
+    # state.clear() called BEFORE service call (race condition, MY-VIBE-RULES.md 24).
+    state.clear.assert_awaited()
+
+    # callback.answer called (Telegram ACK).
+    cb.answer.assert_awaited()
+
+    # DB: booking.status now 'transferred'.
+    async with session_factory() as verify_session:
+        b = await verify_session.get(Booking, booking_id)
+        assert b is not None
+        assert b.status == "transferred", (
+            f"booking status must be 'transferred', got {b.status!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_30_cb_invalid_start_minute(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+) -> None:
+    """5.57: transfer_slot_30_cb defensive range check — start_minute=1500 (out
+    of [0, 1439] valid range) → state.clear + "❌ Ошибка выбора времени" early
+    return, NO service call, NO master notification.
+
+    Mirror of slot_30_cb:1127 defensive range check (client.py:2700-2707).
+    Guards against corrupted callback_data (Telegram allows arbitrary
+    callback_data bytes — never trust client input).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        # Booking exists — but we should NOT reach the service call.
+        future_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=3)
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=future_local)
+        booking_id = booking.id
+
+    workday_id = uuid4()
+    cb, callback_data = _make_slot_30_callback(
+        workday_id=workday_id,
+        start_minute=1500,  # invalid — 25:00, > 1439 max
+    )
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_30_cb(cb, callback_data, state, mock_scheduler)
+
+    # state.clear() called (early return branch).
+    state.clear.assert_awaited()
+    # Client gets error message.
+    text = _answer_text(cb.message)
+    assert "❌ Ошибка выбора времени" in text, (
+        f"expected range-check error, got {text!r}"
+    )
+    # NO master notification (early return before service call).
+    cb.bot.send_message.assert_not_called()
+    # callback.answer called (Telegram ACK even on error).
+    cb.answer.assert_awaited()
+
