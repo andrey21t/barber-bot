@@ -1,11 +1,11 @@
-# NEXT_SESSION_PROMPT — barber-bot, handoff после сессии 5.51
+# NEXT_SESSION_PROMPT — barber-bot, handoff после сессии 5.52
 
 ## Текущее состояние (актуально на 2026-09-11)
 
-**Origin/main:** `ef30201` (review W1-W3 fixes, pushed + DEPLOYED на VPS)
+**Origin/main:** `0ab75e8` (review S1-S5 + SkipHandler fix, pushed + DEPLOYED на VPS)
 **VPS:** `VPS_HOST_FROM_CRED_FILE`, бот `@My_Barber_hair_bot` запущен (polling), контейнер `barber-bot-bot-1` на свежем коммите
-**Гейты зелёные:** ruff ✅ · mypy 0 ошибок (pre-existing профильтрована в этой сессии) · pytest 538 passed, 2 skipped
-**Code-review:** LGTM (0 critical; W1-W3 пофикшены в `ef30201`; остались S1-S5 suggestions — не блокеры)
+**Гейты зелёные:** ruff ✅ · mypy 0 ошибок · pytest 548 passed, 2 skipped (+10 тестов vs 5.51)
+**Code-review:** REVIEW_UNAVAILABLE (subagent вернул пусто 2 раза — детерминированный self-review сделан, зафиксировано в коммит-месседже)
 
 ## Исходная задача сессии 5.51 — 3 жалобы пользователя (2026-09-11)
 
@@ -38,19 +38,41 @@
 - Механика: long polling не видит `/book` пока соединение не восстановится
 - Пинг curl сейчас быстрый (0.11-0.13s), но обрывы пачками — типично для RU-хостера к api.telegram.org
 
+## Что сделано в 5.52 (коммит `0ab75e8`, deployed)
+
+### Suggestions S1-S5 (из ревью 5.51) — ВСЕ закрыты
+
+- **S1:** `slot_cb`/`slot_30_cb` стрипают клавиатуру ДО defensive-проверок — терминальные ветки больше не уходят с живыми мёртвыми кнопками
+- **S2:** устаревшие комментарии про service_msg исправлены по всему client.py
+- **S3:** `service_msg` self-healing: стрипает старый пикер по `service_picker_msg_id` из FSM + рендерит СВЕЖИЙ пикер (удалённый пикер больше не dead-end). Трекер-id пишется во всех 5 точках рендера пикера. Хелпер `_fetch_active_services` (дедуп 3 копий)
+- **S4:** мёртвый `client_inline_menu()` удалён (reply keyboard — live entry с B.13)
+- **S5:** `noop_cb` — handler для плейсхолдеров «Нет свободных дат/слотов» (вечный спиннер ушёл). Зарегистрирован ПОСЛЕ `no_state_callback_fallback` (порядок пинов тестом)
+
+### W1 follow-up
+
+- `name_msg`/`service_msg` фильтры + `~F.text.startswith("/")` — /cancel доходит до `cancel_msg` (раньше catch-all съедал: /cancel мог стать client_name). `cancel_msg` стрипает ОБА трекер-id: `summary_msg_id` + `service_picker_msg_id`
+
+### Багфикс (найден падением integration-теста, существовал с 5.9!)
+
+- `admin_no_state_catchall_text` (admin.py): для non-admin `return` → `raise SkipHandler`. Прежний `return` МОЛЧА съедал update (aiogram: первый сматченный handler = обработано, проваливания НЕТ) → любой НЕ-админ в State(None), набравший текст, не получал ответа вообще. SkipHandler пробрасывает к `client_router.no_state_fallback`. Пинован юнит-тестами + integration через `dp.feed_update`
+
 ## НЕЗАКРЫТЫЕ ЗАДАЧИ (в порядке приоритета)
 
 ### 1. Smoke-тест юзером (ЖДЁМ обратной связи)
 
-Пользователь должен прогнать в @My_Barber_hair_bot чек-лист:
+Пользователь должен прогнать в @My_Barber_hair_bot чек-лист (теперь проверяет и 5.52):
 - `/book` → дата → кнопки «Своя услуга» НЕТ, только услуги мастера
-- Набрать текст вместо тапа → подсказка «выберите услугу кнопкой»
+- Набрать текст вместо тапа → подсказка «выберите услугу кнопкой» + СВЕЖИЙ пикер рядом (5.52 S3)
+- Удалить сообщение пикера, набрать текст снова → снова свежий пикер (5.52 S3)
 - Дойти до конца записи → под «Вы записаны» inline-кнопок НЕТ
 - Клавиатуры шагов гаснут при переходе к следующему шагу
 - «❌ Отмена» на экране подтверждения — работает
 - /cancel из подтверждения — ✅/❌ гаснут на summary
+- /cancel НА ШАГЕ УСЛУГИ/ИМЕНИ — реально отменяет, а не превращается в подсказку/имя (5.52 W1)
+- Любой текст БЕЗ активной записи (State None) → «Начните запись через /book» (5.52 SkipHandler fix)
+- «Нет свободных дат/слотов» кнопка — не крутит спиннер вечно (5.52 S5)
 
-### 2. Фикс сети VPS→Telegram (жалоба 1, root cause найден)
+### 2. Фикс сети VPS→Telegram (жалоба 1, root cause найден в 5.51)
 
 Варианты (пользователю предложены, он не выбрал):
 - **Cloudflare Worker прокси** (рекомендовано: бесплатно, ~30 мин, обрывы исчезают, VPS остаётся)
@@ -59,15 +81,7 @@
 
 Реализация: aiogram поддерживает `Bot(session=AiohttpSession(api=TelegramAPIServer.from_base(url)))` — Worker url подменяет api.telegram.org.
 
-### 3. Code-review suggestions S1-S5 (не блокеры, из отчёта LGTM)
-
-- **S1:** `slot_cb`/`slot_30_cb` (client.py:1101-1110, 1180-1189) стрипают ПОСЛЕ defensive-проверок — ветка «Данные потеряlies» уходит с незачищенной клавиатурой. Нормализовать порядок (как в `service_picker_cb` — strip первым действием)
-- **S2:** устаревшие комментарии (client.py:549, 1772-1774, 1897-1899) — утверждают что service_title ставит service_msg; после 5.51 сеттер только `service_picker_cb`
-- **S3:** `service_msg`-хинт: если юзер удалил сообщение пикера — повторный текст даёт хинт без кнопок (спастись только /cancel, /start). Вариант: ре-рендер `service_picker_keyboard` при повторном хинте
-- **S4:** `client_book_cb` (client.py:395) стрипает ЖИВОЕ /start-меню — primary entry-point теряет кнопку, восстановление только повторным /start
-- **S5 (pre-existing):** `"noop"` callback (keyboards/client.py:291, 328, 384 — «Нет свободных дат/слотов») без handler'а — тап даёт вечный спиннер
-
-### 4. Background из старых сессий
+### 3. Background из старых сессий
 
 - Передача бота Екатерине: поменять `ADMIN_ID` в `.env` на VPS (сейчас ID владельца — он сам тестирует). On-behalf booking (записывать клиентов по телефону из админки) — когда Екатерина начнёт работать
 - B.7 backup БД pg_dump cron на VPS — не сделано (ПДн клиентов, one-way door при потере VPS)
