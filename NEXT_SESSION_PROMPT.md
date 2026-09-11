@@ -1,62 +1,91 @@
-# NEXT_SESSION_PROMPT — barber-bot, handoff после сессии 5.50
+# NEXT_SESSION_PROMPT — barber-bot, handoff после сессии 5.51
 
-## Текущее состояние (актуально на 2026-09-09)
+## Текущее состояние (актуально на 2026-09-11)
 
-**Origin/main:** `6fa2dfc` (phone→username refactor, pushed + deployed)
-**VPS:** `VPS_HOST_FROM_CRED_FILE`, бот запущен, polling активен (@My_Barber_hair_bot)
-**Гейты зелёные:** ruff ✅ · mypy 50→50 (pre-existing) · pytest 539 passed, 2 skipped
-**Code-review:** LGTM (0 critical, 5 non-blocking warnings W1-W5, 2 suggestions S1-S2)
+**Origin/main:** `ef30201` (review W1-W3 fixes, pushed + DEPLOYED на VPS)
+**VPS:** `VPS_HOST_FROM_CRED_FILE`, бот `@My_Barber_hair_bot` запущен (polling), контейнер `barber-bot-bot-1` на свежем коммите
+**Гейты зелёные:** ruff ✅ · mypy 0 ошибок (pre-existing профильтрована в этой сессии) · pytest 538 passed, 2 skipped
+**Code-review:** LGTM (0 critical; W1-W3 пофикшены в `ef30201`; остались S1-S5 suggestions — не блокеры)
 
-## Что сделано в сессии 5.50
+## Исходная задача сессии 5.51 — 3 жалобы пользователя (2026-09-11)
 
-### 1. W1+W2 fixes (commit `3be5942`, deployed)
+1. **Медленный старт записи** — «заходишь, бот долго не отвечает»
+2. **«Своя услуга»** — клиент мог ввести текстом свою услугу → календарь/`/today` врали о длительности (free-text не имеет duration_minutes → молча подставлялся SERVICE_DEFAULT_DURATION_MIN=60)
+3. **Мёртвые кнопки после записи** — inline [Мои записи][Ещё запись] под «Вы записаны» дублировали постоянные кнопки внизу + старые клавиатуры шагов флоу оставались живыми
 
-- **W1:** `transfer_slot_cb` (legacy slot handler) — добавлены `except BookingOutsideWorkDayError` + `except WorkDayCapacityExceededError` (`client.py:2628-2639`)
-- **W2:** `_process_selected_date` workday branch — fallback на legacy slots когда WorkDay не найден (`client.py:693-712`)
+## Что сделано в 5.51
 
-### 2. Phone step removal + @username in notification (commit `6fa2dfc`, deployed)
+### Коммит `6ef4bd7` (deployed) — жалобы 2 + 3
 
-**Что убрано:**
-- FSM state `entering_phone` (states.py)
-- `phone_keyboard()` + `PHONE_SHARE_LABEL` + `PHONE_SKIP_LABEL` (keyboards/client.py)
-- 3 handler'а: `phone_msg`, `phone_skip_msg`, `share_contact_msg` (client.py)
-- `BookingCreate.phone` → `BookingCreate.telegram_username` (schemas.py)
-- `client.phone = payload.phone` UPDATE в `create_booking` (booking.py)
-- 14 phone handler тестов, 2 phone service теста (test_client_handlers.py, test_booking.py)
-- Импорты: `phone_keyboard`, `normalize_phone`, `PHONE_SKIP_LABEL`, `Contact`, `ContentType`
+- **«Своя услуга» удалена полностью:** кнопка (keyboards/client.py), handler `service_custom_cb`, free-text ветки. Услуги только тапом из списка мастера. Typed text → подсказка «Пожалуйста, выберите услугу кнопкой 👇» (`service_msg` — hint no-op). Архивная/удалённая услуга в `service_picker_cb` → свежий пикер из DB. Нет услуг → `state.clear` + «Мастер пока не настроил услуги. Загляните позже 🙏» (все 3 точки: `_process_selected_date`, `book_back_to_service_cb`, fresh-picker fallback)
+- **Мёртвые клавиатуры:** хелпер `_clear_source_keyboard` (edit_reply_markup None, InaccessibleMessage-safe, suppress TelegramBadRequest) на каждом шаге флоу. `post_booking_keyboard` удалена — success-сообщение голое. Бонус: «❌ Отмена» (BookCancelCallbackData) была без handler'а с 5.27 — добавлен `cancel_flow_cb` (StateFilter `*`)
+- **mypy pre-existing фикс:** `name_pre_fill_yes_cb` isinstance-narrowing
+- Тесты переписаны под новые контракты (13 падавших → новые)
 
-**Что добавлено:**
-- `BookingCreate.telegram_username: str | None` — @username из `callback.from_user.username`
-- Master notification: `👤 Паша (@pasha_ivanov)` если username есть, иначе `👤 Паша (ID: 123456789)`
-- `confirm_cb` читает `callback.from_user.username` → `BookingCreate.telegram_username`
-- `name_msg` + `name_pre_fill_yes_cb` переходят напрямую в `confirming` через `_render_summary_and_set_confirming`
-- 2 новых service теста: `test_create_booking_username_in_notification`, `test_create_booking_no_username_shows_telegram_id`
+### Коммит `ef30201` (deployed) — code-review warnings W1-W3
 
-**Что оставлено (намеренно):**
-- `normalize_phone` + `PHONE_PATTERN` в booking.py — dead code, test-only (W1)
-- `Client.phone` column в models.py — deprecated, не populate'ится, migration отдельно (S2)
-- `client_phones` в admin.py (/today, /week rendering) — pre-existing, отдельная логика
+- **W1:** `no_state_callback_fallback` (State(None) fallback для stale кнопок после session timeout) теперь стрипает клавиатуру — раньше каждый тап повторял alert «Сессия истекла» бесконечно
+- **W2:** `cancel_flow_cb` + `cancel_msg` ветвятся по `transfer_booking_id` (читается ДО state.clear). Отмена переноса теперь ведёт в `/mybookings`, а не `/slots` (transfer заливает is_slots_path=True по B.1 — без ветки хинт врал)
+- **W3:** `_render_summary_and_set_confirming` сохраняет `summary_msg_id` в FSM; `cancel_msg` (/cancel из confirming) гасит ✅/❌ клавиатуру на summary через `bot.edit_message_reply_markup` (suppress TelegramBadRequest)
+- +5 тестов на W1-W3
 
-## Code-review findings (5 warnings, non-blocking)
+### Диагностика жалобы 1 (медленный старт) — ПРОВЕДЕНА, вердикт
 
-- **W1:** `normalize_phone` + `PHONE_PATTERN` — dead production code (booking.py:379-429), test-only
-- **W2:** Stale docstrings в integration tests (test_integration_admin_flows.py:600-613, 730-744)
-- **W3:** `callback.from_user` None handling inconsistency в `confirm_cb` (line 1762 guard vs line 1851 no guard)
-- **W4:** `_render_summary_and_set_confirming` docstring: "Both expose .answer()" — InaccessibleMessage не имеет .answer()
-- **W5:** Handler test coverage gap: ни один confirm_cb unit-тест не проверяет `telegram_username` propagation (username=None во всех тестах)
+Зашёл на VPS сам (креды: `~/.config/opencode/references/barber-bot-deploy-credentials.md`, sshpass). Результаты:
 
-## Trigger phrase для следующей сессии
+- **409 Conflict / двойной бот — НЕТ.** Один контейнер, лишних процессов нет
+- **Сеть VPS → api.telegram.org — РЕАЛЬНАЯ причина.** В логах регулярные `Connection reset by peer` (Errno 104) + `Request timeout error` — 13 раз за 2 дня (2026-09-09: 2, 09-10: 9, 09-11: 1), вспышками (вечер 10-го — 3 подряд за 3 мин). Один таймаут случился прямо во время обработки апдейта юзера — ответ терялся
+- Механика: long polling не видит `/book` пока соединение не восстановится
+- Пинг curl сейчас быстрый (0.11-0.13s), но обрывы пачками — типично для RU-хостера к api.telegram.org
 
-«продолжим barber-bot» → прочитать этот файл → спросить что делать: W1-W5 fixes или smoke-тест или новая задача.
+## НЕЗАКРЫТЫЕ ЗАДАЧИ (в порядке приоритета)
 
-«проверь себя» → code-review (qa-code-review) на commit `6fa2dfc` (phone→username refactor). Файлы: client.py, booking.py, schemas.py, states.py, keyboards/client.py, test_booking.py, test_client_handlers.py, test_integration_admin_flows.py. Проверить: state transitions, username extraction, notification format, no dangling phone refs, test coverage для username path.
+### 1. Smoke-тест юзером (ЖДЁМ обратной связи)
 
-«пофикси W1-W5» → 5 non-blocking warnings из code-review:
-- W1: удалить `normalize_phone` + `PHONE_PATTERN` + соответствующий тест
-- W2: обновить stale docstrings в integration tests
-- W3: добавить early return `if callback.from_user is None` в confirm_cb
-- W4: поправить docstring в `_render_summary_and_set_confirming`
-- W5: добавить handler test с `username="test_user"` в confirm_cb
+Пользователь должен прогнать в @My_Barber_hair_bot чек-лист:
+- `/book` → дата → кнопки «Своя услуга» НЕТ, только услуги мастера
+- Набрать текст вместо тапа → подсказка «выберите услугу кнопкой»
+- Дойти до конца записи → под «Вы записаны» inline-кнопок НЕТ
+- Клавиатуры шагов гаснут при переходе к следующему шагу
+- «❌ Отмена» на экране подтверждения — работает
+- /cancel из подтверждения — ✅/❌ гаснут на summary
 
-«давай деплоить» → smoke через Telegram (@My_Barber_hair_bot):
-- /slots → дата → услуга → время → [✅ Да, это я] → сразу summary (БЕЗ шага телефона) → ✅ → мастер видит @username
+### 2. Фикс сети VPS→Telegram (жалоба 1, root cause найден)
+
+Варианты (пользователю предложены, он не выбрал):
+- **Cloudflare Worker прокси** (рекомендовано: бесплатно, ~30 мин, обрывы исчезают, VPS остаётся)
+- Платный прокси
+- Переезд VPS (Hetzner и т.п.)
+
+Реализация: aiogram поддерживает `Bot(session=AiohttpSession(api=TelegramAPIServer.from_base(url)))` — Worker url подменяет api.telegram.org.
+
+### 3. Code-review suggestions S1-S5 (не блокеры, из отчёта LGTM)
+
+- **S1:** `slot_cb`/`slot_30_cb` (client.py:1101-1110, 1180-1189) стрипают ПОСЛЕ defensive-проверок — ветка «Данные потеряlies» уходит с незачищенной клавиатурой. Нормализовать порядок (как в `service_picker_cb` — strip первым действием)
+- **S2:** устаревшие комментарии (client.py:549, 1772-1774, 1897-1899) — утверждают что service_title ставит service_msg; после 5.51 сеттер только `service_picker_cb`
+- **S3:** `service_msg`-хинт: если юзер удалил сообщение пикера — повторный текст даёт хинт без кнопок (спастись только /cancel, /start). Вариант: ре-рендер `service_picker_keyboard` при повторном хинте
+- **S4:** `client_book_cb` (client.py:395) стрипает ЖИВОЕ /start-меню — primary entry-point теряет кнопку, восстановление только повторным /start
+- **S5 (pre-existing):** `"noop"` callback (keyboards/client.py:291, 328, 384 — «Нет свободных дат/слотов») без handler'а — тап даёт вечный спиннер
+
+### 4. Background из старых сессий
+
+- Передача бота Екатерине: поменять `ADMIN_ID` в `.env` на VPS (сейчас ID владельца — он сам тестирует). On-behalf booking (записывать клиентов по телефону из админки) — когда Екатерина начнёт работать
+- B.7 backup БД pg_dump cron на VPS — не сделано (ПДн клиентов, one-way door при потере VPS)
+
+## Как деплоить
+
+```bash
+BARBER_PASS=$(grep -E '^PASS:' ~/.config/opencode/references/barber-bot-deploy-credentials.md | sed 's/^PASS: //')
+sshpass -p "$BARBER_PASS" ssh root@VPS_HOST_FROM_CRED_FILE
+cd /opt/barber-bot && git pull && docker compose up -d --build
+docker logs --tail 20 barber-bot-bot-1   # smoke-check: "Run polling for bot @My_Barber_hair_bot"
+```
+
+Миграции применяются автоматически (контейнер стартует через `alembic upgrade head && python -m bot.main`).
+
+## Правила сессии (напоминание)
+
+- **MY-VIBE-RULES.md** — dev-режим: deep-analysis на нетривиальное → реализация → verify (pytest/ruff/mypy) → code-review subagent → коммит свободный (личный репо)
+- **Креды VPS НЕ коммитить** — живут в `~/.config/opencode/references/barber-bot-deploy-credentials.md`
+- **VPS-диагностику делать самому** через sshpass (не просить юзера вводить команды)
+- Code-reviewer subagent: если вернул пустой результат 2+ раза — REVIEW_UNAVAILABLE, фиксировать в коммит-месседже, детерминированные проверки делать самому
