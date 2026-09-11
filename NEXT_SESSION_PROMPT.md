@@ -1,155 +1,158 @@
-# NEXT_SESSION_PROMPT — barber-bot, session 5.57
+# NEXT_SESSION_PROMPT — barber-bot, session 5.58
 
 ## Контекст
 
 Продолжаем работу над барбер-ботом (~/PycharmProjects/barber-bot). Прочитай
-NEXT_SESSION_PROMPT.md в корне репо — там handoff после 5.56 (human-readable
-reminders + F1/W2 fixes, force-push rewrite истории от IP-leak).
+NEXT_SESSION_PROMPT.md в корне репо — там handoff после 5.57 (admin reply
+keyboard variant B + coverage gaps closure).
 
-**main:** `875d0c7` (5.56: human-readable reminders + html.escape master.name +
-newline-squash + pre-push hook с generic IP regex)
-**VPS:** задеплоен `92dcada` в 14:59 UTC 11 сен. W2 fix (.replace("\n"," ")) в
-`875d0c7` НЕ на проде (только .md + scheduler.py:186) — подхватится при
-следующем docker compose up --build. Не критично (мастер "Ekaterina" без \n).
-**Гейты:** ruff ✅ · mypy ✅ · pytest 551 passed / 2 skipped
+**main:** `afc1f4d` (5.57: 2 теста transfer_slot_30_cb, 0%→covered)
+**VPS:** задеплоен `d2734ef` в 16:33 UTC 11 сен (variant B — admin_inline_menu
+для master в _restore_reply_keyboard_async). Коммит afc1f4d (тесты) НЕ на
+проду — подхватится при следующем `docker compose up --build` (тесты не
+влияют на runtime, деплой не срочный).
+**Гейты:** ruff ✅ · mypy ✅ · pytest 554 passed / 2 skipped
 
-## Задачи на сессию 5.57
+## Что сделано в 5.57
 
-### 1. Валидация скриншотов из прошлой сессии (ВАЖНО — проверь код против фактов)
+### 1. Admin reply keyboard — variant B (ГЛАВНАЯ задача, закрыта) ✅
 
-В прошлой сессии (5.56) юзер прислал скриншоты bot @My_Barber_hair_bot.
-Ассистент сопоставил с БД (notifications_log, apscheduler_jobs, bookings):
+**Проблема:** Ekaterina (telegram_id=461355056, ADMIN_ID) видела stale client
+reply keyboard "Записаться"/"Мои записи" с прошлой сессии (до B.13/5.36).
+Код правильно запрещает показ (4 guard'а _is_master), но Telegram не убирает
+уже показанную keyboard (`is_persistent=True`).
 
-| Скриншот | Тип | Время отправки | Деплой 14:59 UTC | Вердикт |
-|---|---|---|---|---|
-| "Через час: 15:30" | remind_1h для 47bf8c59 | 11:30 UTC (14:30 MSK) | ДО деплоя | OLD формат ✓ |
-| "Напоминаю: завтра в 15:30" | remind_24h для 47bf8c59 | 13:40 UTC (16:40 MSK) | ДО деплоя | OLD формат ✓ |
-| "Новая запись: 13 сентября, 12:30, Olesya, Мелирование" | master_new для 1481976a | 14:18 UTC (17:18 MSK) | ДО деплоя | OLD (5.56 master_new не менял) |
+**Решение (variant B):** в `_restore_reply_keyboard_async` (client.py:237-239)
+для master вместо silent `return` отправляется `admin_inline_menu()` (7 inline
+кнопок, текст "📋 Меню:"). Master может `/book` (без guard, по дизайну) и после
+confirm/cancel видит admin menu, не пустой чат.
 
-Все 3 напоминания на скриншотах — старый формат (отправлены ДО деплоя нового
-кода). **Первый NEW-формат придёт:**
-- Сб 12.09 12:00 MSK: remind_1h "Через час в 13:00 — 💇 Окрашивание, мастер Ekaterina"
-- Сб 12.09 12:30 MSK: remind_24h "Напоминаю: завтра в 12:30 — 💇 Мелирование, мастер Ekaterina"
+**Файлы:**
+- `bot/handlers/client.py:75` — импорт `admin_inline_menu`
+- `bot/handlers/client.py:217-240` — helper с master branch
+- `tests/test_client_handlers.py:5408+` — `test_restore_reply_keyboard_async_master_gets_admin_menu`
+- Коммит `d2734ef`, запушен, задеплоен на VPS
 
-**Задача:** проверить логи на проде — пришли ли NEW-формат напоминания.
+**Code-review:** VERDICT LGTM (2 suggestions — S1 stale keyboard cleanup через
+ReplyKeyboardRemove отклонено — разойдётся с `/menu` convention; S2
+`assert_awaited_once` coupling — корректно, ловит будущие изменения).
+
+**Что НЕ сделано:** stale reply keyboard не убирается автоматически — Ekaterina
+нужно сделать `/start` (ReplyKeyboardRemove уберёт stale keyboard). Это
+конгруэнтно `/menu` и `admin_menu_cb` — они тоже не шлют ReplyKeyboardRemove.
+Если после `/start` keyboard снова появится — значит реальный баг.
+
+### 2. Coverage gaps — transfer_slot_30_cb ✅
+
+130 строк / 0% coverage → covered. 2 новых теста:
+- `test_transfer_slot_30_cb_happy_path` — workday-path transfer, master
+  notified, client gets "✅ Запись перенесена", booking.status='transferred'
+- `test_transfer_slot_30_cb_invalid_start_minute` — start_minute=1500 (out
+  of [0,1439]) → state.clear + "❌ Ошибка выбора времени" early return
+
+Коммит `afc1f4d`, запушен. Деплой НЕ нужен — тесты не влияют на runtime.
+
+### 3. Backup проверка ✅
+
+- VPS: cron `30 3 * * *` установлен 11.09 10:08 UTC. `/var/log/barber_backup.log`
+  ещё НЕ создан — первый автоматический ночной backup будет **12.09 03:30 UTC**
+  (06:30 MSK). Dump в `/opt/barber-bot/backups/barber_2026-09-11_1007.dump` —
+  ручной запуск перед cron'установкой.
+- Mac: `~/barber-bot-backups/barber_2026-09-11_1007.dump` синхронизирован через
+  launchd `com.barber-offsite-backup` (зарегистрирован в launchctl).
+
+## Задачи на сессию 5.58
+
+### 1. Live-тест NEW-формата напоминаний (БЛОКИРУЕТСЯ ВРЕМЕНЕМ — завтра)
+
+На 11.09 16:33 UTC (момент деплоя d2734ef) ближайшие запланированные
+напоминания:
+- **12.09 09:00 UTC (12:00 MSK)** — `remind_1h` для 283ff705 (Окрашивание 13:00 MSK)
+- **12.09 09:30 UTC (12:30 MSK)** — `remind_24h` для 1481976a (Мелирование 13.09 12:30 MSK)
+- **12.09 11:30 UTC (14:30 MSK)** — `remind_1h` для a95de5b7 (Мелирование 12.09 15:30 MSK)
+
+**Проверить 12.09 после 12:00 MSK:**
 ```bash
-sshpass -p "$BARBER_PASS" ssh ... root@VPS 'docker logs --since 24h barber-bot-bot-1 2>&1' | rg "send_reminder|executed"
+CRED=~/.config/opencode/references/barber-bot-deploy-credentials.md
+VPS_HOST=$(grep -E '^HOST:' $CRED | sed 's/^HOST: //')
+BARBER_PASS=$(grep -E '^PASS:' $CRED | sed 's/^PASS: //')
+sshpass -p "$BARBER_PASS" ssh ... root@$VPS_HOST 'docker exec barber-bot-db-1 psql -U barber -d barber -c "SELECT id, kind, sent_at, booking_id FROM notifications_log WHERE sent_at > '"'"'2026-09-12 00:00'"'"' ORDER BY sent_at DESC;"'
 ```
-И проверить notifications_log:
-```sql
-SELECT * FROM notifications_log WHERE sent_at > '2026-09-12 00:00' ORDER BY sent_at DESC;
-```
+
+**NEW-формат (5.56):** "Через час в 13:00 — 💇 Окрашивание, мастер Ekaterina"
+(с service name + master name). OLD-формат: "Через час: 15:30" (без названий).
+
 Если NEW-формат пришёл — ✅ live-тест пройден. Если OLD-формат — проверить
-что контейнер реально на коде 875d0c7 (docker inspect image → created date).
+что контейнер реально на коде 92dcada (docker inspect image → created date,
+должно быть 11.09 ~14:58 UTC или позже).
 
-### 2. Admin reply keyboard — ГЛАВНАЯ задача сессии
+### 2. Live-тест variant B (после 12.09, когда Ekaterina будет пользоваться)
 
-**Проблема:** Ekaterina (telegram_id=461355056) — мастер/админ, но видит
-reply keyboard "Записаться" / "Мои записи" как обычный клиент. При этом у
-неё есть booking "Окрашивание и стрижка, Андрей" — она тестировала как
-клиент в собственной системе.
+Ekaterina делает `/book` → выбирает дату/слот/услугу → confirm → должна видеть
+"📋 Меню:" с 7 admin-кнопками (Открыть день, Изменить окно, Сегодня, Неделя,
+Открыть неделю, Закрыть день, Услуги). Если видит пустой чат — variant B не
+работает, нужно дебажить.
 
-**Вопрос:** должен ли бот определять что telegram_id=461355056 это
-мастер/админ и показывать admin-кнопки ("Сегодня", "Записания",
-"Настройки") вместо client-кнопок?
+Альтернатива: попросить Ekaterina сделать `/start` — должна увидеть admin
+menu + stale reply keyboard убрана (ReplyKeyboardRemove).
 
-**Что изучить:**
-- `bot/handlers/start.py` — как бот определяет admin vs client (по
-  `settings.admin_id`? по `Master.telegram_id`?)
-- `bot/handlers/client.py:216 _restore_reply_keyboard_async` — где
-  вызывается, для кого
-- `bot/keyboards/client.py` — reply keyboard "Записаться"/"Мои записи"
-- `bot/keyboards/admin.py` — admin keyboard, когда показывается
-- `bot/config.py` — есть ли `ADMIN_ID` в settings
-- Если мастер и клиент — один и тот же telegram_id (Ekaterina тестировала
-  как клиент), как бот должен различать контексты?
+### 3. Проверка ночного backup (12.09, после 06:30 MSK)
 
-**Гипотезы для проверки:**
-1. `ADMIN_ID` не задан в `.env` → бот не знает кто админ → все видят
-   client keyboard
-2. `ADMIN_ID` задан, но проверка только в `/start` / admin handlers, а
-   reply keyboard восстанавливается для всех без проверки
-3. `ADMIN_ID` = telegram_id Ekaterina, но она хочет И клиентский доступ
-   (бронировать за себя) И admin-доступ — нужен гибридный режим
-
-**Варианты решения (обсудить с юзером перед реализацией):**
-- A: admin видит ТОЛЬКО admin-кнопки (не может бронировать как клиент)
-- B: admin видит admin-кнопки + "Записаться" (гибрид)
-- C: admin выбирает режим командой `/admin` / `/client` (переключатель)
-- D: оставить как есть — admin использует `/today` `/week` команды без
-  reply keyboard, reply keyboard только для клиентов (но тогда зачем
-  она показывается admin?)
-
-### 3. Live-тест reminder NEW-формата (если ещё не пришёл)
-
-Если на момент сессии напоминания на NEW-формате ещё не пришли — создать
-тестовую запись:
-- Через бота: `/book` → дата завтра+2 дня → слот → услуга → подтвердить
-  → wait для remind_24h (если старт через 25h) или remind_1h (если через 1h+)
-- Или через БД напрямую (быстрее, но не проверяет UX-путь):
-```sql
-INSERT INTO bookings (...) VALUES (..., start_at=NOW()+interval '2 hours', ...);
--- Затем через python код: schedule_for_booking(booking_id)
-```
-
-### 4. Проверка ночного backup (если ещё не проверена)
-
-Cron `30 3 * * *` на VPS + launchd 06:30 MSK на Mac.
 ```bash
-# VPS
-sshpass ... ssh root@VPS 'tail /var/log/barber_backup.log && ls -la /opt/barber-bot/backups/'
-# Mac
-ls -la ~/barber-bot-backups/ && tail ~/barber-bot-backups/launchd.log
+# VPS — после 12.09 06:30 MSK
+sshpass ... ssh root@$VPS_HOST 'cat /var/log/barber_backup.log && ls -la /opt/barber-bot/backups/'
+# Mac — после 12.09 ~06:35 MSK (launchd тянет с VPS)
+ls -la ~/barber-bot-backups/ && find ~/barber-bot-backups/ -name "barber_2026-09-12*" -newer ~/barber-bot-backups/barber_2026-09-11_1007.dump
 ```
 
-### 5. Coverage gaps (опционально, если будет время)
+Если `/var/log/barber_backup.log` существует и содержит "OK: ... (verified
+TOC)" — ночной backup работает. Если файла нет — cron не отработал, проверить
+`journalctl --since "12 hours ago" | grep backup.sh`.
 
-Покрытие 78% total. Ключевые gaps:
+### 4. Coverage gaps (опционально, если будет время)
+
+Покрытие 78% → 78.x% (после 5.57 transfer_slot_30_cb). Ключевые gaps:
 - `bot/handlers/admin.py` 65% (644 строки) — admin-функции, low priority
   (single-user, ты сам админ)
-- `bot/handlers/client.py` 75% (252 строки) — `transfer_slot_30_cb` 130
-  строк полностью непокрыт
+- `bot/handlers/client.py` 75% → ~77% — `transfer_slot_30_cb` теперь covered,
+  но error branches (10 exception'ов) НЕ покрыты. Mirror transfer_slot_cb
+  error tests (#16-25) — низкий priority (same service layer)
 - `scheduler.py` 89% — edge-cases (TelegramAPIError handler, network errors)
 
 Принцип: покрываем по risk-priority, не ради 100%. Critical path
 (бронирование, напоминания) — обязательно. Admin — low priority. Dead
 code (legacy slots fallback) — лучше удалить, не покрывать.
 
-## Данные для расследования admin keyboard
+### 5. APScheduler orphan cleanup (future task, опционально)
 
-### DB state (на 2026-09-11 15:50 UTC)
+7 active job'ов + orphan-записи от выполненных DateTrigger'ов НЕ чистятся
+APScheduler'ом из PostgreSQL jobstore (мусор накапливается). Не критично,
+но можно добавить cleanup в `on_startup_scan`. Низкий priority.
+
+## Данные для live-тестов
+
+### apscheduler_jobs (7 active, на 11.09 16:33 UTC)
+
+| Job ID | Next run (UTC) | Booking | Услуга |
+|---|---|---|---|
+| remind_1h_283ff705 | 12.09 09:00 | 283ff705 | Окрашивание 12.09 10:00 UTC |
+| remind_24h_1481976a | 12.09 09:30 | 1481976a | Мелирование 13.09 09:30 UTC |
+| remind_1h_a95de5b7 | 12.09 11:30 | a95de5b7 | Мелирование 12.09 12:30 UTC |
+| remind_24h_c97a5833 | 12.09 12:30 | c97a5833 | под ноль 13.09 12:30 UTC |
+| remind_1h_aff076c5 | 12.09 13:30 | aff076c5 | Окрашивание 12.09 14:30 UTC |
+| remind_1h_1481976a | 13.09 08:30 | 1481976a | Мелирование 13.09 09:30 UTC |
+| remind_1h_c97a5833 | 13.09 11:30 | c97a5833 | под ноль 13.09 12:30 UTC |
+
+### bookings (upcoming, на 11.09 16:33 UTC)
 
 ```
-masters:
-  id=eaee30b1..., name="Ekaterina", telegram_id=461355056
-
-bookings (upcoming):
-  1481976a | 2026-09-13 09:30 UTC | Мелирование | client_tg=1156374642 (Olesya)
-  aff076c5 | 2026-09-12 14:30 UTC | Окрашивание  | client_tg=1156374642 (Olesya)
-  a95de5b7 | 2026-09-12 12:30 UTC | Мелирование  | client_tg=1156374642 (Olesya)
-  283ff705 | 2026-09-12 10:00 UTC | Окрашивание  | client_tg=1156374642 (Olesya)
-  47bf8c59 | 2026-09-11 12:30 UTC | Окрашивание и стрижка | client_tg=461355056 (Ekaterina!)
-  c97a5833 | 2026-09-13 12:30 UTC | под ноль     | client_tg=213896615
-
-notifications_log (last 5):
-  23 | aff076c5 remind_24h | 14:30 UTC
-  22 | 1481976a master_new | 14:18 UTC
-  21 | 47bf8c59 remind_24h | 13:40 UTC
-  20 | a95de5b7 remind_24h | 12:30 UTC
-  19 | 47bf8c59 remind_1h  | 11:30 UTC
+1481976a | 2026-09-13 09:30 UTC | Мелирование | client_tg=1156374642 (Olesya)
+aff076c5 | 2026-09-12 14:30 UTC | Окрашивание  | client_tg=1156374642 (Olesya)
+a95de5b7 | 2026-09-12 12:30 UTC | Мелирование  | client_tg=1156374642 (Olesya)
+283ff705 | 2026-09-12 10:00 UTC | Окрашивание  | client_tg=1156374642 (Olesya)
+47bf8c59 | 2026-09-11 12:30 UTC | Окрашивание и стрижка | client_tg=461355056 (Ekaterina!)
+c97a5833 | 2026-09-13 12:30 UTC | под ноль     | client_tg=213896615
 ```
-
-Ekaterina (telegram_id=461355056) имеет booking 47bf8c59 как CLIENT.
-Значит она тестировала бронирование через бот от своего имени. Это и
-вызывает вопрос: она видит client reply keyboard потому что она клиент
-в системе, или потому что бот не distinguishes admin от client?
-
-### apscheduler_jobs (7 active)
-
-Все job'ы — remind_1h или remind_24h для upcoming bookings. Оrphan-записи
-от выполненных DateTrigger'ов НЕ чистятся APScheduler'ом из PostgreSQL
-jobstore (мусор накапливается). Не критично, но можно добавить cleanup
-в on_startup_scan (future task).
 
 ## Как деплоить
 
@@ -169,6 +172,6 @@ sshpass -p "$BARBER_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
   code-review → коммит свободный (личный репо)
 - Креды VPS НЕ коммитить — в `~/.config/opencode/references/barber-bot-deploy-credentials.md`
 - VPS-диагностику делать самому через sshpass
-- Pre-push: IP regex теперь в hook'е — любые IP-адреса в коммитах заблокированы
-- **Перед admin keyboardChanges** — обсудить с юзером вариант решения
-  (A/B/C/D выше), не начинать реализацию без согласия
+- Pre-push: IP regex в hook'е — любые IP-адреса в коммитах заблокированы
+- **Перед новыми фичами** — обсудить с юзером, не начинать реализацию без согласия
+- Coverage gaps — покрывать по risk-priority, не ради 100%
