@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     MISFIRE_GRACE_TIME: int = 3600  # Render free tier sleep 15 мин = 900 сек → 3600 сек запас
     SERVICE_DEFAULT_DURATION_MIN: int = 60
     MAX_BOOKING_DAYS_AHEAD: int = 60  # aiogram_calendar range (today..today+N days)
+    # Session 5.53: optional TLS-proxy base URL (Cloudflare Worker) for the
+    # VPS network problem (handoff 5.51: connection resets to api.telegram.org).
+    # Empty = direct api.telegram.org (default, feature flag OFF).
+    # Value format: https://<worker>.workers.dev/<WORKER_SECRET>
+    TELEGRAM_API_BASE_URL: str = ""
 
     @property
     def async_database_url(self) -> str:

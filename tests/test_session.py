@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from bot.config import get_settings
 from bot.session import CorpAiohttpSession, build_ssl_context
 
 
@@ -126,3 +127,60 @@ def test_build_ssl_context_env_path_does_not_exist_falls_through_to_home(
 
     assert isinstance(ctx, ssl.SSLContext)
     mock_load.assert_called_once_with(str(ca_home))
+
+
+# ============================================================
+# build_session — optional Telegram API proxy (Session 5.53)
+# ============================================================
+
+
+def test_build_session_flag_off_returns_default_api(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """5.53: TELEGRAM_API_BASE_URL empty/absent → direct api.telegram.org
+    (feature flag OFF, default — zero behavior change vs pre-5.53).
+    """
+    monkeypatch.delenv("BARBER_SSL_CA_BUNDLE", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "TELEGRAM_API_BASE_URL", "", raising=False)
+    monkeypatch.setattr("bot.session.get_settings", lambda: settings)
+
+    from bot.session import build_session
+
+    session = build_session()
+
+    # Default aiogram APIServer: api root is api.telegram.org, no secret prefix.
+    assert session.api.api_url(token="T", method="m") == "https://api.telegram.org/botT/m"
+
+
+def test_build_session_flag_on_routes_via_proxy_with_secret_prefix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """5.53: TELEGRAM_API_BASE_URL set → all Bot API calls go through the
+    Worker proxy. from_base keeps the secret path prefix — the Worker
+    (deploy/telegram-proxy-worker.js) strips it and proxies upstream.
+    """
+    monkeypatch.delenv("BARBER_SSL_CA_BUNDLE", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    proxy = "https://telegram-proxy.example.workers.dev/SECRET123"
+    settings = get_settings()
+    monkeypatch.setattr(settings, "TELEGRAM_API_BASE_URL", proxy, raising=False)
+    monkeypatch.setattr("bot.session.get_settings", lambda: settings)
+
+    from bot.session import build_session
+
+    session = build_session()
+
+    assert (
+        session.api.api_url(token="T", method="sendMessage")
+        == f"{proxy}/botT/sendMessage"
+    )
+    assert (
+        session.api.file_url(token="T", path="f/p")
+        == f"{proxy}/file/botT/f/p"
+    )
+    # corp CA context still applied (proxy does not disable TLS inspection fix).
+    assert isinstance(session._connector_init["ssl"], ssl.SSLContext)
