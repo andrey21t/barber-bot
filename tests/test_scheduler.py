@@ -84,6 +84,23 @@ async def test_build_scheduler_memory_jobstore(scheduler: AsyncIOScheduler) -> N
     assert isinstance(scheduler._jobstores["default"], MemoryJobStore)
 
 
+def test_set_bot_ref_sets_global() -> None:
+    """_set_bot_ref sets the global _bot_ref for scheduled jobs.
+
+    Called from main.py:_on_startup before scheduler.start() so that
+    scheduled jobs (which don't receive bot as arg) can fall back to
+    _bot_ref. Regression guard: if someone renames _bot_ref or removes
+    _set_bot_ref, scheduled reminders silently lose bot access.
+    """
+    import scheduler as sched_mod
+
+    original = sched_mod._bot_ref
+    mock_bot = MagicMock()
+    sched_mod._set_bot_ref(mock_bot)
+    assert sched_mod._bot_ref is mock_bot
+    sched_mod._set_bot_ref(original)  # restore to avoid leaking to other tests
+
+
 @pytest.mark.asyncio
 async def test_schedule_for_booking_creates_two_jobs(scheduler: AsyncIOScheduler) -> None:
     """Acceptance #3: scheduler.get_jobs() returns 2 (remind_24h + remind_1h)."""
@@ -640,5 +657,164 @@ async def test_schedule_for_booking_keeps_both_when_far_future(
 
     assert scheduler.get_job(f"remind_24h_{booking_id}") is not None
     assert scheduler.get_job(f"remind_1h_{booking_id}") is not None
+
+    scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_send_reminder_remind_1h_text(
+    session_factory: Any, session: AsyncSession, scheduler: AsyncIOScheduler
+) -> None:
+    """send_reminder: remind_1h text branch — "Через час в HH:MM — 💇 ..., мастер ...".
+
+    Mirror of test_send_reminder_happy_path but with kind="remind_1h" to cover
+    the elif branch (scheduler.py:192-193). Critical path: remind_1h fires for
+    every booking (1 hour before start), so the text format must be verified
+    independently from remind_24h.
+    """
+    _start_scheduler(scheduler)
+    booking_start = datetime.now(UTC) - timedelta(hours=12)
+    booking = await _seed_booking(session, booking_start)
+
+    mock_bot = AsyncMock()
+    with (
+        patch("scheduler._bot_ref", mock_bot),
+        patch("bot.db.async_session_factory", session_factory),
+    ):
+        await send_reminder(booking.id, "remind_1h", bot=mock_bot)
+
+    assert mock_bot.send_message.await_count == 1
+    chat_id, text = mock_bot.send_message.await_args.args
+    assert chat_id == 111222333
+    # Text format (5.56): "Через час в HH:MM — 💇 <service>, мастер <name>"
+    assert text.startswith("Через час в ")
+    assert "💇 Test" in text
+    assert "мастер Екатерина" in text
+    scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_send_reminder_unknown_kind_skips(
+    session_factory: Any, session: AsyncSession, scheduler: AsyncIOScheduler
+) -> None:
+    """send_reminder: unknown kind (e.g. "remind_week") → log warning, return.
+
+    Covers defensive else branch (scheduler.py:195-196). Returns BEFORE
+    log_notification → UNIQUE(booking_id, kind) not poisoned → retry with
+    correct kind still works. Without this guard, a typo in kind would
+    silently INSERT into notifications_log and block valid retries.
+    """
+    _start_scheduler(scheduler)
+    booking_start = datetime.now(UTC) - timedelta(hours=12)
+    booking = await _seed_booking(session, booking_start)
+
+    mock_bot = AsyncMock()
+    with (
+        patch("scheduler._bot_ref", mock_bot),
+        patch("bot.db.async_session_factory", session_factory),
+    ):
+        await send_reminder(booking.id, "remind_week", bot=mock_bot)
+
+    # No send_message (unknown kind returns before send + before log_notification)
+    assert mock_bot.send_message.await_count == 0
+    scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_send_reminder_retry_after_exhausted(
+    session_factory: Any, session: AsyncSession, scheduler: AsyncIOScheduler
+) -> None:
+    """send_reminder: both attempts fail with TelegramRetryAfter → log error, return.
+
+    Covers retry-exhausted path (scheduler.py:217-222). Mirror of
+    test_send_reminder_retry_after, but both attempts raise RetryAfter.
+    Attempt 0: sleep + continue. Attempt 1: `if attempt == 0` False → log error
+    + return (no 3rd try). Real scenario: Telegram under sustained flood control.
+    """
+    from aiogram.exceptions import TelegramRetryAfter
+
+    _start_scheduler(scheduler)
+    booking_start = datetime.now(UTC) - timedelta(hours=12)
+    booking = await _seed_booking(session, booking_start)
+
+    mock_bot = AsyncMock()
+    method = MagicMock()
+    retry_exc = TelegramRetryAfter(method=method, message="flood", retry_after=1)
+    mock_bot.send_message.side_effect = [retry_exc, retry_exc]
+
+    with (
+        patch("scheduler._bot_ref", mock_bot),
+        patch("bot.db.async_session_factory", session_factory),
+        patch("scheduler.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+    ):
+        await send_reminder(booking.id, "remind_24h", bot=mock_bot)
+
+    # Both attempts consumed; sleep called once (only on attempt 0, not attempt 1)
+    assert mock_bot.send_message.await_count == 2
+    mock_sleep.assert_awaited_once_with(1)
+    scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_send_reminder_generic_telegram_api_error(
+    session_factory: Any, session: AsyncSession, scheduler: AsyncIOScheduler
+) -> None:
+    """send_reminder: generic TelegramAPIError (not Forbidden/BadRequest/RetryAfter)
+    → log error, return. Covers scheduler.py:231-232, 238.
+
+    Mirror of test_send_reminder_forbidden_logs_warning but with base
+    TelegramAPIError (network error, 5xx). Single attempt, no retry.
+    TelegramAPIError is the parent of Forbidden/BadRequest/RetryAfter, but
+    `except (TelegramForbiddenError, TelegramBadRequest)` matches only subclass
+    instances — a base-class instance falls through to `except TelegramAPIError`.
+    """
+    from aiogram.exceptions import TelegramAPIError
+
+    _start_scheduler(scheduler)
+    booking_start = datetime.now(UTC) - timedelta(hours=12)
+    booking = await _seed_booking(session, booking_start)
+
+    mock_bot = AsyncMock()
+    method = MagicMock()
+    mock_bot.send_message.side_effect = TelegramAPIError(
+        method=method, message="internal server error"
+    )
+
+    with (
+        patch("scheduler._bot_ref", mock_bot),
+        patch("bot.db.async_session_factory", session_factory),
+    ):
+        await send_reminder(booking.id, "remind_24h", bot=mock_bot)
+
+    # Single attempt, no retry (generic API error ≠ RetryAfter)
+    assert mock_bot.send_message.await_count == 1
+    scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_schedule_for_booking_skips_both_past_due(
+    scheduler: AsyncIOScheduler,
+) -> None:
+    """Both remind_24h and remind_1h past-due → skip both silently.
+
+    Covers scheduler.py:297 (remind_1h past-due skip log). The existing
+    test_schedule_for_booking_skips_past_due_remind_24h covers the case
+    where remind_24h is past-due but remind_1h is future (start_at = now+7h).
+    This test covers the edge case where the booking is fully in the past
+    (start_at = now-25h): both reminders are past-due → both skipped.
+
+    Real scenario: bot offline >24h during a booking window. on_startup_scan
+    reschedules and must skip ancient reminders (don't fire "завтра в 14:00"
+    for a booking that was 2 days ago).
+    """
+    _start_scheduler(scheduler)
+
+    booking_id = uuid4()
+    start_at = datetime.now(UTC) - timedelta(hours=25)
+
+    schedule_for_booking(scheduler, booking_id, start_at)
+
+    assert scheduler.get_job(f"remind_24h_{booking_id}") is None
+    assert scheduler.get_job(f"remind_1h_{booking_id}") is None
 
     scheduler.shutdown(wait=False)
