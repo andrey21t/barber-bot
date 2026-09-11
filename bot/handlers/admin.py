@@ -28,6 +28,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -3879,9 +3880,15 @@ async def admin_state_catchall_callback(callback: CallbackQuery) -> None:
 #
 # Fix: перехватываем в admin_router (registered ПЕРЕД client_router в
 # main.py:117-119). StateFilter(None) — только no-FSM state (НЕ трогает
-# admin FSM states — там admin_state_catchall_text). _is_admin check —
-# non-admin silent return, проваливается в client_router fallback (OK
-# для клиентов — /book hint правильный).
+# admin FSM states — там admin_state_catchall_text).
+#
+# Non-admin: raise SkipHandler (5.52) — dispatch continues to the next
+# matching handler, client_router.no_state_fallback answers
+# "Начните запись через /book" (client hint — correct for clients).
+# NB: plain `return` here would SILENTLY EAT the update (aiogram treats a
+# matched+returned handler as handled; no fall-through) — exactly that bug
+# (Session 5.9 → 5.52) made every non-admin text in State(None) get no
+# answer at all. SkipHandler is the only way to decline a matched handler.
 # ============================================================
 
 
@@ -3893,9 +3900,13 @@ async def admin_no_state_catchall_text(message: Message) -> None:
     подсказывает /menu вместо того, чтобы проваливаться в client_router
     fallback ("Начните запись через /book" — клиентский hint для админа).
 
-    Non-admin → silent return, проваливается в client_router fallback (OK).
-    /commands → НЕ матчит (~F.text.startswith("/")), идут в свои handlers.
+    Non-admin → SkipHandler: dispatch continues to client_router
+    no_state_fallback (5.52 — a plain `return` here is a silent swallow:
+    aiogram consumes the update on the first matched handler, the comment
+    claimed fall-through that never happened, so clients in State(None)
+    typing plain text got silence since 5.9).
+    /commands → НЕ матчат (~F.text.startswith("/")), идут в свои handlers.
     """
     if not _is_admin(message):
-        return
+        raise SkipHandler
     await message.answer("📋 /menu для действий")

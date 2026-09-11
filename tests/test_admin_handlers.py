@@ -4738,3 +4738,45 @@ async def test_cmd_today_without_phone_shows_bez_telefona(
     text = _answer_text(msg)
     assert "без телефона" in text, "phone=None → 'без телефона' in /today render"
     assert "📞 None" not in text, "no literal 'None' in render"
+
+
+# ============================================================
+# Этап 3.5 — admin_no_state_catchall_text (SkipHandler contract, 5.52)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_admin_no_state_catchall_text_admin_gets_menu_hint() -> None:
+    """Этап 3.5: админ в State(None) + произвольный текст → /menu hint
+    (а не клиентский "Начните запись через /book" — был баг smoke-теста 5.9).
+    """
+    msg = _make_message(user_id=ADMIN_TG_ID, text="12")
+
+    await admin_handlers.admin_no_state_catchall_text(msg)
+
+    msg.answer.assert_awaited_once()
+    assert "/menu" in _answer_text(msg)
+
+
+@pytest.mark.asyncio
+async def test_admin_no_state_catchall_text_non_admin_raises_skip_handler() -> None:
+    """5.52: non-admin → SkipHandler + НЕ отвечает сам.
+
+    Прет-фикс поведение (Session 5.9 → 5.52): plain `return` здесь молча
+    съедал update (aiogram: первый сматченный handler = обработано, никакого
+    проваливания) → любой клиент в State(None), набравший текст, не получал
+    ответа ВООБЩЕ — client_router.no_state_fallback был мёртв для non-admin.
+    SkipHandler — единственный способ отказаться от сматченного handler'а:
+    dispatch продолжается к client_router (пинован интеграционным тестом
+    test_cancel_command_works_in_service_step: "ещё текст" после /cancel →
+    "Начните запись через /book").
+    """
+    from aiogram.dispatcher.event.bases import SkipHandler
+
+    msg = _make_message(user_id=NON_ADMIN_TG_ID, text="привет")
+
+    with pytest.raises(SkipHandler):
+        await admin_handlers.admin_no_state_catchall_text(msg)
+
+    # Handler сам НЕ отвечает — ответ даёт следующий handler (client_router).
+    msg.answer.assert_not_awaited()

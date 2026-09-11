@@ -161,6 +161,23 @@ class RecordingBot:
     def reset(self) -> None:
         self.calls.clear()
 
+    async def edit_message_reply_markup(self, *args: Any, **kwargs: Any) -> Any:
+        """Stub for bot.edit_message_reply_markup (W3 cancel_msg strip of the
+        ✅/❌ summary keyboard, S3 5.52 service_msg strip of the previous
+        service picker). Records the aiogram method object so tests can
+        assert the strip happened; returns True (handler ignores result).
+        """
+        from aiogram.methods import EditMessageReplyMarkup
+
+        self.calls.append(
+            EditMessageReplyMarkup(
+                chat_id=kwargs.get("chat_id") or (args[0] if args else 1),
+                message_id=kwargs.get("message_id") or 1,
+                reply_markup=kwargs.get("reply_markup"),
+            )
+        )
+        return True
+
     async def send_message(self, *args: Any, **kwargs: Any) -> Any:
         """Stub for callback.bot.send_message (used by confirm_cb to notify
         master). Returns a stub Message — handler doesn't await on it.
@@ -787,11 +804,23 @@ async def test_booking_flow_typed_text_in_service_step_hints_and_flow_continues(
         assert svc_btn is not None, "Стрижка button in the service picker"
 
         # Step 3: type text instead of tapping → hint, state NOT advanced.
+        # 5.52 (S3): the hint is self-healing — same answer carries a FRESH
+        # service picker (deleted/scroll-away picker no longer a dead end),
+        # and the PREVIOUS picker message gets its keyboard stripped
+        # (bot.edit_message_reply_markup — recorded by RecordingBot).
         bot.reset()
         await dp.feed_update(bot, _make_text_update("Борода + стрижка", user_id=client_tg))
         step3 = _extract_send_text(bot)
         assert "выберите услугу кнопкой" in step3, (
             f"5.51: typed text → button hint. Got: {step3!r}"
+        )
+        from aiogram.methods import EditMessageReplyMarkup
+
+        strip_calls = [c for c in bot.calls if isinstance(c, EditMessageReplyMarkup)]
+        assert strip_calls, "S3: previous picker keyboard must be stripped on typed text"
+        fresh_picker_btn = await _find_button_by_label(bot, "Стрижка")
+        assert fresh_picker_btn is not None, (
+            "S3 (5.52): hint answer must carry a FRESH tappable service picker"
         )
 
         # Step 4: tap 'Стрижка' (from the picker message above) right after
@@ -852,4 +881,60 @@ async def test_booking_flow_typed_text_in_service_step_hints_and_flow_continues(
         duration = (booking.end_at - booking.start_at).total_seconds() / 60
         assert duration == 60, (
             f"end_at - start_at must be 60 min (Стрижка duration), got {duration}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancel_command_works_in_service_step(
+    integration_dispatcher: tuple[Dispatcher, MagicMock],
+    session_factory: Any,
+) -> None:
+    """5.52 (review W1): /cancel typed at the service step must reach
+    cancel_msg (Command filter, StateFilter("*")), NOT be swallowed by
+    service_msg. Pre-5.52 the StateFilter-only catch-all ate it — the user
+    got a re-rendered picker instead of cancellation (and at the name step
+    /cancel could become client_name). This test pins the real dispatch
+    through dp.feed_update — unit tests bypass router filters.
+
+    Also verifies: cancel_msg strips the tracked service picker (S3/W3
+    msg_id pattern — EditMessageReplyMarkup recorded), state is cleared
+    (next plain text hits no_state_fallback's "Начните запись через /book").
+    """
+    from freezegun import freeze_time
+
+    with freeze_time("2026-08-25 14:00:00", tz_offset=0):
+        dp, bot = integration_dispatcher
+        await _seed_workday_tomorrow(session_factory)
+        client_tg = 999_888_777
+
+        # Step 1-2: /slots → tomorrow tap → service picker (entering_service).
+        await dp.feed_update(bot, _make_text_update("/slots", user_id=client_tg))
+        tomorrow = (datetime.now(ZoneInfo(TZ)) + timedelta(days=1)).date()
+        bot.reset()
+        await dp.feed_update(bot, _make_calendar_day_update(tomorrow, user_id=client_tg))
+        assert "Выберите услугу" in _extract_send_text(bot)
+
+        # Step 3: /cancel at the service step → cancel_msg wins dispatch.
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("/cancel", user_id=client_tg))
+        texts = _extract_all_send_texts(bot)
+        assert any("Ввод отменён" in t for t in texts), (
+            f"W1: /cancel must reach cancel_msg. Got: {texts!r}"
+        )
+        assert not any("выберите услугу кнопкой" in t for t in texts), (
+            "W1: /cancel must NOT hit service_msg (fresh-picker re-render) — "
+            "that means the catch-all still swallows commands"
+        )
+
+        # The tracked service picker was stripped (S3 tracker + cancel_msg loop).
+        from aiogram.methods import EditMessageReplyMarkup
+
+        strip_calls = [c for c in bot.calls if isinstance(c, EditMessageReplyMarkup)]
+        assert strip_calls, "5.52: cancel_msg must strip the tracked service picker"
+
+        # State is cleared: plain text now hits no_state_fallback (State(None)).
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("ещё текст", user_id=client_tg))
+        assert "Начните запись через /book" in _extract_send_text(bot), (
+            "After /cancel the FSM must be State(None) — plain text hits the fallback"
         )

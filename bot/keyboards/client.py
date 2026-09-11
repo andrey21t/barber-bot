@@ -164,8 +164,11 @@ class ClientMenuBookCallbackData(CallbackData, prefix="client_book"):
     Plain prefix (no payload) — same pattern as BookConfirmCallbackData.
 
     Session 5.51: post_booking_keyboard was REMOVED (duplicated the
-    always-on reply keyboard); the handler stays for STALE keyboards from
-    pre-5.51 sessions and the /start client_inline_menu.
+    always-on reply keyboard). 5.52 (review S4): the client_inline_menu
+    builder was dead code — /start has shown the reply keyboard since B.13
+    (5.36) and nothing rendered the inline menu. Builder removed; the
+    handler stays for STALE inline keyboards that still sit in old chats
+    (pre-B.13 /start messages, pre-5.51 post_booking keyboards).
     """
 
 
@@ -187,21 +190,6 @@ class ClientMenuMyBookingsCallbackData(CallbackData, prefix="client_mybookings")
     list rendering. Reusing it for "show my list" would collide semantically
     with the cancel handler's filter and confuse aiogram dispatch.
     """
-
-
-def client_inline_menu() -> InlineKeyboardMarkup:
-    """Single-button inline menu for client /start (2026-09-06 fix).
-
-    Layout: 1 button [💇 Записаться] — starts /book flow via callback
-    (ClientMenuBookCallbackData). Kept minimal per user request:
-    "клиент зашёл — сразу кнопка для записи, без «О нас» / «Контакты»".
-
-    If later we add more client actions (e.g. 📋 Мои записи, 📞 Контакты),
-    extend here with more buttons + adjust() layout.
-    """
-    builder = InlineKeyboardBuilder()
-    builder.button(text="💇 Записаться", callback_data=ClientMenuBookCallbackData().pack())
-    return builder.as_markup()
 
 
 async def calendar_keyboard(min_date: datetime, max_date: datetime) -> InlineKeyboardMarkup:
