@@ -72,6 +72,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings, get_settings
 from bot.db import async_session_factory
+from bot.keyboards.admin import admin_inline_menu
 from bot.keyboards.client import (
     CLIENT_REPLY_BOOK_LABEL,
     CLIENT_REPLY_MYBOOKINGS_LABEL,
@@ -217,8 +218,9 @@ async def _restore_reply_keyboard_async(message: Message) -> None:
     """Send the client reply keyboard back to the user (Session 5.36 / B.13).
 
     Called from cancel_msg and confirm_cb AFTER the inline-keyboard message
-    was sent. Guarded by _is_master — master does NOT get the client reply
-    keyboard (they have admin_inline_menu).
+    was sent. For non-master → client reply keyboard. For master → admin
+    inline menu (Session 5.57: variant B — master can book via /book and after
+    booking/cancel sees admin_inline_menu instead of an empty chat).
 
     The text "👇 Кнопки внизу" is a visual anchor for the reply keyboard
     appearing below. Without it, Telegram sometimes delays showing the
@@ -233,6 +235,7 @@ async def _restore_reply_keyboard_async(message: Message) -> None:
     keyboard) but keeps the reply keyboard always visible.
     """
     if _is_master(message):
+        await message.answer("📋 Меню:", reply_markup=admin_inline_menu())
         return
     await message.answer("👇 Кнопки внизу", reply_markup=client_reply_keyboard())
 

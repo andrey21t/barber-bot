@@ -5405,3 +5405,53 @@ async def test_cancel_msg_restores_reply_keyboard(
     flat = [btn for row in second_rm.keyboard for btn in row]
     assert len(flat) == 2, "restored reply keyboard has the 2 client buttons"
 
+
+@pytest.mark.asyncio
+async def test_restore_reply_keyboard_async_master_gets_admin_menu(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.57 (variant B): master (ADMIN_ID) → _restore_reply_keyboard_async
+    sends admin_inline_menu (NOT a silent return, NOT client reply keyboard).
+
+    Pre-5.57 behavior: master got silent return → after booking confirm/cancel
+    master's chat had no menu (only "✅ Вы записаны" / "Ввод отменён"). Stale
+    reply keyboard from pre-B.13 sessions lingered because no ReplyKeyboardRemove
+    fired after the booking flow for master.
+
+    5.57 variant B: master gets admin_inline_menu in the same helper that
+    restores client reply keyboard for non-master. Single entry point
+    (_restore_reply_keyboard_async) branches on _is_master.
+
+    Paired with test_cancel_msg_restores_reply_keyboard (non-master) so a
+    future refactor that drops the admin branch (but keeps the client branch)
+    would be caught by this test, not pass silently.
+    """
+    from aiogram.types import InlineKeyboardMarkup
+    from bot.config import get_settings
+    from bot.keyboards.admin import admin_inline_menu
+
+    admin_id = get_settings().ADMIN_ID
+    async with session_factory() as session:
+        await _seed_full_stack(session)
+
+    msg = _make_message(user_id=admin_id, text="<unused for restore helper>")
+
+    await client_handlers._restore_reply_keyboard_async(msg)
+
+    msg.answer.assert_awaited_once()
+    call = msg.answer.await_args
+    text = str(call.args[0]) if call.args else str(call.kwargs.get("text", ""))
+    assert text == "📋 Меню:", f"master should see admin menu anchor, got {text!r}"
+    rm = call.kwargs.get("reply_markup")
+    assert isinstance(rm, InlineKeyboardMarkup), (
+        "master should get inline keyboard (admin_inline_menu), not reply keyboard"
+    )
+    flat_texts = [btn.text for row in rm.inline_keyboard for btn in row]
+    expected = admin_inline_menu()
+    expected_texts = [btn.text for row in expected.inline_keyboard for btn in row]
+    assert flat_texts == expected_texts, (
+        f"reply_markup buttons must match admin_inline_menu, got {flat_texts!r}"
+    )
+    assert len(flat_texts) == 7, "admin_inline_menu has 7 buttons (layout 2+2+2+1)"
+
