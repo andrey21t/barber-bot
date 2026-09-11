@@ -348,15 +348,15 @@ async def test_cancel_booking_happy_path(
 
 
 @pytest.mark.asyncio
-async def test_cancel_booking_too_late(
+async def test_cancel_booking_late_allowed(
     session: AsyncSession,
     seed_data: dict[str, Any],
 ) -> None:
-    """Spec.md 406: now >= start_at - CANCEL_MIN_HOURS (24h) → CancelTooLateError,
-    no DB changes, scheduler.remove_job NOT called.
+    """Session 5.55: 24h cancel block removed — late cancellation now succeeds.
+    booking.status → 'cancelled', slot.status → 'open', scheduler.remove_job called.
     """
     booking = await _seed_confirmed_booking(session, seed_data)
-    booking_id = booking.id  # capture before rollback
+    booking_id = booking.id
     slot_id = booking.slot_id
     mock_scheduler = _mock_scheduler()
 
@@ -364,25 +364,22 @@ async def test_cancel_booking_too_late(
     # deadline = start_at - 24h = today 11:00 UTC. Use today 23:59 UTC → past deadline.
     ref = datetime.now(UTC).replace(hour=23, minute=59, second=0, microsecond=0)
 
-    with pytest.raises(CancelTooLateError):
-        await cancel_booking(
-            session,
-            booking_id=booking_id,
-            client_id=seed_data["client"].id,
-            scheduler=mock_scheduler,
-            now_utc=ref,
-        )
+    result = await cancel_booking(
+        session,
+        booking_id=booking_id,
+        client_id=seed_data["client"].id,
+        scheduler=mock_scheduler,
+        now_utc=ref,
+    )
 
-    # No DB changes — booking.status still 'confirmed', slot.status still 'booked'.
-    # cancel_booking raised before any UPDATE, so session has only read operations
-    # pending — no rollback needed, just SELECT to verify state.
+    assert result.booking_id == booking_id
+
     stmt_b = select(Booking.status).where(Booking.id == booking_id)
-    assert (await session.execute(stmt_b)).scalar_one() == "confirmed"
+    assert (await session.execute(stmt_b)).scalar_one() == "cancelled"
     stmt_s = select(Slot.status).where(Slot.id == slot_id)
-    assert (await session.execute(stmt_s)).scalar_one() == "booked"
+    assert (await session.execute(stmt_s)).scalar_one() == "open"
 
-    # Scheduler NOT touched
-    mock_scheduler.remove_job.assert_not_called()
+    mock_scheduler.remove_job.assert_called()
 
 
 @pytest.mark.asyncio
