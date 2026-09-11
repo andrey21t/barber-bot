@@ -593,20 +593,34 @@ def admin_week_days_keyboard(selected: set[int]) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def admin_openweek_overwrite_keyboard() -> InlineKeyboardMarkup:
-    """[✅ Да, перезаписать] / [❌ Нет, отмена] keyboard for /openweek
-    overwrite confirm step (Session 5.27 B).
+def admin_openweek_overwrite_keyboard(
+    button_text: str = "✅ Да, перезаписать",
+) -> InlineKeyboardMarkup:
+    """[✅ Да, ...] / [❌ Нет, отмена] keyboard for /openweek confirm step
+    (Session 5.27 B; 5.60 — button_text parameter for re-open vs overwrite).
 
     Triggered when master taps [✅ Открыть] but some selected days already have
     WorkDay rows. Without this guard, open_workday UPCERT would silently
     overwrite existing windows (data loss risk — master forgot week was open).
+
+    5.60 — заголовок alert и текст «Да» зависят от статуса существующих дней:
+    - all_active → «✅ Да, перезаписать» (overwrite existing window)
+    - all_closed → «✅ Да, открыть» (re-open closed day)
+    - mixed     → «✅ Да, открыть/перезаписать» (both actions)
+
+    callback_data is the same for all variants — yes-handler reads FSM state,
+    not button text, so re-open and overwrite share the same apply path.
+
+    Args:
+        button_text: label for the confirm button. Default "✅ Да, перезаписать"
+            for backward compat with all-active case.
 
     «✅ Да» callback_data="admin_openweek_overwrite_yes" (string).
     «❌ Нет» callback_data="admin_openweek_overwrite_no" (string).
     """
     builder = InlineKeyboardBuilder()
     builder.button(
-        text="✅ Да, перезаписать",
+        text=button_text,
         callback_data="admin_openweek_overwrite_yes",
     )
     builder.button(text="❌ Нет, отмена", callback_data="admin_openweek_overwrite_no")

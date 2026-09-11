@@ -3226,7 +3226,14 @@ async def admin_openweek_confirm_cb(
     # (closed via /closeday) appear here too. Alert text adapts: "(закрыт)"
     # suffix for is_active=False so master doesn't confuse "already open"
     # with "closed" — semantically different actions (re-open vs overwrite).
+    #
+    # 5.60 — alert заголовок и кнопка дифференцируются по статусу дней:
+    # all_closed  → «День закрыт. Открыть заново» + «✅ Да, открыть»
+    # all_active  → «Уже есть окно. Перезаписать» + «✅ Да, перезаписать» (current)
+    # mixed       → «Часть дней закрыта, часть открыта» + «✅ Да, открыть/перезаписать»
     existing_lines: list[str] = []
+    has_closed = False
+    has_active = False
     for weekday in sorted(selected):
         work_date = monday + timedelta(days=weekday)
         if work_date < today_local:
@@ -3237,30 +3244,49 @@ async def admin_openweek_confirm_cb(
             day_label = _WEEKDAY_LABELS_HANDLER[weekday]
             date_label = work_date.strftime("%d.%m")
             window = f"{wd.start_time.strftime('%H:%M')}–{wd.end_time.strftime('%H:%M')}"
-            status = " (закрыт)" if not wd.is_active else ""
+            if wd.is_active:
+                has_active = True
+                status = ""
+            else:
+                has_closed = True
+                status = " (закрыт)"
             existing_lines.append(f"• {day_label} {date_label} {window}{status}")
 
     if existing_lines:
         # НЕ clear state — yes-handler needs picked_start_minute etc.
         new_window = f"{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}"
         existing_str = "\n".join(existing_lines)
-        alert_text = f"⚠️ Уже есть окно:\n{existing_str}\n\nПерезаписать окно на {new_window}?"
+        if has_closed and not has_active:
+            # All selected existing days are closed → re-open action.
+            alert_text = f"⚠️ День закрыт:\n{existing_str}\n\nОткрыть заново на {new_window}?"
+            button_text = "✅ Да, открыть"
+        elif has_active and not has_closed:
+            # All selected existing days are active → overwrite (current behavior).
+            alert_text = f"⚠️ Уже есть окно:\n{existing_str}\n\nПерезаписать окно на {new_window}?"
+            button_text = "✅ Да, перезаписать"
+        else:
+            # Mixed: some closed (re-open), some active (overwrite).
+            alert_text = (
+                f"⚠️ Часть дней закрыта, часть открыта:\n{existing_str}\n\n"
+                f"Открыть закрытые и перезаписать активные на {new_window}?"
+            )
+            button_text = "✅ Да, открыть/перезаписать"
         if callback.message is not None:
             if isinstance(callback.message, Message):
                 try:
                     await callback.message.edit_text(
                         alert_text,
-                        reply_markup=admin_openweek_overwrite_keyboard(),
+                        reply_markup=admin_openweek_overwrite_keyboard(button_text),
                     )
                 except TelegramBadRequest:
                     await callback.message.answer(
                         alert_text,
-                        reply_markup=admin_openweek_overwrite_keyboard(),
+                        reply_markup=admin_openweek_overwrite_keyboard(button_text),
                     )
             else:
                 await callback.message.answer(
                     alert_text,
-                    reply_markup=admin_openweek_overwrite_keyboard(),
+                    reply_markup=admin_openweek_overwrite_keyboard(button_text),
                 )
         await callback.answer()
         return
