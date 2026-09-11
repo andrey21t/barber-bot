@@ -15,11 +15,9 @@ Contract (deep-analysis-protocol Pass 3):
   4. service_picker_cb: callback book_service, StateFilter(entering_service) → selecting_slot
      (Session 5.27 FEAT — tap-to-select; Session 5.29 Task 2 moved from confirming to
      selecting_slot, fetches slots filtered by service.duration_minutes)
-  4b. service_custom_cb: callback book_service_custom, StateFilter(entering_service) → stays
-      in entering_service, asks for free-text
-  4c. service_msg: text, StateFilter(entering_service) → selecting_slot
-      (free-text service; Session 5.29 Task 2 moved from confirming to selecting_slot,
-      fetches slots filtered by SERVICE_DEFAULT_DURATION_MIN)
+  4b. service_msg: text, StateFilter(entering_service) → tap-only hint
+      (Session 5.51 — free-text service input DISABLED: unknown duration
+      corrupted the slot grid; typed text answers "выберите кнопкой")
   5. name_msg: text, StateFilter(entering_name) → confirming + render summary
      (Session 5.29 Task 2 — summary rendering moved here from service_msg/service_picker_cb)
   6. confirm_cb: callback book_confirm, StateFilter(confirming) → State(None) + create_booking
@@ -40,12 +38,14 @@ Invariants (spec.md + MY-VIBE-RULES.md):
 """
 
 import logging
+from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dt_time
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State
@@ -67,6 +67,7 @@ from bot.db import async_session_factory
 from bot.keyboards.client import (
     CLIENT_REPLY_BOOK_LABEL,
     CLIENT_REPLY_MYBOOKINGS_LABEL,
+    BookCancelCallbackData,
     BookConfirmCallbackData,
     BookDateCallbackData,
     BookServiceCallbackData,
@@ -85,7 +86,6 @@ from bot.keyboards.client import (
     date_picker_keyboard,
     mybookings_keyboard,
     name_pre_fill_keyboard,
-    post_booking_keyboard,
     service_picker_keyboard,
     slot_picker_keyboard,
     slot_picker_keyboard_30min,
@@ -219,15 +219,38 @@ async def _restore_reply_keyboard_async(message: Message) -> None:
 
     NB: this sends a SEPARATE message with the reply keyboard. Telegram
     forbids combining reply + inline keyboards in one message, so the
-    booking flow's inline buttons (post_booking_keyboard in confirm_cb,
-    /cancel text in cancel_msg) stay in their own messages and this helper
+    booking flow messages stay in their own messages and this helper
     adds the reply keyboard in a follow-up. Minor visual noise (2 messages
-    after confirm_cb: "✅ Вы записаны" with inline buttons + "👇 Кнопки внизу"
-    with reply keyboard) but keeps the reply keyboard always visible.
+    after confirm_cb: "✅ Вы записаны" + "👇 Кнопки внизу" with reply
+    keyboard) but keeps the reply keyboard always visible.
     """
     if _is_master(message):
         return
     await message.answer("👇 Кнопки внизу", reply_markup=client_reply_keyboard())
+
+
+async def _clear_source_keyboard(callback: CallbackQuery) -> None:
+    """Remove the inline keyboard from the message the user just tapped (Session 5.51).
+
+    Telegram keeps inline keyboards alive forever. Without this the chat
+    accumulates dead keyboards from past flow steps (date picker, service
+    picker, slot picker, ✅/❌ confirm) — tapping them after the flow moved
+    on silently drops (state no longer matches) — the "кнопки не работают"
+    UX complaint. Called at the START of flow callback handlers: the tapped
+    message loses its buttons immediately, the fresh step message carries
+    the live keyboard.
+
+    Best-effort by design — never blocks the flow:
+    - TelegramBadRequest "message is not modified" — already stripped (e.g.
+      double-tap re-entered the handler); suppressed.
+    - TelegramBadRequest "message to edit not found" — message deleted; suppressed.
+    - InaccessibleMessage (>48h old channel post) — has no .edit_reply_markup;
+      isinstance guard returns silently.
+    """
+    if not isinstance(callback.message, Message):
+        return
+    with suppress(TelegramBadRequest):
+        await callback.message.edit_reply_markup(reply_markup=None)
 
 
 # ============================================================
@@ -366,7 +389,10 @@ async def client_book_cb(
 
     callback.answer() closes the Telegram loading spinner on the inline
     button (UX contract — every callback handler must answer).
+
+    Session 5.51: strips the tapped stale /start menu keyboard.
     """
+    await _clear_source_keyboard(callback)
     settings = get_settings()
     async with async_session_factory() as session:
         master = await _select_master(session, settings)
@@ -616,7 +642,16 @@ async def _process_selected_date(
     booked by another client or /closeday may have deactivated the workday.
     Booking flow has no retry paths here — service picker is always renderable;
     slot retry happens after service selection (service_picker_cb/service_msg).
+
+    Session 5.51: the tapped date-picker message loses its inline keyboard
+    immediately (_clear_source_keyboard) — every branch below either renders
+    the next step or a fresh retry picker, so the old keyboard is always dead.
     """
+    # Strip the tapped date picker's keyboard FIRST — every branch renders
+    # a new message (next-step picker / retry picker / terminal hint), so
+    # the old keyboard is dead from this moment on.
+    await _clear_source_keyboard(callback)
+
     fsm_data = await state.get_data()
     is_slots_path: bool | None = fsm_data.get("is_slots_path")
 
@@ -634,42 +669,40 @@ async def _process_selected_date(
         if not is_transfer:
             # === Booking flow (Session 5.29 Task 2): дата → услуга → слот ===
             # Fetch services for master's business, render service picker.
-            # Slot fetching moved to service_picker_cb/service_msg (after
-            # service selection — uses real service.duration_minutes for
-            # overlap filter against existing bookings, fixes the
-            # 15:30+Стрижка vs 16:00-18:00-Окрашивание overlap bug).
+            # Slot fetching moved to service_picker_cb (after service
+            # selection — uses real service.duration_minutes for overlap
+            # filter against existing bookings, fixes the 15:30+Стрижка vs
+            # 16:00-18:00-Окрашивание overlap bug).
+            # Session 5.51: free-text fallback REMOVED. No services in DB →
+            # booking impossible (unknown duration would corrupt the slot
+            # grid) → clear FSM + ask to come back later.
             from bot.models import Business, Service  # noqa: PLC0415
 
             stmt_b = select(Business).where(Business.id == master.business_id).limit(1)
             business = (await session.execute(stmt_b)).scalar_one_or_none()
+            if business is None:
+                services = []
+            else:
+                stmt_s = (
+                    select(Service)
+                    .where(Service.business_id == business.id, Service.is_active == True)  # noqa: E712
+                    .order_by(Service.name)
+                )
+                services = list((await session.execute(stmt_s)).scalars().all())
+            if not services:
+                await state.clear()
+                if callback.message is not None:
+                    await callback.message.answer(
+                        "Мастер пока не настроил услуги. Загляните позже 🙏"
+                    )
+                await callback.answer()
+                return
+
             await state.update_data(selected_date=slot_date.isoformat())
             await state.set_state(next_state)
-            if business is None:
-                # No business → no services → free-text prompt.
-                if callback.message is not None:
-                    await callback.message.answer(
-                        "Какая услуга? (например: стрижка, окрашивание+стрижка)"
-                    )
-                await callback.answer()
-                return
-
-            stmt_s = (
-                select(Service)
-                .where(Service.business_id == business.id, Service.is_active == True)  # noqa: E712
-                .order_by(Service.name)
-            )
-            services = list((await session.execute(stmt_s)).scalars().all())
-            if not services:
-                if callback.message is not None:
-                    await callback.message.answer(
-                        "Какая услуга? (например: стрижка, окрашивание+стрижка)"
-                    )
-                await callback.answer()
-                return
-
             if callback.message is not None:
                 await callback.message.answer(
-                    "Выберите услугу тапом или напишите свою:",
+                    "Выберите услугу:",
                     reply_markup=service_picker_keyboard(services),
                 )
             await callback.answer()
@@ -1030,11 +1063,14 @@ async def book_date_cancel_cb(callback: CallbackQuery, state: FSMContext) -> Non
     /book vs /slots hint branching. /transfer doesn't reach this handler
     (uses TransferStates.selecting_date + transfer_simple_calendar_cb +
     SimpleCalendar's own 'Отмена' button → SimpleCalAct.cancel branch).
+
+    Session 5.51: strips the tapped picker's keyboard (flow terminates).
     """
     fsm_data = await state.get_data()
     is_slots_path: bool | None = fsm_data.get("is_slots_path")
     # state.clear() BEFORE callback.answer (race condition, MY-VIBE-RULES.md:23).
     await state.clear()
+    await _clear_source_keyboard(callback)
     if callback.message is not None:
         if is_slots_path:
             hint = "Ввод отменён. /slots чтобы начать заново"
@@ -1071,6 +1107,7 @@ async def slot_cb(
             )
         await callback.answer()
         return
+    await _clear_source_keyboard(callback)
     await state.update_data(slot_id=str(callback_data.slot_id))
     # Session 5.36 (B.13): pre-fill name branch. If from_user.first_name is
     # non-empty, show inline [✅ Да, это я] / [👤 Другое имя] instead of the
@@ -1149,6 +1186,7 @@ async def slot_30_cb(
             )
         await callback.answer()
         return
+    await _clear_source_keyboard(callback)
     await state.update_data(
         workday_id=str(callback_data.workday_id),
         start_minute=start_minute,
@@ -1200,6 +1238,7 @@ async def name_pre_fill_yes_cb(
     profile between slot_cb and this tap), fall back to entering_name text
     input (no crash, no lost state).
     """
+    await _clear_source_keyboard(callback)
     first_name = _client_first_name(callback)
     if not first_name:
         # Race: from_user became None OR first_name stripped to empty between
@@ -1230,6 +1269,11 @@ async def name_pre_fill_yes_cb(
 
     # Transition directly to confirming — phone step removed.
     # _render_summary_and_set_confirming renders summary + confirm_keyboard.
+    # Type narrowing: InaccessibleMessage (old channel post) has no .answer()
+    # — same isinstance pattern as confirm_cb. Pre-existing mypy error fix.
+    if not isinstance(callback.message, Message):
+        await callback.answer()
+        return
     if not await _render_summary_and_set_confirming(callback.message, state, first_name):
         await callback.answer()
         return
@@ -1257,7 +1301,10 @@ async def name_pre_fill_other_cb(
     NB: ReplyKeyboardRemove was already sent in slot_cb/slot_30_cb when
     entering entering_name_pre_fill, so the reply keyboard is already
     hidden — no need to send it again here.
+
+    Session 5.51: strips the tapped [✅ Да, это я] keyboard.
     """
+    await _clear_source_keyboard(callback)
     await state.set_state(BookingStates.entering_name)
     if callback.message is not None:
         await callback.message.answer(
@@ -1278,8 +1325,11 @@ async def book_back_to_service_cb(callback: CallbackQuery, state: FSMContext) ->
 
     State transitions: selecting_slot → entering_service.
     Defensive: master not found → state.clear + retry hint (race).
-    No business / no services → free-text prompt (mirrors _process_selected_date).
+    Session 5.51: no business / no services → booking impossible (free-text
+    removed) → state.clear + "не настроил услуги". Strips the tapped
+    slot-picker keyboard — every branch renders a new message or ends the flow.
     """
+    await _clear_source_keyboard(callback)
     settings = get_settings()
     async with async_session_factory() as session:
         master = await _select_master(session, settings)
@@ -1294,30 +1344,28 @@ async def book_back_to_service_cb(callback: CallbackQuery, state: FSMContext) ->
         stmt_b = select(Business).where(Business.id == master.business_id).limit(1)
         business = (await session.execute(stmt_b)).scalar_one_or_none()
         if business is None:
-            await state.set_state(BookingStates.entering_service)
+            services = []
+        else:
+            stmt_s = (
+                select(Service)
+                .where(Service.business_id == business.id, Service.is_active == True)  # noqa: E712
+                .order_by(Service.name)
+            )
+            services = list((await session.execute(stmt_s)).scalars().all())
+        if not services:
+            await state.clear()
             if callback.message is not None:
                 await callback.message.answer(
-                    "Какая услуга? (например: стрижка, окрашивание+стрижка)"
+                    "Мастер пока не настроил услуги. Загляните позже 🙏"
                 )
             await callback.answer()
             return
-        stmt_s = (
-            select(Service)
-            .where(Service.business_id == business.id, Service.is_active == True)  # noqa: E712
-            .order_by(Service.name)
-        )
-        services = list((await session.execute(stmt_s)).scalars().all())
     await state.set_state(BookingStates.entering_service)
     if callback.message is not None:
-        if not services:
-            await callback.message.answer(
-                "Какая услуга? (например: стрижка, окрашивание+стрижка)"
-            )
-        else:
-            await callback.message.answer(
-                "Выберите услугу тапом или напишите свою:",
-                reply_markup=service_picker_keyboard(services),
-            )
+        await callback.message.answer(
+            "Выберите услугу:",
+            reply_markup=service_picker_keyboard(services),
+        )
     await callback.answer()
 
 
@@ -1488,14 +1536,18 @@ async def service_picker_cb(
     Defensive: re-SELECT Service by id (callback_data could be stale/tampered
     — the inline keyboard was built from a DB snapshot at _process_selected_date
     time, but master could have archived the service between picker render
-    and tap). If service deleted or archived → fall back to text input (legacy
-    path): keep state in entering_service, ask for service manually. This
-    avoids a dead-end (user tapped a button that no longer resolves).
+    and tap). Session 5.51: service deleted/archived → re-render a FRESH
+    service picker from DB (free-text fallback removed — unknown duration
+    corrupts the slot grid). If no services remain → state.clear + hint.
 
     Defensive: if selected_date missing in FSM (state corruption after bot
     restart with MemoryStorage) → state.clear + retry hint (NEW edge case
     from critic finding 4, Session 5.29).
+
+    Session 5.51: strips the tapped service-picker keyboard (every branch
+    advances the flow or ends it).
     """
+    await _clear_source_keyboard(callback)
     settings = get_settings()
     fsm_data = await state.get_data()
     selected_date_str: str | None = fsm_data.get("selected_date")
@@ -1523,25 +1575,7 @@ async def service_picker_cb(
         return
 
     async with async_session_factory() as session:
-        from bot.models import Service  # noqa: PLC0415
-
-        stmt = select(Service).where(Service.id == callback_data.service_id)
-        service = (await session.execute(stmt)).scalar_one_or_none()
-        if service is None or not service.is_active:
-            # Service was archived/deleted between picker render and tap.
-            # Stay in entering_service, ask for free-text input.
-            if callback.message is not None:
-                await callback.message.answer(
-                    "Эта услуга больше недоступна. Напишите услугу текстом "
-                    "(например: стрижка, окрашивание+стрижка):"
-                )
-            await callback.answer()
-            return
-
-        await state.update_data(
-            service_id=str(service.id),
-            service_title=service.name,
-        )
+        from bot.models import Business, Service  # noqa: PLC0415
 
         master = await _select_master(session, settings)
         if master is None:
@@ -1552,6 +1586,44 @@ async def service_picker_cb(
                 )
             await callback.answer()
             return
+
+        stmt = select(Service).where(Service.id == callback_data.service_id)
+        service = (await session.execute(stmt)).scalar_one_or_none()
+        if service is None or not service.is_active:
+            # Service was archived/deleted between picker render and tap.
+            # Session 5.51: re-render a FRESH service picker from DB (no
+            # free-text fallback). If nothing remains → booking impossible.
+            stmt_b = select(Business).where(Business.id == master.business_id).limit(1)
+            business = (await session.execute(stmt_b)).scalar_one_or_none()
+            if business is None:
+                services = []
+            else:
+                stmt_s = (
+                    select(Service)
+                    .where(Service.business_id == business.id, Service.is_active == True)  # noqa: E712
+                    .order_by(Service.name)
+                )
+                services = list((await session.execute(stmt_s)).scalars().all())
+            if not services:
+                await state.clear()
+                if callback.message is not None:
+                    await callback.message.answer(
+                        "Мастер пока не настроил услуги. Загляните позже 🙏"
+                    )
+                await callback.answer()
+                return
+            if callback.message is not None:
+                await callback.message.answer(
+                    "Эта услуга больше недоступна. Выберите другую:",
+                    reply_markup=service_picker_keyboard(services),
+                )
+            await callback.answer()
+            return
+
+        await state.update_data(
+            service_id=str(service.id),
+            service_title=service.name,
+        )
 
         keyboard = await _fetch_slot_picker_for_service(
             session,
@@ -1597,26 +1669,7 @@ async def service_picker_cb(
 
 
 # ============================================================
-# 4c. service_custom_cb — user tapped "✏️ Своя услуга" (Session 5.27 FEAT)
-# ============================================================
-@router.callback_query(F.data == "book_service_custom", StateFilter(BookingStates.entering_service))
-async def service_custom_cb(callback: CallbackQuery, state: FSMContext) -> None:
-    """User tapped "Своя услуга" — keep state in entering_service, ask for text.
-
-    Existing service_msg catches the next text message and proceeds to
-    confirming (legacy path, no service_id set → _build_end_at uses default
-    duration). callback.answer() closes the loading spinner on the inline
-    button (Telegram UX contract).
-    """
-    if callback.message is not None:
-        await callback.message.answer(
-            "Напишите услугу текстом (например: стрижка, окрашивание+стрижка):"
-        )
-    await callback.answer()
-
-
-# ============================================================
-# 4d. book_back_to_date_cb — user tapped '↩️ Назад' in service picker
+# 4c. book_back_to_date_cb — user tapped '↩️ Назад' in service picker
 # ============================================================
 @router.callback_query(F.data == "book_back_to_date", StateFilter(BookingStates.entering_service))
 async def book_back_to_date_cb(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1629,7 +1682,10 @@ async def book_back_to_date_cb(callback: CallbackQuery, state: FSMContext) -> No
     State transitions: entering_service → selecting_date.
     Defensive: master not found → state.clear + retry hint (race with
     business config change between render and back-tap).
+
+    Session 5.51: strips the tapped service-picker keyboard.
     """
+    await _clear_source_keyboard(callback)
     fsm_data = await state.get_data()
     is_slots_path: bool | None = fsm_data.get("is_slots_path")
     settings = get_settings()
@@ -1655,91 +1711,23 @@ async def book_back_to_date_cb(callback: CallbackQuery, state: FSMContext) -> No
 
 
 # ============================================================
-# 5. service_msg — user typed service → show confirmation
+# 5. service_msg — user typed text while service picker is on screen
 # ============================================================
 @router.message(StateFilter(BookingStates.entering_service))
-async def service_msg(message: Message, state: FSMContext) -> None:
-    """User typed free-text service — save, fetch slots filtered by
-    SERVICE_DEFAULT_DURATION_MIN, transition to selecting_slot, render slot picker.
+async def service_msg(message: Message) -> None:
+    """Free-text service input is DISABLED (Session 5.51).
 
-    Session 5.29 (Task 2 — FSM reorder): moved from "service → confirming"
-    to "service → selecting_slot". Free-text services don't have a known
-    duration in DB → fallback to SERVICE_DEFAULT_DURATION_MIN (60) for the
-    overlap filter. The user-visible consequence: a free-text "стрижка" gets
-    a 60-min filter, which is more permissive than a tapped "Стрижка" service
-    (also 60 min in DB) — no UX difference for the default case.
+    Rationale: a free-text service has no duration in DB → booking silently
+    used SERVICE_DEFAULT_DURATION_MIN (60) → the calendar and master's
+    /today /week showed a window that didn't match the real job length.
+    Services are tap-only: the client picks from the master's own list,
+    where every option has a known duration_minutes.
 
-    Defensive: if selected_date missing in FSM (state corruption after bot
-    restart with MemoryStorage) → state.clear + retry hint (NEW edge case
-    from critic finding 4, Session 5.29).
+    This handler exists so a typed text doesn't silently drop: aiogram
+    answers with a hint to use the picker. The service-picker message (with
+    its buttons) is still in the chat above this text.
     """
-    service = message.text.strip() if message.text else ""
-    if not service:
-        await message.answer("Услуга не может быть пустой. Введите услугу:")
-        return
-    if len(service) > 255:
-        await message.answer("Услуга слишком длинная (макс. 255 символов). Введите короче:")
-        return
-
-    settings = get_settings()
-    fsm_data = await state.get_data()
-    selected_date_str: str | None = fsm_data.get("selected_date")
-    is_slots_path: bool | None = fsm_data.get("is_slots_path")
-    if not selected_date_str:
-        await state.clear()
-        await message.answer("❌ Данные потеряны. Начните заново через /book или /slots")
-        return
-
-    try:
-        slot_date = date.fromisoformat(selected_date_str)
-    except ValueError:
-        await state.clear()
-        await message.answer("❌ Ошибка даты. Начните заново через /book или /slots")
-        return
-
-    await state.update_data(service_title=service, service_id=None)
-
-    async with async_session_factory() as session:
-        master = await _select_master(session, settings)
-        if master is None:
-            await state.clear()
-            await message.answer("❌ Не удалось найти мастера. Обратитесь к администратору.")
-            return
-
-        keyboard = await _fetch_slot_picker_for_service(
-            session,
-            master,
-            slot_date,
-            settings,
-            is_slots_path=bool(is_slots_path),
-            min_duration_min=settings.SERVICE_DEFAULT_DURATION_MIN,
-        )
-        if keyboard is None:
-            # No slots for default duration on this date — retry date picker.
-            await state.update_data(
-                service_id=None,
-                service_title=None,
-                selected_date=None,
-            )
-            await state.set_state(BookingStates.selecting_date)
-            await message.answer(
-                f"На эту дату нет окна под услугу «{service}» "
-                f"({settings.SERVICE_DEFAULT_DURATION_MIN} мин). Выберите другую дату:",
-                reply_markup=await _retry_markup(
-                    session,
-                    master,
-                    settings,
-                    is_transfer=False,
-                    is_slots_path=is_slots_path,
-                ),
-            )
-            return
-
-        await state.set_state(BookingStates.selecting_slot)
-        await message.answer(
-            "Выберите время:",
-            reply_markup=keyboard,
-        )
+    await message.answer("Пожалуйста, выберите услугу кнопкой 👇")
 
 
 # ============================================================
@@ -1755,6 +1743,11 @@ async def confirm_cb(
     """User confirmed — call create_booking service, handle exceptions.
 
     `scheduler` injected from dp["scheduler"] workflow_data (set in bot.main).
+
+    Session 5.51: strips the ✅/❌ keyboard from the summary message — after
+    booking (or any terminal error below) those buttons are dead; the client
+    gets the always-on reply keyboard back instead of the removed
+    post_booking_keyboard (it duplicated [Записаться]/[Мои записи]).
     """
     # W3 (code-review iter 2): early guard — callback.from_user is None in
     # inaccessible-message edge cases. Mirrors mybookings_cancel_cb /
@@ -1763,6 +1756,7 @@ async def confirm_cb(
     if callback.from_user is None:
         await callback.answer()
         return
+    await _clear_source_keyboard(callback)
     data = await state.get_data()
     slot_id_str = data.get("slot_id")
     workday_id_str = data.get("workday_id")
@@ -1938,17 +1932,12 @@ async def confirm_cb(
     # state.clear() BEFORE answer (race condition, MY-VIBE-RULES.md 24)
     await state.clear()
     if callback.message is not None:
-        # Session 6 — Task 1: attach post-booking inline keyboard so the
-        # client isn't left in a dead-end after "✅ Вы записаны". Two buttons:
-        # [📋 Мои записи] (ClientMenuMyBookingsCallbackData → re-renders the
-        # /mybookings list via _render_mybookings) and [💇 Ещё запись]
-        # (ClientMenuBookCallbackData → starts a new /book flow). Both
-        # handlers require StateFilter(None) — confirm_cb just cleared state,
-        # so both callbacks are reachable. See post_booking_keyboard docstring
-        # for the "no has_bookings flag" rationale (we just booked → non-empty).
+        # Session 5.51: no inline post_booking_keyboard — the always-on
+        # reply keyboard (restored right below) covers both actions
+        # ([💇 Записаться] / [📋 Мои записи]). Duplicated inline buttons
+        # confused clients ("extra buttons that don't work").
         await callback.message.answer(
             "✅ Вы записаны. Напомню за 24ч и за 1ч.",
-            reply_markup=post_booking_keyboard(),
         )
         # Session 5.36 (B.13): restore client reply keyboard after booking.
         # ReplyKeyboardRemove was sent in slot_cb/slot_30_cb; now that the
@@ -1958,6 +1947,42 @@ async def confirm_cb(
         # Message has .answer(), InaccessibleMessage is for old channel posts.
         if isinstance(callback.message, Message):
             await _restore_reply_keyboard_async(callback.message)
+    await callback.answer()
+
+
+# ============================================================
+# 6a. cancel_flow_cb — user tapped ❌ Отмена in the confirm keyboard
+#     (Session 5.51: handler was MISSING — dead button since 5.27)
+# ============================================================
+@router.callback_query(BookCancelCallbackData.filter(), StateFilter("*"))
+async def cancel_flow_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """Cancel the booking flow from the ✅/❌ confirm keyboard.
+
+    Bug fix (Session 5.51): the ❌ Отмена button (BookCancelCallbackData,
+    keyboards/client.py confirm_keyboard) had NO handler since Session 5.27 —
+    tapping it silently dropped (aiogram logged "callback query not
+    answered"). Now it clears FSM state like /cancel does.
+
+    StateFilter("*"): the button only appears on the confirming summary,
+    but a STALE ❌ (flow restarted via /book, state now selecting_date)
+    must also work — "Отмена" means "stop whatever flow I'm in".
+
+    Mirrors cancel_msg: /book vs /slots hint from is_slots_path (read
+    BEFORE state.clear), strip the tapped keyboard, restore the reply
+    keyboard.
+    """
+    fsm_data = await state.get_data()
+    is_slots_path: bool | None = fsm_data.get("is_slots_path")
+    # state.clear() BEFORE answer (race condition, MY-VIBE-RULES.md 24)
+    await state.clear()
+    await _clear_source_keyboard(callback)
+    if is_slots_path:
+        hint = "Ввод отменён. /slots чтобы начать заново"
+    else:
+        hint = "Ввод отменён. /book чтобы начать заново"
+    if isinstance(callback.message, Message):
+        await callback.message.answer(hint)
+        await _restore_reply_keyboard_async(callback.message)
     await callback.answer()
 
 
@@ -2146,7 +2171,10 @@ async def client_mybookings_cb(
     button (UX contract — every callback handler must answer). Empty
     bookings case: helper already answers "У вас нет активных записей",
     callback.answer still runs to clear the spinner.
+
+    Session 5.51: strips the tapped stale post-booking menu keyboard.
     """
+    await _clear_source_keyboard(callback)
     if callback.from_user is None:
         await callback.answer()
         return
@@ -2220,6 +2248,12 @@ async def mybookings_cancel_cb(
                 await callback.message.answer("❌ Отмена возможна только за 24+ часов до записи")
             await callback.answer()
             return
+
+        # Session 5.51: cancel succeeded → the /mybookings list (with its
+        # [❌ Отменить]/[🔄 Перенести] buttons) is stale — strip its keyboard.
+        # Early error popups above keep the keyboard (other bookings' buttons
+        # are still valid, user can tap another one).
+        await _clear_source_keyboard(callback)
 
         # Send master notification (Pure/IO — service prepared text, handler sends).
         # Single-master MVP: master.telegram_id == settings.ADMIN_ID (verified
@@ -2311,6 +2345,11 @@ async def mybookings_transfer_cb(
             await callback.answer()
             return
 
+    # Session 5.51: validation passed → transfer FSM starts, the /mybookings
+    # list message (with its [❌]/[🔄] buttons) goes stale — strip it. Early
+    # popups above keep the keyboard (other bookings remain actionable).
+    await _clear_source_keyboard(callback)
+
     # Save booking_id + is_slots_path in FSM (B.1: is_slots_path=True so
     # _process_selected_date enters workday branch (line 684) for transfer flow
     # → renders BookSlot30CallbackData picker instead of legacy slot picker).
@@ -2379,6 +2418,9 @@ async def transfer_slot_cb(
     `scheduler` injected from dp["scheduler"] workflow_data (same as confirm_cb).
     state.clear() BEFORE service call (race condition, MY-VIBE-RULES.md 24 — same as
     confirm_cb:355 and mybookings_cancel_cb does NOT clear because it has no FSM state).
+
+    Session 5.51: strips the tapped slot-picker keyboard (every branch
+    terminates the transfer flow — success or terminal error).
     """
     from sqlalchemy import select
 
@@ -2387,6 +2429,7 @@ async def transfer_slot_cb(
     if callback.from_user is None:
         await callback.answer()
         return
+    await _clear_source_keyboard(callback)
 
     data = await state.get_data()
     booking_id_str = data.get("transfer_booking_id")
@@ -2526,6 +2569,9 @@ async def transfer_slot_30_cb(
 
     `scheduler` injected from dp["scheduler"] workflow_data (same as transfer_slot_cb).
     state.clear() BEFORE service call (race condition, same as transfer_slot_cb).
+
+    Session 5.51: strips the tapped slot-picker keyboard (every branch
+    terminates the transfer flow).
     """
     from datetime import time as dt_time
 
@@ -2548,6 +2594,7 @@ async def transfer_slot_30_cb(
     if callback.from_user is None:
         await callback.answer()
         return
+    await _clear_source_keyboard(callback)
 
     # Defensive range check (mirror slot_30_cb:1127).
     start_minute = callback_data.start_minute

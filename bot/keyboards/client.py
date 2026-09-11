@@ -118,10 +118,9 @@ class BookServiceCallbackData(CallbackData, prefix="book_service"):
     Distinct prefix "book_service" — no conflict with booking flow callbacks
     (BookSlotCallbackData prefix="book_slot", BookSlot30CallbackData prefix="book_slot_30").
 
-    Fallback "Своя услуга" uses plain string "book_service_custom" (no payload)
-    caught by F.data == "book_service_custom" filter — handler keeps FSM in
-    entering_service and asks for text; existing service_msg catches the
-    free-text answer (legacy path, no service_id set → default duration).
+    Session 5.51: the free-text fallback ("✏️ Своя услуга" → book_service_custom)
+    is REMOVED — free-text services had no DB duration → wrong calendar.
+    Services are tap-only now.
     """
 
     service_id: UUID
@@ -144,8 +143,8 @@ class BookDateCallbackData(CallbackData, prefix="book_date"):
     simple_calendar_cb).
 
     Cancel is a plain string "book_date_cancel" (no payload) caught by
-    F.data == "book_date_cancel" filter — mirrors the "book_service_custom"
-    pattern (BookServiceCallbackData docstring).
+    F.data == "book_date_cancel" filter — plain-string callback pattern
+    (no payload to pack).
     """
 
     work_date: str
@@ -164,20 +163,20 @@ class ClientMenuBookCallbackData(CallbackData, prefix="client_book"):
     book_service, book_date) — aiogram dispatch is exact-prefix match.
     Plain prefix (no payload) — same pattern as BookConfirmCallbackData.
 
-    Also re-used by post_booking_keyboard [💇 Ещё запись] button (2026-09-06
-    Session 6 — Task 1): after a successful booking, the client taps this
-    button to start another booking without typing /book. StateFilter(None)
-    on client_book_cb allows entry from the just-cleared confirm_cb state.
+    Session 5.51: post_booking_keyboard was REMOVED (duplicated the
+    always-on reply keyboard); the handler stays for STALE keyboards from
+    pre-5.51 sessions and the /start client_inline_menu.
     """
 
 
 class ClientMenuMyBookingsCallbackData(CallbackData, prefix="client_mybookings"):
-    """Post-booking [📋 Мои записи] button (Session 6 — Task 1, 2026-09-06).
+    """[📋 Мои записи] button (Session 6 — Task 1, 2026-09-06).
 
-    Used by post_booking_keyboard to give the client a one-tap way to view
-    their existing bookings after a successful confirm. Tap → handler
-    re-uses the same _render_mybookings helper as /mybookings (shows list +
-    [❌ Отменить] / [🔄 Перенести] buttons for cancelable bookings).
+    Session 5.51: post_booking_keyboard was REMOVED — new keyboards don't
+    carry this callback. The handler stays for STALE keyboards from
+    pre-5.51 sessions. Tap → handler re-uses the same _render_mybookings
+    helper as /mybookings (shows list + [❌ Отменить] / [🔄 Перенести]
+    buttons for cancelable bookings).
 
     Distinct prefix from booking flow callbacks (book_*, mybook_*) — aiogram
     dispatch is exact-prefix match. Plain prefix (no payload) — same pattern
@@ -202,32 +201,6 @@ def client_inline_menu() -> InlineKeyboardMarkup:
     """
     builder = InlineKeyboardBuilder()
     builder.button(text="💇 Записаться", callback_data=ClientMenuBookCallbackData().pack())
-    return builder.as_markup()
-
-
-def post_booking_keyboard() -> InlineKeyboardMarkup:
-    """Two-button inline menu shown after a successful booking (Session 6 — Task 1).
-
-    Layout: 1 row, 2 buttons:
-      - [📋 Мои записи] → ClientMenuMyBookingsCallbackData → re-renders the
-        /mybookings list (cancelable bookings get [❌ Отменить] buttons).
-      - [💇 Ещё запись]  → ClientMenuBookCallbackData → starts a new /book
-        flow (state.clear already done in confirm_cb, StateFilter(None) OK).
-
-    Why both buttons unconditionally (no has_bookings flag): the mybookings
-    handler already says "У вас нет активных записей" when the list is empty,
-    so showing [📋 Мои записи] after a successful booking is never misleading
-    (we just created one — list is non-empty). Skipping a DB count lookup
-    here keeps the keyboard builder pure (no session needed) and matches
-    the Pure/I-O contract of keyboard helpers (no side effects, no DB).
-
-    adjust(2) — both buttons on the same row (Telegram renders side-by-side
-    on desktop, stacked on narrow mobile — both layouts are readable).
-    """
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📋 Мои записи", callback_data=ClientMenuMyBookingsCallbackData().pack())
-    builder.button(text="💇 Ещё запись", callback_data=ClientMenuBookCallbackData().pack())
-    builder.adjust(2)
     return builder.as_markup()
 
 
@@ -440,30 +413,33 @@ def service_picker_keyboard(services: list[Service]) -> InlineKeyboardMarkup:
 
     Each button shows service.name (up to 255 chars — Telegram truncates display
     if too long). callback_data carries BookServiceCallbackData(service_id).
-    Last row adds "✏️ Своя услуга" (callback_data="book_service_custom") as a
-    fallback to the legacy free-text input — covers unusual requests that
-    don't match the predefined service list.
+
+    Session 5.51: "✏️ Своя услуга" button REMOVED. Free-text services broke the
+    calendar: unknown text → service_id=None → SERVICE_DEFAULT_DURATION_MIN
+    (60) silently substituted → slot grid and /today showed wrong duration.
+    Client must choose from the master's own services — that's the only way
+    the booked time matches what the calendar reserved.
 
     Session 5.30 (S1): last row adds "↩️ Назад" (callback_data="book_back_to_date")
     to let user return to the date picker without /cancel + /book restart.
 
-    Empty services list is handled by the caller (name_msg shows text prompt
-    instead when no services in DB — single-master MVP, rare case).
+    Empty services list is handled by the caller (the date-selection step
+    answers "Мастер пока не настроил услуги" and exits FSM — single-master
+    MVP, rare case).
 
     Args:
         services: list of bot.models.Service (active, business-scoped).
 
     Returns:
-        InlineKeyboardMarkup — buttons in 2 columns (adjust(2)), custom
-        "✏️ Своя услуга" + "↩️ Назад" appended last. With **even** service
-        count the back button pairs with custom on the last row (adjust(2)
-        groups globally); with **odd** count it lands on its own row.
+        InlineKeyboardMarkup — buttons in 2 columns (adjust(2)), "↩️ Назад"
+        appended last. With **odd** service count the back button pairs with
+        the last service on one row; with **even** count it lands on its own
+        row (adjust(2) groups globally).
     """
     builder = InlineKeyboardBuilder()
     for svc in services:
         cb = BookServiceCallbackData(service_id=svc.id)
         builder.button(text=svc.name, callback_data=cb.pack())
-    builder.button(text="✏️ Своя услуга", callback_data="book_service_custom")
     builder.button(text="↩️ Назад", callback_data="book_back_to_date")
     builder.adjust(2)
     return builder.as_markup()
