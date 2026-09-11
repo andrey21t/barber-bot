@@ -84,21 +84,23 @@ async def test_build_scheduler_memory_jobstore(scheduler: AsyncIOScheduler) -> N
     assert isinstance(scheduler._jobstores["default"], MemoryJobStore)
 
 
-def test_set_bot_ref_sets_global() -> None:
+def test_set_bot_ref_sets_global(monkeypatch: pytest.MonkeyPatch) -> None:
     """_set_bot_ref sets the global _bot_ref for scheduled jobs.
 
     Called from main.py:_on_startup before scheduler.start() so that
     scheduled jobs (which don't receive bot as arg) can fall back to
     _bot_ref. Regression guard: if someone renames _bot_ref or removes
     _set_bot_ref, scheduled reminders silently lose bot access.
+
+    Uses monkeypatch (auto-restores on teardown even if assertion fails) to
+    avoid leaking _bot_ref=MagicMock() to other tests if the assert raises.
     """
     import scheduler as sched_mod
 
-    original = sched_mod._bot_ref
     mock_bot = MagicMock()
+    monkeypatch.setattr(sched_mod, "_bot_ref", mock_bot)
     sched_mod._set_bot_ref(mock_bot)
     assert sched_mod._bot_ref is mock_bot
-    sched_mod._set_bot_ref(original)  # restore to avoid leaking to other tests
 
 
 @pytest.mark.asyncio
@@ -712,17 +714,25 @@ async def test_send_reminder_unknown_kind_skips(
     with (
         patch("scheduler._bot_ref", mock_bot),
         patch("bot.db.async_session_factory", session_factory),
+        patch("bot.services.notifications.log_notification", new_callable=AsyncMock) as mock_log,
     ):
         await send_reminder(booking.id, "remind_week", bot=mock_bot)
 
     # No send_message (unknown kind returns before send + before log_notification)
     assert mock_bot.send_message.await_count == 0
+    # log_notification NOT called — UNIQUE(booking_id, kind) not poisoned,
+    # retry with correct kind still works. This is the invariant the test
+    # guards: if a future refactor moves log_notification before the kind
+    # dispatch, send_message.await_count would still be 0 but mock_log would
+    # be awaited → test fails → regression caught.
+    mock_log.assert_not_awaited()
     scheduler.shutdown(wait=False)
 
 
 @pytest.mark.asyncio
 async def test_send_reminder_retry_after_exhausted(
-    session_factory: Any, session: AsyncSession, scheduler: AsyncIOScheduler
+    session_factory: Any, session: AsyncSession, scheduler: AsyncIOScheduler,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """send_reminder: both attempts fail with TelegramRetryAfter → log error, return.
 
@@ -730,6 +740,12 @@ async def test_send_reminder_retry_after_exhausted(
     test_send_reminder_retry_after, but both attempts raise RetryAfter.
     Attempt 0: sleep + continue. Attempt 1: `if attempt == 0` False → log error
     + return (no 3rd try). Real scenario: Telegram under sustained flood control.
+
+    caplog assertion distinguishes this branch (logger.error at line 217,
+    "flood retry failed") from the attempt-0 warning (logger.warning at line
+    209, "flood control, retry after"). Without caplog, both branches produce
+    await_count==2 + sleep called once — the test couldn't tell which log path
+    ran.
     """
     from aiogram.exceptions import TelegramRetryAfter
 
@@ -752,12 +768,18 @@ async def test_send_reminder_retry_after_exhausted(
     # Both attempts consumed; sleep called once (only on attempt 0, not attempt 1)
     assert mock_bot.send_message.await_count == 2
     mock_sleep.assert_awaited_once_with(1)
+    # Retry-exhausted path: logger.error "flood retry failed" (line 217-221),
+    # NOT the attempt-0 logger.warning "flood control, retry after" (line 209-214).
+    assert any(
+        r.levelname == "ERROR" and "flood retry failed" in r.message for r in caplog.records
+    ), "Expected ERROR log 'flood retry failed'"
     scheduler.shutdown(wait=False)
 
 
 @pytest.mark.asyncio
 async def test_send_reminder_generic_telegram_api_error(
-    session_factory: Any, session: AsyncSession, scheduler: AsyncIOScheduler
+    session_factory: Any, session: AsyncSession, scheduler: AsyncIOScheduler,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """send_reminder: generic TelegramAPIError (not Forbidden/BadRequest/RetryAfter)
     → log error, return. Covers scheduler.py:231-232, 238.
@@ -767,6 +789,11 @@ async def test_send_reminder_generic_telegram_api_error(
     TelegramAPIError is the parent of Forbidden/BadRequest/RetryAfter, but
     `except (TelegramForbiddenError, TelegramBadRequest)` matches only subclass
     instances — a base-class instance falls through to `except TelegramAPIError`.
+
+    caplog assertion distinguishes this branch (logger.error at line 232,
+    "send_message failed") from the Forbidden/BadRequest branch (logger.warning
+    at line 224, "chat issue"). Both produce await_count==1 — without caplog
+    the test couldn't tell which except clause ran.
     """
     from aiogram.exceptions import TelegramAPIError
 
@@ -788,6 +815,11 @@ async def test_send_reminder_generic_telegram_api_error(
 
     # Single attempt, no retry (generic API error ≠ RetryAfter)
     assert mock_bot.send_message.await_count == 1
+    # Generic API error path: logger.error "send_message failed" (line 232-236),
+    # NOT the Forbidden/BadRequest logger.warning "chat issue" (line 224-229).
+    assert any(
+        r.levelname == "ERROR" and "send_message failed" in r.message for r in caplog.records
+    ), "Expected ERROR log 'send_message failed'"
     scheduler.shutdown(wait=False)
 
 
