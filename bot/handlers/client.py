@@ -1504,10 +1504,16 @@ async def _render_summary_and_set_confirming(
             return False
 
     await state.set_state(BookingStates.confirming)
-    await message.answer(
+    sent = await message.answer(
         f"Подтвердите запись:\n\n{summary}",
         reply_markup=confirm_keyboard(),
     )
+    # Review W3 (5.51): remember the summary message so cancel_msg (/cancel)
+    # can strip its ✅/❌ keyboard. cancel_msg is a TEXT handler — it cannot
+    # edit another message implicitly, only via bot.edit_message_reply_markup
+    # with this id. Without it, /cancel from confirming leaves a live-looking
+    # confirm keyboard (dead buttons — the exact bug class of this session).
+    await state.update_data(summary_msg_id=sent.message_id)
     return True
 
 
@@ -1973,10 +1979,18 @@ async def cancel_flow_cb(callback: CallbackQuery, state: FSMContext) -> None:
     """
     fsm_data = await state.get_data()
     is_slots_path: bool | None = fsm_data.get("is_slots_path")
+    # Review W2 (5.51): transfer flow ALSO sets is_slots_path=True (B.1), so
+    # the /slots hint below would misdirect a user who tapped stale ❌ while
+    # transferring a booking from /mybookings. Branch on transfer_booking_id
+    # (read BEFORE state.clear) — after cancelling a transfer the user should
+    # go back to their bookings list, not start a fresh booking.
+    transfer_booking_id: str | None = fsm_data.get("transfer_booking_id")
     # state.clear() BEFORE answer (race condition, MY-VIBE-RULES.md 24)
     await state.clear()
     await _clear_source_keyboard(callback)
-    if is_slots_path:
+    if transfer_booking_id is not None:
+        hint = "Перенос отменён. /mybookings чтобы вернуться к записям"
+    elif is_slots_path:
         hint = "Ввод отменён. /slots чтобы начать заново"
     else:
         hint = "Ввод отменён. /book чтобы начать заново"
@@ -2003,9 +2017,25 @@ async def cancel_msg(message: Message, state: FSMContext) -> None:
     # Read is_slots_path ДО state.clear() (race-condition pattern preserves).
     fsm_data_cancel = await state.get_data()
     is_slots_path_cancel: bool | None = fsm_data_cancel.get("is_slots_path")
+    # Review W2 (5.51): transfer sets is_slots_path=True too — branch on the
+    # actual transfer marker so a cancelled transfer points back to
+    # /mybookings (same as the cancel_flow_cb stale-❌ path below).
+    transfer_booking_id: str | None = fsm_data_cancel.get("transfer_booking_id")
+    # Review W3 (5.51): /cancel from confirming must strip the ✅/❌ keyboard
+    # from the summary message — read its id BEFORE state.clear wipes it.
+    summary_msg_id: int | None = fsm_data_cancel.get("summary_msg_id")
     # state.clear() BEFORE answer (race condition, MY-VIBE-RULES.md 24)
     await state.clear()
-    if is_slots_path_cancel:
+    if summary_msg_id is not None and message.bot is not None:
+        with suppress(TelegramBadRequest):
+            await message.bot.edit_message_reply_markup(
+                chat_id=message.chat.id,
+                message_id=summary_msg_id,
+                reply_markup=None,
+            )
+    if transfer_booking_id is not None:
+        hint = "Перенос отменён. /mybookings чтобы вернуться к записям"
+    elif is_slots_path_cancel:
         hint = "Ввод отменён. /slots чтобы начать заново"
     else:
         hint = "Ввод отменён. /book чтобы начать заново"
@@ -2726,5 +2756,11 @@ async def no_state_callback_fallback(callback: CallbackQuery) -> None:
     EARLIER (lines 548, 649) with StateFilter(None) + specific callback_data
     filter — they win by specificity. This fallback only catches unmatched
     callbacks (e.g. stale slot picker from a previous bot run).
+
+    Session 5.51 (review W1): strip the tapped keyboard. A callback that
+    lands here by definition has no live handler in the current state — the
+    keyboard is dead; without the strip every re-tap repeats the alert
+    forever. Same _clear_source_keyboard pattern as every flow step.
     """
+    await _clear_source_keyboard(callback)
     await callback.answer("Сессия истекла — начните через /book", show_alert=True)
