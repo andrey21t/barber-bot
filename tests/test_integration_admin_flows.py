@@ -642,11 +642,11 @@ async def test_booking_flow_with_service_picker_creates_booking(
         bot.reset()
         await dp.feed_update(bot, _make_calendar_day_update(tomorrow, user_id=client_tg))
         step2 = _extract_send_text(bot)
-        assert "Выберите услугу тапом" in step2, (
+        assert "Выберите услугу" in step2, (
             f"5.29 Task 2: with services in DB, must show service picker after date. Got: {step2!r}"
         )
-        # All 4 services present + 'Своя услуга' fallback (matches prod after
-        # 2026-08-30 sync).
+        # All 4 services present. Session 5.51: 'Своя услуга' REMOVED (free
+        # text has no duration → wrong slot grid); only master's own services.
         svc_btn = await _find_button_by_label(bot, "Стрижка")
         assert svc_btn is not None, "Стрижка button in picker"
         svc2_btn = await _find_button_by_label(bot, "Окрашивание")
@@ -656,7 +656,9 @@ async def test_booking_flow_with_service_picker_creates_booking(
         svc4_btn = await _find_button_by_label(bot, "Мелирование")
         assert svc4_btn is not None, "Мелирование button in picker"
         custom_btn = await _find_button_by_label(bot, "Своя услуга")
-        assert custom_btn is not None, "✏️ Своя услуга fallback button"
+        assert custom_btn is None, (
+            "5.51: 'Своя услуга' free-text button must be gone from the picker"
+        )
 
         # Step 3: tap 'Окрашивание' → slot picker (selecting_slot).
         bot.reset()
@@ -689,14 +691,26 @@ async def test_booking_flow_with_service_picker_creates_booking(
         assert confirm_btn is not None, "✅ Подтвердить button on summary"
         bot.reset()
         await dp.feed_update(bot, _make_callback_update_from_button(confirm_btn, user_id=client_tg))
-        # B.13: confirm_cb sends 2 messages — (1) '✅ Вы записаны' with inline
-        # post_booking_keyboard, (2) '👇 Кнопки внизу' with reply keyboard
-        # (via _restore_reply_keyboard_async). last_text returns the LAST one
-        # ('👇 Кнопки внизу'), so check the success text in all sent messages.
+        # B.13: confirm_cb sends 2 messages — (1) '✅ Вы записаны' BARE text
+        # (5.51: post_booking_keyboard inline removed — duplicates of the
+        # always-on reply keyboard showed as dead buttons), (2) '👇 Кнопки
+        # внизу' with reply keyboard (via _restore_reply_keyboard_async).
         step6_texts = _extract_all_send_texts(bot)
         assert any("Вы записаны" in t for t in step6_texts), (
             f"Expected success message, got: {step6_texts!r}"
         )
+        # 5.51: no inline keyboard on the success message (dead-button fix).
+        from aiogram.methods import SendMessage
+
+        success_calls = [
+            c
+            for c in bot.calls
+            if isinstance(c, SendMessage) and "Вы записаны" in (getattr(c, "text", "") or "")
+        ]
+        assert success_calls, "success SendMessage call must be recorded"
+        assert all(
+            getattr(c, "reply_markup", None) is None for c in success_calls
+        ), "5.51: 'Вы записаны' must be bare text — no inline post_booking_keyboard"
 
         # Verify Booking persisted with correct service_id + duration.
         from bot.models import Booking
@@ -721,33 +735,32 @@ async def test_booking_flow_with_service_picker_creates_booking(
 
 
 @pytest.mark.asyncio
-async def test_booking_flow_custom_service_text_uses_default_duration(
+async def test_booking_flow_typed_text_in_service_step_hints_and_flow_continues(
     integration_dispatcher: tuple[Dispatcher, MagicMock],
     session_factory: Any,
 ) -> None:
-    """5.27 FEAT E2E (reordered in 5.29 Task 2; phone step removed 5.50):
-    /slots → calendar → service picker → '✏️ Своя услуга' → typed text →
-    slot picker → name → ✅ → booking with service_id=None +
-    default duration (SERVICE_DEFAULT_DURATION_MIN).
+    """Session 5.51 E2E: free-text service DISABLED. Typed text in the
+    service step → hint 'Пожалуйста, выберите услугу кнопкой' — and the
+    flow is NOT broken: the user can still tap a service button right
+    after the hint and finish the booking.
 
-    Flow (Session 5.29 Task 2 — FSM reorder, услуга ДО слота; phone step
-    removed in 5.50 — name → confirming directly):
+    Was test_booking_flow_custom_service_text_uses_default_duration (5.27):
+    '✏️ Своя услуга' → typed text → booking with service_id=None + default
+    duration. That path is gone — a free-text service has no known
+    duration_minutes → the slot grid and /today would silently use
+    SERVICE_DEFAULT_DURATION_MIN (60) and lie about the reserved time
+    (user report 2026-09-11).
+
+    Flow verified here:
     1. /slots → SimpleCalendar (selecting_date)
     2. tap tomorrow → service picker (entering_service)
-    3. tap '✏️ Своя услуга' → ask for text (still entering_service)
-    4. type custom service → slot picker (selecting_slot)
+    3. type 'Борода + стрижка' → hint (STILL entering_service — state not
+       cleared, not advanced; the picker message above is still actionable)
+    4. tap 'Стрижка' → slot picker (selecting_slot)
     5. tap 10:00 slot → 'На чьё имя?' (entering_name)
-    6. type name → summary (confirming, phone step removed)
-    7. tap ✅ → booking created
-
-    Verifies the legacy fallback path: 'Своя услуга' button keeps state in
-    entering_service, service_msg catches the next text message, service_id
-    stays None (or reset to None — F1 fix), _build_end_at uses default.
-
-    F1 regression (stale service_id leaking from previous picker tap) is
-    covered by unit tests in test_client_handlers.py
-    (test_service_msg_clears_stale_service_id_from_state). This integration
-    test focuses on the happy path of the custom-service fallback.
+    6. type name → summary (confirming)
+    7. tap ✅ → booking created with the TAPPED service_id (not the typed
+       text, not None — free-text can no longer reach BookingCreate)
     """
     from freezegun import freeze_time
 
@@ -765,54 +778,65 @@ async def test_booking_flow_custom_service_text_uses_default_duration(
         tomorrow = (datetime.now(ZoneInfo(TZ)) + timedelta(days=1)).date()
         bot.reset()
         await dp.feed_update(bot, _make_calendar_day_update(tomorrow, user_id=client_tg))
-        assert "Выберите услугу тапом" in _extract_send_text(bot)
+        assert "Выберите услугу" in _extract_send_text(bot)
+        # Grab the service button NOW — after the hint (Step 3) the LAST
+        # message has no keyboard, and _find_button_by_label only looks at
+        # the last message. Tapping a button from the message above mirrors
+        # real Telegram (the picker message is still actionable).
+        svc_btn = await _find_button_by_label(bot, "Стрижка")
+        assert svc_btn is not None, "Стрижка button in the service picker"
 
-        # Step 3: tap '✏️ Своя услуга' → ask for text (still entering_service).
-        custom_btn = await _find_button_by_label(bot, "Своя услуга")
-        assert custom_btn is not None
-        bot.reset()
-        await dp.feed_update(bot, _make_callback_update_from_button(custom_btn, user_id=client_tg))
-        assert "Напишите услугу" in _extract_send_text(bot)
-
-        # Step 4: type custom service text → slot picker (selecting_slot).
+        # Step 3: type text instead of tapping → hint, state NOT advanced.
         bot.reset()
         await dp.feed_update(bot, _make_text_update("Борода + стрижка", user_id=client_tg))
+        step3 = _extract_send_text(bot)
+        assert "выберите услугу кнопкой" in step3, (
+            f"5.51: typed text → button hint. Got: {step3!r}"
+        )
+
+        # Step 4: tap 'Стрижка' (from the picker message above) right after
+        # the hint → slot picker — the flow survived the typed text
+        # (entering_service still active).
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(svc_btn, user_id=client_tg))
         step4 = _extract_send_text(bot)
         assert "Выберите время" in step4, (
-            f"5.29 Task 2: custom service text → slot picker. Got: {step4!r}"
+            f"5.51: service tap after text hint → slot picker. Got: {step4!r}"
         )
         slot_btn = await _find_button_by_label(bot, "10:00")
-        assert slot_btn is not None, "10:00 slot button after custom service"
+        assert slot_btn is not None, "10:00 slot button after service tap"
 
         # Step 5: tap 10:00 slot → 'На чьё имя?' (entering_name).
         bot.reset()
         await dp.feed_update(bot, _make_callback_update_from_button(slot_btn, user_id=client_tg))
         assert "На чьё имя" in _extract_send_text(bot)
 
-        # Step 5b: type name → summary (confirming, phone step removed).
+        # Step 6: type name → summary (confirming, phone step removed).
         bot.reset()
         await dp.feed_update(bot, _make_text_update("Паша", user_id=client_tg))
-        step5b = _extract_send_text(bot)
-        assert "Подтвердите запись" in step5b, (
-            f"name_msg → confirming (summary). Got: {step5b!r}"
+        step6 = _extract_send_text(bot)
+        assert "Подтвердите запись" in step6, (
+            f"name_msg → confirming (summary). Got: {step6!r}"
         )
-        assert "Борода + стрижка" in step5b
-        assert "Паша" in step5b
+        # Summary shows the TAPPED service, not the typed text.
+        assert "Стрижка" in step6
+        assert "Борода + стрижка" not in step6
+        assert "Паша" in step6
 
         # Step 7: tap ✅.
         confirm_btn = await _find_button_by_label(bot, "Подтвердить")
         assert confirm_btn is not None
         bot.reset()
         await dp.feed_update(bot, _make_callback_update_from_button(confirm_btn, user_id=client_tg))
-        # B.13: confirm_cb sends 2 messages — '✅ Вы записаны' (inline) +
-        # '👇 Кнопки внизу' (reply keyboard restore). Check success in all sent.
+        # B.13: confirm_cb sends 2 messages — '✅ Вы записаны' (bare text,
+        # 5.51) + '👇 Кнопки внизу' (reply keyboard restore).
         step7_texts = _extract_all_send_texts(bot)
         assert any("Вы записаны" in t for t in step7_texts), (
             f"Expected success message, got: {step7_texts!r}"
         )
 
-        # Verify booking: service_id is None, end_at = start + default duration.
-        from bot.config import get_settings
+        # Verify booking: the TAPPED service_id (Стрижка, 60 min) — free-text
+        # 'Борода + стрижка' must never reach BookingCreate.
         from bot.models import Booking
 
         async with session_factory() as session:
@@ -820,13 +844,12 @@ async def test_booking_flow_custom_service_text_uses_default_duration(
                 select(Booking).where(Booking.master_id == ctx["master_id"])
             )
         assert booking is not None
-        assert booking.service_id is None, (
-            "Custom text path must NOT set service_id — _build_end_at uses "
-            "SERVICE_DEFAULT_DURATION_MIN"
+        assert booking.service_id == ctx["service1_id"], (
+            "Booking must carry the tapped 'Стрижка' service_id — the typed "
+            "free-text must NOT leak into the booking (5.51)"
         )
-        assert booking.service_title_snapshot == "Борода + стрижка"
-        default_min = get_settings().SERVICE_DEFAULT_DURATION_MIN
+        assert booking.service_title_snapshot == "Стрижка"
         duration = (booking.end_at - booking.start_at).total_seconds() / 60
-        assert duration == default_min, (
-            f"end_at - start_at must be {default_min} min (default), got {duration}"
+        assert duration == 60, (
+            f"end_at - start_at must be 60 min (Стрижка duration), got {duration}"
         )
