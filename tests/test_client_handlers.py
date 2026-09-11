@@ -1628,7 +1628,17 @@ async def test_simple_calendar_cb_day_select_happy_shows_service_picker(
     await client_handlers.simple_calendar_cb(cb, callback_data, state)
 
     state.update_data.assert_awaited()
-    assert state.update_data.call_args.kwargs.get("selected_date") == target_date.isoformat()
+    # 5.52 (S3): _process_selected_date calls update_data TWICE now —
+    # (1) selected_date, (2) service_picker_msg_id (tracker for the
+    # service_msg strip-and-rerender). Merge kwargs across all calls
+    # (same pattern as test_name_msg_happy).
+    saved_kwargs: dict[str, Any] = {}
+    for call in state.update_data.await_args_list:
+        saved_kwargs.update(call.kwargs)
+    assert saved_kwargs.get("selected_date") == target_date.isoformat()
+    assert saved_kwargs.get("service_picker_msg_id") is not None, (
+        "S3 (5.52): picker message id must be saved for service_msg strip"
+    )
     state.set_state.assert_awaited_once()
     assert state.set_state.call_args.args[0] == BookingStates.entering_service
 
@@ -2122,47 +2132,129 @@ async def test_name_msg_happy_renders_summary_slot_path(
 
 
 @pytest.mark.asyncio
-async def test_service_msg_typed_text_prompts_button_choice(
+async def test_service_msg_typed_text_rerenders_picker(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """Session 5.51: free-text service input DISABLED. Any text typed while
-    the service picker is on screen → hint to tap a button. State is NOT
-    advanced, NOT cleared — the picker message above is still actionable.
+    """5.52 (S3): free-text stays disabled, but the hint is self-healing.
+    Typed text while the service picker state is active →
+    (1) strip the PREVIOUS picker message (by service_picker_msg_id from FSM
+        — W3 bot.edit_message_reply_markup pattern; deleted message suppressed),
+    (2) send a FRESH picker right next to the hint,
+    (3) store the new picker msg_id.
+    Fixes the deleted-picker dead end (old 5.51 hint pointed at nothing; the
+    only escape was /cancel or /start).
     """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        await _seed_service(session, ctx, name="Стрижка", duration_minutes=60)
+        await _seed_service(session, ctx, name="Окрашивание", duration_minutes=120)
+
     msg = _make_message(user_id=111222333, text="Стрижка")
+    msg.bot = AsyncMock()  # W3 pattern: explicit AsyncMock for strip asserts
+    msg.chat = MagicMock(id=111222333)
     state = _make_state()
-    await state.update_data(selected_date="2026-09-12")
-    # Prep update_data above pollutes the mock — reset so assert_not_awaited
-    # below verifies the HANDLER's calls, not the setup.
+    await state.update_data(selected_date="2026-09-12", service_picker_msg_id=777)
     state.update_data.reset_mock()
 
-    await client_handlers.service_msg(msg)
+    await client_handlers.service_msg(msg, state)
 
+    # (1) previous picker stripped by message id.
+    msg.bot.edit_message_reply_markup.assert_awaited_once()
+    strip_kwargs = msg.bot.edit_message_reply_markup.await_args.kwargs
+    assert strip_kwargs.get("message_id") == 777
+    assert strip_kwargs.get("reply_markup") is None
+    # (2) hint + FRESH picker in the same answer.
     text = _answer_text(msg)
     assert "выберите услугу кнопкой" in text
-    state.update_data.assert_not_awaited()
+    reply_markup = _answer_reply_markup(msg)
+    assert isinstance(reply_markup, InlineKeyboardMarkup)
+    flat_texts = [btn.text for row in reply_markup.inline_keyboard for btn in row]
+    assert "Стрижка" in flat_texts
+    assert "Окрашивание" in flat_texts
+    # (3) fresh picker msg_id stored; state NOT advanced, NOT cleared.
+    state.update_data.assert_awaited_once()
+    assert state.update_data.call_args.kwargs.get("service_picker_msg_id") is not None
     state.set_state.assert_not_awaited()
     state.clear.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_service_msg_empty_text_still_prompts_button_choice(
+async def test_service_msg_empty_text_still_rerenders_picker(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """Session 5.51: even empty/whitespace text → same button hint (no
-    separate empty-validation — free-text is disabled entirely, so there
-    is nothing to validate).
+    """5.51 kept: even empty/whitespace text hits the same handler (no
+    separate empty-validation — free-text is disabled entirely). 5.52 S3:
+    the response is the same self-healing re-render (picker always tappable).
+    No service_picker_msg_id in FSM (pre-5.52 in-flight session) → no strip,
+    fresh picker still rendered (backward compatible).
     """
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        await _seed_service(session, ctx, name="Стрижка", duration_minutes=60)
+
     msg = _make_message(user_id=111222333, text="   ")
+    msg.bot = AsyncMock()
+    msg.chat = MagicMock(id=111222333)
     state = _make_state()
 
-    await client_handlers.service_msg(msg)
+    await client_handlers.service_msg(msg, state)
 
     text = _answer_text(msg)
     assert "выберите услугу кнопкой" in text
+    assert isinstance(_answer_reply_markup(msg), InlineKeyboardMarkup)
+    # No stored picker id → nothing to strip.
+    msg.bot.edit_message_reply_markup.assert_not_awaited()
     state.clear.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_service_msg_no_services_aborts_booking(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.52 (S3): typed text with NO active services in DB → state.clear +
+    'Мастер пока не настроил услуги' (mirrors _process_selected_date —
+    free-text removed in 5.51, booking impossible without a known duration).
+    """
+    async with session_factory() as session:
+        await _seed_full_stack(session)  # business + master, no services
+
+    msg = _make_message(user_id=111222333, text="Стрижка")
+    msg.bot = AsyncMock()
+    msg.chat = MagicMock(id=111222333)
+    state = _make_state()
+    await state.update_data(service_picker_msg_id=777)
+    state.update_data.reset_mock()
+
+    await client_handlers.service_msg(msg, state)
+
+    state.clear.assert_awaited_once()
+    text = _answer_text(msg)
+    assert "не настроил услуги" in text
+    assert _answer_reply_markup(msg) is None
+    state.set_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_service_msg_master_not_found_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.52 (S3): typed text with master missing from DB → state.clear +
+    'Не удалось найти мастера' (mirrors _process_selected_date defensive).
+    """
+    async with session_factory() as session:
+        await session.execute(sa_text("DELETE FROM masters"))
+
+    msg = _make_message(user_id=111222333, text="Стрижка")
+    state = _make_state()
+
+    await client_handlers.service_msg(msg, state)
+
+    state.clear.assert_awaited_once()
+    assert "Не удалось найти мастера" in _answer_text(msg)
 
 
 # ============================================================
@@ -2716,6 +2808,113 @@ async def test_no_state_callback_fallback_strips_dead_keyboard() -> None:
     cb.answer.assert_awaited_once()
     alert_kwargs = cb.answer.await_args.kwargs
     assert alert_kwargs.get("show_alert") is True
+
+
+@pytest.mark.asyncio
+async def test_noop_cb_answers_without_strip() -> None:
+    """S5 (5.52): placeholder 'Нет свободных дат/слотов' button
+    (callback_data='noop', exists since Этап 5.4 with NO handler — eternal
+    spinner on tap) finally has a handler: quiet answer closes the spinner.
+
+    No strip — the noop button shares its keyboard with LIVE row-mates
+    (❌ Отмена / ↩️ Назад); stripping would kill them too. Stale noop taps
+    (no FSM state) reach no_state_callback_fallback FIRST by registration
+    order (fallback is earlier in client.py) → W1 strip+alert contract
+    preserved — router dispatch order can't be tested by direct handler
+    calls, documented in both handlers' docstrings.
+    """
+    cb = _make_string_callback("noop")
+
+    await client_handlers.noop_cb(cb)
+
+    cb.answer.assert_awaited_once()
+    # No keyboard strip, no message sends — info placeholder is a no-op.
+    cb.message.edit_reply_markup.assert_not_awaited()
+    cb.message.answer.assert_not_awaited()
+
+
+def test_noop_cb_registered_after_no_state_fallback() -> None:
+    """S5 (5.52): registration-order pin. aiogram dispatches by registration
+    order (first match wins), so no_state_callback_fallback MUST sit before
+    noop_cb: a stale (State None) noop tap then hits the fallback → keyboard
+    strip + «Сессия истекла» alert (W1 contract), while live-state noop taps
+    fall through to noop_cb's quiet answer. A future file reorder that swaps
+    them would silently invert the contract — this test pins it.
+    """
+    handler_names = [
+        getattr(h.callback, "__name__", repr(h.callback))
+        for h in client_handlers.router.callback_query.handlers
+    ]
+    assert handler_names.index("no_state_callback_fallback") < handler_names.index(
+        "noop_cb"
+    ), f"no_state_callback_fallback must be registered before noop_cb: {handler_names}"
+
+
+def test_cancel_msg_registered_after_state_catch_alls() -> None:
+    """5.52 (review W1): name_msg/service_msg are registered BEFORE
+    cancel_msg — order alone would let them swallow /cancel at the
+    name/service steps. The saving guard is their ~F.text.startswith("/")
+    filter; this pin documents the hazard. The actual /cancel dispatch
+    is proven end-to-end by test_cancel_command_works_in_service_step
+    (integration, dp.feed_update).
+    """
+    msg_handler_names = [
+        getattr(h.callback, "__name__", repr(h.callback))
+        for h in client_handlers.router.message.handlers
+    ]
+    assert msg_handler_names.index("name_msg") < msg_handler_names.index("cancel_msg")
+    assert msg_handler_names.index("service_msg") < msg_handler_names.index("cancel_msg")
+    # The catch-alls MUST carry a second filter (the "/..." exclusion) —
+    # count filter slots: StateFilter + text-exclusion = 2, bare StateFilter = 1.
+    for name in ("name_msg", "service_msg"):
+        for h in client_handlers.router.message.handlers:
+            if getattr(h.callback, "__name__", "") == name:
+                assert h.filters is not None and len(h.filters) >= 2, (
+                    f"W1: {name} must exclude '/...' text — bare StateFilter "
+                    "swallows /cancel before cancel_msg (registered later)"
+                )
+                break
+
+
+@pytest.mark.asyncio
+async def test_cancel_msg_strips_tracked_service_picker() -> None:
+    """5.52 (review W1): /cancel from the service step must strip the
+    tracked service-picker keyboard (service_picker_msg_id in FSM — same
+    W3 msg_id pattern as the ✅/❌ summary strip).
+    """
+    msg = _make_message(user_id=111222333, text="/cancel")
+    msg.bot = AsyncMock()
+    msg.chat = MagicMock(id=111222333)
+    state = _make_state()
+    await state.update_data(service_picker_msg_id=55, is_slots_path=False)
+
+    await client_handlers.cancel_msg(msg, state)
+
+    state.clear.assert_awaited_once()
+    msg.bot.edit_message_reply_markup.assert_awaited_once()
+    kwargs = msg.bot.edit_message_reply_markup.await_args.kwargs
+    assert kwargs.get("message_id") == 55
+    assert kwargs.get("reply_markup") is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_msg_strips_both_summary_and_service_picker() -> None:
+    """5.52: /cancel with BOTH tracked ids (confirming-transition edge:
+    summary shown, user goes back, service picker re-rendered) → two strip
+    calls, one per tracked message id.
+    """
+    msg = _make_message(user_id=111222333, text="/cancel")
+    msg.bot = AsyncMock()
+    msg.chat = MagicMock(id=111222333)
+    state = _make_state()
+    await state.update_data(summary_msg_id=42, service_picker_msg_id=55, is_slots_path=False)
+
+    await client_handlers.cancel_msg(msg, state)
+
+    assert msg.bot.edit_message_reply_markup.await_count == 2
+    strip_calls_list = msg.bot.edit_message_reply_markup.await_args_list
+    stripped_ids = {c.kwargs.get("message_id") for c in strip_calls_list}
+    assert stripped_ids == {42, 55}
 
 
 @pytest.mark.asyncio
@@ -3328,6 +3527,9 @@ async def test_slot_30_cb_out_of_range_clears_state() -> None:
     """Этап 5.8b: slot_30_cb, start_minute outside 0-1439 → state.clear +
     '❌ Ошибка выбора времени' + callback.answer. Defensive against tampered
     callback_data (slot_30_cb:range_check).
+    5.52 (S1): the tapped keyboard is stripped FIRST — the range branch is
+    a terminal retry hint, without the strip every re-tap repeats the error
+    (same bug class as W1).
     """
     workday_id = uuid4()
     # start_minute=1500 is out-of-range (max valid 1439 = 23:59).
@@ -3336,6 +3538,7 @@ async def test_slot_30_cb_out_of_range_clears_state() -> None:
     state = _make_state()
     await client_handlers.slot_30_cb(cb, callback_data, state)
 
+    cb.message.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
     state.clear.assert_awaited_once()
     assert "Ошибка выбора времени" in _answer_text(cb.message)
     state.set_state.assert_not_awaited()
@@ -3348,6 +3551,9 @@ async def test_slot_cb_missing_service_title_clears_state() -> None:
     (state corruption from in-flight session carried over from pre-5.29 flow)
     → state.clear + 'Данные потеряны' + callback.answer. Defensive check BEFORE
     set_state(entering_name) so no stale entering_name state.
+    5.52 (S1): the tapped slot-picker keyboard is stripped FIRST — the
+    defensive branch is a terminal retry hint, without the strip every
+    re-tap of a dead slot button repeats 'Данные потеряны' forever.
     """
     from bot.keyboards.client import BookSlotCallbackData
 
@@ -3364,6 +3570,7 @@ async def test_slot_cb_missing_service_title_clears_state() -> None:
     state.get_data = AsyncMock(return_value={})
     await client_handlers.slot_cb(cb, callback_data, state)
 
+    cb.message.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
     state.clear.assert_awaited_once()
     assert "Данные потеряны" in _answer_text(cb.message)
     state.set_state.assert_not_awaited()
@@ -3376,6 +3583,7 @@ async def test_slot_30_cb_missing_service_title_clears_state() -> None:
     """Session 5.29 Task 2 W2: slot_30_cb, service_title missing in state
     (state corruption) → state.clear + 'Данные потеряны' + callback.answer.
     Defensive check after range check, BEFORE set_state(entering_name).
+    5.52 (S1): keyboard stripped FIRST (terminal branch — see slot_cb twin).
     """
     workday_id = uuid4()
     cb, callback_data = _make_slot_30_callback(
@@ -3388,6 +3596,7 @@ async def test_slot_30_cb_missing_service_title_clears_state() -> None:
     state.get_data = AsyncMock(return_value={})
     await client_handlers.slot_30_cb(cb, callback_data, state)
 
+    cb.message.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
     state.clear.assert_awaited_once()
     assert "Данные потеряны" in _answer_text(cb.message)
     state.set_state.assert_not_awaited()
@@ -3770,10 +3979,11 @@ def _make_string_callback(
     *,
     user_id: int = 111222333,
 ) -> MagicMock:
-    """Mock CallbackQuery with raw callback_data string (for 'book_service_custom').
+    """Mock CallbackQuery with raw callback_data string (no CallbackData factory).
 
-    service_custom_cb uses F.data == "book_service_custom" (NOT CallbackData
-    factory), so we set cb.data directly and skip factory parsing.
+    Used for handlers filtered by F.data == "<literal>": 'book_back_to_service',
+    'book_back_to_date', 'book_cancel', 'noop', and no_state_callback_fallback
+    (any stale prefix). cb.data is set directly; factory parsing is skipped.
     """
     bot = AsyncMock()
     cb = MagicMock(spec=CallbackQuery)
@@ -3986,8 +4196,9 @@ async def test_service_picker_cb_service_archived_rerenders_fresh_picker(
     Race scenario: master archived the service while user was looking at the
     inline keyboard. service_picker_cb re-SELECTs Service by id, checks
     is_active — archived → 'Эта услуга больше недоступна' + fresh picker with
-    the remaining active services. State stays entering_service, no
-    update_data (no service saved on race fallback).
+    the remaining active services. State stays entering_service; the only
+    update_data call is service_picker_msg_id (5.52 S3 tracker for the
+    service_msg strip-and-rerender) — no service_id/service_title saved.
 
     Was test_service_picker_cb_service_archived_falls_back_to_text (5.27):
     free-text prompt 'Напишите услугу' → fresh picker (5.51).
@@ -4013,9 +4224,10 @@ async def test_service_picker_cb_service_archived_rerenders_fresh_picker(
     await client_handlers.service_picker_cb(cb, callback_data, state)
 
     # State stays in entering_service (NOT advanced to selecting_slot),
-    # no service saved on race fallback.
+    # no service saved on race fallback — only the S3 picker tracker.
     state.set_state.assert_not_awaited()
-    state.update_data.assert_not_awaited()
+    state.update_data.assert_awaited_once()
+    assert "service_picker_msg_id" in state.update_data.call_args.kwargs
     text = _answer_text(cb.message)
     assert "недоступна" in text
     # Fresh picker rendered with the remaining active service.
@@ -4039,7 +4251,8 @@ async def test_service_picker_cb_service_deleted_rerenders_fresh_picker(
     """Session 5.51: service_picker_cb defensive — service deleted between
     picker render and tap (callback_data has stale service_id) → Service row
     not found → 'Эта услуга больше недоступна' + fresh picker with remaining
-    active services. State stays entering_service, no update_data.
+    active services. State stays entering_service; the only update_data call
+    is service_picker_msg_id (5.52 S3 — see the archived twin).
 
     Was test_service_picker_cb_service_deleted_falls_back_to_text (5.27):
     free-text prompt → fresh picker (5.51). Seed full stack + one ACTIVE
@@ -4059,7 +4272,8 @@ async def test_service_picker_cb_service_deleted_rerenders_fresh_picker(
     await client_handlers.service_picker_cb(cb, callback_data, state)
 
     state.set_state.assert_not_awaited()
-    state.update_data.assert_not_awaited()
+    state.update_data.assert_awaited_once()
+    assert "service_picker_msg_id" in state.update_data.call_args.kwargs
     text = _answer_text(cb.message)
     assert "недоступна" in text
     markup = _answer_reply_markup(cb.message)
