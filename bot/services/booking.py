@@ -698,8 +698,6 @@ async def cancel_booking(
      10. remove_jobs_for_booking(scheduler, booking_id) — AFTER commit, idempotent
      11. Return CancelResult (handler sends master notification + client confirmation)
     """
-    settings = get_settings()
-    ref = now_utc or datetime.now(UTC)
 
     # Step 1-2: SELECT booking with ownership filter (covers not-found and not-owner)
     stmt = select(Booking).where(Booking.id == booking_id, Booking.client_id == client_id)
@@ -711,19 +709,10 @@ async def cancel_booking(
     if booking.status == "cancelled":
         raise BookingAlreadyCancelledError(f"Booking {booking_id} already cancelled")
 
-    # Step 4: 24h rule (spec.md 406). start_at - 24h is the deadline; past → refuse.
-    # Cross-DB aware-aware comparison: on SQLite booking.start_at is naive (DateTime
-    # variant strips tzinfo on bind/result — verified empirically 2026-08-23), on
-    # Postgres it's aware UTC (TIMESTAMPTZ + asyncpg). Inject tzinfo=UTC on DB-read
-    # side so naive (SQLite) becomes aware UTC — no-op on Postgres where already aware.
-    # ref is aware UTC (caller injects datetime.now(UTC) or test passes aware).
-    cancel_deadline = booking.start_at.replace(tzinfo=UTC) - timedelta(
-        hours=settings.CANCEL_MIN_HOURS
-    )
-    if ref >= cancel_deadline:
-        raise CancelTooLateError(
-            f"now={ref} >= cancel_deadline={cancel_deadline} for booking {booking_id}"
-        )
+    # 24h rule removed for cancellation (session 5.55): clients can always cancel.
+    # The too-late guard remains for TRANSFER only (transfer_booking, different
+    # business logic — moving a slot, master needs rebook lead time).
+    # For cancel, the service proceeds to UPDATE unconditionally.
 
     # Step 5: UPDATE booking SET status='cancelled' + rowcount check (race protection).
     # WHERE clause includes status IN (...) so a concurrent cancel/transfer

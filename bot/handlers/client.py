@@ -2189,34 +2189,24 @@ async def _render_mybookings(message: Message, user_id: int) -> None:
         tz_name = business.timezone if business is not None else settings.TIMEZONE
         tz = ZoneInfo(tz_name)
 
-    # Partition bookings: cancelable (start_at - CANCEL_MIN_HOURS > now) vs too-late.
-    # Cross-DB aware-aware comparison: b.start_at naive on SQLite / aware UTC on
-    # Postgres (TIMESTAMPTZ + asyncpg). Inject tzinfo=UTC on DB-read so naive becomes
-    # aware (no-op on Postgres). now_utc is aware UTC.
+    # All upcoming bookings are cancelable (session 5.55: 24h cancel block removed).
+    # For bookings <24h away, show a soft warning encouraging advance notice.
     now_utc = datetime.now(UTC)
     cancelable: list[Booking] = []
     lines = ["📋 Ваши записи:", ""]
     for b in bookings:
-        # b.start_at: naive on SQLite, aware UTC on Postgres. Inject tzinfo=UTC
-        # (no-op on Postgres) before .astimezone — otherwise Python interprets naive
-        # as system-local TZ (Mac default Europe/Moscow → wrong render; Render UTC
-        # correct by accident). Same pattern as booking.py:380 cancel_booking.
         local_time = b.start_at.replace(tzinfo=UTC).astimezone(tz)
         when = local_time.strftime("%d %b %Y, %H:%M")
-        # Snapshots already escaped, strip newlines for list safety (consistent with
-        # admin._render_bookings — html.escape(quote=False) skips \n).
         name = b.client_name_snapshot.replace("\n", " ")
         service = b.service_title_snapshot.replace("\n", " ")
         lines.append(f"• {when}\n  💇 {service}\n  👤 {name}")
 
-        # Aware-aware comparison: b.start_at.replace(tzinfo=UTC) - timedelta(...)
-        # yields aware UTC deadline; now_utc is aware UTC. Both SQLite (after strip
-        # injection) and Postgres compare correctly.
         deadline = b.start_at.replace(tzinfo=UTC) - timedelta(hours=settings.CANCEL_MIN_HOURS)
         if now_utc < deadline:
             cancelable.append(b)
         else:
-            lines.append("  ⏰ Отмена недоступна (менее 24ч до записи)")
+            cancelable.append(b)
+            lines.append("  ⚠️ Запись скоро — лучше предупредить мастера заранее")
 
     lines.append("")
     if cancelable:
@@ -2226,7 +2216,7 @@ async def _render_mybookings(message: Message, user_id: int) -> None:
             reply_markup=mybookings_keyboard(cancelable, business_timezone=tz_name),
         )
     else:
-        lines.append("Отменить запись нельзя — все записи менее чем через 24ч.")
+        lines.append("Записей нет.")
         await message.answer("\n".join(lines))
 
 
@@ -2319,7 +2309,7 @@ async def mybookings_cancel_cb(
       - cancel_booking raises:
           BookingNotFoundError       → "Запись не найдена"
           BookingAlreadyCancelledError → "Запись уже отменена"
-          CancelTooLateError         → "❌ Отмена возможна только за 24+ часов до записи"
+        (Session 5.55: CancelTooLateError removed from cancel flow — 24h block lifted.)
       - On success: send master notification + "✅ Запись отменена" to client.
 
     `scheduler` injected from dp["scheduler"] workflow_data (set in bot.main),
@@ -2355,11 +2345,6 @@ async def mybookings_cancel_cb(
             return
         except BookingAlreadyCancelledError:
             await callback.answer("Запись уже отменена")
-            return
-        except CancelTooLateError:
-            if callback.message is not None:
-                await callback.message.answer("❌ Отмена возможна только за 24+ часов до записи")
-            await callback.answer()
             return
 
         # Session 5.51: cancel succeeded → the /mybookings list (with its

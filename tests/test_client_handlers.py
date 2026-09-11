@@ -299,30 +299,17 @@ async def test_mybookings_msg_with_cancelable_booking(
 
 
 @pytest.mark.asyncio
-async def test_mybookings_msg_with_too_late_booking(
+async def test_mybookings_msg_with_soon_booking(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """Test #5: booking within 24h → too-late → "⏰ Отмена недоступна" in text,
-    NO inline keyboard (cancel window closed per spec.md 406 — 24h rule).
+    """Session 5.55: booking within 24h → soft warning "⚠️ Запись скоро" in text,
+    WITH inline keyboard (cancel is now always available — 24h block removed).
 
-    start_at = +12h (LOCAL) — chosen to be robust on both Render (UTC system TZ)
-    AND dev (Europe/Moscow TZ): `get_client_bookings` filters via
-    `datetime.now(UTC)` (admin.py:156) — aware UTC. SQLAlchemy variant strips
-    aware→naive on SQLite bind (verified 2026-08-23), so aware UTC vs stored
-    naive UTC compares correctly on SQLite; native TIMESTAMPTZ vs aware UTC on
-    Postgres. The handler partition (mybookings_msg:508) uses aware-aware
-    comparison — `b.start_at.replace(tzinfo=UTC) - timedelta(...)`.
-
-    With start_at = +12h:
-      - Render (system TZ=UTC): now_local == now_utc, filter passes (12h>0).
-      - dev (system TZ=MSK): now_local = now_utc+3h, filter: 12h - 3h = 9h > 0, passes.
-      - Handler partition: deadline = start_at - 24h = -12h (past), now_utc > deadline
-        → too-late (correct on any system TZ, uses datetime.now(UTC)).
+    start_at = +12h (LOCAL) — robust on both Render (UTC system TZ) and dev (MSK).
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
-        # 12h ahead at the next hour mark (LOCAL) — robust window for the reasons above.
         soon_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(hours=12)
         soon_local = soon_local.replace(minute=0, second=0, microsecond=0)
         await _seed_booking(session, ctx=ctx, start_at_local=soon_local)
@@ -332,12 +319,12 @@ async def test_mybookings_msg_with_too_late_booking(
 
     msg.answer.assert_called_once()
     text = _answer_text(msg)
-    assert "⏰ Отмена недоступна" in text, (
-        "booking within 24h must show 'Отмена недоступна' marker in /mybookings list"
+    assert "⚠️ Запись скоро" in text, (
+        "booking within 24h must show soft warning in /mybookings list"
     )
-    # NO inline keyboard — cancel is not available, so no button to offer.
-    assert _answer_reply_markup(msg) is None, (
-        "too-late booking must NOT produce inline keyboard (no cancel possible)"
+    # Inline keyboard IS present — cancel is available even for soon bookings.
+    assert _answer_reply_markup(msg) is not None, (
+        "soon booking must produce inline keyboard (cancel always available)"
     )
 
 
@@ -436,13 +423,13 @@ async def test_mybookings_cancel_cb_happy_path(
 
 
 @pytest.mark.asyncio
-async def test_mybookings_cancel_cb_too_late(
+async def test_mybookings_cancel_cb_soon_booking(
     session_factory: Any,
     patched_session_factory: Any,
     mock_scheduler: MagicMock,
 ) -> None:
-    """Test #8: booking within 24h → CancelTooLateError → handler replies
-    "❌ Отмена возможна только за 24+ часов до записи", booking stays 'confirmed'.
+    """Session 5.55: booking within 24h → cancellation now SUCCEEDS (block removed).
+    Master notified, client gets "✅ Запись отменена", booking → 'cancelled'.
     """
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
@@ -456,24 +443,22 @@ async def test_mybookings_cancel_cb_too_late(
 
     await client_handlers.mybookings_cancel_cb(cb, cb_data, mock_scheduler)
 
-    # Master NOT notified (cancel raised before service returned a result).
-    bot.send_message.assert_not_called()
-    # Client gets the "too late" reply on callback.message (NOT on callback.answer,
-    # because the error message is long — handler uses message.answer, then answer()).
-    cb.message.answer.assert_called_once()
-    err_text = _answer_text(cb.message)
-    assert "❌ Отмена возможна только за 24+ часов до записи" in err_text
-    cb.answer.assert_awaited()
+    # Master IS notified (cancel succeeded).
+    bot.send_message.assert_called()
+    # Client gets success reply.
+    cb.message.answer.assert_called()
+    reply_text = _answer_text(cb.message)
+    assert "отменена" in reply_text.lower() or "отменен" in reply_text.lower()
 
-    # DB: booking STILL 'confirmed' (cancel_booking raised before UPDATE commit).
+    # DB: booking 'cancelled'
     async with session_factory() as verify_session:
         b = (
             await verify_session.execute(select(Booking).where(Booking.id == booking_id))
         ).scalar_one()
-        assert b.status == "confirmed"
+        assert b.status == "cancelled"
 
-    # Scheduler NOT touched (service raised before remove_jobs_for_booking).
-    mock_scheduler.remove_job.assert_not_called()
+    # Scheduler IS called on success (remove_jobs_for_booking).
+    mock_scheduler.remove_job.assert_called()
 
 
 @pytest.mark.asyncio
