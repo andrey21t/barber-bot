@@ -17,6 +17,7 @@ Module-level `scheduler = build_scheduler()` безопасен.
 """
 
 import asyncio
+import html
 import logging
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
@@ -133,13 +134,15 @@ async def send_reminder(booking_id: UUID, kind: str, bot: Any = None) -> None:
 
     async with async_session_factory() as session:
         # Booking has no ORM relationships (models.py uses plain FKs without
-        # relationship()). Explicit JOIN to fetch Client + Business in one query.
-        from bot.models import Booking, Business, Client
+        # relationship()). Explicit JOIN to fetch Client + Business + Master
+        # in one query (Master added in 5.56 for human-readable reminder text).
+        from bot.models import Booking, Business, Client, Master
 
         stmt = (
-            select(Booking, Client, Business)
+            select(Booking, Client, Business, Master)
             .join(Client, Booking.client_id == Client.id)
             .join(Business, Booking.business_id == Business.id)
+            .join(Master, Booking.master_id == Master.id)
             .where(Booking.id == booking_id)
         )
         result = await session.execute(stmt)
@@ -147,7 +150,7 @@ async def send_reminder(booking_id: UUID, kind: str, bot: Any = None) -> None:
         if row is None:
             logger.warning("send_reminder: booking %s not found", booking_id)
             return
-        booking, client, business = row
+        booking, client, business, master = row
 
         # booking.start_at is naive UTC on SQLite (per models.py:30 comment),
         # aware UTC on Postgres. .replace(tzinfo=UTC) is no-op on aware, makes
@@ -172,10 +175,19 @@ async def send_reminder(booking_id: UUID, kind: str, bot: Any = None) -> None:
             )
             return
         time_str = booking.start_at.replace(tzinfo=UTC).astimezone(tz).strftime("%H:%M")
+        # Human-readable reminder (5.56): include service + master name so the
+        # client knows WHAT the appointment is for, not just "завтра в 14:00".
+        # service_title_snapshot is already html.escape()'d in DB (booking.py:511).
+        # master.name is NOT escape'd at write (models.py:57, no escape in DB seed),
+        # so escape at render — mirrors booking.py:510-511 pattern. Without escape,
+        # a master name with <, >, & would fail Telegram HTML parse → TelegramBadRequest
+        # → UNIQUE(booking_id,kind) blocks retry forever (silent reminder loss).
+        service = booking.service_title_snapshot
+        master_name = html.escape(master.name, quote=False)
         if kind == "remind_24h":
-            text = f"Напоминаю: завтра в {time_str}"
+            text = f"Напоминаю: завтра в {time_str} — 💇 {service}, мастер {master_name}"
         elif kind == "remind_1h":
-            text = f"Через час: {time_str}"
+            text = f"Через час в {time_str} — 💇 {service}, мастер {master_name}"
         else:
             logger.warning("send_reminder: unknown kind=%s for booking=%s, skip", kind, booking_id)
             return

@@ -210,10 +210,10 @@ async def test_on_startup_scan_phase_1_sends_overdue(
     assert mock_bot.send_message.await_count == 1
     chat_id, text = mock_bot.send_message.await_args.args
     assert chat_id == 111222333  # client.telegram_id from _seed_booking
-    # Text format: "Напоминаю: завтра в HH:MM" (start_at in business.timezone).
-    # Exact time depends on test run time (start_at = now-12h), so check prefix only.
+    # Text format (5.56): "Напоминаю: завтра в HH:MM — 💇 <service>, мастер <name>"
     assert text.startswith("Напоминаю: завтра в ")
-    assert len(text) == len("Напоминаю: завтра в HH:MM")
+    assert "💇 Test" in text
+    assert "мастер Екатерина" in text
 
     # log_notification should have recorded remind_24h (UNIQUE guard inside send_reminder)
     stmt = select(NotificationLog).where(
@@ -377,7 +377,67 @@ async def test_send_reminder_happy_path(
     assert mock_bot.send_message.await_count == 1
     chat_id, text = mock_bot.send_message.await_args.args
     assert chat_id == 111222333
+    # Text format (5.56): "Напоминаю: завтра в HH:MM — 💇 <service>, мастер <name>"
     assert text.startswith("Напоминаю: завтра в ")
+    assert "💇 Test" in text
+    assert "мастер Екатерина" in text
+    scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_send_reminder_escapes_master_name_html_metachars(
+    session_factory: Any, session: AsyncSession, scheduler: AsyncIOScheduler
+) -> None:
+    """Regression test for F1 (code-review 5.56): master.name with HTML
+    metacharacters (<, >, &) must be html.escape()'d in reminder text.
+
+    Bot's default parse_mode=ParseMode.HTML (main.py:104). Without escape,
+    a master name like "A & B" or "<script>" would fail Telegram HTML parse →
+    TelegramBadRequest → log_notification UNIQUE(booking_id, kind) blocks retry
+    forever → silent reminder loss.
+
+    Fix (5.56): scheduler.py:181 escapes master.name via html.escape(name, quote=False),
+    mirroring booking.py:510-511 pattern for client_name_snapshot.
+
+    Test seeds booking with safe master.name="Екатерина" (default _seed_booking),
+    then UPDATEs Master.name to "A & B <b>" via direct SQL (simulates future
+    /addmaster or DB-side edit with unsafe chars). Asserts the reminder text
+    contains the escaped form "A &amp; B &lt;b&gt;" — NOT the raw metacharacters.
+    """
+    _start_scheduler(scheduler)
+    booking_start = datetime.now(UTC) - timedelta(hours=12)
+    booking = await _seed_booking(session, booking_start)
+
+    # Corrupt master name AFTER seed (direct UPDATE, simulates DB-side edit)
+    from bot.models import Master
+    from sqlalchemy import update
+
+    unsafe_name = "A & B <b>"
+    await session.execute(
+        update(Master).where(Master.id == booking.master_id).values(name=unsafe_name)
+    )
+    await session.commit()
+
+    mock_bot = AsyncMock()
+    with (
+        patch("scheduler._bot_ref", mock_bot),
+        patch("bot.db.async_session_factory", session_factory),
+    ):
+        await send_reminder(booking.id, "remind_24h", bot=mock_bot)
+
+    assert mock_bot.send_message.await_count == 1
+    _, text = mock_bot.send_message.await_args.args
+    # Escaped form — html.escape(name, quote=False) replaces & < > but not " '.
+    expected_escaped = "A &amp; B &lt;b&gt;"
+    assert expected_escaped in text, (
+        f"Expected escaped master name {expected_escaped!r} in reminder, got {text!r}. "
+        "If you see raw '& B <b>' — F1 regression: master.name NOT escape'd → "
+        "TelegramBadRequest on parse_mode=HTML → silent reminder loss."
+    )
+    # Ensure raw metacharacters are NOT present (only escaped forms).
+    assert "A & B <b>" not in text, (
+        f"Raw HTML metacharacters leaked into reminder text: {text!r}"
+    )
     scheduler.shutdown(wait=False)
 
 
@@ -428,9 +488,12 @@ async def test_send_reminder_timezone_utc_to_moscow(
 
     assert mock_bot.send_message.await_count == 1
     _, text = mock_bot.send_message.await_args.args
-    # 11:00 UTC → 14:00 Europe/Moscow (UTC+3, no DST in January)
-    assert text == "Напоминаю: завтра в 14:00", (
-        f"Expected 'Напоминаю: завтра в 14:00' (11:00 UTC → 14:00 MSK), got {text!r}. "
+    # 11:00 UTC → 14:00 Europe/Moscow (UTC+3, no DST in January).
+    # Strict match (5.56) verifies both TZ conversion AND the new reminder format
+    # ("Напоминаю: завтра в HH:MM — 💇 <service>, мастер <name>").
+    assert text == "Напоминаю: завтра в 14:00 — 💇 Test, мастер Екатерина", (
+        f"Expected 'Напоминаю: завтра в 14:00 — 💇 Test, мастер Екатерина' "
+        f"(11:00 UTC → 14:00 MSK), got {text!r}. "
         "If you see '11:00' — F1 regression: booking.start_at treated as system-local TZ."
     )
     scheduler.shutdown(wait=False)
