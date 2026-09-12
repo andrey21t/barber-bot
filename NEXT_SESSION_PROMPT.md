@@ -1,215 +1,205 @@
-# NEXT_SESSION_PROMPT — barber-bot, session 5.60
+# NEXT_SESSION_PROMPT — barber-bot, coverage Tier 2 (admin.py 66% → ~88%)
 
 ## Контекст
 
-Продолжаем барбер-бот. Сессия 5.59 закрыта: 3 live-теста (2 из 3),
-code-review 5.58 → W1-W3 фиксы.
+Продолжаем закрывать coverage gaps Tier 2 в `admin.py` (66% → цель ~88%).
 
-**main:** `6a77b09` (5.59: 3 фикса по code-review 5.58)
-**VPS:** `d2734ef` на проде (runtime) — 5.58/5.59 только тесты, деплой не нужен
-**Гейты:** ruff ✅ · mypy ✅ · pytest 562 passed / 2 skipped
+**Репо:** `~/PycharmProjects/barber-bot/` (личный pet-проект, коммитить свободно, AGENTS.md § git-repo-categories).
+**Стек:** Python 3.12, aiogram 3.x, SQLAlchemy 2.0 async, SQLite (dev), APScheduler 3.x, freezegun.
+**Формат работы:** `~/PycharmProjects/barber-bot/MY-VIBE-RULES.md` — dev-режим (код сразу, без педагогики), резюме после блока, гейты: deep-analysis на нетривиальное → реализация → verify → code-review.
+**Last commits:**
+- `1098ccf` test(admin): cover admin_addslots_cb 4 branches
+- `975ad00` test(admin): cover cmd_openday 11 branches
+- `512986b` test(client): mybookings_cancel_cb rebook button
+- `7f30e11` feat(admin): 5.61 — week navigation
 
-## Что закрыто в 5.59
+**Гейты на старте:** ruff ✅ · mypy 2 pre-existing errors (`open_workday`, `AdminStates` attr-defined — НЕ ЧИНИТЬ, не наши) · pytest 601 passed / 2 skipped.
 
-1. ✅ **Variant B** (7 admin-кнопок) — live подтверждён (Ekaterina видела)
-2. ✅ **«Нет свободных дат»** — корректное поведение (слотов на 12-13.09 нет в БД)
-3. ✅ **Code-review 5.58** → 1 Warning (false-green docstring) + 2 Suggestions
-   (spec_set, freeze_time) → все 3 фикса в `6a77b09`
-4. ✅ **NEW-reminders live-тест** — НЕ состоялся (все брони на 12-13.09 отменены
-   админом через /openweek в 19:37-20:10 MSK). Нужен новый слот + запись.
-5. ⏳ **Backup live-тест** — завтра 12.09 06:30 MSK. Проверить:
-   ```bash
-   CRED=~/.config/opencode/references/barber-bot-deploy-credentials.md
-   VPS_HOST=$(grep -E '^HOST:' $CRED | sed 's/^HOST: //')
-   BARBER_PASS=$(grep -E '^PASS:' $CRED | sed 's/^PASS: //')
-   sshpass -p "$BARBER_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
-     -o PreferredAuthentications=password -o PubkeyAuthentication=no \
-     root@$VPS_HOST 'cat /var/log/barber_backup.log && ls -la /opt/barber-bot/backups/'
-   ls -la ~/barber-bot-backups/  # Mac offsite через launchd
-   ```
-   Ожидание: лог с "OK: ... (verified TOC)" + barber_2026-09-12_*.dump на VPS и Mac.
+**Coverage baseline:** TOTAL 80% (admin.py 66% / 651 miss из 1937 stmts).
 
-## Задача 5.60: 3 UX/логические правки админ-флоу слотов
+## Проверь себя (ОБЯЗАТЕЛЬНО в начале сессии)
 
-**Причина:** при live-проверке variant B (Ekaterina открыла неделю через
-админ-меню) выявлены 3 UX/логических несоответствия. Не runtime-баги, а
-логика/UX в admin-флоу /openweek.
+1. `cd ~/PycharmProjects/barber-bot && git log --oneline -5` — последний коммит должен быть `1098ccf` или новее.
+2. `uv run pytest --cov=bot --cov-report=term 2>&1 | tail -25` — TOTAL должен быть 80%, admin.py 66%.
+3. `uv run ruff check . 2>&1 | tail -3` — должен быть "All checks passed".
+4. `uv run mypy bot tests 2>&1 | tail -10` — должно быть 6 errors (pre-existing: 2 в admin_handlers, 2 в admin_move, 2 в client_handlers). НЕ мои.
 
-### P1 (логический баг) — неправильный заголовок alert при закрытом дне
+Если что-то не так — откатись к `1098ccf` (`git reset --hard 1098ccf`), рапорт INCOMPLETE.
 
-**Файл:** `bot/handlers/admin.py:3243-3266` (`admin_openweek_confirm_cb`)
+## Задача: закрыть ~8% coverage gaps (80% → ~88%)
 
-**Проблема:** когда админ пытается открыть неделю, а в ней есть **закрытые**
-дни (`is_active=False`), код показывает:
+Промт шёл сверху вниз. Если на задаче идёт 40+ минут — пропусти, оставь на следующую.
+
+**Паттерн тестов** (один для всех, см. `tests/test_admin_handlers.py:301-340` для cmd_*, `:2147-2189` для callback'ов):
+
+```python
+# Command handler (cmd_*):
+async with session_factory() as session:
+    await _seed_admin_stack(session)
+tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+msg = _make_message(user_id=ADMIN_TG_ID, text=f"/openday {tomorrow} 11:00 18:00")
+await admin_handlers.cmd_openday(msg, _make_command(f"{tomorrow} 11:00 18:00"))
+text = _answer_text(msg)
+assert "✅" in text
+
+# Callback handler (admin_*_cb):
+async with session_factory() as session:
+    await _seed_admin_stack(session)
+callback = _make_callback(ADMIN_TG_ID)
+state = _make_mock_state({...})
+await admin_handlers.admin_X_cb(callback, state)
+state.set_state.assert_called_once_with(admin_handlers.AdminStates.X)
 ```
-⚠️ Уже есть окно:
-• Сб 12.09 10:30–19:30 (закрыт)
-• Вс 13.09 09:00–18:00 (закрыт)
 
-Перезаписать окно на 12:00–19:30?
-```
-Это семантическая ошибка. «Перезаписать» = заменить одно окно другим.
-Но закрытый день — это не «окно, которое заменяют», а **день, который
-открывают заново**. Закрыт → действие = re-open.
+Хелперы: `_make_message`, `_make_callback`, `_make_mock_state`, `_answer_text`, `callback_answer_text`, `_seed_admin_stack`. Все уже есть в `tests/test_admin_handlers.py`.
 
-**Решение:** дифференцировать alert_text по статусу дня:
-- Все дни **закрыты** → «День закрыт. Открыть заново на {window}?»
-- Все дни **активны** → «Уже есть окно на {window}. Перезаписать?»
-- **Смешанный** (некоторые закрыты, некоторые активны) → 2 строки в alert:
-  «Открыть заново: ... Перезаписать: ...»
-  Или более простой вариант: объединить в одно «Открыть / перезаписать окно?»
+### T2.1. admin_openday_start_msg (1255-1283, ~28 строк) — ~20 мин
 
-**Место правки:**
-- `bot/handlers/admin.py:3236-3247` — цикл по existing days, формирует
-  `existing_lines` с суффиксом `(закрыт)`. Добавить флаг `all_closed` /
-  `all_active` / `mixed`, формировать заголовок в зависимости.
-- `bot/keyboards/admin.py:596-613` (`admin_openweek_overwrite_keyboard`) —
-  текст кнопки [✅ Да, перезаписать] → при re-open «✅ Да, открыть».
+**Файл:** `bot/handlers/admin.py:1249-1289`
 
-**Deep-analysis (Pass 1-4) обязательна** — логика ветвлений, 3 состояния
-(все закрыты / все активны / смешанный), FSM state не трогать (state
-preserved на alert path, see :3244).
+**Что покрывать:**
+- Non-admin → silent return (no answer)
+- Master not found → `❌ Мастер не найден` + state.clear
+- Bad time format (не HH:MM) → `❌ Время должно быть ЧЧ:ММ` + state.clear
+- Happy → state.update_data(start_time) + state.set_state(picking_window_end) + calendar answer
 
-### P2 (UX) — прошедшие дни недели показаны как тапабельные
+**Гейты:** deep-analysis Pass 1-2 (FSM state-переходы), pytest+ruff, code-reviewer (FSM state change — logic change).
 
-**Файл:** `bot/keyboards/admin.py:568-593` (`admin_week_days_keyboard`)
+**Коммит:** `test(admin): cover admin_openday_start_msg 4 branches (T2.1)`
 
-**Проблема:** клавиатура показывает **все 7 дней** (Пн-Вс) без учёта
-прошедших. Если сегодня пятница 11.09, то Пн(7.09), Вт(8.09), Ср(9.09),
-Чт(10.09) — прошедшие. Админ может тапнуть любой, получить ✅, нажать
-«Открыть» — и в summary получит «❌ Пн 07.09: прошедшая дата».
+### T2.2. admin_openday_end_msg (1297-1371, ~74 строки) — ~35 мин
 
-Код уже фильтрует прошедшие в `_apply_openweek:3079-3081`, но UX — кнопка
-была тапабельна, а на самом деле ничего не делает. Это вводит в заблуждение.
+**Файл:** `bot/handlers/admin.py:1290-1406`
 
-**Решение:** передать в `admin_week_days_keyboard` множество прошедших
-дней недели. Для прошедших дней:
-- **Вариант A (проще):** добавить суффикс `❌` к label, callback_data
-  остаётся (тап → toggle, потом в apply отфильтруется). Минимальная
-  правка, админ видит что день прошедший.
-- **Вариант B (лучше UX):** прошедшие дни — без callback_data (или
-  callback → `callback.answer("День прошёл", show_alert=True)`). Кнопка
-  визуально disabled (нет ✅ prefix, серый `—` вместо `✅`).
+**Что покрывать:**
+- Non-admin → silent return
+- Master not found → `❌ Мастер не найден` + state.clear
+- Bad time format → error message + state.clear
+- end <= start → `❌ Конец должен быть позже начала` + state.clear
+- Happy → state.update_data(end_time) + state.set_state(confirming_window) + summary answer with keyboard
 
-Рекомендация: **Вариант A** (минимальная правка, не ломает toggle-логику).
-Вариант B — если есть время.
+**Гейты:** те же. Может потребоваться `_make_mock_state({"start_time": "11:00"})`.
 
-**Место правки:**
-- `bot/keyboards/admin.py:568-593` — добавить параметр
-  `past_weekdays: set[int] = frozenset()`, для прошедших суффикс `❌`.
-- `bot/handlers/admin.py:2988, 3036` — при вызове передать
-  `past_weekdays=_past_weekdays_for_week(monday, business_tz)`.
-- Добавить helper `_past_weekdays_for_week(monday, tz) -> set[int]` в
-  handlers/admin.py (или keyboards/admin.py) — для каждого weekday 0-6
-  проверить `monday + timedelta(days=weekday) < today_local`.
+**Коммит:** `test(admin): cover admin_openday_end_msg 5 branches (T2.2)`
 
-### P3 (UX, сложнее) — «Ближайшие записи» как осадок в чате
+### T2.3. admin_openweek_edit_start_cb (1864-1915, ~51 строка) — ~25 мин
 
-**Файл:** `bot/handlers/admin.py:2095-2121` (`admin_week_cb`)
+**Файл:** `bot/handlers/admin.py:1852-1920`
 
-**Проблема:** когда админ жмёт «неделя» в inline-меню → бот шлёт
-`await callback.message.answer(...)` — **отдельное сообщение в чат**.
-После этого админ жмёт «Открыть неделю» → flow работает в **другом**
-сообщении (edit_text шагов 1-2-3). Старое «Ближайшие записи» остаётся
-висеть в чате как осадок. Во время всего /openweek flow под клавиатурой
-шага 2-3 видно старое сообщение с записями.
+**Что покрывать:**
+- Non-admin → callback.answer + return
+- Master not found → `❌ Мастер не найден` alert + return
+- State has no selected_date → `❌ Данные сессии потеряны` + state.clear
+- Happy → state.set_state(opening_week_edit_start) + answer with keyboard
 
-**Решение (нужен выбор):**
-- **Вариант A (минимальный):** в `admin_week_cb` при `callback.message`
-  использовать `edit_text` (если message редактируемо) вместо `answer`.
-  Так при следующем /openweek edit_text того же сообщения заменяет
-  «Ближайшие записи» на первый шаг flow. Но: если message старше 48ч
-  или удалено — TelegramBadRequest → fallback на answer.
-  **Проблема:** `admin_week_cb` может вызываться из любого сообщения меню
-  (в т.ч. из сообщения flow), и edit_text на сообщение flow сломает flow.
-  Нужно проверять: если message в FSM state (opening_week) → НЕ edit,
-  а ответ в новом сообщении.
+**Гейты:** те же.
 
-- **Вариант B (лучший UX):** убрать «Ближайшие записи» из отдельного
-  сообщения, встроить в **inline-меню** как expand/collapse секцию.
-  Кнопка «неделя» → edit_text того же сообщения меню (где висит меню)
-  → показать список + меню. Это редизайн inline-меню, сложнее.
+**Коммит:** `test(admin): cover admin_openweek_edit_start_cb 4 branches (T2.3)`
 
-- **Вариант C (компромисс):** в `/openweek` flow на шаге 1 — `delete`
-  (удалить) предыдущее сообщение «Ближайшие записи» (если оно существует
-  в чате и было отправлено bot'ом). Но: `delete` не работает на сообщениях
-  старше 48ч. Нужно проверить возраст.
+### T2.4. admin_today_cb edges (2070-2093, ~23 строки) — ~15 мин
 
-Рекомендация: **Вариант A** (минимальный, не ломает существующее).
-Вариант B — отдельная сессия (редизайн inline-меню).
+**Файл:** `bot/handlers/admin.py:2065-2095` (базовый happy уже может быть покрыт — проверить!)
 
-**Deep-analysis (Pass 1-4) обязательна** для P3 — 3 варианта, FSM state,
-Telegram API ограничения (edit >48h, delete >48h), race с другими callbacks.
+**Что покрывать (только непокрытые ветки):**
+- Non-admin → callback.answer + return
+- Master not found → alert + return
+- message is None → skip answer (edge case)
+
+**Сначала проверь coverage report** — может уже частично покрыто из других тестов. Не дублировать.
+
+**Коммит:** `test(admin): cover admin_today_cb edges (T2.4)`
+
+### T2.5. admin_services_cb + admin_service_name_msg + admin_service_duration_msg (2180-2321, ~92 строки) — ~40 мин
+
+**Файл:** `bot/handlers/admin.py:2168-2321`
+
+**Что покрывать:**
+- admin_services_cb: non-admin, master not found, happy (existing services list), no services → hint
+- admin_service_name_msg: non-admin, master not found, empty name, happy → state.set_state + answer
+- admin_service_duration_msg: non-admin, master not found, bad duration (non-numeric, <= 0), happy → service created + state.clear
+
+**Гейты:** deep-analysis (FSM state), code-reviewer (logic change — new service creation).
+
+**Коммит:** `test(admin): cover admin_services_cb + service_name/duration FSM (T2.5)`
+
+### T2.6. admin_move_confirm_cb edges (2690-2735, ~45 строк) — ~25 мин
+
+**Файл:** `bot/handlers/admin.py:2632-2800`
+
+**Что покрывать (edge cases — happy может быть уже покрыт, проверить):**
+- Non-admin → callback.answer + return
+- Master not found → alert + return
+- State lost (no booking_id) → `❌ Данные сессии потеряны` + state.clear
+- Slot already taken (race) → error message + state.clear
+
+**Сначала coverage report** — не дублировать существующие тесты.
+
+**Коммит:** `test(admin): cover admin_move_confirm_cb edges (T2.6)`
+
+### T2.7. client.py edges (~30 строк) — ~20 мин
+
+**Файл:** `bot/handlers/client.py` — проверить coverage report, взять топ непокрытых.
+
+Скорее всего: business_not_found FK violation (293-294), slot_picker edges (754-839).
+
+**Коммит:** `test(client): cover handler edges (T2.7)`
 
 ## Порядок работы (MY-VIBE-RULES.md)
 
-Для **каждой** правки (P1, P2, P3):
-1. **Deep-analysis Pass 1-4** (risk-class: logic — ветвления, 3 состояния)
-   - Pass 1: риск-класс (logic, не high-stakes — не migration/security)
-   - Pass 2: edge cases (пустые дни, все 7 дней, один день, прошедшие)
-   - Pass 3: state-переходы (FSM state preserved на alert path)
-   - Pass 4: self-verify (pytest + ruff + mypy)
-2. **Реализация** — реальный код, не псевдокод
-3. **Verify** — `uv run pytest tests/test_admin_handlers.py -x` + ruff + mypy
-4. **Code-review** через `code-reviewer` subagent (logic change — обязателен)
-5. **Коммит** — свободный (личный репо, MY-VIBE-RULES:73)
-6. **Деплой на VPS** — только если правка влияет на runtime (P1/P2/P3
-   ВСЕ влияют на runtime — это не тесты). Деплой:
-   ```bash
-   CRED=~/.config/opencode/references/barber-bot-deploy-credentials.md
-   VPS_HOST=$(grep -E '^HOST:' $CRED | sed 's/^HOST: //')
-   BARBER_PASS=$(grep -E '^PASS:' $CRED | sed 's/^PASS: //')
-   sshpass -p "$BARBER_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
-     -o PreferredAuthentications=password -o PubkeyAuthentication=no \
-     root@$VPS_HOST 'cd /opt/barber-bot && git pull && docker compose up -d --build && \
-     docker logs --tail 20 barber-bot-bot-1' 2>&1 | tail -30
-   ```
+Для **каждой** задачи (T2.1-T2.7):
+1. **Проверь coverage report** — `uv run pytest --cov=bot.handlers.admin --cov-report=term-missing tests/test_admin_handlers.py 2>&1 | grep "admin.py"` — не дублируй уже покрытое.
+2. **Deep-analysis Pass 1-2** (risk: logic — FSM state-переходы; skip для trivial edge cases)
+3. **Реализация** — реальные тесты, не псевдокод. Один блок = один коммит.
+4. **Verify** — `uv run pytest tests/test_admin_handlers.py -x && uv run ruff check .`
+5. **Code-review** через `task(subagent_type="code-reviewer")` — только для logic change (FSM state change, new behavior). Skip для trivial edge cases (non-admin silent return).
+6. **Коммит** — свободный (личный репо, MY-VIBE-RULES:73).
+7. **Push** после каждого 2-3 коммита: `git push origin main`.
+8. **Деплой на VPS НЕ НУЖЕН** — это только тесты, runtime код не трогаем.
 
-**Один коммит на одну правку** (P1, P2, P3 — 3 отдельных коммита).
-Не объединять — иначе code-review будет путать логику.
+**Один коммит на одну задачу** (T2.1, T2.2, ... — отдельные коммиты).
 
 ## Что НЕ делать
 
-- ❌ Не трогать `scheduler.py` (покрыт 98%, boundary-тест 5.59)
-- ❌ Не менять FSM state machine (AdminStates) — только тексты/клавиатуры
-- ❌ Не менять `open_workday` / `select_workday` service layer
-- ❌ Не коммитить IP-адреса / креды VPS (pre-push hook: IP regex)
-- ❌ Не менять `admin_inline_menu` (7 кнопок) — только тексты alert
-- ❌ Не делать `delete` на сообщениях старше 48ч (Telegram API)
-- ❌ Не использовать `callback.message.delete()` без проверки возраста
+- ❌ Не трогать `bot/handlers/admin.py`, `bot/keyboards/admin.py`, `bot/handlers/client.py` — только тесты!
+- ❌ Не чинить 2 pre-existing mypy errors (`open_workday`, `AdminStates` attr-defined) — не наши.
+- ❌ Не трогать `scheduler.py` (покрыт 98%, NEXT_SESSION_PROMPT 5.60 запрет).
+- ❌ Не деплоить на VPS — тесты не влияют на runtime.
+- ❌ Не запускать code-reviewer для trivial edge cases (non-admin return) — только для logic change (FSM state, new service creation).
+- ❌ Не коммитить IP-адреса / креды VPS (pre-push hook: IP regex).
 
-## Тесты
+## Телеметрия после каждой задачи
 
-Для P1 и P2 — добавить юнит-тесты в `tests/test_admin_handlers.py`:
-- P1: тест на 3 состояния (все закрыты → «открыть заново», все активны →
-  «перезаписать», смешанный → «открыть/перезаписать»)
-- P2: тест что `admin_week_days_keyboard` с `past_weekdays={0,1,2,3}`
-  показывает суффикс `❌` на Пн-Чт, callback_data для прошедших
-  (вариант A) или его отсутствие (вариант B)
-- P3: тест что `admin_week_cb` при редактируемом message делает edit_text,
-  при TelegramBadRequest → answer
+После каждого коммита — записывай в PLANS.md (создай если нет):
 
-## Данные для live-тестов
+```
+## T2.N — admin_X (commit_hash)
+- Покрыто веток: N
+- Coverage admin.py: X% → Y% (miss: A → B)
+- Tests: 601 → 6XX
+- Время: ~XX мин
+```
 
-### БД после 5.59 (11.09 ~21:00 MSK)
+## Финальный отчёт сессии
 
-- **Слотов в будущем: 0** (min_date=28.08, max_date=29.08)
-- **Броней в будущем (confirmed/transferred): 0** (все 5 отменены)
-- **47bf8c59** (сегодня 15:30 MSK, «Окрашивание и стрижка», client_name=«Андрей») — confirmed, в прошлом
-- **Мастер:** Ekaterina (1 шт, active)
-- **apscheduler_jobs: 0**
+В конце — резюме:
+- TOTAL coverage: 80% → X% (цель ~88%)
+- Коммитов: N
+- Тестов добавлено: N
+- Что НЕ сделано (если что-то пропустил) — конкретные file:line
 
-### Как создать слот на 12.09 для live-теста NEW-reminders
+## Деплой и live-тесты — НЕ для этой сессии
 
-После деплоя 5.60 на VPS:
-1. Ekaterina: `/openweek` → окно 10:00-19:00 → Сб 12.09 → Открыть
-2. Оlesya (client tg=1156374642): `/book` → 12.09 → 13:00 → «Окрашивание» → confirm
-3. remind_1h в 12:00 MSK 12.09 → NEW-формат
-4. Проверить: notifications_log + docker logs grep send_reminder
+Деплой 5.60+5.61 уже сделан в прошлой сессии (`b3fdcf6` на проде). Live-тесты фичи 5.61 (week nav) — вручную в Telegram с Ekaterina, не программная задача.
 
-## Открытые вопросы к пользователю
+## Backup live-тест (опционально)
 
-1. **P3:** какой вариант (A/B/C)? Рекомендация A.
-2. **P2:** вариант A (суффикс `❌`, callback остаётся) или B (callback → alert)?
-3. После 5.60 — coverage gaps (admin.py 65%, client.py 79%) или APScheduler
-   orphan cleanup?
+Если есть время в конце — проверить backup (по расписанию должен был случиться):
+```bash
+CRED=~/.config/opencode/references/barber-bot-deploy-credentials.md
+VPS_HOST=$(grep -E '^HOST:' $CRED | sed 's/^HOST: //')
+BARBER_PASS=$(grep -E '^PASS:' $CRED | sed 's/^PASS: //')
+sshpass -p "$BARBER_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+  -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+  root@$VPS_HOST 'cat /var/log/barber_backup.log && ls -la /opt/barber-bot/backups/' 2>&1 | tail -30
+```
+Ожидание: лог с "OK: ... (verified TOC)" + barber_2026-09-13_*.dump на VPS.
