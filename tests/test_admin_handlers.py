@@ -3416,6 +3416,337 @@ def test_admin_week_days_keyboard_marks_past_days_with_x() -> None:
         )
 
 
+def test_week_monday_offset_zero_equals_current_week_monday() -> None:
+    """5.61 backward compat: _week_monday(tz, 0) == _current_week_monday(tz).
+
+    Without this invariant, existing callsites that still use
+    _current_week_monday (kept as thin wrapper) would drift from new
+    _week_monday-based code.
+    """
+    from bot.handlers.admin import _current_week_monday, _week_monday
+
+    tz = "Europe/Moscow"
+    assert _week_monday(tz, 0) == _current_week_monday(tz), (
+        "offset=0 must match _current_week_monday for backward compat"
+    )
+
+
+def test_week_monday_offset_one_plus_seven_days() -> None:
+    """5.61: _week_monday(tz, 1) == _current_week_monday(tz) + 7 days."""
+    from datetime import timedelta
+
+    from bot.handlers.admin import _current_week_monday, _week_monday
+
+    tz = "Europe/Moscow"
+    base = _current_week_monday(tz)
+    assert _week_monday(tz, 1) == base + timedelta(days=7), (
+        f"offset=1 must be +7 days from base; base={base}, "
+        f"got={_week_monday(tz, 1)}"
+    )
+    assert _week_monday(tz, 2) == base + timedelta(days=14), (
+        "offset=2 must be +14 days"
+    )
+    assert _week_monday(tz, 4) == base + timedelta(days=28), (
+        "offset=4 (cap) must be +28 days"
+    )
+
+
+def test_week_monday_negative_offset_raises() -> None:
+    """5.61: negative offset raises ValueError (prev-week navigation capped
+    at offset=0 by keyboard, defense-in-depth here)."""
+    from bot.handlers.admin import _week_monday
+
+    with pytest.raises(ValueError, match="offset must be >= 0"):
+        _week_monday("Europe/Moscow", -1)
+
+
+def test_admin_week_days_keyboard_scheduled_marker_yellow() -> None:
+    """5.61: scheduled_weekdays (active WorkDay) get ` 🟡` suffix."""
+    from bot.keyboards.admin import admin_week_days_keyboard
+
+    kb = admin_week_days_keyboard(
+        set(),
+        scheduled_weekdays=frozenset({5}),  # Сб has active WorkDay
+    )
+    buttons = [btn for row in kb.inline_keyboard for btn in row]
+    labels = [btn.text for btn in buttons]
+
+    assert "Сб 🟡" in labels, f"Scheduled Sat must have 🟡; got: {labels}"
+    assert "Пн" in labels, "Mon not scheduled — no marker"
+    assert "Пн 🟡" not in labels, "Mon must NOT have 🟡"
+
+
+def test_admin_week_days_keyboard_closed_marker_white_circle() -> None:
+    """5.61: closed_weekdays (is_active=False) get ` ⚪` suffix."""
+    from bot.keyboards.admin import admin_week_days_keyboard
+
+    kb = admin_week_days_keyboard(
+        set(),
+        closed_weekdays=frozenset({6}),  # Вс closed via /closeday
+    )
+    buttons = [btn for row in kb.inline_keyboard for btn in row]
+    labels = [btn.text for btn in buttons]
+
+    assert "Вс ⚪" in labels, f"Closed Sun must have ⚪; got: {labels}"
+    assert "Пн ⚪" not in labels, "Mon not closed — no ⚪"
+
+
+def test_admin_week_days_keyboard_past_overrides_scheduled() -> None:
+    """5.61 suffix priority: ❌ (past) > 🟡 (scheduled) > ⚪ (closed).
+
+    Past day with active WorkDay → only ❌ shown (apply will filter it anyway,
+    no point confusing admin with 🟡 on a past day).
+    """
+    from bot.keyboards.admin import admin_week_days_keyboard
+
+    kb = admin_week_days_keyboard(
+        set(),
+        past_weekdays=frozenset({0}),  # Пн past
+        scheduled_weekdays=frozenset({0}),  # Пн also has active WorkDay
+    )
+    buttons = [btn for row in kb.inline_keyboard for btn in row]
+    labels = [btn.text for btn in buttons]
+
+    assert "Пн ❌" in labels, f"Past must win over scheduled; got: {labels}"
+    assert "Пн 🟡" not in labels, "Past day must NOT show 🟡"
+
+
+def test_admin_week_days_keyboard_nav_buttons_default_present() -> None:
+    """5.61: by default both ← Пред. and След. → buttons are present."""
+    from bot.keyboards.admin import admin_week_days_keyboard
+
+    kb = admin_week_days_keyboard(set())
+    buttons = [btn for row in kb.inline_keyboard for btn in row]
+    labels = [btn.text for btn in buttons]
+
+    assert "← Пред." in labels, "Default: prev button present"
+    assert "След. →" in labels, "Default: next button present"
+
+
+def test_admin_week_days_keyboard_nav_prev_hidden_at_offset_zero() -> None:
+    """5.61: at week_offset=0 (current week), ← Пред. is hidden — previous
+    week is fully in past, no point navigating there."""
+    from bot.keyboards.admin import admin_week_days_keyboard
+
+    kb = admin_week_days_keyboard(set(), can_go_prev=False)
+    buttons = [btn for row in kb.inline_keyboard for btn in row]
+    labels = [btn.text for btn in buttons]
+
+    assert "← Пред." not in labels, "can_go_prev=False → prev hidden"
+    assert "След. →" in labels, "can_go_next default True → next present"
+
+
+def test_admin_week_days_keyboard_nav_next_hidden_at_cap() -> None:
+    """5.61: at week_offset=MAX (4), След. → is hidden — can't go beyond cap."""
+    from bot.keyboards.admin import admin_week_days_keyboard
+
+    kb = admin_week_days_keyboard(set(), can_go_next=False)
+    buttons = [btn for row in kb.inline_keyboard for btn in row]
+    labels = [btn.text for btn in buttons]
+
+    assert "След. →" not in labels, "can_go_next=False → next hidden"
+    assert "← Пред." in labels, "can_go_prev default True → prev present"
+
+
+def test_admin_week_days_keyboard_nav_callback_data_packs_delta() -> None:
+    """5.61: nav buttons use AdminOpenWeekNavCallbackData with delta=-1/+1."""
+    from bot.keyboards.admin import (
+        AdminOpenWeekNavCallbackData,
+        admin_week_days_keyboard,
+    )
+
+    kb = admin_week_days_keyboard(set())
+    buttons = [btn for row in kb.inline_keyboard for btn in row]
+    nav_buttons = [btn for btn in buttons if btn.text in ("← Пред.", "След. →")]
+
+    assert len(nav_buttons) == 2, f"Expected 2 nav buttons; got: {len(nav_buttons)}"
+    deltas = []
+    for btn in nav_buttons:
+        assert btn.callback_data is not None
+        unpacked = AdminOpenWeekNavCallbackData.unpack(btn.callback_data)
+        deltas.append(unpacked.delta)
+    assert -1 in deltas, "← Пред. must have delta=-1"
+    assert 1 in deltas, "След. → must have delta=+1"
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-11 14:00:00", tz_offset=0)  # Friday UTC 14:00 → Moscow 17:00
+async def test_admin_openweek_end_cb_seeds_week_offset_zero(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.61: end_cb seeds week_offset=0 in state (current week on entry)."""
+    from uuid import UUID as _UUID
+
+    from bot.keyboards.admin import AdminWindowSlot30CallbackData
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    sentinel = _UUID(int=0)
+    cb_data = AdminWindowSlot30CallbackData(workday_id=sentinel, start_minute=1080)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state({"business_tz": TZ, "picked_start_minute": 600})
+
+    await admin_handlers.admin_openweek_end_cb(callback, cb_data, state)
+
+    data = _state_all_updates(state)
+    assert data["week_offset"] == 0, (
+        f"week_offset must be 0 on entry; got: {data.get('week_offset')}"
+    )
+    assert data["scheduled_weekdays"] == [], (
+        f"No WorkDays seeded → scheduled empty; got: {data.get('scheduled_weekdays')}"
+    )
+    assert data["closed_weekdays"] == [], (
+        f"No WorkDays seeded → closed empty; got: {data.get('closed_weekdays')}"
+    )
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-11 14:00:00", tz_offset=0)  # Friday 11.09 MSK 17:00
+async def test_admin_openweek_week_nav_cb_next_increments_offset(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.61: tap След. → (delta=+1) from week_offset=0 → week_offset=1,
+    selected_weekdays reset to [].
+
+    Friday 11.09: base monday=07.09. Next week (offset=1) monday=14.09, all
+    7 days future → past_weekdays=[]. No WorkDays seeded → scheduled/closed=[].
+    """
+    from bot.keyboards.admin import AdminOpenWeekNavCallbackData
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cb_data = AdminOpenWeekNavCallbackData(delta=1)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state(
+        {
+            "business_tz": TZ,
+            "picked_start_minute": 600,
+            "picked_end_minute": 1080,
+            "selected_weekdays": [1, 3],  # Tue + Thu selected — will reset
+            "past_weekdays": [0, 1, 2, 3],
+            "scheduled_weekdays": [],
+            "closed_weekdays": [],
+            "week_offset": 0,
+        }
+    )
+
+    await admin_handlers.admin_openweek_week_nav_cb(callback, cb_data, state)
+
+    data = _state_all_updates(state)
+    assert data["week_offset"] == 1, (
+        f"Next from offset=0 → offset=1; got: {data.get('week_offset')}"
+    )
+    assert data["selected_weekdays"] == [], (
+        f"Selected must reset on week change; got: {data.get('selected_weekdays')}"
+    )
+    # Friday 11.09 + 1 week = 14-20.09, all future → past_weekdays=[]
+    assert data["past_weekdays"] == [], (
+        f"Next week all future → no past; got: {data.get('past_weekdays')}"
+    )
+    # Alert about reset should have been shown (selected was non-empty).
+    args, kwargs = callback.answer.call_args
+    assert "Выбор сброшен" in (args[0] if args else kwargs.get("text", "")), (
+        f"Reset alert must be shown when selected was non-empty; "
+        f"got: {callback.answer.call_args}"
+    )
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-11 14:00:00", tz_offset=0)  # Friday 11.09 MSK 17:00
+async def test_admin_openweek_week_nav_cb_prev_at_zero_no_op(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.61: tap ← Пред. (delta=-1) at week_offset=0 → no-op (clamped to 0).
+
+    Defense-in-depth: keyboard hides ← Пред. at offset=0, but if stale callback
+    slips through (rapid tap, race), handler clamps and does nothing.
+    """
+    from bot.keyboards.admin import AdminOpenWeekNavCallbackData
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cb_data = AdminOpenWeekNavCallbackData(delta=-1)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state(
+        {
+            "business_tz": TZ,
+            "picked_start_minute": 600,
+            "picked_end_minute": 1080,
+            "selected_weekdays": [],
+            "past_weekdays": [0, 1, 2, 3],
+            "scheduled_weekdays": [],
+            "closed_weekdays": [],
+            "week_offset": 0,
+        }
+    )
+
+    await admin_handlers.admin_openweek_week_nav_cb(callback, cb_data, state)
+
+    # No-op: handler must NOT call update_data (state unchanged) and NOT
+    # re-render message (edit_text not called).
+    assert not state.update_data.called, (
+        "Clamped no-op must NOT call update_data"
+    )
+    assert not callback.message.edit_text.called, (
+        "Clamped no-op must NOT re-render message"
+    )
+    # No-op MUST dismiss loading spinner via callback.answer() — without
+    # this, Telegram shows infinite spinner on the button.
+    callback.answer.assert_called_once()
+    # Defense-in-depth: no-op must not mutate FSM state (no clear, no set_state).
+    state.clear.assert_not_called()
+    state.set_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-11 14:00:00", tz_offset=0)  # Friday 11.09 MSK 17:00
+async def test_admin_openweek_week_nav_cb_next_at_cap_no_op(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.61: tap След. → (delta=+1) at week_offset=MAX (4) → no-op (clamped)."""
+    from bot.keyboards.admin import AdminOpenWeekNavCallbackData
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cb_data = AdminOpenWeekNavCallbackData(delta=1)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state(
+        {
+            "business_tz": TZ,
+            "picked_start_minute": 600,
+            "picked_end_minute": 1080,
+            "selected_weekdays": [],
+            "past_weekdays": [],
+            "scheduled_weekdays": [],
+            "closed_weekdays": [],
+            "week_offset": 4,  # at cap
+        }
+    )
+
+    await admin_handlers.admin_openweek_week_nav_cb(callback, cb_data, state)
+
+    assert not state.update_data.called, (
+        "Clamped no-op at cap must NOT call update_data"
+    )
+    assert not callback.message.edit_text.called, (
+        "Clamped no-op at cap must NOT re-render"
+    )
+    callback.answer.assert_called_once()
+    state.clear.assert_not_called()
+    state.set_state.assert_not_called()
+
+
 @pytest.mark.asyncio
 @freeze_time("2026-09-11 14:00:00", tz_offset=0)  # Friday UTC 14:00 → Moscow 17:00
 async def test_admin_openweek_end_cb_caches_past_weekdays_in_state(

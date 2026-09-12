@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import (
+    InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
@@ -312,6 +313,25 @@ class AdminOpenWeekCallbackData(CallbackData, prefix="admin_openweek_days"):
     weekday: int
 
 
+class AdminOpenWeekNavCallbackData(CallbackData, prefix="admin_openweek_nav"):
+    """Navigate between weeks in /openweek flow step 3 (Session 5.61).
+
+    Payload:
+    - delta: int — week offset change, -1 (prev) or +1 (next).
+
+    Wire format: "admin_openweek_nav:<int>" ≈ 21+1+2 = 24 bytes < 64 limit.
+    Distinct prefix from AdminOpenWeekCallbackData ("days" vs "nav") — no
+    dispatch conflict.
+
+    Handler (admin_openweek_week_nav_cb) updates week_offset in FSM state,
+    resets selected_weekdays (week changed → old selection invalid), recomputes
+    past_weekdays / scheduled_weekdays / closed_weekdays for the new monday.
+    Alert "Выбор сброшен — новая неделя" signals the reset to the admin.
+    """
+
+    delta: int
+
+
 class AdminOpenweekEditCallbackData(CallbackData, prefix="admin_openweek_edit"):
     """[✏️ Пн] inline button — start per-day window edit (Session 5.28 D).
 
@@ -568,9 +588,14 @@ _WEEKDAY_LABELS: tuple[str, ...] = (
 def admin_week_days_keyboard(
     selected: set[int],
     past_weekdays: frozenset[int] = frozenset(),
+    scheduled_weekdays: frozenset[int] = frozenset(),
+    closed_weekdays: frozenset[int] = frozenset(),
+    can_go_prev: bool = True,
+    can_go_next: bool = True,
 ) -> InlineKeyboardMarkup:
-    """7 toggle-кнопок дней недели + «✅ Открыть» + «❌ Отмена» (Session 5.26;
-    5.60 P2 — past_weekdays parameter for ❌ suffix on past days).
+    """7 toggle-кнопок дней недели + навигация по неделям + «✅ Открыть» + «❌ Отмена»
+    (Session 5.26; 5.60 P2 — past_weekdays `❌` suffix; 5.61 — scheduled/closed
+    weekday markers + week navigation).
 
     Args:
         selected: set of weekday ints (0=Mon..6=Sun) currently toggled ON.
@@ -580,13 +605,27 @@ def admin_week_days_keyboard(
             callback_data stays unchanged so admin can still tap → toggle
             (apply filters past days at /openweek confirm: admin.py:3079-3081).
             Default empty for backward compat (no past days in fresh week).
+        scheduled_weekdays: frozenset of weekday ints with an active WorkDay
+            (is_active=True). Gets ` 🟡` suffix — visual signal "day has window,
+            will be overwritten". 5.61.
+        closed_weekdays: frozenset of weekday ints with a closed WorkDay
+            (is_active=False). Gets ` ⚪` suffix — "day was open then closed via
+            /closeday, re-open action". 5.61.
+        can_go_prev: show «← Пред.» button. False when week_offset=0 (current
+            week — prev week is fully in past, no point navigating there).
+        can_go_next: show «След. →» button. False when week_offset >= MAX
+            (4 weeks ahead cap).
 
-    Layout: 7 weekday buttons (1 row, adjust(7) compresses to ≤8/row Telegram
-    inline limit 8 buttons/row), then [✅ Открыть] + [❌ Отмена] row.
+    Suffix priority: ` ❌` (past) > ` 🟡` (active WorkDay) > ` ⚪` (closed WorkDay).
+    Past day with WorkDay → ` ❌` wins (apply will filter it anyway, no point
+    showing 🟡/⚪). Future day with active WorkDay → ` 🟡`. Future day with
+    closed WorkDay → ` ⚪`.
+
+    Layout: 7 weekday buttons (row 1, adjust(7) compresses to ≤8/row Telegram
+    inline limit 8 buttons/row), then nav row (← Пред. / След. →, adjust(2)),
+    then [✅ Открыть] + [❌ Отмена] row (adjust(2)).
 
     Selected weekdays помечены ✅ prefix; unselected — без prefix.
-    Past weekdays дополнительно помечены ` ❌` suffix — визуальный сигнал
-    «tap ничего не даст в apply» (хотя toggle всё ещё работает визуально).
     «✅ Открыть» callback_data="admin_openweek_confirm" (string).
     «❌ Отмена» callback_data="admin_openweek_cancel" (string).
     """
@@ -594,11 +633,35 @@ def admin_week_days_keyboard(
     for weekday in range(7):
         label = _WEEKDAY_LABELS[weekday]
         prefix = "✅ " if weekday in selected else ""
-        past_suffix = " ❌" if weekday in past_weekdays else ""
+        if weekday in past_weekdays:
+            past_suffix = " ❌"
+        elif weekday in scheduled_weekdays:
+            past_suffix = " 🟡"
+        elif weekday in closed_weekdays:
+            past_suffix = " ⚪"
+        else:
+            past_suffix = ""
         builder.button(
             text=f"{prefix}{label}{past_suffix}",
             callback_data=AdminOpenWeekCallbackData(weekday=weekday).pack(),
         )
+    nav_row: list[InlineKeyboardButton] = []
+    if can_go_prev:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="← Пред.",
+                callback_data=AdminOpenWeekNavCallbackData(delta=-1).pack(),
+            )
+        )
+    if can_go_next:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="След. →",
+                callback_data=AdminOpenWeekNavCallbackData(delta=1).pack(),
+            )
+        )
+    if nav_row:
+        builder.row(*nav_row)
     builder.button(text="✅ Открыть", callback_data="admin_openweek_confirm")
     builder.button(text="❌ Отмена", callback_data="admin_openweek_cancel")
     builder.adjust(7, 2)
