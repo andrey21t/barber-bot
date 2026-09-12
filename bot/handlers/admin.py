@@ -54,6 +54,7 @@ from bot.keyboards.admin import (
     AdminOpenWeekCallbackData,
     AdminOpenweekEditCallbackData,
     AdminOpenWeekEntryCallbackData,
+    AdminOpenWeekNavCallbackData,
     AdminServicesCallbackData,
     AdminTodayCallbackData,
     AdminWeekCallbackData,
@@ -2992,7 +2993,7 @@ async def admin_openweek_end_cb(
         await state.clear()
         await callback.answer("❌ Мастер не найден", show_alert=True)
         return
-    _master_id, _business_id, _tz = resolved
+    master_id, _business_id, _tz = resolved
 
     data = await state.get_data()
     picked_start_minute = data.get("picked_start_minute")
@@ -3015,19 +3016,25 @@ async def admin_openweek_end_cb(
     # Шаг 3 — только диапазон недели (week_range), без перечисления дней.
     # Пользователю(msg follow-up) перечисление «Пн 07.09 · Вт 08.09 · ...»
     # кажется лишним: окно + диапазон недели уже дают контекст.
-    business_tz = data.get("business_tz") or _tz
-    monday = _current_week_monday(business_tz)
-    sunday = monday + timedelta(days=6)
-    week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
-
     # 5.60 P2 — кешируем past_weekdays в state на входе в шаг 3. Не меняется
     # в течение openweek flow (monday зафиксирован), поэтому toggle handler
     # (admin_openweek_days_cb) читает из state без перевычисления.
+    # 5.61 — week_offset для навигации по неделям, scheduled/closed weekdays
+    # для маркеров 🟡/⚪ на клавиатуре дней.
+    business_tz = data.get("business_tz") or _tz
+    monday = _week_monday(business_tz, 0)
+    sunday = monday + timedelta(days=6)
+    week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
+
     today_local = datetime.now(ZoneInfo(business_tz)).date()
     past_weekdays = _past_weekdays_for_week(monday, today_local)
+    scheduled_wd, closed_wd = await _scheduled_closed_weekdays(master_id, business_tz, monday)
     await state.update_data(
         selected_weekdays=[],
         past_weekdays=sorted(past_weekdays),
+        scheduled_weekdays=sorted(scheduled_wd),
+        closed_weekdays=sorted(closed_wd),
+        week_offset=0,
     )
 
     if callback.message is not None:
@@ -3036,7 +3043,14 @@ async def admin_openweek_end_cb(
             f"Окно: <b>{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}</b>\n"
             f"Неделя <b>{week_range}</b>"
         )
-        step3_kb = admin_week_days_keyboard(set(), past_weekdays=past_weekdays)
+        step3_kb = admin_week_days_keyboard(
+            set(),
+            past_weekdays=past_weekdays,
+            scheduled_weekdays=scheduled_wd,
+            closed_weekdays=closed_wd,
+            can_go_prev=False,
+            can_go_next=True,
+        )
         # edit_text заменяет picker Шага 2 на days keyboard в том же сообщении —
         # старая клавиатура исчезает, нельзя тапнуть две таблицы одновременно.
         if isinstance(callback.message, Message):
@@ -3086,10 +3100,18 @@ async def admin_openweek_days_cb(
     if callback.message is not None:
         # 5.60 P2 — past_weekdays из state (закеширован в admin_openweek_end_cb
         # на входе в шаг 3). frozenset для O(1) lookup в keyboard loop.
+        # 5.61 — scheduled/closed weekdays + nav flags тоже из state.
         past_wd_storage: list[int] = list(data.get("past_weekdays", []))
+        sched_wd_storage: list[int] = list(data.get("scheduled_weekdays", []))
+        closed_wd_storage: list[int] = list(data.get("closed_weekdays", []))
+        week_offset: int = int(data.get("week_offset", 0))
         new_kb = admin_week_days_keyboard(
             set(selected),
             past_weekdays=frozenset(past_wd_storage),
+            scheduled_weekdays=frozenset(sched_wd_storage),
+            closed_weekdays=frozenset(closed_wd_storage),
+            can_go_prev=week_offset > 0,
+            can_go_next=week_offset < _OPENWEEK_MAX_OFFSET,
         )
         if isinstance(callback.message, Message):
             try:
@@ -3100,6 +3122,112 @@ async def admin_openweek_days_cb(
                     "Дни недели обновлены. Тапните ещё раз чтобы отметить/снять:",
                     reply_markup=new_kb,
                 )
+
+
+@router.callback_query(
+    AdminOpenWeekNavCallbackData.filter(),
+    StateFilter(AdminStates.opening_week_days),
+)
+async def admin_openweek_week_nav_cb(
+    callback: CallbackQuery,
+    callback_data: AdminOpenWeekNavCallbackData,
+    state: FSMContext,
+) -> None:
+    """[← Пред.] / [След. →] → navigate between weeks in step 3 (Session 5.61).
+
+    Updates week_offset in state (clamped to 0.._OPENWEEK_MAX_OFFSET), resets
+    selected_weekdays (old selection invalid for new week), recomputes
+    past_weekdays / scheduled_weekdays / closed_weekdays for the new monday,
+    and re-renders step 3 text + keyboard.
+
+    Alert "Выбор сброшен — новая неделя" signals the reset (only when
+    selected_weekdays was non-empty — avoids noise on first nav when user
+    hasn't selected anything yet).
+
+    Edge cases:
+    - delta=-1 with week_offset=0: clamp to 0, no change (also blocked by
+      can_go_prev=False on keyboard, but defense-in-depth here).
+    - delta=+1 with week_offset=MAX: clamp to MAX, no change (same defense).
+    - Selected days non-empty → alert shown. Empty → silent re-render.
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await state.clear()
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    master_id, _business_id, tz = resolved
+
+    data = await state.get_data()
+    business_tz = data.get("business_tz") or tz
+    current_offset: int = int(data.get("week_offset", 0))
+    new_offset = current_offset + callback_data.delta
+    # Clamp to valid range (defense-in-depth — keyboard already hides
+    # disabled buttons, but stale callbacks or rapid taps could slip through).
+    new_offset = max(0, min(new_offset, _OPENWEEK_MAX_OFFSET))
+    if new_offset == current_offset:
+        # No-op (already at boundary) — silent, just dismiss loading.
+        await callback.answer()
+        return
+
+    monday = _week_monday(business_tz, new_offset)
+    sunday = monday + timedelta(days=6)
+    week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
+
+    today_local = datetime.now(ZoneInfo(business_tz)).date()
+    past_wd = _past_weekdays_for_week(monday, today_local)
+    sched_wd, closed_wd = await _scheduled_closed_weekdays(
+        master_id, business_tz, monday
+    )
+
+    selected_was_nonempty = bool(list(data.get("selected_weekdays", [])))
+    await state.update_data(
+        selected_weekdays=[],
+        past_weekdays=sorted(past_wd),
+        scheduled_weekdays=sorted(sched_wd),
+        closed_weekdays=sorted(closed_wd),
+        week_offset=new_offset,
+    )
+
+    # picked_start_minute / picked_end_minute stay in state — window time is
+    # common for all weeks, no need to re-enter.
+    picked_start_minute = data.get("picked_start_minute")
+    picked_end_minute = data.get("picked_end_minute")
+    if picked_start_minute is None or picked_end_minute is None:
+        await state.clear()
+        await callback.answer("❌ Данные сессии потеряны", show_alert=True)
+        return
+    start_time = dt_time(int(picked_start_minute) // 60, int(picked_start_minute) % 60)
+    end_time = dt_time(picked_end_minute // 60, picked_end_minute % 60)
+
+    step3_text = (
+        f"Шаг 3: выберите дни недели (тап → ✅).\n\n"
+        f"Окно: <b>{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}</b>\n"
+        f"Неделя <b>{week_range}</b>"
+    )
+    new_kb = admin_week_days_keyboard(
+        set(),
+        past_weekdays=past_wd,
+        scheduled_weekdays=sched_wd,
+        closed_weekdays=closed_wd,
+        can_go_prev=new_offset > 0,
+        can_go_next=new_offset < _OPENWEEK_MAX_OFFSET,
+    )
+    if callback.message is not None:
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(step3_text, reply_markup=new_kb)
+            except TelegramBadRequest:
+                await callback.message.answer(step3_text, reply_markup=new_kb)
+        else:
+            await callback.message.answer(step3_text, reply_markup=new_kb)
+    if selected_was_nonempty:
+        await callback.answer("Выбор сброшен — новая неделя", show_alert=True)
+    else:
+        await callback.answer()
 
 
 async def _apply_openweek(
@@ -3274,7 +3402,7 @@ async def admin_openweek_confirm_cb(
         await callback.answer()
         return
 
-    monday = _current_week_monday(tz)
+    monday = _week_monday(tz, int(data.get("week_offset", 0)))
     today_local = datetime.now(ZoneInfo(tz)).date()
 
     # B: check existing WorkDays among selected (skip past days — they will
@@ -3408,7 +3536,7 @@ async def admin_openweek_overwrite_yes_cb(
         return
 
     await state.clear()
-    monday = _current_week_monday(tz)
+    monday = _week_monday(tz, int(data.get("week_offset", 0)))
     result_text, opened_days = await _apply_openweek(
         master_id, tz, monday, selected, start_time, end_time
     )
@@ -3873,10 +4001,41 @@ def _current_week_monday(tz: str) -> date:
     opens /openweek to plan NEXT week, not to see 6 "❌ прошедшая дата".
     Sat (weekday=5) → current week (today + tomorrow still alive).
     """
+    return _week_monday(tz, 0)
+
+
+# Maximum week_offset for /openweek navigation. 4 weeks = ~1 month ahead —
+# enough for planning, prevents accidentally opening slots 3 months out.
+# Override only via deliberate edit (not user-config — too niche).
+_OPENWEEK_MAX_OFFSET = 4
+
+
+def _week_monday(tz: str, offset: int = 0) -> date:
+    """Monday of the work week at ``offset`` from current.
+
+    Offset semantics: offset=0 = same as _current_week_monday (with Sunday-rule:
+    if today is Sunday, returns next Monday). offset=1 = next week from the
+    Sunday-rule base, offset=2 = +2 weeks, etc. Negative offsets NOT supported
+    (prev-week navigation is capped at offset=0 by keyboard handler).
+
+    Sunday-rule base: offset=0 returns next Monday when today is Sunday;
+    offset=1 returns Monday of the week AFTER next (today Sun 14.09 →
+    offset=0 = Mon 14.09, offset=1 = Mon 21.09).
+
+    Args:
+        tz: business timezone (e.g. "Europe/Moscow").
+        offset: 0.._OPENWEEK_MAX_OFFSET. Negative offsets raise ValueError.
+
+    Returns:
+        date of Monday for the requested week.
+    """
+    if offset < 0:
+        raise ValueError(f"offset must be >= 0; got {offset}")
     today_local = datetime.now(ZoneInfo(tz)).date()
     monday = today_local - timedelta(days=today_local.weekday())
-    if today_local.weekday() == 6:  # Вс → следующая неделя
+    if today_local.weekday() == 6:  # Вс → следующая неделя (Sunday-rule base)
         monday += timedelta(days=7)
+    monday += timedelta(days=7 * offset)
     return monday
 
 
@@ -3896,16 +4055,59 @@ def _past_weekdays_for_week(monday: date, today_local: date) -> frozenset[int]:
     )
 
 
-def _openweek_week_header(tz: str) -> str:
+async def _scheduled_closed_weekdays(
+    master_id: UUID,
+    tz: str,
+    monday: date,
+) -> tuple[frozenset[int], frozenset[int]]:
+    """For each weekday 0..6 in the week starting ``monday``, check if a
+    WorkDay row exists. Returns (scheduled_weekdays, closed_weekdays):
+
+    - scheduled_weekdays: weekday ints with is_active=True (🟡 marker — will
+      be overwritten on /openweek apply).
+    - closed_weekdays: weekday ints with is_active=False (⚪ marker — closed
+      via /closeday, re-open action on confirm).
+
+    Past days are NOT excluded here — caller composes past_weekdays separately,
+    and admin_week_days_keyboard applies ❌ priority (past > scheduled/closed).
+    A past day with active WorkDay → only ❌ shown (apply will filter it).
+
+    Args:
+        master_id: master UUID.
+        tz: business timezone (used only for consistency, not in the query).
+        monday: Monday of the week to inspect.
+
+    Returns:
+        (scheduled, closed) — two frozensets of weekday ints 0..6.
+    """
+    scheduled: set[int] = set()
+    closed: set[int] = set()
+    async with async_session_factory() as session:
+        for weekday in range(7):
+            work_date = monday + timedelta(days=weekday)
+            wd = await select_workday(session, master_id, work_date)
+            if wd is None:
+                continue
+            if wd.is_active:
+                scheduled.add(weekday)
+            else:
+                closed.add(weekday)
+    return frozenset(scheduled), frozenset(closed)
+
+
+def _openweek_week_header(tz: str, offset: int = 0) -> str:
     """Render week line for /openweek headers: 'Неделя 07.09 – 13.09'.
 
     Used in Шаг 1 (cmd_openweek + entry_cb), Шаг 2 (start_cb), Шаг 3 (end_cb).
     Single source of truth — avoids divergence between 3 callsites.
 
+    5.61 — offset parameter for future-week navigation. offset=0 (default)
+    preserves backward compat (existing callsites unchanged).
+
     Перечисление «Пн 07.09 · Вт 08.09 · ...» убрано — диапазон недели даёт
     достаточный контекст, подробности в самом days keyboard (Шаг 3).
     """
-    monday = _current_week_monday(tz)
+    monday = _week_monday(tz, offset)
     sunday = monday + timedelta(days=6)
     week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
     return f"Неделя <b>{week_range}</b>"
