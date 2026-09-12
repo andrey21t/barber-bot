@@ -767,6 +767,106 @@ async def test_cmd_openday_happy_reopens_closed_workday(
 
 
 # ============================================================
+# admin_addslots_cb — 4 branches (lines 925-952)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_admin_addslots_cb_non_admin_silent(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Non-admin tap → _is_admin_callback False → callback.answer() + return.
+
+    No state.clear, no set_state — admin flow not entered.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(NON_ADMIN_TG_ID)
+    state = _make_mock_state()
+
+    await admin_handlers.admin_addslots_cb(callback, state)
+
+    callback.answer.assert_called_once()
+    state.clear.assert_not_called()
+    state.set_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_addslots_cb_master_not_found(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Admin with no Master row → '❌ Мастер не найден' alert + return.
+
+    No _seed_admin_stack → _resolve_master_and_business returns None.
+    """
+    # No _seed_admin_stack deliberately
+    callback = _make_callback(ADMIN_TG_ID)
+    state = _make_mock_state()
+
+    await admin_handlers.admin_addslots_cb(callback, state)
+
+    callback.answer.assert_called_once()
+    args, _ = callback.answer.call_args
+    assert "Мастер не найден" in str(args)
+    state.clear.assert_not_called()
+    state.set_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_addslots_cb_happy_enters_adding_slots_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Happy: admin tap → state.clear + set_state(adding_slots_date) +
+    calendar keyboard + callback.answer (dismiss loading spinner).
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    state = _make_mock_state()
+
+    await admin_handlers.admin_addslots_cb(callback, state)
+
+    state.clear.assert_called_once()
+    state.set_state.assert_called_once_with(admin_handlers.AdminStates.adding_slots_date)
+
+    # Message shown with calendar keyboard
+    callback.message.answer.assert_called_once()
+    answer_args, answer_kwargs = callback.message.answer.call_args
+    assert "Выберите дату" in str(answer_args[0])
+    assert "reply_markup" in answer_kwargs
+
+    callback.answer.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_addslots_cb_message_none_skips_calendar(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Edge: callback.message is None (rare — e.g. inline mode) → skip
+    calendar answer, still set_state + callback.answer.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.message = None  # simulate missing message
+    state = _make_mock_state()
+
+    await admin_handlers.admin_addslots_cb(callback, state)
+
+    state.clear.assert_called_once()
+    state.set_state.assert_called_once_with(admin_handlers.AdminStates.adding_slots_date)
+    # No message.answer call (message is None)
+    callback.answer.assert_called_once()
+
+
+# ============================================================
 # cmd_closeslot — 10 branches
 # ============================================================
 
