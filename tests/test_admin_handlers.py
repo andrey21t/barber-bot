@@ -1488,7 +1488,7 @@ async def test_cmd_today_happy_with_booking(
         )
 
     msg = _make_message(user_id=ADMIN_TG_ID, text="/today")
-    await admin_handlers.cmd_today(msg)
+    await admin_handlers.cmd_today(msg, _make_mock_state())
 
     text = _answer_text(msg)
     assert "Записи на сегодня" in text
@@ -1506,7 +1506,7 @@ async def test_cmd_today_non_admin_silent_ignore(
         await _seed_admin_stack(session)
 
     msg = _make_message(user_id=NON_ADMIN_TG_ID, text="/today")
-    await admin_handlers.cmd_today(msg)
+    await admin_handlers.cmd_today(msg, _make_mock_state())
 
     assert _answer_call_count(msg) == 0
 
@@ -1521,7 +1521,7 @@ async def test_cmd_today_master_not_found_shows_error(
         await _seed_admin_stack(session, admin_telegram_id=777777777)
 
     msg = _make_message(user_id=ADMIN_TG_ID, text="/today")
-    await admin_handlers.cmd_today(msg)
+    await admin_handlers.cmd_today(msg, _make_mock_state())
 
     text = _answer_text(msg)
     assert "Мастер не найден" in text
@@ -1538,7 +1538,7 @@ async def test_cmd_today_no_bookings_shows_empty_message(
         # No bookings seeded
 
     msg = _make_message(user_id=ADMIN_TG_ID, text="/today")
-    await admin_handlers.cmd_today(msg)
+    await admin_handlers.cmd_today(msg, _make_mock_state())
 
     text = _answer_text(msg)
     assert "На сегодня записей нет" in text
@@ -1577,7 +1577,7 @@ async def test_cmd_week_happy_with_booking(
         )
 
     msg = _make_message(user_id=ADMIN_TG_ID, text="/week")
-    await admin_handlers.cmd_week(msg)
+    await admin_handlers.cmd_week(msg, _make_mock_state())
 
     text = _answer_text(msg)
     assert "Ближайшие записи" in text
@@ -1594,7 +1594,7 @@ async def test_cmd_week_non_admin_silent_ignore(
         await _seed_admin_stack(session)
 
     msg = _make_message(user_id=NON_ADMIN_TG_ID, text="/week")
-    await admin_handlers.cmd_week(msg)
+    await admin_handlers.cmd_week(msg, _make_mock_state())
 
     assert _answer_call_count(msg) == 0
 
@@ -1609,7 +1609,7 @@ async def test_cmd_week_master_not_found_shows_error(
         await _seed_admin_stack(session, admin_telegram_id=777777777)
 
     msg = _make_message(user_id=ADMIN_TG_ID, text="/week")
-    await admin_handlers.cmd_week(msg)
+    await admin_handlers.cmd_week(msg, _make_mock_state())
 
     text = _answer_text(msg)
     assert "Мастер не найден" in text
@@ -1625,7 +1625,7 @@ async def test_cmd_week_no_bookings_shows_empty_message(
         await _seed_admin_stack(session)
 
     msg = _make_message(user_id=ADMIN_TG_ID, text="/week")
-    await admin_handlers.cmd_week(msg)
+    await admin_handlers.cmd_week(msg, _make_mock_state())
 
     text = _answer_text(msg)
     assert "Ближайших записей нет" in text
@@ -1664,7 +1664,7 @@ async def test_cmd_week_shows_far_future_booking_beyond_7_days(
         )
 
     msg = _make_message(user_id=ADMIN_TG_ID, text="/week")
-    await admin_handlers.cmd_week(msg)
+    await admin_handlers.cmd_week(msg, _make_mock_state())
 
     text = _answer_text(msg)
     assert "Ближайшие записи" in text, f"Header should be 'Ближайшие записи'; got: {text!r}"
@@ -1809,7 +1809,7 @@ async def test_cmd_week_ignores_past_bookings(
         )
 
     msg = _make_message(user_id=ADMIN_TG_ID, text="/week")
-    await admin_handlers.cmd_week(msg)
+    await admin_handlers.cmd_week(msg, _make_mock_state())
 
     text = _answer_text(msg)
     assert "Ближайших записей нет" in text, f"Past booking must NOT appear; got: {text!r}"
@@ -2738,6 +2738,108 @@ async def test_cmd_menu_escapes_from_fsm_state(
     assert reply_markup is not None
 
 
+# ============================================================
+# Session 5.62 (пункт 5): reply keyboard buttons — F.text match
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_cmd_menu_matches_reply_keyboard_text(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """'📋 Меню' (reply keyboard button text) → same handler as /menu command.
+
+    Session 5.62: admin_reply_keyboard() имеет 3 кнопки с emoji+text label'ами.
+    Handler декорирован or_f(F.text == "📋 Меню", Command("menu")) — оба триггера
+    идут в один handler. Это regression guard: если убрать F.text match — reply
+    keyboard кнопка станет "мёртвой" (tap → no handler → silent).
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(ADMIN_TG_ID, text="📋 Меню")
+    state = _make_mock_state()
+
+    await admin_handlers.cmd_menu(msg, state)
+
+    state.clear.assert_called_once()
+    args, kwargs = msg.answer.call_args
+    text = args[0] if args else kwargs.get("text", "")
+    assert "Меню" in text
+
+
+@pytest.mark.asyncio
+async def test_cmd_today_matches_reply_keyboard_text_and_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """'📅 Сегодня' (reply keyboard) → cmd_today + state.clear().
+
+    Session 5.62: cmd_today расширен с StateFilter(None) до StateFilter("*").
+    state.clear() в начале — escape hatch из mid-FSM. Если admin застрял в
+    /openweek flow и тапает "Сегодня" — FSM чистится, today bookings показываются.
+    Безопасно: cmd_today read-only (не меняет state, не пишет в БД).
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(ADMIN_TG_ID, text="📅 Сегодня")
+    state = _make_mock_state()
+
+    await admin_handlers.cmd_today(msg, state)
+
+    # state.clear() вызывается в начале (escape hatch из mid-FSM)
+    state.clear.assert_called_once()
+    text = _answer_text(msg)
+    assert "На сегодня записей нет" in text  # no bookings seeded
+
+
+@pytest.mark.asyncio
+async def test_cmd_week_matches_reply_keyboard_text_and_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """'🗓 Неделя' (reply keyboard) → cmd_week + state.clear().
+
+    Session 5.62: cmd_week расширен до StateFilter("*") + F.text match.
+    state.clear() в начале — escape hatch из mid-FSM. Read-only — безопасно.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(ADMIN_TG_ID, text="🗓 Неделя")
+    state = _make_mock_state()
+
+    await admin_handlers.cmd_week(msg, state)
+
+    state.clear.assert_called_once()
+    text = _answer_text(msg)
+    assert "Ближайших записей нет" in text  # no bookings seeded
+
+
+@pytest.mark.asyncio
+async def test_cmd_today_non_admin_silent_with_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Non-admin tap на '📅 Сегодня' → silent (no answer, no state.clear).
+
+    Regression guard: добавление state: FSMContext параметра НЕ должно менять
+    _require_admin_or_silent behavior — non-admin не получает ответа.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=NON_ADMIN_TG_ID, text="📅 Сегодня")
+    state = _make_mock_state()
+
+    await admin_handlers.cmd_today(msg, state)
+
+    assert _answer_call_count(msg) == 0
+    state.clear.assert_not_called()  # silent return before state.clear()
+
+
 @pytest.mark.asyncio
 async def test_cmd_today_renders_move_button_for_bookings(
     session_factory: Any,
@@ -2765,7 +2867,7 @@ async def test_cmd_today_renders_move_button_for_bookings(
         )
 
     msg = _make_message(user_id=ADMIN_TG_ID, text="/today")
-    await admin_handlers.cmd_today(msg)
+    await admin_handlers.cmd_today(msg, _make_mock_state())
 
     # msg.answer called with reply_markup — second positional arg or kwarg.
     args, kwargs = msg.answer.call_args
@@ -6199,7 +6301,7 @@ async def test_cmd_today_with_client_phone(
         )
 
     msg = _make_message(user_id=ADMIN_TG_ID, text="/today")
-    await admin_handlers.cmd_today(msg)
+    await admin_handlers.cmd_today(msg, _make_mock_state())
 
     text = _answer_text(msg)
     assert "📞 +79991234567" in text, "phone shown in /today when Client.phone set"
@@ -6235,7 +6337,7 @@ async def test_cmd_today_without_phone_shows_bez_telefona(
         )
 
     msg = _make_message(user_id=ADMIN_TG_ID, text="/today")
-    await admin_handlers.cmd_today(msg)
+    await admin_handlers.cmd_today(msg, _make_mock_state())
 
     text = _answer_text(msg)
     assert "без телефона" in text, "phone=None → 'без телефона' in /today render"

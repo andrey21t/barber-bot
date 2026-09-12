@@ -184,6 +184,46 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def admin_reply_keyboard() -> ReplyKeyboardMarkup:
+    """Always-on reply keyboard для мастера (Session 5.62, пункт 5 от Екатерины).
+
+    Екатерина жаловалась что inline menu уезжает вверх по чату — нужно скроллить
+    или вводить /menu чтобы вернуть. Аналогично client_reply_keyboard (5.36 B.13)
+    — делаем always-on reply keyboard снизу экрана.
+
+    Layout: 3 кнопки на одном ряду (resize_keyboard=True shrink'нет до компактных
+    кнопок после первого тапа, как в client_reply_keyboard).
+
+    Кнопки:
+    - 📋 Меню → cmd_menu (F.text match, StateFilter("*")) — escape hatch из любого
+      FSM state, показывает inline menu с 7 actions в сообщении.
+    - 📅 Сегодня → cmd_today (F.text match, StateFilter("*")) — список записей на
+      сегодня. Read-only, безопасно чистит FSM state если admin был mid-flow.
+    - 🗓 Неделя → cmd_week (F.text match, StateFilter("*")) — список записей на
+      ближайшие 7 дней. Read-only, безопасно чистит FSM state.
+
+    Остальные actions (/addslots, /openday, /openweek, /closeday, /services) —
+    через inline menu (tap "📋 Меню" → inline keyboard в сообщении). Они требуют
+    StateFilter(None) так как сами устанавливают FSM state.
+
+    is_persistent=True — Telegram НЕ скрывает reply keyboard после первого тапа
+    (поведение по умолчанию для старой admin_keyboard). Inline keyboard в
+    сообщениях (calendar, slot picker) продолжает работать — reply keyboard
+    не блокирует inline pickers.
+    """
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="📋 Меню"),
+                KeyboardButton(text="📅 Сегодня"),
+                KeyboardButton(text="🗓 Неделя"),
+            ]
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 def admin_today_keyboard(
     bookings: list[Booking],
     business_timezone: str = "Europe/Moscow",
