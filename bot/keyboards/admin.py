@@ -823,3 +823,49 @@ def admin_close_today_confirm_keyboard(workday_id: UUID) -> InlineKeyboardMarkup
     )
     builder.adjust(1)
     return builder.as_markup()
+
+
+def admin_week_picker_keyboard(
+    can_go_prev: bool,
+    can_go_next: bool,
+) -> InlineKeyboardMarkup:
+    """Week picker keyboard for /openweek step 0 (Session 5.64, пункт 1).
+
+    nav row: [← Пред.] [След. →] (uses AdminOpenWeekNavCallbackData — same
+    callback as step 3, dispatched by StateFilter to a different handler).
+    row 2: [✅ Выбрать эту неделю] (string "admin_openweek_week_select").
+    row 3: [❌ Отмена] (string "admin_openweek_cancel" — caught by
+    admin_openweek_cancel_cb which uses StateFilter(AdminStates)).
+
+    No weekday buttons — week picker is a single-selection step (user picks
+    a week via nav, then taps "Выбрать" to confirm). Selected week is tracked
+    in FSM state `week_offset` (updated by nav handler).
+
+    Args:
+        can_go_prev: show «← Пред.» button. False when week_offset=0 (current
+            week — prev week is fully in past, no point navigating there).
+        can_go_next: show «След. →» button. False when week_offset >=
+            _OPENWEEK_MAX_OFFSET (4 weeks ahead cap).
+    """
+    builder = InlineKeyboardBuilder()
+    nav_row: list[InlineKeyboardButton] = []
+    if can_go_prev:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="← Пред.",
+                callback_data=AdminOpenWeekNavCallbackData(delta=-1).pack(),
+            )
+        )
+    if can_go_next:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="След. →",
+                callback_data=AdminOpenWeekNavCallbackData(delta=1).pack(),
+            )
+        )
+    if nav_row:
+        builder.row(*nav_row)
+    builder.button(text="✅ Выбрать эту неделю", callback_data="admin_openweek_week_select")
+    builder.button(text="❌ Отмена", callback_data="admin_openweek_cancel")
+    builder.adjust(1)
+    return builder.as_markup()

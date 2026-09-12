@@ -3627,12 +3627,16 @@ async def test_admin_window_booked_cb_alerts_no_state_change(
 
 
 @pytest.mark.asyncio
-async def test_cmd_openweek_shows_start_picker(
+async def test_cmd_openweek_shows_week_picker(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """/openweek → state.clear + set_state(opening_week_start) + reply with
-    start picker (admin_window_slot_picker_keyboard mode='start' БЕЗ booked_slots).
+    """/openweek → state.clear + set_state(opening_week_week) + reply with
+    week picker keyboard (admin_week_picker_keyboard — Session 5.64, пункт 1).
+
+    Was test_cmd_openweek_shows_start_picker (pre-5.64: showed slot picker
+    directly). Now step 0 = week picker, step 1 (start picker) only after
+    «✅ Выбрать эту неделю» tap.
     """
     from bot.states import AdminStates
 
@@ -3645,15 +3649,21 @@ async def test_cmd_openweek_shows_start_picker(
     await admin_handlers.cmd_openweek(msg, state)
 
     state.clear.assert_called_once()
-    state.set_state.assert_called_once_with(AdminStates.opening_week_start)
+    state.set_state.assert_called_once_with(AdminStates.opening_week_week)
     data = _state_data_passed(state)
-    assert "business_tz" in data
+    assert data["business_tz"] is not None
+    assert data["week_offset"] == 0, (
+        f"Step 0 must seed week_offset=0; got: {data.get('week_offset')}"
+    )
 
     args, kwargs = msg.answer.call_args
     text = args[0] if args else kwargs.get("text", "")
     assert "Открыть неделю" in text
+    assert "Шаг 1: выберите неделю" in text, (
+        f"Step 0 prompt must mention week selection; got: {text!r}"
+    )
     reply_markup = kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
-    assert reply_markup is not None, "Expected start picker reply_markup"
+    assert reply_markup is not None, "Expected week picker reply_markup"
 
 
 @pytest.mark.asyncio
@@ -3677,12 +3687,15 @@ async def test_cmd_openweek_master_not_found_clears_state(
 
 
 @pytest.mark.asyncio
-async def test_admin_openweek_entry_cb_sets_state_and_shows_picker(
+async def test_admin_openweek_entry_cb_shows_week_picker(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """[🗓 Открыть неделю] tap → state.clear + set_state(opening_week_start) +
-    edit_text with start picker (callback.message is Message).
+    """[🗓 Открыть неделю] tap → state.clear + set_state(opening_week_week) +
+    edit_text with week picker (callback.message is Message). Session 5.64.
+
+    Was test_admin_openweek_entry_cb_sets_state_and_shows_picker (pre-5.64:
+    showed slot picker directly). Now step 0 = week picker.
     """
     from bot.states import AdminStates
 
@@ -3699,20 +3712,209 @@ async def test_admin_openweek_entry_cb_sets_state_and_shows_picker(
     await admin_handlers.admin_openweek_entry_cb(callback, state)
 
     state.clear.assert_called_once()
-    state.set_state.assert_called_once_with(AdminStates.opening_week_start)
+    state.set_state.assert_called_once_with(AdminStates.opening_week_week)
     assert callback.message.edit_text.called
     edit_args, edit_kwargs = callback.message.edit_text.call_args
     text = edit_args[0] if edit_args else edit_kwargs.get("text", "")
     assert "Открыть неделю" in text
+    assert "Шаг 1: выберите неделю" in text, (
+        f"Step 0 prompt must mention week selection; got: {text!r}"
+    )
+
+
+# ============================================================
+# Session 5.64 (пункт 1): /openweek step 0 — week picker
+# ============================================================
 
 
 @pytest.mark.asyncio
+@freeze_time("2026-09-11 14:00:00", tz_offset=0)  # Friday 11.09 MSK 17:00
+async def test_openweek_week_picker_nav_cb_next_increments_offset(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.64: tap След. → (delta=+1) on step 0 (state=opening_week_week) at
+    week_offset=0 → week_offset=1, edit_text with new week header.
+
+    Friday 11.09: base monday=07.09. Next week (offset=1) monday=14.09,
+    week_range = "14.09 – 20.09".
+    """
+    from bot.keyboards.admin import AdminOpenWeekNavCallbackData
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cb_data = AdminOpenWeekNavCallbackData(delta=1)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state({"business_tz": TZ, "week_offset": 0})
+
+    await admin_handlers.admin_openweek_week_picker_nav_cb(callback, cb_data, state)
+
+    data = _state_data_passed(state)
+    assert data["week_offset"] == 1, (
+        f"Nav +1 from offset=0 → offset=1; got: {data.get('week_offset')}"
+    )
+    assert callback.message.edit_text.called, "Nav must re-render week picker"
+    edit_args, edit_kwargs = callback.message.edit_text.call_args
+    text = edit_args[0] if edit_args else edit_kwargs.get("text", "")
+    assert "14.09 – 20.09" in text, (
+        f"Header must show next week range 14.09-20.09; got: {text!r}"
+    )
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-11 14:00:00", tz_offset=0)
+async def test_openweek_week_picker_nav_cb_prev_at_zero_no_op(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.64: tap ← Пред. (delta=-1) at week_offset=0 on step 0 → no-op (clamp 0).
+
+    Defense-in-depth: keyboard hides ← Пред. at offset=0, but stale callback
+    could slip through. Handler clamps and does nothing (silent answer).
+    """
+    from bot.keyboards.admin import AdminOpenWeekNavCallbackData
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cb_data = AdminOpenWeekNavCallbackData(delta=-1)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state({"business_tz": TZ, "week_offset": 0})
+
+    await admin_handlers.admin_openweek_week_picker_nav_cb(callback, cb_data, state)
+
+    assert not state.update_data.called, "Clamped no-op must NOT call update_data"
+    assert not callback.message.edit_text.called, "Clamped no-op must NOT re-render"
+    callback.answer.assert_called_once()
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-11 14:00:00", tz_offset=0)
+async def test_openweek_week_picker_nav_cb_next_at_cap_no_op(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.64: tap След. → (delta=+1) at week_offset=MAX (4) on step 0 → no-op."""
+    from bot.keyboards.admin import AdminOpenWeekNavCallbackData
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cb_data = AdminOpenWeekNavCallbackData(delta=1)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state({"business_tz": TZ, "week_offset": 4})
+
+    await admin_handlers.admin_openweek_week_picker_nav_cb(callback, cb_data, state)
+
+    assert not state.update_data.called, "Clamped no-op at cap must NOT call update_data"
+    assert not callback.message.edit_text.called, "Clamped no-op at cap must NOT re-render"
+    callback.answer.assert_called_once()
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-11 14:00:00", tz_offset=0)
+async def test_openweek_week_picker_nav_cb_state_loss_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.64: nav on step 0 without business_tz in state → state.clear + alert.
+
+    Race: state expired (Redis TTL) or cleared by cmd_today escape hatch
+    between showing week picker and tapping nav. Handler must not crash.
+    """
+    from bot.keyboards.admin import AdminOpenWeekNavCallbackData
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cb_data = AdminOpenWeekNavCallbackData(delta=1)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state({})  # empty state — no business_tz
+
+    await admin_handlers.admin_openweek_week_picker_nav_cb(callback, cb_data, state)
+
+    state.clear.assert_called_once()
+    args, kwargs = callback.answer.call_args
+    alert_text = args[0] if args else kwargs.get("text", "")
+    assert "потеряны" in alert_text, (
+        f"State-loss alert must mention data lost; got: {alert_text!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_openweek_week_select_cb_transitions_to_start_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.64: [✅ Выбрать эту неделю] on step 0 → set_state(opening_week_start) +
+    edit_text with slot picker (admin_window_slot_picker_keyboard mode='start').
+
+    week_offset=1 (next week) in state → header in transition message must
+    show the chosen week (offset=1 = next week from base).
+    """
+    from bot.states import AdminStates
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID, callback_data=None)
+    callback.data = "admin_openweek_week_select"
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state({"business_tz": TZ, "week_offset": 1})
+
+    await admin_handlers.admin_openweek_week_select_cb(callback, state)
+
+    state.set_state.assert_called_once_with(AdminStates.opening_week_start)
+    assert callback.message.edit_text.called, "Select must re-render with slot picker"
+    edit_args, edit_kwargs = callback.message.edit_text.call_args
+    text = edit_args[0] if edit_args else edit_kwargs.get("text", "")
+    assert "Шаг 2" in text, (
+        f"Step 0 → 1 transition message must mention 'Шаг 2'; got: {text!r}"
+    )
+    reply_markup = edit_kwargs.get("reply_markup")
+    assert reply_markup is not None, "Expected slot picker reply_markup"
+
+
+@pytest.mark.asyncio
+async def test_openweek_week_select_cb_master_not_found_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """5.64: [✅ Выбрать эту неделю] without seeded master → state.clear + alert."""
+    async with session_factory():
+        pass  # no seed
+
+    callback = _make_callback(ADMIN_TG_ID, callback_data=None)
+    callback.data = "admin_openweek_week_select"
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state({"business_tz": TZ, "week_offset": 0})
+
+    await admin_handlers.admin_openweek_week_select_cb(callback, state)
+
+    state.clear.assert_called_once()
+    state.set_state.assert_not_called()
+    args, kwargs = callback.answer.call_args
+    alert_text = args[0] if args else kwargs.get("text", "")
+    assert "Мастер не найден" in alert_text
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-11 14:00:00", tz_offset=0)  # Friday 11.09 MSK 17:00
 async def test_admin_openweek_start_cb_saves_start_and_shows_end_picker(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
     """[start slot tap] in opening_week_start → update_data(picked_start_minute),
     set_state(opening_week_end), answer with end picker (mode='end').
+
+    5.64 (W1 fix): header must show the chosen week (week_offset from state),
+    NOT the current week (pre-5.64 hardcoded offset=0 in _openweek_week_header
+    call). Friday 11.09 + 1 week → 14.09-20.09, header must show this range.
     """
     from uuid import UUID as _UUID
 
@@ -3725,7 +3927,10 @@ async def test_admin_openweek_start_cb_saves_start_and_shows_end_picker(
     sentinel = _UUID(int=0)
     cb_data = AdminWindowSlot30CallbackData(workday_id=sentinel, start_minute=600)
     callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
-    state = _make_mock_state({"business_tz": TZ})
+    # 5.64 (W1 fix): seed week_offset=1 to catch pre-fix bug where start_cb
+    # called _openweek_week_header(business_tz) without offset → showed
+    # current week (07-13.09) instead of chosen (14-20.09).
+    state = _make_mock_state({"business_tz": TZ, "week_offset": 1})
 
     await admin_handlers.admin_openweek_start_cb(callback, cb_data, state)
 
@@ -3736,6 +3941,12 @@ async def test_admin_openweek_start_cb_saves_start_and_shows_end_picker(
     # edit_text (preferred) or answer fallback — callback_answer_text handles both.
     text = callback_answer_text(callback)
     assert "Шаг 2" in text
+    # 5.64 (W1 fix): header must show week_offset=1 → next week range 14.09-20.09.
+    # Pre-fix this would have shown 07.09-13.09 (current week, offset=0 hardcoded).
+    assert "14.09 – 20.09" in text, (
+        f"End picker header must show chosen week (offset=1 → 14-20.09); "
+        f"got: {text!r}"
+    )
     # reply_markup is on edit_text (preferred) or answer (fallback).
     if callback.message.edit_text.called:
         _, kwargs = callback.message.edit_text.call_args
@@ -4080,11 +4291,19 @@ def test_admin_week_days_keyboard_nav_callback_data_packs_delta() -> None:
 
 @pytest.mark.asyncio
 @freeze_time("2026-09-11 14:00:00", tz_offset=0)  # Friday UTC 14:00 → Moscow 17:00
-async def test_admin_openweek_end_cb_seeds_week_offset_zero(
+async def test_admin_openweek_end_cb_preserves_week_offset_from_state(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """5.61: end_cb seeds week_offset=0 in state (current week on entry)."""
+    """5.64 (пункт 1): end_cb reads week_offset from state (set on step 0),
+    does NOT overwrite it. Was test_admin_openweek_end_cb_seeds_week_offset_zero
+    (pre-5.64: end_cb seeded week_offset=0).
+
+    Setup: week_offset=1 (next week, chosen on step 0) in state.
+    Verify: end_cb does NOT call update_data with week_offset (preserved from
+    state), and scheduled_weekdays computed for monday+7 (week_offset=1).
+    Friday 11.09 + 1 week = 14-20.09, all future → no WorkDays → empty lists.
+    """
     from uuid import UUID as _UUID
 
     from bot.keyboards.admin import AdminWindowSlot30CallbackData
@@ -4095,13 +4314,21 @@ async def test_admin_openweek_end_cb_seeds_week_offset_zero(
     sentinel = _UUID(int=0)
     cb_data = AdminWindowSlot30CallbackData(workday_id=sentinel, start_minute=1080)
     callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
-    state = _make_mock_state({"business_tz": TZ, "picked_start_minute": 600})
+    state = _make_mock_state(
+        {
+            "business_tz": TZ,
+            "picked_start_minute": 600,
+            "week_offset": 1,  # set by step 0 (week picker nav)
+        }
+    )
 
     await admin_handlers.admin_openweek_end_cb(callback, cb_data, state)
 
     data = _state_all_updates(state)
-    assert data["week_offset"] == 0, (
-        f"week_offset must be 0 on entry; got: {data.get('week_offset')}"
+    # end_cb must NOT seed week_offset=0 — preserve the value from step 0.
+    assert "week_offset" not in data, (
+        f"end_cb must NOT overwrite week_offset (set on step 0); "
+        f"got: {data.get('week_offset')}"
     )
     assert data["scheduled_weekdays"] == [], (
         f"No WorkDays seeded → scheduled empty; got: {data.get('scheduled_weekdays')}"

@@ -61,6 +61,9 @@ class AdminStates(StatesGroup):
     entering_service_duration = State()
     # /openweek (Session 5.26): batch open week — picker start → picker end →
     # toggle weekdays → confirm → open_workday per selected day.
+    # Session 5.64 (пункт 1): добавлен opening_week_week — шаг 0 «выбор недели»
+    # ПЕРЕД picker start. Логика: сначала неделя → start_time → end_time → дни.
+    opening_week_week = State()
     opening_week_start = State()
     opening_week_end = State()
     opening_week_days = State()
