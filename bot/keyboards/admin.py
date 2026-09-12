@@ -1,13 +1,15 @@
 """Keyboards for master (admin) — inline menu + back-compat reply keyboard.
 
-Session 5.62: inline keyboard с 6 кнопками для мастера Екатерины (пункт 2 —
-«Открыть день» удалён, CREATE через «Открыть неделю» или /openday текст).
-Каждая кнопка триггерит callback → FSM flow (multi-step для 3 из 6):
+Session 5.63 (пункт 3): inline keyboard с 5 кнопками для мастера Екатерины
+(«Открыть день» удалён в 5.62 пункт 2, «Закрыть день» удалён в 5.63 пункт 3).
+CREATE day через «Открыть неделю» или /openday текст. CLOSE day через «Сегодня»
+view (admin_today_keyboard добавляет [🔒 Закрыть день] если есть активный
+WorkDay) или /closeday текст (power-user shortcut).
+Каждая кнопка триггерит callback → FSM flow (multi-step для 3 из 5):
 - ➕ Изменить окно → adding_slots (date → start → end — MODIFY flow)
-- 📅 Сегодня → мгновенный список (no FSM)
+- 📅 Сегодня → мгновенный список (no FSM) + [🔒 Закрыть день] если WorkDay active
 - 🗓 Неделя → мгновенный список (no FSM)
 - 🗓 Открыть неделю → opening_week (batch CREATE, 5.26)
-- 📅 Закрыть день → closing_day (calendar → confirm, 5.26)
 - 💇 Услуги → entering_service (name → duration → price)
 
 /closeslot SHRINK inline flow REMOVED (5.10 simplification) — «Изменить окно»
@@ -37,7 +39,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram_calendar import SimpleCalendar
 
-from bot.models import Booking
+from bot.models import Booking, WorkDay
 
 
 class AdminMenuCallbackData(CallbackData, prefix="admin_menu"):
@@ -116,26 +118,30 @@ class AdminMoveConfirmCallbackData(CallbackData, prefix="admin_move_confirm"):
 
 
 def admin_inline_menu() -> InlineKeyboardMarkup:
-    """Inline keyboard с 6 кнопками для мастера (5.62).
+    """Inline keyboard с 5 кнопками для мастера (5.63).
 
     Session 5.62 (пункт 2 от Екатерины): кнопка «Открыть день» (старый
     текстовый формат с HH:MM input) УДАЛЕНА. CREATE day теперь только через
     «🗓 Открыть неделю» (inline picker) или текстовую команду /openday
     (power-user shortcut, без inline UI). MODIFY остаётся «➕ Изменить окно».
 
-    Layout: 2 + 2 + 2 (3 rows).
+    Session 5.63 (пункт 3 от Екатерины): кнопка «Закрыть день» УДАЛЕНА из
+    inline menu. CLOSE day теперь через «📅 Сегодня» view (admin_today_keyboard
+    добавляет [🔒 Закрыть день] если есть активный WorkDay) или текстовую
+    команду /closeday (power-user shortcut, без inline UI).
+
+    Layout: 2 + 2 + 1 (3 rows).
     Row 1: ➕ Изменить окно (MODIFY, 5.10), 📅 Сегодня.
     Row 2: 🗓 Неделя, 🗓 Открыть неделю (batch CREATE, 5.26).
-    Row 3: 📅 Закрыть день (5.26), 💇 Услуги (entering_service flow).
+    Row 3: 💇 Услуги (entering_service flow).
     """
     builder = InlineKeyboardBuilder()
     builder.button(text="➕ Изменить окно", callback_data=AdminAddslotsCallbackData().pack())
     builder.button(text="📅 Сегодня", callback_data=AdminTodayCallbackData().pack())
     builder.button(text="🗓 Неделя", callback_data=AdminWeekCallbackData().pack())
     builder.button(text="🗓 Открыть неделю", callback_data=AdminOpenWeekEntryCallbackData().pack())
-    builder.button(text="📅 Закрыть день", callback_data=AdminCloseDayEntryCallbackData().pack())
     builder.button(text="💇 Услуги", callback_data=AdminServicesCallbackData().pack())
-    builder.adjust(2, 2, 2)
+    builder.adjust(2, 2, 1)
     return builder.as_markup()
 
 
@@ -219,6 +225,7 @@ def admin_reply_keyboard() -> ReplyKeyboardMarkup:
 def admin_today_keyboard(
     bookings: list[Booking],
     business_timezone: str = "Europe/Moscow",
+    today_workday: WorkDay | None = None,
 ) -> InlineKeyboardMarkup:
     """Inline keyboard with [🔄 Перенести] button for each today booking (Этап 5.9).
 
@@ -226,10 +233,19 @@ def admin_today_keyboard(
     /today text line). admin taps → admin_move flow (calendar → 30-min slot
     picker → admin_move_booking service).
 
+    Session 5.63 (пункт 3): adds [🔒 Закрыть день] button in a separate row
+    IF today_workday is_active=True. Tap → admin_close_today_cb (inline confirm
+    → close_workday_with_cancellations). Replaces the old "📅 Закрыть день"
+    button that lived in admin_inline_menu (deleted in пункт 3).
+
     adjust(1) — one button per row (avoid horizontal clutter; Екатерина sees a
     list, not a grid). Telegram inline keyboard limit 100 buttons/row × N rows
     — pet-project single-tenant (Екатерина < 10 bookings/day), no pagination
     needed. If > 30 bookings — would need pagination (defer until pain).
+
+    today_workday: WorkDay | None — today's WorkDay row. If is_active=True,
+    a [🔒 Закрыть день] button is appended as a separate row. If None or
+    is_active=False, no close button (nothing to close today).
 
     NB: workday-only bookings (slot_id is None) AND legacy slot-based bookings
     BOTH get [🔄 Перенести] button — admin_move_booking handles both paths
@@ -250,6 +266,11 @@ def admin_today_keyboard(
         builder.button(
             text=f"🔄 {when} — {name}, {service}",
             callback_data=AdminMoveCallbackData(booking_id=b.id).pack(),
+        )
+    if today_workday is not None and getattr(today_workday, "is_active", False):
+        builder.button(
+            text="🔒 Закрыть день",
+            callback_data=AdminCloseTodayCallbackData().pack(),
         )
     builder.adjust(1)
     return builder.as_markup()
@@ -383,11 +404,29 @@ class AdminOpenweekEditCallbackData(CallbackData, prefix="admin_openweek_edit"):
     work_date_iso: str
 
 
-class AdminCloseDayEntryCallbackData(CallbackData, prefix="admin_closeday_entry"):
-    """Trigger /closeday flow from inline menu (Session 5.26).
+class AdminCloseTodayCallbackData(CallbackData, prefix="admin_close_today"):
+    """[🔒 Закрыть день] tap from admin_today_keyboard (Session 5.63, пункт 3).
 
-    No payload — tap → SimpleCalendar for date selection (next handler
-    admin_closeday_calendar_cb).
+    No payload — handler re-fetches today's WorkDay by business_tz (race-safe
+    vs concurrent close via /closeday text or another admin tab).
+    """
+
+
+class AdminCloseTodayConfirmCallbackData(CallbackData, prefix="admin_close_today_confirm"):
+    """[✅ Да, отменить записи] in today-close confirm step (Session 5.63, пункт 3).
+
+    Carries workday_id in callback_data — no FSM state needed (race-safe vs
+    state loss between confirm render and tap). Mirror AdminMoveConfirmCallbackData
+    pattern (booking_id in callback_data, not state).
+    """
+
+    workday_id: str
+
+
+class AdminCloseTodayCancelCallbackData(CallbackData, prefix="admin_close_today_cancel"):
+    """[❌ Не закрывать] in today-close confirm step (Session 5.63, пункт 3).
+
+    No payload — handler clears state (if any) and shows admin_inline_menu.
     """
 
 
@@ -763,15 +802,24 @@ def admin_openweek_edit_keyboard(opened_days: list[OpenedDay]) -> InlineKeyboard
     return builder.as_markup()
 
 
-def admin_closeday_confirm_keyboard() -> InlineKeyboardMarkup:
-    """[✅ Да, отменить записи] / [❌ Не закрывать] keyboard for /closeday
-    confirm step (Session 5.26).
+def admin_close_today_confirm_keyboard(workday_id: UUID) -> InlineKeyboardMarkup:
+    """[✅ Да, отменить записи] / [❌ Не закрывать] keyboard for today-view
+    close confirm (Session 5.63, пункт 3).
 
-    «✅ Да» callback_data="admin_closeday_confirm" (string).
-    «❌ Не закрывать» callback_data="admin_closeday_cancel" (string).
+    Uses AdminCloseTodayConfirmCallbackData(workday_id) — no FSM state needed.
+    workday_id is injected into callback_data so confirm handler can fetch the
+    WorkDay without reading state (race-safe vs state loss).
+
+    workday_id: UUID of the WorkDay to close (today's active WorkDay).
     """
     builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Да, отменить записи", callback_data="admin_closeday_confirm")
-    builder.button(text="❌ Не закрывать", callback_data="admin_closeday_cancel")
+    builder.button(
+        text="✅ Да, отменить записи",
+        callback_data=AdminCloseTodayConfirmCallbackData(workday_id=str(workday_id)).pack(),
+    )
+    builder.button(
+        text="❌ Не закрывать",
+        callback_data=AdminCloseTodayCancelCallbackData().pack(),
+    )
     builder.adjust(1)
     return builder.as_markup()

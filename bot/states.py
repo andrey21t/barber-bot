@@ -70,10 +70,13 @@ class AdminStates(StatesGroup):
     # opening_week_edit_end (pick new end) → update_workday → state.clear().
     opening_week_edit_start = State()
     opening_week_edit_end = State()
-    # /closeday (Session 5.26): close concrete day — calendar → confirm
-    # (if active bookings) → close_workday_with_cancellations.
-    closing_day_date = State()
-    closing_day_confirm = State()
+    # Session 5.63 (пункт 3): closing_day_* states УДАЛЕНЫ вместе с inline
+    # кнопкой "Закрыть день" и 4 handlers (entry_cb, calendar_cb, confirm_cb,
+    # cancel_cb). Текстовая команда /closeday осталась как power-user shortcut
+    # (без FSM — close прямо из args, mirror /openday). Закрытие через "Сегодня"
+    # view: admin_today_keyboard добавляет [🔒 Закрыть день] если есть активный
+    # WorkDay на сегодня → admin_close_today_cb (callback_data несёт workday_id,
+    # без state — race-safe vs state loss).
 
 
 class AdminMoveStates(StatesGroup):

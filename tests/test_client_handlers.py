@@ -5492,8 +5492,9 @@ async def test_restore_reply_keyboard_async_master_gets_admin_menu(
     assert flat_texts == expected_texts, (
         f"reply_markup buttons must match admin_inline_menu, got {flat_texts!r}"
     )
-    assert len(flat_texts) == 6, (
-        "admin_inline_menu has 6 buttons (layout 2+2+2, 5.62 removed 'Открыть день')"
+    assert len(flat_texts) == 5, (
+        "admin_inline_menu has 5 buttons (layout 2+2+1, 5.62 removed 'Открыть день', "
+        "5.63 removed 'Закрыть день')"
     )
 
 

@@ -27,7 +27,7 @@ from datetime import time as dt_time
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject, StateFilter, or_f
@@ -45,7 +45,9 @@ from bot.config import get_settings
 from bot.db import async_session_factory
 from bot.keyboards.admin import (
     AdminAddslotsCallbackData,
-    AdminCloseDayEntryCallbackData,
+    AdminCloseTodayCallbackData,
+    AdminCloseTodayCancelCallbackData,
+    AdminCloseTodayConfirmCallbackData,
     AdminMenuCallbackData,
     AdminMoveCallbackData,
     AdminMoveConfirmCallbackData,
@@ -62,7 +64,7 @@ from bot.keyboards.admin import (
     BookedSlot,
     OpenedDay,
     admin_calendar_keyboard,
-    admin_closeday_confirm_keyboard,
+    admin_close_today_confirm_keyboard,
     admin_inline_menu,
     admin_move_confirm_keyboard,
     admin_openweek_edit_keyboard,
@@ -74,7 +76,7 @@ from bot.keyboards.admin import (
     render_booked_header,
 )
 from bot.keyboards.client import client_book_kb
-from bot.models import Booking, Service, WorkDay
+from bot.models import Booking, Client, Service, WorkDay
 from bot.services.admin import (
     create_service,
     deactivate_service,
@@ -593,14 +595,28 @@ async def cmd_today(message: Message, state: FSMContext) -> None:
         # Single SELECT — not N+1 (one query per booking). Phone is an attribute
         # of Client, not a snapshot in Booking, so we resolve via Client.id.
         client_phones = await _fetch_client_phones(session, bookings) if bookings else {}
+        # Session 5.63 (пункт 3): fetch today's WorkDay to gate [🔒 Закрыть день]
+        # button in admin_today_keyboard. None if no workday, is_active=False if
+        # already closed — both hide the close button.
+        today_local = datetime.now(ZoneInfo(tz)).date()
+        today_workday = await select_workday(session, master_id, today_local)
 
     if not bookings:
-        await message.answer("На сегодня записей нет.")
+        # No bookings today — still show [🔒 Закрыть день] if today_workday is
+        # active (admin can close an empty day). Mirror admin_today_keyboard
+        # signature (bookings list + today_workday).
+        if today_workday is not None and today_workday.is_active:
+            await message.answer(
+                "На сегодня записей нет.\n\nДата открыта — можно закрыть день.",
+                reply_markup=admin_today_keyboard(bookings, tz, today_workday=today_workday),
+            )
+        else:
+            await message.answer("На сегодня записей нет.")
         return
 
     await message.answer(
         _render_bookings("📅 Записи на сегодня:", bookings, tz, client_phones=client_phones),
-        reply_markup=admin_today_keyboard(bookings, tz),
+        reply_markup=admin_today_keyboard(bookings, tz, today_workday=today_workday),
     )
 
 
@@ -3340,11 +3356,133 @@ async def admin_openweek_cancel_cb(callback: CallbackQuery, state: FSMContext) -
 # --- /closeday -------------------------------------------------------------
 
 
-@router.message(Command("closeday"), StateFilter(None))
-async def cmd_closeday(message: Message, state: FSMContext) -> None:
-    """/closeday — entry point для close day flow (Session 5.26).
+async def _notify_cancelled_clients(
+    cancelled_bookings: list[Booking],
+    business_tz: str,
+    bot: Bot | None,
+    scheduler: AsyncIOScheduler,
+) -> int:
+    """Send cancellation notification to each cancelled client + remove
+    scheduler jobs (extracted from old admin_closeday_confirm_cb:3625-3691).
 
-    Show SimpleCalendar for date selection (next handler admin_closeday_calendar_cb).
+    Mirror cancel_booking step 10 (scheduler.py:182-201):
+    - remove_jobs_for_booking per booking (sync, no await).
+    - Resolve Client.telegram_id via select (booking.client_id is FK, not
+      telegram_id).
+    - bot.send_message to client with cancellation text + client_book_kb.
+    - TelegramRetryAfter -> retry once after retry_after (flood control).
+    - TelegramBadRequest (client blocked bot) -> log warning, skip notification.
+
+    Returns notified_count (clients who received the message; 0 if bot is
+    None or all clients blocked the bot).
+    """
+    tz_obj = ZoneInfo(business_tz)
+    notified_count = 0
+    for booking in cancelled_bookings:
+        remove_jobs_for_booking(scheduler, booking.id)
+        async with async_session_factory() as lookup_session:
+            stmt_c = select(Client).where(Client.id == booking.client_id)
+            client = (await lookup_session.execute(stmt_c)).scalar_one_or_none()
+        if client is None:
+            logger.warning(
+                "closeday: client %s for booking %s not found - skip notification",
+                booking.client_id,
+                booking.id,
+            )
+            continue
+        local_time = booking.start_at.replace(tzinfo=UTC).astimezone(tz_obj)
+        formatted_time = local_time.strftime("%d %B %Y, %H:%M")
+        client_text = (
+            f"📢 Ваша запись отменена мастером:\n\n"
+            f"📅 {formatted_time}\n"
+            f"👤 {booking.client_name_snapshot}\n"
+            f"💇 {booking.service_title_snapshot}\n\n"
+            f"Запишитесь на другое время через /book."
+        )
+        if bot is not None:
+            try:
+                await bot.send_message(
+                    chat_id=client.telegram_id,
+                    text=client_text,
+                    reply_markup=client_book_kb(),
+                )
+                notified_count += 1
+            except TelegramRetryAfter as e:
+                logger.warning(
+                    "closeday: flood control for client %s, retry after %ss (booking %s)",
+                    client.telegram_id,
+                    e.retry_after,
+                    booking.id,
+                )
+                await asyncio.sleep(e.retry_after)
+                try:
+                    await bot.send_message(
+                        chat_id=client.telegram_id,
+                        text=client_text,
+                        reply_markup=client_book_kb(),
+                    )
+                    notified_count += 1
+                except (TelegramBadRequest, TelegramRetryAfter):
+                    logger.warning(
+                        "closeday: client %s blocked the bot after retry - notification skipped "
+                        "(booking %s cancelled)",
+                        client.telegram_id,
+                        booking.id,
+                    )
+            except TelegramBadRequest:
+                logger.warning(
+                    "closeday: client %s blocked the bot - notification skipped "
+                    "(booking %s cancelled)",
+                    client.telegram_id,
+                    booking.id,
+                )
+    return notified_count
+
+
+def _format_closeday_summary(work_date: date, cancelled_count: int, notified_count: int) -> str:
+    """Render summary message for /closeday and admin_close_today flows."""
+    if cancelled_count == 0:
+        return f"✅ День {work_date.strftime('%d %B %Y')} закрыт. Активных записей не было."
+    return (
+        f"✅ День {work_date.strftime('%d %B %Y')} закрыт. "
+        f"Отменено записей: {cancelled_count}. "
+        f"Клиентов уведомлено: {notified_count}."
+    )
+
+
+@router.message(Command("closeday"), StateFilter("*"))
+async def cmd_closeday(
+    message: Message,
+    command: CommandObject,
+    state: FSMContext,
+    scheduler: AsyncIOScheduler,
+) -> None:
+    """``/closeday [DATE]`` - close today (or DATE if specified) workday.
+
+    Power-user shortcut (Session 5.63, пункт 3): mirror ``/openday`` - text
+    command with optional date arg, no calendar, no FSM, no confirm step.
+    Closes the workday and cancels ALL active bookings on it (with client
+    notifications). Power-user takes responsibility (same contract as
+    ``/openday``: if you typed it, you meant it).
+
+    Args:
+        ``/closeday`` - close today (in business_tz).
+        ``/closeday 2026-09-18`` - close that date.
+
+    Behavior:
+    - Non-admin -> silent return.
+    - Master not found -> error message.
+    - Invalid date format -> error message.
+    - No WorkDay on that date -> "не открыт, нечего закрывать" + state.clear.
+    - Already closed -> "уже закрыт" + state.clear.
+    - Active + bookings -> close + cancel + notify + summary.
+    - Active + no bookings -> close + summary (no notifications needed).
+
+    State is cleared AFTER master resolution + date validation, BEFORE workday
+    fetch. NOT cleared on master not found / invalid date (early return before
+    state.clear). state.clear is hygiene — /closeday itself doesn\'t use FSM,
+    but if admin was mid-flow (e.g., /addslots) and typed /closeday, clear state
+    so stale FSM data doesn\'t linger.
     """
     if not _is_admin(message):
         return
@@ -3355,70 +3493,76 @@ async def cmd_closeday(message: Message, state: FSMContext) -> None:
     if resolved is None:
         await message.answer("❌ Мастер не найден")
         return
-    _master_id, _business_id, tz = resolved
+    master_id, _business_id, tz = resolved
+
+    args = (command.args or "").strip()
+    if args:
+        try:
+            work_date = date.fromisoformat(args)
+        except ValueError:
+            await message.answer(
+                "❌ Неверная дата. Формат: ГГГГ-ММ-ДД (например 2026-09-18)\n"
+                "Или `/closeday` без аргументов — закроет сегодня."
+            )
+            return
+    else:
+        work_date = datetime.now(ZoneInfo(tz)).date()
 
     await state.clear()
-    await state.set_state(AdminStates.closing_day_date)
-    await state.update_data(business_tz=tz)
 
-    await message.answer(
-        "📅 Выберите дату для закрытия:",
-        reply_markup=await admin_calendar_keyboard(*_admin_calendar_range(tz)),
-    )
+    async with async_session_factory() as session:
+        workday = await select_workday(session, master_id, work_date)
 
-
-@router.callback_query(AdminCloseDayEntryCallbackData.filter(), StateFilter("*"))
-async def admin_closeday_entry_cb(callback: CallbackQuery, state: FSMContext) -> None:
-    """[📅 Закрыть день] tap → start /closeday flow (Session 5.26).
-
-    state.clear() then set_state(closing_day_date) — escape hatch из любого
-    FSM state. Show SimpleCalendar for date selection.
-    """
-    if not _is_admin_callback(callback):
-        await callback.answer()
-        return
-    assert callback.from_user is not None
-    resolved = await _resolve_master_and_business(callback.from_user.id)
-    if resolved is None:
-        await callback.answer("❌ Мастер не найден", show_alert=True)
-        return
-    _master_id, _business_id, tz = resolved
-
-    await state.clear()
-    await state.set_state(AdminStates.closing_day_date)
-    await state.update_data(business_tz=tz)
-
-    if callback.message is not None:
-        await callback.message.answer(
-            "📅 Выберите дату для закрытия:",
-            reply_markup=await admin_calendar_keyboard(*_admin_calendar_range(tz)),
+    if workday is None:
+        await message.answer(
+            f"❌ На {work_date.strftime('%d %B %Y')} рабочий день не открыт. Нечего закрывать."
         )
-    await callback.answer()
+        return
+
+    if not workday.is_active:
+        await message.answer(f"❌ День {work_date.strftime('%d %B %Y')} уже закрыт.")
+        return
+
+    async with async_session_factory() as session:
+        try:
+            result = await close_workday_with_cancellations(session, workday.id, business_tz=tz)
+        except SQLAlchemyError:
+            await message.answer("❌ Ошибка БД. Попробуйте позже через /menu")
+            return
+
+    if result is None:
+        await message.answer(
+            f"❌ День {work_date.strftime('%d %B %Y')} уже закрыт.",
+            reply_markup=admin_inline_menu(),
+        )
+        return
+
+    notified_count = await _notify_cancelled_clients(
+        result.cancelled_bookings, tz, message.bot, scheduler
+    )
+    cancelled_count = len(result.cancelled_bookings)
+    summary = _format_closeday_summary(result.work_date, cancelled_count, notified_count)
+    await message.answer(summary, reply_markup=admin_inline_menu())
 
 
-@router.callback_query(
-    SimpleCalendarCallback.filter(),
-    StateFilter(AdminStates.closing_day_date),
-)
-async def admin_closeday_calendar_cb(
+@router.callback_query(AdminCloseTodayCallbackData.filter(), StateFilter("*"))
+async def admin_close_today_cb(
     callback: CallbackQuery,
-    callback_data: SimpleCalendarCallback,
     state: FSMContext,
+    scheduler: AsyncIOScheduler,
+    callback_data: AdminCloseTodayCallbackData,
 ) -> None:
-    """SimpleCalendar для /closeday — навигация + выбор даты (Session 5.26).
+    """[🔒 Закрыть день] tap from admin_today_keyboard (Session 5.63, пункт 3).
 
-    Branch by callback_data.act (mirror admin_addslots_calendar_cb:711):
-    - ignore/today+same-month: callback.answer(cache_time=60)
-    - day: SELECT WorkDay. Branches:
-        * None → "не открыт, нечего закрывать" + state.clear()
-        * is_active=False → "уже закрыт" + state.clear()
-        * is_active=True + active bookings → list + [✅ Да, отменить записи]
-          / [❌ Не закрывать]. State: closing_day_confirm + workday_id.
-        * is_active=True + no active bookings → close immediately (no confirm
-          needed — nothing to lose). close_workday_with_cancellations called
-          directly with cancelled_bookings=[].
-    - cancel: state.clear() + "❌ Закрытие дня отменено"
-    - navigation: lib сделал edit_reply_markup, handler answers
+    Re-fetches today's WorkDay (race-safe vs concurrent close via /closeday
+    text or another admin tab between cmd_today render and this tap).
+    Branches:
+    - WorkDay not found -> "не открыт" + state.clear.
+    - Already closed -> "уже закрыт" + state.clear.
+    - Active + no bookings -> close immediately + summary + state.clear.
+    - Active + bookings -> show list + admin_close_today_confirm_keyboard
+      (workday_id in callback_data, no FSM state needed - race-safe vs state
+      loss).
     """
     if not _is_admin_callback(callback):
         await callback.answer()
@@ -3431,115 +3575,15 @@ async def admin_closeday_calendar_cb(
         return
     master_id, _business_id, tz = resolved
 
-    if callback_data.act == SimpleCalAct.ignore:
-        await callback.answer(cache_time=60)
-        return
-    if callback_data.act == SimpleCalAct.today:
-        today_sys = datetime.now().replace(tzinfo=None)
-        if today_sys.year == callback_data.year and today_sys.month == callback_data.month:
-            await callback.answer(cache_time=60)
-            return
+    await state.clear()
 
-    cal = SimpleCalendar(locale="ru_RU.UTF-8", cancel_btn="Отмена", today_btn="Сегодня")
-    cal.set_dates_range(*_admin_calendar_range(tz))
-    selected, selected_date = await cal.process_selection(callback, callback_data)
+    today_local = datetime.now(ZoneInfo(tz)).date()
+    async with async_session_factory() as session:
+        workday = await select_workday(session, master_id, today_local)
 
-    if callback_data.act == SimpleCalAct.day:
-        if not selected:
-            await callback.answer(cache_time=60)
-            return  # out-of-range
-        work_date = selected_date.date()
-
-        async with async_session_factory() as session:
-            workday = await select_workday(session, master_id, work_date)
-
-        if workday is None:
-            if isinstance(callback.message, Message):
-                hint = (
-                    f"❌ На {work_date.strftime('%d %B %Y')} рабочий день не открыт. "
-                    "Нечего закрывать."
-                )
-                try:
-                    await callback.message.edit_text(hint, reply_markup=None)
-                except TelegramBadRequest:
-                    await callback.message.answer(hint)
-            await state.clear()
-            await callback.answer()
-            return
-
-        if not workday.is_active:
-            if isinstance(callback.message, Message):
-                hint = f"❌ День {work_date.strftime('%d %B %Y')} уже закрыт."
-                try:
-                    await callback.message.edit_text(hint, reply_markup=None)
-                except TelegramBadRequest:
-                    await callback.message.answer(hint)
-            await state.clear()
-            await callback.answer()
-            return
-
-        # WorkDay is_active=True — check active bookings.
-        async with async_session_factory() as session:
-            active_bookings = await get_active_bookings_for_workday(session, workday, tz)
-
-        if not active_bookings:
-            # No active bookings — close immediately (nothing to lose).
-            async with async_session_factory() as session:
-                result = await close_workday_with_cancellations(session, workday.id, business_tz=tz)
-            if result is None:
-                if isinstance(callback.message, Message):
-                    await callback.message.answer(
-                        f"❌ День {work_date.strftime('%d %B %Y')} не найден."
-                    )
-            else:
-                if isinstance(callback.message, Message):
-                    await callback.message.answer(
-                        f"✅ День {work_date.strftime('%d %B %Y')} закрыт. "
-                        "Активных записей не было.",
-                        reply_markup=admin_inline_menu(),
-                    )
-            await state.clear()
-            await callback.answer()
-            return
-
-        # Active bookings — show list + confirm keyboard.
-        await state.update_data(closing_day_workday_id=str(workday.id))
-        await state.set_state(AdminStates.closing_day_confirm)
-
-        tz_obj = ZoneInfo(tz)
-        bookings_text_lines: list[str] = []
-        for b in active_bookings:
-            local_time = b.start_at.replace(tzinfo=UTC).astimezone(tz_obj)
-            when = local_time.strftime("%H:%M")
-            bookings_text_lines.append(
-                f"• {when} — {b.client_name_snapshot}, {b.service_title_snapshot}"
-            )
-        bookings_list = "\n".join(bookings_text_lines)
-        confirm_text = (
-            f"📅 <b>{work_date.strftime('%d %B %Y')}</b>\n\n"
-            f"В этот день {len(active_bookings)} запис(ь/и/ей):\n"
-            f"{bookings_list}\n\n"
-            f"Закрыть день и отменить все записи?"
-        )
-
+    if workday is None:
         if isinstance(callback.message, Message):
-            try:
-                await callback.message.edit_text(
-                    confirm_text,
-                    reply_markup=admin_closeday_confirm_keyboard(),
-                )
-            except TelegramBadRequest:
-                await callback.message.answer(
-                    confirm_text,
-                    reply_markup=admin_closeday_confirm_keyboard(),
-                )
-        await callback.answer()
-        return
-
-    if callback_data.act == SimpleCalAct.cancel:
-        await state.clear()
-        if isinstance(callback.message, Message):
-            hint = "❌ Закрытие дня отменено. /menu для меню"
+            hint = "❌ Сегодня рабочий день не открыт. Нечего закрывать."
             try:
                 await callback.message.edit_text(hint, reply_markup=None)
             except TelegramBadRequest:
@@ -3547,25 +3591,89 @@ async def admin_closeday_calendar_cb(
         await callback.answer()
         return
 
-    # Navigation (prev_y/next_y/prev_m/next_m/today-diff-month).
+    if not workday.is_active:
+        if isinstance(callback.message, Message):
+            hint = "❌ Сегодня уже закрыт."
+            try:
+                await callback.message.edit_text(hint, reply_markup=None)
+            except TelegramBadRequest:
+                await callback.message.answer(hint)
+        await callback.answer()
+        return
+
+    async with async_session_factory() as session:
+        active_bookings = await get_active_bookings_for_workday(session, workday, tz)
+
+    if not active_bookings:
+        async with async_session_factory() as session:
+            try:
+                result = await close_workday_with_cancellations(session, workday.id, business_tz=tz)
+            except SQLAlchemyError:
+                if isinstance(callback.message, Message):
+                    await callback.message.answer("❌ Ошибка БД. Попробуйте позже через /menu")
+                await callback.answer()
+                return
+        if result is None:
+            if isinstance(callback.message, Message):
+                await callback.message.answer(
+                    f"❌ День {today_local.strftime('%d %B %Y')} уже закрыт.",
+                    reply_markup=admin_inline_menu(),
+                )
+            await callback.answer()
+            return
+        notified_count = await _notify_cancelled_clients(
+            result.cancelled_bookings, tz, callback.bot, scheduler
+        )
+        cancelled_count = len(result.cancelled_bookings)
+        summary = _format_closeday_summary(result.work_date, cancelled_count, notified_count)
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(summary, reply_markup=admin_inline_menu())
+            except TelegramBadRequest:
+                await callback.message.answer(summary, reply_markup=admin_inline_menu())
+        await callback.answer()
+        return
+
+    tz_obj = ZoneInfo(tz)
+    bookings_text_lines: list[str] = []
+    for b in active_bookings:
+        local_time = b.start_at.replace(tzinfo=UTC).astimezone(tz_obj)
+        when = local_time.strftime("%H:%M")
+        bookings_text_lines.append(
+            f"• {when} — {b.client_name_snapshot}, {b.service_title_snapshot}"
+        )
+    bookings_list = "\n".join(bookings_text_lines)
+    confirm_text = (
+        f"📅 <b>{today_local.strftime('%d %B %Y')}</b>\n\n"
+        f"В этот день {len(active_bookings)} запис(ь/и/ей):\n"
+        f"{bookings_list}\n\n"
+        f"Закрыть день и отменить все записи?"
+    )
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_text(
+                confirm_text,
+                reply_markup=admin_close_today_confirm_keyboard(workday.id),
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                confirm_text,
+                reply_markup=admin_close_today_confirm_keyboard(workday.id),
+            )
     await callback.answer()
 
 
-@router.callback_query(
-    F.data == "admin_closeday_confirm",
-    StateFilter(AdminStates.closing_day_confirm),
-)
-async def admin_closeday_confirm_cb(
+@router.callback_query(AdminCloseTodayConfirmCallbackData.filter(), StateFilter("*"))
+async def admin_close_today_confirm_cb(
     callback: CallbackQuery,
-    state: FSMContext,
     scheduler: AsyncIOScheduler,
+    callback_data: AdminCloseTodayConfirmCallbackData,
 ) -> None:
-    """[✅ Да, отменить записи] → close_workday_with_cancellations + notify
-    clients + remove scheduler jobs. Render summary (Session 5.26).
+    """[✅ Да, отменить записи] in today-close confirm step (Session 5.63, пункт 3).
 
-    state.clear() BEFORE service call (race protection).
-    `scheduler` injected from dp["scheduler"] workflow_data (same as
-    admin_move_confirm_cb:1896).
+    Reads workday_id from callback_data (race-safe vs FSM state loss between
+    confirm render and tap — no state to lose). close_workday_with_cancellations
+    + notify cancelled clients + remove scheduler jobs + summary.
     """
     if not _is_admin_callback(callback):
         await callback.answer()
@@ -3573,32 +3681,15 @@ async def admin_closeday_confirm_cb(
     assert callback.from_user is not None
     resolved = await _resolve_master_and_business(callback.from_user.id)
     if resolved is None:
-        await state.clear()
         await callback.answer("❌ Мастер не найден", show_alert=True)
         return
     _master_id, _business_id, tz = resolved
 
-    data = await state.get_data()
-    workday_id_str = data.get("closing_day_workday_id")
-    if not workday_id_str:
-        await state.clear()
-        if callback.message is not None:
-            await callback.message.answer(
-                "❌ Данные сессии потеряны. /closeday чтобы начать заново"
-            )
-        await callback.answer()
-        return
-
-    # state.clear() BEFORE service call (race protection).
-    await state.clear()
-
     try:
-        workday_id = UUID(workday_id_str)
+        workday_id = UUID(callback_data.workday_id)
     except (ValueError, TypeError):
-        if callback.message is not None:
-            await callback.message.answer(
-                "❌ Ошибка данных в сессии. /closeday чтобы начать заново"
-            )
+        if isinstance(callback.message, Message):
+            await callback.message.answer("❌ Ошибка данных кнопки. /closeday чтобы закрыть день")
         await callback.answer()
         return
 
@@ -3606,129 +3697,61 @@ async def admin_closeday_confirm_cb(
         try:
             result = await close_workday_with_cancellations(session, workday_id, business_tz=tz)
         except SQLAlchemyError:
-            if callback.message is not None:
+            if isinstance(callback.message, Message):
                 await callback.message.answer("❌ Ошибка БД. Попробуйте позже через /menu")
             await callback.answer()
             return
 
     if result is None:
-        if callback.message is not None:
+        if isinstance(callback.message, Message):
             await callback.message.answer(
-                "❌ Рабочий день не найден. /closeday чтобы начать заново",
+                "❌ Рабочий день не найден (возможно уже закрыт). /today чтобы проверить",
                 reply_markup=admin_inline_menu(),
             )
         await callback.answer()
         return
 
-    # Notify each cancelled client + remove scheduler jobs.
-    tz_obj = ZoneInfo(tz)
-    notified_count = 0
-    for booking in result.cancelled_bookings:
-        # Remove scheduler jobs (mirror cancel_booking step 10).
-        remove_jobs_for_booking(scheduler, booking.id)
-
-        # Resolve client.telegram_id for notification.
-        from sqlalchemy import select as _select
-
-        from bot.models import Client as _Client
-
-        async with async_session_factory() as lookup_session:
-            stmt_c = _select(_Client).where(_Client.id == booking.client_id)
-            client = (await lookup_session.execute(stmt_c)).scalar_one_or_none()
-
-        if client is None:
-            logger.warning(
-                "closeday: client %s for booking %s not found — skip notification",
-                booking.client_id,
-                booking.id,
-            )
-            continue
-
-        local_time = booking.start_at.replace(tzinfo=UTC).astimezone(tz_obj)
-        formatted_time = local_time.strftime("%d %B %Y, %H:%M")
-        client_text = (
-            f"📢 Ваша запись отменена мастером:\n\n"
-            f"📅 {formatted_time}\n"
-            f"👤 {booking.client_name_snapshot}\n"
-            f"💇 {booking.service_title_snapshot}\n\n"
-            f"Запишитесь на другое время через /book."
-        )
-        if callback.bot is not None:
-            try:
-                await callback.bot.send_message(
-                    chat_id=client.telegram_id,
-                    text=client_text,
-                    reply_markup=client_book_kb(),
-                )
-                notified_count += 1
-            except TelegramRetryAfter as e:
-                # Flood control — retry once after retry_after (mirror scheduler.py:192-201).
-                logger.warning(
-                    "closeday: flood control for client %s, retry after %ss (booking %s)",
-                    client.telegram_id,
-                    e.retry_after,
-                    booking.id,
-                )
-                await asyncio.sleep(e.retry_after)
-                try:
-                    await callback.bot.send_message(chat_id=client.telegram_id, text=client_text)
-                    notified_count += 1
-                except (TelegramBadRequest, TelegramRetryAfter):
-                    logger.warning(
-                        "closeday: client %s blocked the bot after retry — notification skipped "
-                        "(booking %s cancelled)",
-                        client.telegram_id,
-                        booking.id,
-                    )
-            except TelegramBadRequest:
-                logger.warning(
-                    "closeday: client %s blocked the bot — notification skipped "
-                    "(booking %s cancelled)",
-                    client.telegram_id,
-                    booking.id,
-                )
-
-    if callback.message is not None:
-        cancelled_count = len(result.cancelled_bookings)
-        if cancelled_count == 0:
-            summary = (
-                f"✅ День {result.work_date.strftime('%d %B %Y')} закрыт. Активных записей не было."
-            )
-        else:
-            summary = (
-                f"✅ День {result.work_date.strftime('%d %B %Y')} закрыт. "
-                f"Отменено записей: {cancelled_count}. "
-                f"Клиентов уведомлено: {notified_count}."
-            )
-        # edit_text заменяет сообщение с кнопкой [✅ Закрыть] на результат —
-        # кнопка исчезает (FSM cleared, повторный тап = state loss). reply_markup=
-        # admin_inline_menu даёт свежее меню в этом же сообщении (UX: не листать вверх).
-        if isinstance(callback.message, Message):
-            try:
-                await callback.message.edit_text(summary, reply_markup=admin_inline_menu())
-            except TelegramBadRequest:
-                await callback.message.answer(summary, reply_markup=admin_inline_menu())
-        else:
+    notified_count = await _notify_cancelled_clients(
+        result.cancelled_bookings, tz, callback.bot, scheduler
+    )
+    cancelled_count = len(result.cancelled_bookings)
+    summary = _format_closeday_summary(result.work_date, cancelled_count, notified_count)
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_text(summary, reply_markup=admin_inline_menu())
+        except TelegramBadRequest:
             await callback.message.answer(summary, reply_markup=admin_inline_menu())
+    elif callback.message is not None:
+        await callback.message.answer(summary, reply_markup=admin_inline_menu())
     await callback.answer()
 
 
-@router.callback_query(
-    F.data == "admin_closeday_cancel",
-    StateFilter(AdminStates),
-)
-async def admin_closeday_cancel_cb(callback: CallbackQuery, state: FSMContext) -> None:
-    """[❌ Не закрывать] string callback in closing_day_* states — clear FSM."""
+@router.callback_query(AdminCloseTodayCancelCallbackData.filter(), StateFilter("*"))
+async def admin_close_today_cancel_cb(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """[❌ Не закрывать] in today-close confirm step (Session 5.63, пункт 3).
+
+    Clears FSM state (if any) and shows "Закрытие отменено" + admin_inline_menu.
+    """
     if not _is_admin_callback(callback):
         await callback.answer()
         return
     await state.clear()
-    if callback.message is not None:
-        await callback.message.answer(
-            "❌ Закрытие дня отменено. /menu для меню",
-            reply_markup=admin_inline_menu(),
-        )
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_text(
+                "❌ Закрытие дня отменено. /menu для меню",
+                reply_markup=admin_inline_menu(),
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                "❌ Закрытие дня отменено. /menu для меню",
+                reply_markup=admin_inline_menu(),
+            )
     await callback.answer()
+
 
 
 # Constants for /openweek summary labels (Python date.weekday() — Mon=0).
