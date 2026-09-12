@@ -767,6 +767,125 @@ async def test_cmd_openday_happy_reopens_closed_workday(
 
 
 # ============================================================
+# admin_openday_start_msg — 5 branches (lines 1248-1286)
+# FSM: StateFilter(AdminStates.opening_workday_start), F.text, ~"/"
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_admin_openday_start_msg_non_admin_silent(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Non-admin text in opening_workday_start state → silent return (no answer)."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=NON_ADMIN_TG_ID, text="11:00")
+    state = _make_mock_state({"selected_date": "2099-01-01"})
+
+    await admin_handlers.admin_openday_start_msg(msg, state)
+
+    assert _answer_call_count(msg) == 0
+    state.clear.assert_not_called()
+    state.set_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_openday_start_msg_no_selected_date_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """State has no selected_date (e.g. FSM entered without cmd_openday) → state.clear + hint."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="11:00")
+    state = _make_mock_state({})  # no selected_date key
+
+    await admin_handlers.admin_openday_start_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Дата не выбрана" in text
+    assert "/menu" in text
+    state.clear.assert_awaited_once()
+    state.set_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_openday_start_msg_bad_stored_date_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """selected_date in state is not ISO-parseable (stale/corrupted) → state.clear + hint."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="11:00")
+    state = _make_mock_state({"selected_date": "not-a-date"})
+
+    await admin_handlers.admin_openday_start_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Ошибка даты" in text
+    state.clear.assert_awaited_once()
+    state.set_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_openday_start_msg_bad_time_format_keeps_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Bad time format (not HH:MM / ЧЧ.ММ / ЧЧ,ММ) → error hint, state STAYS (admin can retry)."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="25")
+    state = _make_mock_state({"selected_date": "2099-01-01"})
+
+    await admin_handlers.admin_openday_start_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Формат ЧЧ:ММ" in text
+    state.clear.assert_not_called()
+    state.set_state.assert_not_called()
+    state.update_data.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_openday_start_msg_happy_transitions_to_end(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Happy: '11:00' → state.update_data(start_time='11:00') + set_state(opening_workday_end)
+    + answer 'Начало: 11:00 / Введите время окончания'.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="11:00")
+    state = _make_mock_state({"selected_date": "2099-01-01"})
+
+    await admin_handlers.admin_openday_start_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert text.startswith("Начало: <b>11:00</b>")
+    assert "Введите время окончания" in text
+
+    state.update_data.assert_awaited_once()
+    update_args, update_kwargs = state.update_data.call_args
+    update_payload = update_args[0] if update_args else update_kwargs
+    # time(11, 0).isoformat() == "11:00:00" (with seconds)
+    assert update_payload["start_time"] == "11:00:00"
+
+    state.set_state.assert_awaited_once_with(
+        admin_handlers.AdminStates.opening_workday_end
+    )
+    state.clear.assert_not_called()
+
+
+# ============================================================
 # admin_addslots_cb — 4 branches (lines 925-952)
 # ============================================================
 
