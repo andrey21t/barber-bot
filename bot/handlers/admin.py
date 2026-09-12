@@ -50,7 +50,6 @@ from bot.keyboards.admin import (
     AdminMoveCallbackData,
     AdminMoveConfirmCallbackData,
     AdminMoveSlot30CallbackData,
-    AdminOpendayCallbackData,
     AdminOpenWeekCallbackData,
     AdminOpenweekEditCallbackData,
     AdminOpenWeekEntryCallbackData,
@@ -81,7 +80,6 @@ from bot.services.admin import (
     deactivate_service,
     get_active_bookings_for_workday,
     get_all_future_bookings,
-    get_bookings_for_date,
     get_bookings_for_date_range,
     get_today_bookings,
     list_services,
@@ -355,8 +353,10 @@ async def cmd_openday(message: Message, command: CommandObject) -> None:
     on the same date → update_workday (Gap 6 shrink checks). Shrink with
     active bookings → WorkDayShrinkError (admin cancels them first).
 
-    FSM alternative (calendar → start_time → end_time) is admin_openday_cb
-    + admin_openday_calendar_cb + admin_openday_start_msg + admin_openday_end_msg.
+    Session 5.62 (пункт 2): inline FSM alternative (admin_openday_cb →
+    calendar → HH:MM text → end_time → open_workday) УДАЛЕНА. Екатерина
+    убрала кнопку "Открыть день" — текстовая команда /openday осталась как
+    power-user shortcut. Inline CREATE через "🗓 Открыть неделю" (5.26).
     """
     if not _is_admin(message):
         return
@@ -441,8 +441,9 @@ def _parse_hhmm(s: str) -> dt_time:
     phone keypad (no need to switch layout to reach ':'). Single separator
     only — '11.00' OK, '11.00.30' (len=3) raises ValueError.
 
-    Used by cmd_openday (text args) and admin_openday_start_msg / end_msg (FSM
-    text input). Centralised parse keeps error messages consistent.
+    Used by cmd_openday (text args, power-user shortcut). Centralised parse
+    keeps error messages consistent. Session 5.62 (пункт 2): inline FSM
+    handlers admin_openday_start_msg / end_msg удалены.
     """
     parts = re.split(r"[:.,]", s)
     if len(parts) != 2:
@@ -456,8 +457,11 @@ def _parse_hhmm(s: str) -> dt_time:
 def _render_shrink_conflicts(exc: WorkDayShrinkError, business_tz: str) -> str:
     """Render WorkDayShrinkError conflicts as readable multi-line text.
 
-    Used by 4 admin handlers that catch WorkDayShrinkError (cmd_openday,
-    admin_openday_end_msg, admin_window_confirm_cb, admin_openweek_confirm_cb).
+    Used by 3 callers that catch WorkDayShrinkError: cmd_openday (text
+    command), admin_window_confirm_cb (inline picker), _apply_openweek
+    (helper called by admin_openweek_confirm_cb and
+    admin_openweek_overwrite_yes_cb). Session 5.62 (пункт 2): admin_openday_end_msg
+    удалён, callers count 4→3.
     Returns text block with one row per blocking booking (client name, local
     start time, service title) — master sees WHICH booking blocks the shrink
     and decides: reschedule via /today → [🔄 Перенести], mass-cancel via /closeday,
@@ -1121,283 +1125,6 @@ async def admin_addslots_calendar_cb(
 
 
 # ============================================================
-# Inline menu callbacks (Вариант B + Этап 5.1) — admin_openday
-#
-# FSM для openday: date (SimpleCalendar) → start_time (HH:MM text) →
-# end_time (HH:MM text) → open_workday (idempotent UPDATE через UNIQUE).
-#
-# Адаптация паттерна 1.3b (addslots), отличия:
-# - state: opening_workday_date → opening_workday_start → opening_workday_end
-#   (3 state вместо 2 — start_time + end_time вместо одного списка часов)
-# - service: open_workday (НЕ add_slots) — WorkDay [start, end] вместо Slot list
-# - parse: HH:MM (НЕ целые часы 0-23) — _parse_hhmm helper (cmd_openday:280)
-# - error: WorkDayShrinkError если shrink с активными bookings (Gap 6)
-# - render: "✅ День открыт на {date}: {start}–{end}" (НЕ список часов)
-# - INL-001: edit_message_text при calendar → ask start (fallback на answer)
-# - W1: ~F.text.startswith("/") в фильтре start/end_msg → /cancel в client_router
-# - W2: state.clear() в branch "Мастер не найден" в start/end_msg
-# ============================================================
-
-
-@router.callback_query(AdminOpendayCallbackData.filter(), StateFilter("*"))
-async def admin_openday_cb(callback: CallbackQuery, state: FSMContext) -> None:
-    """Menu tap: открыть день — start opening_workday flow.
-
-    UX-edge: tap mid-FSM → state.clear() + set_state(opening_workday_date).
-    Show SimpleCalendar for date selection (next handler — calendar_cb).
-    """
-    if not _is_admin_callback(callback):
-        await callback.answer()
-        return
-
-    assert callback.from_user is not None  # type narrowing, runtime no-op
-    resolved = await _resolve_master_and_business(callback.from_user.id)
-    if resolved is None:
-        await callback.answer("❌ Мастер не найден", show_alert=True)
-        return
-    _master_id, _business_id, tz = resolved
-
-    await state.clear()
-    await state.set_state(AdminStates.opening_workday_date)
-
-    if callback.message is not None:
-        await callback.message.answer(
-            "📅 Выберите дату для открытия рабочего дня:",
-            reply_markup=await admin_calendar_keyboard(*_admin_calendar_range(tz)),
-        )
-    await callback.answer()
-
-
-@router.callback_query(
-    SimpleCalendarCallback.filter(), StateFilter(AdminStates.opening_workday_date)
-)
-async def admin_openday_calendar_cb(
-    callback: CallbackQuery,
-    callback_data: SimpleCalendarCallback,
-    state: FSMContext,
-) -> None:
-    """SimpleCalendar для openday — навигация + выбор даты.
-
-    Branch by callback_data.act (копия admin_addslots_calendar_cb, отличия:
-    state opening_workday_* вместо adding_slots_*, текст "Введите время начала
-    (ЧЧ:ММ):" вместо "Введите часы через пробел", "Открытие дня отменено" вместо
-    "Открытие слотов отменено").
-    """
-    if not _is_admin_callback(callback):
-        await callback.answer()
-        return
-
-    assert callback.from_user is not None
-    resolved = await _resolve_master_and_business(callback.from_user.id)
-    if resolved is None:
-        await state.clear()
-        await callback.answer("❌ Мастер не найден", show_alert=True)
-        return
-    _master_id, _business_id, tz = resolved
-
-    if callback_data.act == SimpleCalAct.ignore:
-        await callback.answer(cache_time=60)
-        return
-    if callback_data.act == SimpleCalAct.today:
-        today_sys = datetime.now().replace(tzinfo=None)
-        if today_sys.year == callback_data.year and today_sys.month == callback_data.month:
-            await callback.answer(cache_time=60)
-            return
-
-    cal = SimpleCalendar(locale="ru_RU.UTF-8", cancel_btn="Отмена", today_btn="Сегодня")
-    cal.set_dates_range(*_admin_calendar_range(tz))
-    selected, selected_date = await cal.process_selection(callback, callback_data)
-
-    if callback_data.act == SimpleCalAct.day:
-        if not selected:
-            return  # out-of-range — lib answered alert
-        work_date = selected_date.date()
-        await state.update_data(selected_date=work_date.isoformat())
-        await state.set_state(AdminStates.opening_workday_start)
-
-        # Pre-prompt active bookings on the chosen date — master sees which
-        # bookings block a narrow window upfront, doesn't reach
-        # WorkDayShrinkError on confirm with UUIDs.
-        bookings_block = ""
-        async with async_session_factory() as session:
-            bookings = await get_bookings_for_date(session, _master_id, tz, work_date)
-        if bookings:
-            lines = []
-            for b in bookings:
-                local_start = _booking_local_time(b.start_at, tz)
-                time_str = local_start.strftime("%H:%M")
-                lines.append(
-                    f"   • {time_str} {b.client_name_snapshot} — {b.service_title_snapshot}"
-                )
-            bookings_block = (
-                "\n📋 <b>Записи на этот день:</b>\n"
-                + "\n".join(lines)
-                + "\n\n<i>Окно должно покрывать все записи. Чтобы сузить — сначала "
-                "перенесите запись (/today → 🔄 Перенести) или закройте день (/closeday).</i>\n\n"
-            )
-
-        ask_text = (
-            f"Дата: <b>{work_date.strftime('%d %B %Y')}</b>\n"
-            f"{bookings_block}"
-            "Введите время начала (ЧЧ:ММ / ЧЧ.ММ / ЧЧ,ММ, например <code>11:00</code>):"
-        )
-        if isinstance(callback.message, Message):
-            try:
-                await callback.message.edit_text(ask_text, reply_markup=None)
-            except TelegramBadRequest:
-                await callback.message.answer(ask_text)
-        await callback.answer()
-        return
-
-    if callback_data.act == SimpleCalAct.cancel:
-        await state.clear()
-        if isinstance(callback.message, Message):
-            try:
-                await callback.message.edit_text(
-                    "❌ Открытие дня отменено. /menu — заново",
-                    reply_markup=None,
-                )
-            except TelegramBadRequest:
-                await callback.message.answer("❌ Открытие дня отменено. /menu — заново")
-        await callback.answer()
-        return
-
-    # Navigation (prev_y/next_y/prev_m/next_m/today-diff-month):
-    await callback.answer()
-
-
-@router.message(StateFilter(AdminStates.opening_workday_start), F.text, ~F.text.startswith("/"))
-async def admin_openday_start_msg(message: Message, state: FSMContext) -> None:
-    """User typed start_time (HH:MM) → store + ask end_time.
-
-    State stays on parse error (admin can retry). state.clear() in unrecoverable
-    branches (date missing in state, master not found).
-    """
-    if not _is_admin(message):
-        return
-
-    data = await state.get_data()
-    selected_date_iso = data.get("selected_date")
-    if not selected_date_iso:
-        await state.clear()
-        await message.answer("❌ Дата не выбрана. Откройте день заново через /menu")
-        return
-
-    # Validate stored date (defense-in-depth against stale state) — work_date
-    # itself is only used in admin_openday_end_msg (past-date check + open_workday).
-    try:
-        date.fromisoformat(selected_date_iso)
-    except ValueError:
-        await state.clear()
-        await message.answer("❌ Ошибка даты в сессии. Начните заново через /menu")
-        return
-
-    text = message.text or ""
-    try:
-        start_time = _parse_hhmm(text.strip())
-    except ValueError:
-        await message.answer("❌ Формат ЧЧ:ММ (или ЧЧ.ММ / ЧЧ,ММ). Например <code>11:00</code>")
-        return  # state stays — ask again
-
-    await state.update_data(start_time=start_time.isoformat())
-    await state.set_state(AdminStates.opening_workday_end)
-    await message.answer(
-        f"Начало: <b>{start_time.strftime('%H:%M')}</b>\n"
-        "Введите время окончания (ЧЧ:ММ / ЧЧ.ММ / ЧЧ,ММ, например <code>18:00</code>):"
-    )
-
-
-@router.message(StateFilter(AdminStates.opening_workday_end), F.text, ~F.text.startswith("/"))
-async def admin_openday_end_msg(message: Message, state: FSMContext) -> None:
-    """User typed end_time (HH:MM) → open_workday + render result.
-
-    State терминальный — state.clear() в success / unrecoverable error ветках.
-    State stays в parse-error / shrink-error (admin can retry end_time or shrink
-    via different input).
-    """
-    if not _is_admin(message):
-        return
-
-    data = await state.get_data()
-    selected_date_iso = data.get("selected_date")
-    start_time_iso = data.get("start_time")
-    if not selected_date_iso or not start_time_iso:
-        await state.clear()
-        await message.answer("❌ Данные сессии потеряны. Начните заново через /menu")
-        return
-
-    try:
-        work_date = date.fromisoformat(selected_date_iso)
-        start_time = dt_time.fromisoformat(start_time_iso)
-    except ValueError:
-        await state.clear()
-        await message.answer("❌ Ошибка данных в сессии. Начните заново через /menu")
-        return
-
-    text = message.text or ""
-    try:
-        end_time = _parse_hhmm(text.strip())
-    except ValueError:
-        await message.answer("❌ Формат ЧЧ:ММ (или ЧЧ.ММ / ЧЧ,ММ). Например <code>18:00</code>")
-        return  # state stays — ask again
-
-    admin_id = _require_admin_or_silent(message)
-    assert admin_id is not None
-    resolved = await _resolve_master_and_business(admin_id)
-    if resolved is None:
-        # W2: clear state — unrecoverable error, consistency с calendar/start handlers.
-        await state.clear()
-        await message.answer("❌ Мастер не найден. Обратитесь к администратору.")
-        return
-    master_id, _business_id, tz = resolved
-
-    # Defensive past-date re-check (как admin_addslots_hours_msg:689-694) —
-    # между выбором даты и вводом end_time мог пройти день.
-    today_local = datetime.now(ZoneInfo(tz)).date()
-    if work_date < today_local:
-        await message.answer(
-            f"❌ Нельзя открыть день в прошлом. Сегодня: {today_local.strftime('%d.%m.%Y')}"
-        )
-        await state.clear()
-        return
-
-    async with async_session_factory() as session:
-        # F1 fix (Session 5.18, variant B): capture was_closed BEFORE open_workday
-        # re-opens the day (mirror cmd_openday).
-        existing = await select_workday(session, master_id, work_date)
-        was_closed = existing is not None and not existing.is_active
-        try:
-            await open_workday(session, master_id, work_date, start_time, end_time, business_tz=tz)
-        except ValueError as exc:
-            await message.answer(f"❌ {exc}")
-            return  # state stays — admin can retry end_time
-        except WorkDayShrinkError as exc:
-            await message.answer(
-                f"❌ Нельзя сократить окно — есть активные записи:\n"
-                f"{_render_shrink_conflicts(exc, tz)}\n"
-                "Сначала перенесите запись (/today → 🔄 Перенести) или закройте день (/closeday), "
-                "либо выберите другое время."
-            )
-            return  # state stays — admin can retry end_time (расширяя окно)
-        except SQLAlchemyError:
-            # S2 fix (code-review 5.1): DB-level ошибки (IntegrityError на UNIQUE
-            # race despite advisory lock, OperationalError на connection loss) —
-            # НЕ ValueError, не ловились except выше. State hang — unrecoverable,
-            # очищаем. Mirror admin_service_duration_msg:1467-1474.
-            await state.clear()
-            await message.answer("❌ Ошибка БД. Начните заново через /menu")
-            return
-
-    await state.clear()  # терминальный
-    await message.answer(
-        f"✅ День открыт на {work_date.strftime('%d %B %Y')}:\n"
-        f"<b>{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}</b>"
-        + ("\n(день был закрыт — открыт заново)" if was_closed else ""),
-        reply_markup=admin_inline_menu(),
-    )
-
-
-# ============================================================
 # Этап 5.10 inline-часы: AdminWindow* pick / confirm / cancel handlers
 #
 # Replaces text-input hours_msg/hour_msg (deleted above) with inline 30-min
@@ -1417,8 +1144,8 @@ async def admin_openday_end_msg(message: Message, state: FSMContext) -> None:
 # Mirror patterns (no line numbers — prone to drift; use symbol name for grep):
 #   admin_move_slot_30_cb — slot tap + state save + summary
 #   admin_move_confirm_cb — state.clear() BEFORE service call
-#   admin_openday_end_msg — error mapping (ValueError, WorkDayShrinkError,
-#     SQLAlchemyError)
+#   cmd_openday — error mapping (ValueError, WorkDayShrinkError, SQLAlchemyError)
+#     — text command, mirror pattern for inline handlers (admin_window_confirm_cb).
 # ============================================================
 
 
@@ -1571,7 +1298,7 @@ async def admin_window_confirm_cb(
     open_workday handles create + update idempotently via UNIQUE INDEX
     (workday_id NOT passed — open_workday resolves via (master_id, work_date)).
 
-    Error mapping (mirror admin_openday_end_msg error mapping):
+    Error mapping (mirror cmd_openday error mapping, lines 408-427):
       ValueError → "❌ {exc}" (state already cleared, message only)
       WorkDayShrinkError → "❌ Нельзя сократить окно..." (race with concurrent
         create_booking between pick and confirm)
@@ -3644,7 +3371,8 @@ async def cmd_closeday(message: Message, state: FSMContext) -> None:
 async def admin_closeday_entry_cb(callback: CallbackQuery, state: FSMContext) -> None:
     """[📅 Закрыть день] tap → start /closeday flow (Session 5.26).
 
-    Mirror admin_openday_cb (line 866) — state.clear() then set_state(closing_day_date).
+    state.clear() then set_state(closing_day_date) — escape hatch из любого
+    FSM state. Show SimpleCalendar for date selection.
     """
     if not _is_admin_callback(callback):
         await callback.answer()
