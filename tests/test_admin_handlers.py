@@ -6282,3 +6282,161 @@ async def test_admin_no_state_catchall_text_non_admin_raises_skip_handler() -> N
 
     # Handler сам НЕ отвечает — ответ даёт следующий handler (client_router).
     msg.answer.assert_not_awaited()
+
+
+# ============================================================
+# admin_openweek_edit_start_cb — 5 branches (lines 1852-1915, T2.3)
+# FSM: StateFilter(AdminStates.opening_week_edit_start) + AdminWindowSlot30CallbackData
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_admin_openweek_edit_start_cb_non_admin_silent(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Non-admin tap → callback.answer() + return (no state changes)."""
+    from bot.keyboards.admin import AdminWindowSlot30CallbackData
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        workday = await _seed_workday(session, ctx=ctx, work_date=tomorrow)
+
+    cb_data = AdminWindowSlot30CallbackData(workday_id=workday.id, start_minute=11 * 60)
+    callback = _make_callback(NON_ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state({"edit_workday_id": str(workday.id)})
+
+    await admin_handlers.admin_openweek_edit_start_cb(callback, cb_data, state)
+
+    callback.answer.assert_awaited_once()
+    state.clear.assert_not_called()
+    state.set_state.assert_not_called()
+    state.update_data.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_openweek_edit_start_cb_master_not_found_clears(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Admin telegram_id resolves to no master → state.clear + alert 'Мастер не найден'."""
+    from bot.keyboards.admin import AdminWindowSlot30CallbackData
+
+    # No _seed_admin_stack → _resolve_master_and_business returns None.
+    sentinel = UUID("00000000-0000-0000-0000-000000000001")
+    cb_data = AdminWindowSlot30CallbackData(workday_id=sentinel, start_minute=11 * 60)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state({"edit_workday_id": str(sentinel)})
+
+    await admin_handlers.admin_openweek_edit_start_cb(callback, cb_data, state)
+
+    callback.answer.assert_awaited_once()
+    args, kwargs = callback.answer.call_args
+    # show_alert=True kwarg indicates alert mode
+    assert kwargs.get("show_alert") is True
+    assert "Мастер не найден" in str(args[0] if args else kwargs.get("text", ""))
+    state.clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_openweek_edit_start_cb_no_edit_workday_id_clears(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """State has no edit_workday_id (state loss) → state.clear + 'Данные сессии потеряны'."""
+    from bot.keyboards.admin import AdminWindowSlot30CallbackData
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        workday = await _seed_workday(session, ctx=ctx, work_date=tomorrow)
+
+    cb_data = AdminWindowSlot30CallbackData(workday_id=workday.id, start_minute=11 * 60)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state({})  # no edit_workday_id
+
+    await admin_handlers.admin_openweek_edit_start_cb(callback, cb_data, state)
+
+    state.clear.assert_awaited_once()
+    state.set_state.assert_not_called()
+    text = callback_answer_text(callback)
+    assert "Данные сессии потеряны" in text
+    assert "/openweek" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_openweek_edit_start_cb_workday_not_found_clears(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """edit_workday_id in state but no WorkDay in DB → state.clear + 'Рабочий день не найден'.
+
+    Note: handler sets state(opening_week_edit_end) BEFORE the DB lookup, so
+    set_state IS called — but then state.clear() wipes it. We assert state.clear
+    and the error message, NOT absence of set_state.
+    """
+    from bot.keyboards.admin import AdminWindowSlot30CallbackData
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    # workday_id in callback_data that doesn't exist in DB
+    ghost_workday_id = UUID("00000000-0000-0000-0000-000000000002")
+    cb_data = AdminWindowSlot30CallbackData(
+        workday_id=ghost_workday_id, start_minute=11 * 60
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state({"edit_workday_id": str(ghost_workday_id)})
+
+    await admin_handlers.admin_openweek_edit_start_cb(callback, cb_data, state)
+
+    state.clear.assert_awaited_once()
+    text = callback_answer_text(callback)
+    assert "Рабочий день не найден" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_openweek_edit_start_cb_happy_shows_end_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Happy: start tap → state.update_data(edit_picked_start_minute) +
+    set_state(opening_week_edit_end) + end-picker keyboard in answer.
+    """
+    from bot.keyboards.admin import AdminWindowSlot30CallbackData
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        workday = await _seed_workday(
+            session, ctx=ctx, work_date=tomorrow,
+            start_time_str="10:00", end_time_str="19:00",
+        )
+
+    picked_start_minute = 11 * 60  # 11:00
+    cb_data = AdminWindowSlot30CallbackData(
+        workday_id=workday.id, start_minute=picked_start_minute
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state({"edit_workday_id": str(workday.id)})
+
+    await admin_handlers.admin_openweek_edit_start_cb(callback, cb_data, state)
+
+    # state.update_data called with edit_picked_start_minute
+    update = _state_data_passed(state)
+    assert update["edit_picked_start_minute"] == picked_start_minute
+
+    state.set_state.assert_awaited_once_with(
+        admin_handlers.AdminStates.opening_week_edit_end
+    )
+    state.clear.assert_not_called()
+
+    # answer with end-picker keyboard
+    reply_markup = _picker_reply_markup(callback)
+    assert reply_markup is not None, "Expected end-picker reply_markup"
+    args, _ = callback.message.answer.call_args
+    text = str(args[0])
+    assert "окончания" in text
+
+
