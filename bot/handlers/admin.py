@@ -71,6 +71,7 @@ from bot.keyboards.admin import (
     admin_openweek_overwrite_keyboard,
     admin_today_keyboard,
     admin_week_days_keyboard,
+    admin_week_picker_keyboard,
     admin_window_confirm_keyboard,
     admin_window_slot_picker_keyboard,
     render_booked_header,
@@ -2624,21 +2625,16 @@ async def cmd_openweek(message: Message, state: FSMContext) -> None:
     _master_id, _business_id, tz = resolved
 
     await state.clear()
-    await state.set_state(AdminStates.opening_week_start)
-    await state.update_data(business_tz=tz)
+    await state.set_state(AdminStates.opening_week_week)
+    await state.update_data(business_tz=tz, week_offset=0)
 
-    from uuid import UUID as _UUID
-
-    sentinel = _UUID(int=0)
     await message.answer(
         f"🗓 <b>Открыть неделю</b>\n\n"
         f"{_openweek_week_header(tz)}\n\n"
-        "Шаг 1: выберите время начала окна (общее для всех выбранных дней):",
-        reply_markup=admin_window_slot_picker_keyboard(
-            workday_id=sentinel,
-            mode="start",
-            business_tz=tz,
-            booked_slots=None,
+        "Шаг 1: выберите неделю (← Пред. / След. →), затем «✅ Выбрать»:",
+        reply_markup=admin_week_picker_keyboard(
+            can_go_prev=False,
+            can_go_next=True,
         ),
     )
 
@@ -2656,31 +2652,155 @@ async def admin_openweek_entry_cb(callback: CallbackQuery, state: FSMContext) ->
     _master_id, _business_id, tz = resolved
 
     await state.clear()
-    await state.set_state(AdminStates.opening_week_start)
-    await state.update_data(business_tz=tz)
+    await state.set_state(AdminStates.opening_week_week)
+    await state.update_data(business_tz=tz, week_offset=0)
 
-    from uuid import UUID as _UUID
-
-    sentinel = _UUID(int=0)
-    picker_kb = admin_window_slot_picker_keyboard(
-        workday_id=sentinel,
-        mode="start",
-        business_tz=tz,
-        booked_slots=None,
+    picker_kb = admin_week_picker_keyboard(
+        can_go_prev=False,
+        can_go_next=True,
     )
     if isinstance(callback.message, Message):
         try:
             await callback.message.edit_text(
                 f"🗓 <b>Открыть неделю</b>\n\n"
                 f"{_openweek_week_header(tz)}\n\n"
-                "Шаг 1: выберите время начала окна (общее для всех выбранных дней):",
+                "Шаг 1: выберите неделю (← Пред. / След. →), затем «✅ Выбрать»:",
                 reply_markup=picker_kb,
             )
         except TelegramBadRequest:
             await callback.message.answer(
                 f"🗓 <b>Открыть неделю</b>\n\n"
                 f"{_openweek_week_header(tz)}\n\n"
-                "Шаг 1: выберите время начала окна (общее для всех выбранных дней):",
+                "Шаг 1: выберите неделю (← Пред. / След. →), затем «✅ Выбрать»:",
+                reply_markup=picker_kb,
+            )
+    await callback.answer()
+
+
+@router.callback_query(
+    AdminOpenWeekNavCallbackData.filter(),
+    StateFilter(AdminStates.opening_week_week),
+)
+async def admin_openweek_week_picker_nav_cb(
+    callback: CallbackQuery,
+    callback_data: AdminOpenWeekNavCallbackData,
+    state: FSMContext,
+) -> None:
+    """[← Пред.] / [След. →] on /openweek step 0 (week picker, Session 5.64).
+
+    Updates week_offset in state (clamped to 0.._OPENWEEK_MAX_OFFSET), then
+    re-renders the week picker with the new week's header. No selected_weekdays
+    reset needed (week picker has no weekday buttons — selection is just the
+    current week_offset).
+
+    Distinct from admin_openweek_week_nav_cb (state=opening_week_days) which
+    handles nav on step 3 (days keyboard with weekday toggles + WorkDay
+    markers). Same callback_data (AdminOpenWeekNavCallbackData) — dispatched
+    by StateFilter.
+
+    Edge cases:
+    - delta=-1 at offset=0: clamp to 0, no-op (silent re-render of same week).
+    - delta=+1 at offset=MAX: clamp to MAX, no-op.
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+
+    data = await state.get_data()
+    business_tz = data.get("business_tz")
+    if not business_tz:
+        await state.clear()
+        await callback.answer("❌ Данные сессии потеряны", show_alert=True)
+        return
+    current_offset: int = int(data.get("week_offset", 0))
+    new_offset = max(0, min(current_offset + callback_data.delta, _OPENWEEK_MAX_OFFSET))
+    if new_offset == current_offset:
+        await callback.answer()
+        return
+
+    await state.update_data(week_offset=new_offset)
+
+    header = _openweek_week_header(business_tz, new_offset)
+    new_kb = admin_week_picker_keyboard(
+        can_go_prev=new_offset > 0,
+        can_go_next=new_offset < _OPENWEEK_MAX_OFFSET,
+    )
+    if callback.message is not None and isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_text(
+                f"🗓 <b>Открыть неделю</b>\n\n"
+                f"{header}\n\n"
+                "Шаг 1: выберите неделю (← Пред. / След. →), затем «✅ Выбрать»:",
+                reply_markup=new_kb,
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                f"🗓 <b>Открыть неделю</b>\n\n"
+                f"{header}\n\n"
+                "Шаг 1: выберите неделю (← Пред. / След. →), затем «✅ Выбрать»:",
+                reply_markup=new_kb,
+            )
+    await callback.answer()
+
+
+@router.callback_query(
+    F.data == "admin_openweek_week_select",
+    StateFilter(AdminStates.opening_week_week),
+)
+async def admin_openweek_week_select_cb(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """[✅ Выбрать эту неделю] on /openweek step 0 → transition to step 1
+    (start_time picker, Session 5.64, пункт 1).
+
+    Reads week_offset from state (already set by cmd_openweek or
+    admin_openweek_week_nav_cb) and transitions to AdminStates.opening_week_start.
+    The week picker message is replaced with the slot picker (edit_text) —
+    same UX pattern as admin_openweek_start_cb transitioning to step 2.
+
+    Sentinel workday_id (UUID(int=0)) — picker is for /openweek (no existing
+    WorkDay context), mirrors the pre-5.64 cmd_openweek behavior.
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await state.clear()
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    _master_id, _business_id, tz = resolved
+
+    data = await state.get_data()
+    business_tz = data.get("business_tz", tz)
+    week_offset = int(data.get("week_offset", 0))
+
+    await state.set_state(AdminStates.opening_week_start)
+
+    from uuid import UUID as _UUID
+
+    sentinel = _UUID(int=0)
+    header = _openweek_week_header(business_tz, week_offset)
+    picker_kb = admin_window_slot_picker_keyboard(
+        workday_id=sentinel,
+        mode="start",
+        business_tz=business_tz,
+        booked_slots=None,
+    )
+    if callback.message is not None and isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_text(
+                f"Неделя выбрана: {header}\n\n"
+                "Шаг 2: выберите время начала окна (общее для всех выбранных дней):",
+                reply_markup=picker_kb,
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                f"Неделя выбрана: {header}\n\n"
+                "Шаг 2: выберите время начала окна (общее для всех выбранных дней):",
                 reply_markup=picker_kb,
             )
     await callback.answer()
@@ -2708,6 +2828,7 @@ async def admin_openweek_start_cb(
 
     data = await state.get_data()
     business_tz = data.get("business_tz", tz)
+    week_offset = int(data.get("week_offset", 0))
 
     picked_start_minute = callback_data.start_minute
     await state.update_data(picked_start_minute=picked_start_minute)
@@ -2718,7 +2839,8 @@ async def admin_openweek_start_cb(
     sentinel = _UUID(int=0)
     if callback.message is not None:
         step2_text = (
-            f"Шаг 2: выберите время окончания окна:\n\n{_openweek_week_header(business_tz)}"
+            f"Шаг 2: выберите время окончания окна:\n\n"
+            f"{_openweek_week_header(business_tz, week_offset)}"
         )
         step2_kb = admin_window_slot_picker_keyboard(
             workday_id=sentinel,
@@ -2785,8 +2907,12 @@ async def admin_openweek_end_cb(
     # (admin_openweek_days_cb) читает из state без перевычисления.
     # 5.61 — week_offset для навигации по неделям, scheduled/closed weekdays
     # для маркеров 🟡/⚪ на клавиатуре дней.
+    # 5.64 (пункт 1) — week_offset теперь задаётся на шаге 0 (week picker),
+    # а не hardcode 0. Если админ начал /openweek без шага 0 (impossible in
+    # normal flow — но defensive default 0 для backwards compat).
     business_tz = data.get("business_tz") or _tz
-    monday = _week_monday(business_tz, 0)
+    week_offset = int(data.get("week_offset", 0))
+    monday = _week_monday(business_tz, week_offset)
     sunday = monday + timedelta(days=6)
     week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
 
@@ -2798,7 +2924,9 @@ async def admin_openweek_end_cb(
         past_weekdays=sorted(past_weekdays),
         scheduled_weekdays=sorted(scheduled_wd),
         closed_weekdays=sorted(closed_wd),
-        week_offset=0,
+        # 5.64 (пункт 1): week_offset уже в state (установлен на шаге 0).
+        # НЕ перезатираем — иначе навигация по неделям на шаге 3 теряла бы
+        # выбранную неделю (cм. admin_openweek_week_nav_cb для шага 3).
     )
 
     if callback.message is not None:

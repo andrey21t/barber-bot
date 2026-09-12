@@ -399,10 +399,20 @@ async def test_openweek_full_flow_creates_workday(
         dp, bot = integration_dispatcher
         admin_ctx = await _seed_admin(session_factory)
 
-        # Step 1: /openweek → start picker.
+        # Step 0: /openweek → week picker (Session 5.64, пункт 1).
         await dp.feed_update(bot, _make_text_update("/openweek"))
+        step0_text = _extract_send_text(bot)
+        assert "Шаг 1: выберите неделю" in step0_text, (
+            f"Step 0 must show week picker prompt; got: {step0_text!r}"
+        )
+
+        # Step 1: tap [✅ Выбрать эту неделю] → start picker (Шаг 2).
+        select_button = await _find_button_by_label(bot, "✅ Выбрать эту неделю")
+        assert select_button is not None, "Expected '✅ Выбрать эту неделю' button"
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(select_button))
         step1_text = _extract_send_text(bot)
-        assert "Шаг 1" in step1_text
+        assert "Шаг 2" in step1_text
 
         # Step 2: tap 10:00 in start picker → end picker (Шаг 2).
         start_button = await _find_button_by_label(bot, "10:00")
@@ -468,36 +478,25 @@ async def test_openweek_cancel_clears_state(
     integration_dispatcher: tuple[Dispatcher, MagicMock],
     session_factory: Any,
 ) -> None:
-    """/openweek → start → end → days → [❌ Отмена] → state cleared +
+    """/openweek → step 0 (week picker) → [❌ Отмена] → state cleared +
     'Открытие недели отменено' message + menu shown.
 
     Verifies admin_openweek_cancel_cb dispatch on F.data == 'admin_openweek_cancel'
-    with StateFilter(opening_week_days). The '❌ Отмена' button only appears
-    on the Шаг 3 days keyboard (admin_week_days_keyboard) — slot pickers
-    (Шаг 1, Шаг 2) intentionally omit cancel (user uses /menu escape).
+    with StateFilter(AdminStates) — catches all admin FSM states including
+    opening_week_week (Session 5.64, пункт 1). Pre-5.64 the [❌ Отмена] button
+    only appeared on Шаг 3 days keyboard — now it's on week picker too.
     """
     dp, bot = integration_dispatcher
     await _seed_admin(session_factory)
 
-    # Шаг 1: /openweek → start picker.
+    # Шаг 1: /openweek → week picker (Session 5.64).
     await dp.feed_update(bot, _make_text_update("/openweek"))
-    assert "Шаг 1" in _extract_send_text(bot)
-    start_btn = await _find_button_by_label(bot, "10:00")
-    assert start_btn is not None, "10:00 button on Шаг 1 picker"
-
-    # Шаг 2: tap 10:00 → end picker.
-    bot.reset()
-    await dp.feed_update(bot, _make_callback_update_from_button(start_btn))
-    assert "Шаг 2" in _extract_send_text(bot)
-    end_btn = await _find_button_by_label(bot, "12:00")
-    assert end_btn is not None, "12:00 button on Шаг 2 picker"
-
-    # Шаг 3: tap 12:00 → days keyboard (with [❌ Отмена]).
-    bot.reset()
-    await dp.feed_update(bot, _make_callback_update_from_button(end_btn))
-    assert "Шаг 3" in _extract_send_text(bot)
+    step0_text = _extract_send_text(bot)
+    assert "Шаг 1: выберите неделю" in step0_text, (
+        f"Step 0 must show week picker prompt; got: {step0_text!r}"
+    )
     cancel_btn = await _find_button_by_label(bot, "❌ Отмена")
-    assert cancel_btn is not None, "❌ Отмена button on Шаг 3 days keyboard"
+    assert cancel_btn is not None, "❌ Отмена button on week picker (step 0)"
 
     # Tap [❌ Отмена] → 'Открытие недели отменено' + menu.
     bot.reset()
