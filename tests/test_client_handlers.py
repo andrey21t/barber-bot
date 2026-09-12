@@ -5617,3 +5617,322 @@ async def test_transfer_slot_30_cb_invalid_start_minute(
     # callback.answer called (Telegram ACK even on error).
     cb.answer.assert_awaited()
 
+
+# ============================================================
+# T2.7 — client.py coverage edges
+# 1. reply_book_msg master-None branch (293-294)
+# 2-6. _process_selected_date is_slots_path=True transfer branches (754-839)
+# 7-9. _process_selected_date is_slots_path=False transfer legacy-empty branches (852-901)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_reply_book_msg_master_not_found_shows_error_no_state(
+    patched_session_factory: Any,
+) -> None:
+    """T2.7: reply_book_msg with NO master in DB →
+    '❌ Не удалось найти мастера...' (line 293-294) + state.set_state NOT called.
+    Mirrors test_cmd_book_master_not_found_shows_error_no_state but for the
+    reply-keyboard entry path (B.13).
+    """
+    from bot.keyboards.client import CLIENT_REPLY_BOOK_LABEL
+
+    # No _seed_full_stack — DB has no master row.
+    msg = _make_message(user_id=111222333, text=CLIENT_REPLY_BOOK_LABEL)
+    state = _make_state()
+
+    await client_handlers.reply_book_msg(msg, state)
+
+    state.set_state.assert_not_awaited()
+    msg.answer.assert_awaited_once()
+    assert "Не удалось найти мастера" in _answer_text(msg)
+
+
+@pytest.mark.asyncio
+async def test_transfer_simple_calendar_cb_is_slots_path_workday_none_legacy_slots_found(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T2.7: is_slots_path=True, workday None, legacy Slot exists →
+    render legacy slot_picker_keyboard + set_state (lines 754-770).
+    """
+
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        target_date = (datetime.now(UTC) + timedelta(days=2)).date()
+        slot = Slot(master_id=ctx["master_id"], slot_date=target_date, slot_hour=14, status="open")
+        session.add(slot)
+        await session.commit()
+
+    target_dt = datetime.combine(target_date, time(12, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"is_slots_path": True})
+    await client_handlers.transfer_simple_calendar_cb(cb, callback_data, state)
+
+    assert state.set_state.call_args.args[0] == TransferStates.selecting_slot
+    assert "Выберите новое время" in _answer_text(cb.message)
+    assert isinstance(_answer_reply_markup(cb.message), InlineKeyboardMarkup)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_simple_calendar_cb_is_slots_path_workday_none_no_legacy_slots(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T2.7: is_slots_path=True, workday None, no legacy slots →
+    'Мастер не работает в этот день' + retry markup (lines 771-783).
+    """
+    async with session_factory() as session:
+        await _seed_full_stack(session)
+        # No WorkDay, no Slot on target_date — master "doesn't work" that day.
+
+    target_date = (datetime.now(UTC) + timedelta(days=2)).date()
+    target_dt = datetime.combine(target_date, time(12, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"is_slots_path": True})
+    await client_handlers.transfer_simple_calendar_cb(cb, callback_data, state)
+
+    state.set_state.assert_not_awaited()
+    assert "Мастер не работает в этот день" in _answer_text(cb.message)
+    assert isinstance(_answer_reply_markup(cb.message), InlineKeyboardMarkup)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_simple_calendar_cb_is_slots_path_workday_inactive(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T2.7: is_slots_path=True, workday exists but is_active=False →
+    'День закрыт мастером' + retry markup (lines 784-797).
+    """
+    target_date = (datetime.now(UTC) + timedelta(days=2)).date()
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        await _seed_workday(session, ctx, work_date=target_date, is_active=False)
+
+    target_dt = datetime.combine(target_date, time(12, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"is_slots_path": True})
+    await client_handlers.transfer_simple_calendar_cb(cb, callback_data, state)
+
+    state.set_state.assert_not_awaited()
+    assert "День закрыт мастером" in _answer_text(cb.message)
+    assert isinstance(_answer_reply_markup(cb.message), InlineKeyboardMarkup)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_simple_calendar_cb_is_slots_path_workday_active_no_slots_30(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T2.7: is_slots_path=True, workday active but too short for 60-min slot →
+    'На эту дату нет свободного времени' + retry markup (lines 798-826).
+
+    WorkDay 10:00-10:30 has 1 candidate slot (10:00), but 10:00+60=11:00 > 10:30
+    → filtered out by min_duration_min=SERVICE_DEFAULT_DURATION_MIN → slots_30=[].
+    """
+    target_date = (datetime.now(UTC) + timedelta(days=2)).date()
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        await _seed_workday(
+            session, ctx, work_date=target_date,
+            start_time=time(10, 0), end_time=time(10, 30),
+        )
+
+    target_dt = datetime.combine(target_date, time(12, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"is_slots_path": True})
+    await client_handlers.transfer_simple_calendar_cb(cb, callback_data, state)
+
+    state.set_state.assert_not_awaited()
+    assert "На эту дату нет свободного времени" in _answer_text(cb.message)
+    assert isinstance(_answer_reply_markup(cb.message), InlineKeyboardMarkup)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_simple_calendar_cb_is_slots_path_workday_active_slots_30_found(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T2.7: is_slots_path=True, workday active + slots_30 available →
+    set_state + slot_picker_keyboard_30min (lines 827-839).
+    """
+    target_date = (datetime.now(UTC) + timedelta(days=2)).date()
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        await _seed_workday(session, ctx, work_date=target_date)  # 10:00-18:00 default
+
+    target_dt = datetime.combine(target_date, time(12, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"is_slots_path": True})
+    await client_handlers.transfer_simple_calendar_cb(cb, callback_data, state)
+
+    assert state.set_state.call_args.args[0] == TransferStates.selecting_slot
+    assert "Выберите новое время" in _answer_text(cb.message)
+    assert isinstance(_answer_reply_markup(cb.message), InlineKeyboardMarkup)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_simple_calendar_cb_legacy_empty_workday_active_slots_30_found(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T2.7: is_slots_path=False (default), legacy slots empty, workday active +
+    slots_30 available → set_state + slot_picker_keyboard_30min (lines 852-872).
+    """
+    target_date = (datetime.now(UTC) + timedelta(days=2)).date()
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        await _seed_workday(session, ctx, work_date=target_date)  # 10:00-18:00
+
+    target_dt = datetime.combine(target_date, time(12, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={})  # is_slots_path absent → None → falsy
+    await client_handlers.transfer_simple_calendar_cb(cb, callback_data, state)
+
+    assert state.set_state.call_args.args[0] == TransferStates.selecting_slot
+    assert "Выберите новое время" in _answer_text(cb.message)
+    assert isinstance(_answer_reply_markup(cb.message), InlineKeyboardMarkup)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_simple_calendar_cb_legacy_empty_workday_inactive(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T2.7: is_slots_path=False, legacy slots empty, workday inactive →
+    'День закрыт мастером' + retry markup (lines 874-888).
+    """
+    target_date = (datetime.now(UTC) + timedelta(days=2)).date()
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        await _seed_workday(session, ctx, work_date=target_date, is_active=False)
+
+    target_dt = datetime.combine(target_date, time(12, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={})  # is_slots_path absent → falsy
+    await client_handlers.transfer_simple_calendar_cb(cb, callback_data, state)
+
+    state.set_state.assert_not_awaited()
+    assert "День закрыт мастером" in _answer_text(cb.message)
+    assert isinstance(_answer_reply_markup(cb.message), InlineKeyboardMarkup)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_simple_calendar_cb_legacy_empty_no_workday(
+    session_factory: Any,
+    patched_session_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T2.7: is_slots_path=False, no legacy slots, no workday →
+    'На эту дату нет свободных слотов' + retry markup (lines 889-901).
+    """
+    async with session_factory() as session:
+        await _seed_full_stack(session)
+        # No WorkDay, no Slot — both legacy and workday branches return empty.
+
+    target_date = (datetime.now(UTC) + timedelta(days=2)).date()
+    target_dt = datetime.combine(target_date, time(12, 0))
+    _patch_process_selection(monkeypatch, selected=True, selected_date=target_dt)
+    callback_data = _make_simple_calendar_callback(SimpleCalAct.day)
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(111222333)
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={})  # is_slots_path absent → falsy
+    await client_handlers.transfer_simple_calendar_cb(cb, callback_data, state)
+
+    state.set_state.assert_not_awaited()
+    assert "На эту дату нет свободных слотов" in _answer_text(cb.message)
+    assert isinstance(_answer_reply_markup(cb.message), InlineKeyboardMarkup)
+    cb.answer.assert_awaited()
+
