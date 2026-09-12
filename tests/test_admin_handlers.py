@@ -6560,3 +6560,404 @@ async def test_admin_today_cb_message_is_none_skips_answer(
     callback.answer.assert_awaited_once()
 
 
+# ============================================================
+# admin_services_cb + admin_service_name_msg + admin_service_duration_msg
+# (lines 2168-2326, T2.5) — services FSM flow, 18 branches
+# ============================================================
+
+# Sentinel UUID for state.business_id in tests where _resolve_master not called
+# (handler accepts any UUID-str until create_service would lookup; for parse-error
+# branches we never reach create_service, so any non-None UUID suffices).
+_SENTINEL_BID = "00000000-0000-0000-0000-000000000001"
+
+
+# --- admin_services_cb (5 branches) ---------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_admin_services_cb_non_admin_silent(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Non-admin tap → callback.answer() + return (no state changes)."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(NON_ADMIN_TG_ID)
+    state = _make_mock_state()
+
+    await admin_handlers.admin_services_cb(callback, state)
+
+    callback.answer.assert_awaited_once()
+    state.clear.assert_not_called()
+    state.set_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_services_cb_master_not_found_alert(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Admin telegram_id resolves to no master → alert 'Мастер не найден' + return."""
+    callback = _make_callback(ADMIN_TG_ID)  # No _seed_admin_stack
+    state = _make_mock_state()
+
+    await admin_handlers.admin_services_cb(callback, state)
+
+    callback.answer.assert_awaited_once()
+    args, kwargs = callback.answer.call_args
+    assert kwargs.get("show_alert") is True
+    assert "Мастер не найден" in str(args[0] if args else kwargs.get("text", ""))
+    state.clear.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_services_cb_happy_enters_name_step(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Happy: admin tap → state.clear + state.update_data(business_id) +
+    set_state(entering_service_name) + answer '💇 Введите название услуги' +
+    callback.answer.
+    """
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        business_id = ctx["business_id"]
+
+    callback = _make_callback(ADMIN_TG_ID)
+    state = _make_mock_state()
+
+    await admin_handlers.admin_services_cb(callback, state)
+
+    state.clear.assert_awaited_once()
+    state.set_state.assert_awaited_once_with(
+        admin_handlers.AdminStates.entering_service_name
+    )
+    update = _state_data_passed(state)
+    assert update["business_id"] == str(business_id)
+
+    args, _ = callback.message.answer.call_args
+    text = str(args[0])
+    assert "Введите название услуги" in text
+    callback.answer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_services_cb_message_is_none_skips_answer(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Edge case: callback.message is None (deleted inline msg) → state flow
+    still proceeds (clear+set_state+update_data), only message.answer skipped.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.message = None  # type: ignore[assignment]
+    state = _make_mock_state()
+
+    await admin_handlers.admin_services_cb(callback, state)
+
+    state.clear.assert_awaited_once()
+    state.set_state.assert_awaited_once()
+    callback.answer.assert_awaited_once()
+
+
+# --- admin_service_name_msg (5 branches) ----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_admin_service_name_msg_non_admin_silent(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Non-admin text in entering_service_name state → silent return."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=NON_ADMIN_TG_ID, text="Стрижка")
+    state = _make_mock_state({"business_id": "00000000-0000-0000-0000-000000000001"})
+
+    await admin_handlers.admin_service_name_msg(msg, state)
+
+    assert _answer_call_count(msg) == 0
+    state.clear.assert_not_called()
+    state.set_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_service_name_msg_no_business_id_clears(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """State lost (no business_id) → state.clear + 'Сессия утеряна'."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="Стрижка")
+    state = _make_mock_state({})  # no business_id
+
+    await admin_handlers.admin_service_name_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Сессия утеряна" in text
+    state.clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_service_name_msg_empty_name_keeps_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Empty name (or whitespace) → 'Название не может быть пустым', state STAYS."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="   ")
+    state = _make_mock_state({"business_id": "00000000-0000-0000-0000-000000000001"})
+
+    await admin_handlers.admin_service_name_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Название не может быть пустым" in text
+    state.clear.assert_not_called()
+    state.set_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_service_name_msg_too_long_name_keeps_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """name > 255 chars → 'Слишком длинное название', state STAYS."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    long_name = "а" * 256
+    msg = _make_message(user_id=ADMIN_TG_ID, text=long_name)
+    state = _make_mock_state({"business_id": "00000000-0000-0000-0000-000000000001"})
+
+    await admin_handlers.admin_service_name_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Слишком длинное" in text
+    state.clear.assert_not_called()
+    state.set_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_service_name_msg_happy_transitions_to_duration(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Happy: name 'Стрижка' → state.update_data(name) + set_state(entering_service_duration)
+    + answer 'Название: Стрижка / Введите длительность'.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="Стрижка мужская")
+    state = _make_mock_state({"business_id": "00000000-0000-0000-0000-000000000001"})
+
+    await admin_handlers.admin_service_name_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Название: <b>Стрижка мужская</b>" in text
+    assert "Введите длительность" in text
+
+    update = _state_data_passed(state)
+    assert update["name"] == "Стрижка мужская"
+    state.set_state.assert_awaited_once_with(
+        admin_handlers.AdminStates.entering_service_duration
+    )
+    state.clear.assert_not_called()
+
+
+# --- admin_service_duration_msg (8 branches) ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_admin_service_duration_msg_non_admin_silent(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Non-admin text in entering_service_duration state → silent return."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=NON_ADMIN_TG_ID, text="60")
+    state = _make_mock_state({"name": "Стрижка", "business_id": _SENTINEL_BID})
+
+    await admin_handlers.admin_service_duration_msg(msg, state)
+
+    assert _answer_call_count(msg) == 0
+    state.clear.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_service_duration_msg_state_lost_clears(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """State lost (no name or business_id) → state.clear + 'Сессия утеряна'."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="60")
+    state = _make_mock_state({"name": "Стрижка"})  # no business_id
+
+    await admin_handlers.admin_service_duration_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Сессия утеряна" in text
+    state.clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_service_duration_msg_non_numeric_keeps_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Duration non-numeric → 'Длительность должна быть числом минут', state STAYS."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="abc")
+    state = _make_mock_state({"name": "Стрижка", "business_id": _SENTINEL_BID})
+
+    await admin_handlers.admin_service_duration_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Длительность должна быть числом минут" in text
+    state.clear.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_service_duration_msg_zero_or_negative_keeps_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """duration <= 0 → 'Длительность должна быть > 0', state STAYS."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="0")
+    state = _make_mock_state({"name": "Стрижка", "business_id": _SENTINEL_BID})
+
+    await admin_handlers.admin_service_duration_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Длительность должна быть > 0" in text
+    state.clear.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_service_duration_msg_bad_business_id_uuid_clears(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """business_id in state is not valid UUID → state.clear + 'Ошибка сессии'."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="60")
+    state = _make_mock_state({"name": "Стрижка", "business_id": "not-a-uuid"})
+
+    await admin_handlers.admin_service_duration_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Ошибка сессии (business_id)" in text
+    state.clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_service_duration_msg_value_error_from_create_service(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """create_service raises ValueError → '❌ <exc>', state STAYS (retry)."""
+    from unittest.mock import AsyncMock, patch
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        business_id = ctx["business_id"]
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="60")
+    state = _make_mock_state({"name": "Стрижка", "business_id": str(business_id)})
+
+    with patch(
+        "bot.handlers.admin.create_service",
+        new_callable=AsyncMock,
+        side_effect=ValueError("name too long"),
+    ):
+        await admin_handlers.admin_service_duration_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "❌" in text
+    assert "name too long" in text
+    state.clear.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_service_duration_msg_sqlalchemy_error_clears(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """create_service raises SQLAlchemyError → state.clear + 'Ошибка БД'."""
+    from unittest.mock import AsyncMock, patch
+
+    from sqlalchemy.exc import SQLAlchemyError
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        business_id = ctx["business_id"]
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="60")
+    state = _make_mock_state({"name": "Стрижка", "business_id": str(business_id)})
+
+    with patch(
+        "bot.handlers.admin.create_service",
+        new_callable=AsyncMock,
+        side_effect=SQLAlchemyError("simulated DB error"),
+    ):
+        await admin_handlers.admin_service_duration_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Ошибка БД" in text
+    state.clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_service_duration_msg_happy_creates_service(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Happy: duration '60' → create_service → '✅ Услуга добавлена' + state.clear
+    + Service row in DB.
+    """
+    from bot.models import Service
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        business_id = ctx["business_id"]
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="60")
+    state = _make_mock_state({"name": "Стрижка", "business_id": str(business_id)})
+
+    await admin_handlers.admin_service_duration_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "✅ Услуга добавлена" in text
+    assert "Стрижка" in text
+    assert "60 мин" in text
+    state.clear.assert_awaited_once()
+
+    async with session_factory() as verify:
+        services = (await verify.execute(select(Service))).scalars().all()
+        assert len(services) == 1
+        assert services[0].name == "Стрижка"
+        assert services[0].duration_minutes == 60
+
+
+
