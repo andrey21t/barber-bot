@@ -510,6 +510,263 @@ async def test_cmd_addslots_slot_already_exists_race(
 
 
 # ============================================================
+# cmd_openday — 11 branches (lines 354-427)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_cmd_openday_non_admin_silent_ignore(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Non-admin → _is_admin False → return silently (no answer, no DB write)."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+    msg = _make_message(user_id=NON_ADMIN_TG_ID, text=f"/openday {tomorrow} 11:00 18:00")
+    await admin_handlers.cmd_openday(msg, _make_command(f"{tomorrow} 11:00 18:00"))
+
+    assert _answer_call_count(msg) == 0
+
+
+@pytest.mark.asyncio
+async def test_cmd_openday_wrong_args_count_shows_format(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """args != 3 → 'Формат: /openday ГГГГ-ММ-ДД ЧЧ:ММ ЧЧ:ММ' hint."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/openday 2026-09-17 11:00")
+    await admin_handlers.cmd_openday(msg, _make_command("2026-09-17 11:00"))
+
+    text = _answer_text(msg)
+    assert "Формат:" in text
+    assert "/openday" in text
+
+
+@pytest.mark.asyncio
+async def test_cmd_openday_invalid_iso_date_shows_error(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Bad date → 'Неверная дата. Формат: ГГГГ-ММ-ДД'."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="/openday 17-09-2026 11:00 18:00")
+    await admin_handlers.cmd_openday(msg, _make_command("17-09-2026 11:00 18:00"))
+
+    text = _answer_text(msg)
+    assert "Неверная дата" in text
+
+
+@pytest.mark.asyncio
+async def test_cmd_openday_invalid_time_format_shows_error(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Bad time format (not HH:MM) → 'Время должно быть ЧЧ:ММ'."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+    msg = _make_message(user_id=ADMIN_TG_ID, text=f"/openday {tomorrow} 11-00 18:00")
+    await admin_handlers.cmd_openday(msg, _make_command(f"{tomorrow} 11-00 18:00"))
+
+    text = _answer_text(msg)
+    assert "Время должно быть ЧЧ:ММ" in text
+
+
+@pytest.mark.asyncio
+async def test_cmd_openday_master_not_found_shows_error(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Admin telegram_id not linked to Master → 'Мастер не найден'.
+
+    No _seed_admin_stack → _resolve_master_and_business returns None.
+    """
+    # Deliberately NO _seed_admin_stack — admin_id resolves to no master.
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+    msg = _make_message(user_id=ADMIN_TG_ID, text=f"/openday {tomorrow} 11:00 18:00")
+    await admin_handlers.cmd_openday(msg, _make_command(f"{tomorrow} 11:00 18:00"))
+
+    text = _answer_text(msg)
+    assert "Мастер не найден" in text
+
+
+@pytest.mark.asyncio
+async def test_cmd_openday_past_date_rejected(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Past date → 'Нельзя открыть день в прошлом'."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    yesterday = (datetime.now(UTC) - timedelta(days=1)).date()
+    msg = _make_message(user_id=ADMIN_TG_ID, text=f"/openday {yesterday} 11:00 18:00")
+    await admin_handlers.cmd_openday(msg, _make_command(f"{yesterday} 11:00 18:00"))
+
+    text = _answer_text(msg)
+    assert "Нельзя открыть день в прошлом" in text
+
+
+@pytest.mark.asyncio
+async def test_cmd_openday_value_error_from_open_workday(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """open_workday raises ValueError (e.g. end <= start) → '❌ <exc>'."""
+    from unittest.mock import AsyncMock, patch
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+    msg = _make_message(user_id=ADMIN_TG_ID, text=f"/openday {tomorrow} 11:00 18:00")
+
+    with patch(
+        "bot.handlers.admin.open_workday",
+        new_callable=AsyncMock,
+        side_effect=ValueError("end must be after start"),
+    ):
+        await admin_handlers.cmd_openday(msg, _make_command(f"{tomorrow} 11:00 18:00"))
+
+    text = _answer_text(msg)
+    assert "❌" in text
+    assert "end must be after start" in text
+
+
+@pytest.mark.asyncio
+async def test_cmd_openday_workday_shrink_error(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """open_workday raises WorkDayShrinkError → 'Нельзя сократить окно' hint."""
+    from unittest.mock import AsyncMock, patch
+
+    from bot.services.workday import WorkDayShrinkError
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+    msg = _make_message(user_id=ADMIN_TG_ID, text=f"/openday {tomorrow} 11:00 12:00")
+
+    with patch(
+        "bot.handlers.admin.open_workday",
+        new_callable=AsyncMock,
+        side_effect=WorkDayShrinkError("active booking blocks shrink"),
+    ):
+        await admin_handlers.cmd_openday(msg, _make_command(f"{tomorrow} 11:00 12:00"))
+
+    text = _answer_text(msg)
+    assert "Нельзя сократить окно" in text
+
+
+@pytest.mark.asyncio
+async def test_cmd_openday_sqlalchemy_error(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """open_workday raises SQLAlchemyError → 'Ошибка БД' (S2 fix, code-review 5.1)."""
+    from unittest.mock import AsyncMock, patch
+
+    from sqlalchemy.exc import SQLAlchemyError
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+    msg = _make_message(user_id=ADMIN_TG_ID, text=f"/openday {tomorrow} 11:00 18:00")
+
+    with patch(
+        "bot.handlers.admin.open_workday",
+        new_callable=AsyncMock,
+        side_effect=SQLAlchemyError("simulated DB error"),
+    ):
+        await admin_handlers.cmd_openday(msg, _make_command(f"{tomorrow} 11:00 18:00"))
+
+    text = _answer_text(msg)
+    assert "Ошибка БД" in text
+
+
+@pytest.mark.asyncio
+async def test_cmd_openday_happy_new_workday(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Happy path — open new workday → '✅ День открыт' + WorkDay row in DB."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+    msg = _make_message(user_id=ADMIN_TG_ID, text=f"/openday {tomorrow} 11:00 18:00")
+    await admin_handlers.cmd_openday(msg, _make_command(f"{tomorrow} 11:00 18:00"))
+
+    text = _answer_text(msg)
+    assert "✅ День открыт" in text
+    assert "11:00" in text and "18:00" in text
+    # No "день был закрыт" suffix — fresh new day
+    assert "открыт заново" not in text
+
+    async with session_factory() as verify:
+        from bot.models import WorkDay
+
+        wd = (await verify.execute(select(WorkDay))).scalars().all()
+        assert len(wd) == 1
+        assert wd[0].is_active is True
+
+
+@pytest.mark.asyncio
+async def test_cmd_openday_happy_reopens_closed_workday(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Re-open existing inactive workday → '✅ День открыт' + 'открыт заново' suffix.
+
+    F1 fix (Session 5.18, variant B): captures was_closed BEFORE open_workday
+    re-opens the day. After open_workday, is_active is always True → without
+    capture, the 'открыт заново' suffix never showed.
+    """
+    from datetime import time as dt_time
+
+    from bot.models import WorkDay
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        master_id = ctx["master_id"]
+        # Pre-existing INACTIVE workday for tomorrow
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        session.add(
+            WorkDay(
+                master_id=master_id,
+                work_date=tomorrow,
+                start_time=dt_time(9, 0),
+                end_time=dt_time(17, 0),
+                is_active=False,
+            )
+        )
+        await session.commit()
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text=f"/openday {tomorrow} 11:00 18:00")
+    await admin_handlers.cmd_openday(msg, _make_command(f"{tomorrow} 11:00 18:00"))
+
+    text = _answer_text(msg)
+    assert "✅ День открыт" in text
+    assert "день был закрыт — открыт заново" in text
+
+    async with session_factory() as verify:
+        wd = (await verify.execute(select(WorkDay))).scalars().all()
+        assert len(wd) == 1
+        assert wd[0].is_active is True
+
+
+# ============================================================
 # cmd_closeslot — 10 branches
 # ============================================================
 
