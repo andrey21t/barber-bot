@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
-from aiogram.filters import Command, CommandObject, StateFilter
+from aiogram.filters import Command, CommandObject, StateFilter, or_f
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback
@@ -215,14 +215,18 @@ def _require_admin_or_silent(message: Message) -> int | None:
 # ============================================================
 # Этап 3 (Session 5.9) — /menu command + admin_menu_cb callback
 # ============================================================
-# /menu — re-show inline menu (13 сообщений в admin.py ссылаются на
-# "/menu — заново" — без команды dead-end UX). StateFilter(None) — НЕ ловит
-# mid-FSM (там /cancel сначала, потом /menu). admin_menu_cb — для кнопки
-# "📋 Меню" в welcome (если будет добавлена в admin_inline_menu() в будущем).
+# /menu — re-show inline menu (13 сообщений в admin.py ссылают на
+# "/menu — заново" — без команды dead-end UX). StateFilter("*") — ловит
+# mid-FSM (escape hatch: state.clear() first, then show menu). admin_menu_cb
+# — для inline кнопки "📋 Меню" в welcome (если будет добавлена в
+# admin_inline_menu() в будущем).
+# Session 5.62 (пункт 5): F.text == "📋 Меню" match добавлен для reply
+# keyboard button (admin_reply_keyboard). or_f() объединяет F.text exact
+# match и Command("menu") в один handler.
 # ============================================================
 
 
-@router.message(Command("menu"), StateFilter("*"))
+@router.message(or_f(F.text == "📋 Меню", Command("menu")), StateFilter("*"))
 async def cmd_menu(message: Message, state: FSMContext) -> None:
     """Show admin inline menu — escape hatch from any FSM state.
 
@@ -231,6 +235,9 @@ async def cmd_menu(message: Message, state: FSMContext) -> None:
 
     StateFilter("*") matches any state including None — single handler covers
     both 'fresh /menu' and 'escape from stuck FSM'. _is_admin: non-admin silent.
+
+    Session 5.62 (пункт 5): добавлен F.text == "📋 Меню" match для reply keyboard
+    кнопки. Same handler — что /menu command, что tap по reply keyboard.
     """
     if not _is_admin(message):
         return
@@ -556,12 +563,20 @@ async def cmd_closeslot(message: Message, command: CommandObject) -> None:
 # ============================================================
 # 3. /today — bookings for today (LOCAL date)
 # ============================================================
-@router.message(Command("today"), StateFilter(None))
-async def cmd_today(message: Message) -> None:
-    """List confirmed/transferred bookings for today."""
+@router.message(or_f(F.text == "📅 Сегодня", Command("today")), StateFilter("*"))
+async def cmd_today(message: Message, state: FSMContext) -> None:
+    """List confirmed/transferred bookings for today.
+
+    Session 5.62 (пункт 5): расширен с StateFilter(None) до StateFilter("*") +
+    F.text == "📅 Сегодня" match для reply keyboard кнопки. state.clear() в
+    начале — escape hatch из mid-FSM (если admin в /addslots /openweek и
+    тапает "Сегодня" — FSM чистится, today bookings показываются). Безопасно
+    для read-only команд (cmd_today только читает БД, не меняет state).
+    """
     admin_id = _require_admin_or_silent(message)
     if admin_id is None:
         return
+    await state.clear()
     resolved = await _resolve_master_and_business(admin_id)
     if resolved is None:
         await message.answer("❌ Мастер не найден")
@@ -588,12 +603,18 @@ async def cmd_today(message: Message) -> None:
 # ============================================================
 # 4. /week — bookings for next 7 days
 # ============================================================
-@router.message(Command("week"), StateFilter(None))
-async def cmd_week(message: Message) -> None:
-    """List confirmed/transferred bookings for next 7 days (LOCAL today → today+7)."""
+@router.message(or_f(F.text == "🗓 Неделя", Command("week")), StateFilter("*"))
+async def cmd_week(message: Message, state: FSMContext) -> None:
+    """List confirmed/transferred bookings for next 7 days (LOCAL today → today+7).
+
+    Session 5.62 (пункт 5): расширен с StateFilter(None) до StateFilter("*") +
+    F.text == "🗓 Неделя" match для reply keyboard кнопки. state.clear() в
+    начале — escape hatch из mid-FSM. Read-only — безопасно.
+    """
     admin_id = _require_admin_or_silent(message)
     if admin_id is None:
         return
+    await state.clear()
     resolved = await _resolve_master_and_business(admin_id)
     if resolved is None:
         await message.answer("❌ Мастер не найден")
