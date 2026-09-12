@@ -6960,4 +6960,331 @@ async def test_admin_service_duration_msg_happy_creates_service(
         assert services[0].duration_minutes == 60
 
 
+# ============================================================
+# admin_move_confirm_cb edges (lines 2632-2798, T2.6) — 11 edge branches.
+# Happy path already covered by test_admin_move_confirm_cb_calls_service_and_notifies_client.
+# Edge tests cover: non-admin, state lost, 9 service exception mappings.
+# ============================================================
+
+
+def _make_move_state(*, booking_id: str | None = None,
+                     workday_id: str | None = None,
+                     start_minute: int | None = None) -> MagicMock:
+    """Build state for admin_move_confirm_cb with the 3 keys it reads.
+
+    Pass None for any key to simulate that key missing (state loss branch).
+    """
+    data: dict[str, Any] = {}
+    if booking_id is not None:
+        data["admin_move_booking_id"] = booking_id
+    if workday_id is not None:
+        data["admin_move_new_workday_id"] = workday_id
+    if start_minute is not None:
+        data["admin_move_new_start_minute"] = start_minute
+    return _make_mock_state(data)
+
+
+_BID_MOVE = "11111111-1111-1111-1111-111111111111"
+_WID_MOVE = "22222222-2222-2222-2222-222222222222"
+
+
+@pytest.mark.asyncio
+async def test_admin_move_confirm_cb_non_admin_silent(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Non-admin tap → callback.answer() + return (no state changes, no service call)."""
+    callback = _make_callback(NON_ADMIN_TG_ID)
+    state = _make_move_state(booking_id=_BID_MOVE, workday_id=_WID_MOVE, start_minute=15 * 60)
+    mock_scheduler = MagicMock()
+
+    await admin_handlers.admin_move_confirm_cb(callback, state, mock_scheduler)
+
+    callback.answer.assert_awaited_once()
+    state.clear.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_move_confirm_cb_state_lost_clears(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """State lost (any of booking_id/workday_id/start_minute missing) →
+    state.clear + 'Данные потеряны. /today чтобы начать' + callback.answer.
+    """
+    callback = _make_callback(ADMIN_TG_ID)
+    # Missing start_minute — simulates state loss mid-flow
+    state = _make_move_state(booking_id=_BID_MOVE, workday_id=_WID_MOVE)
+    mock_scheduler = MagicMock()
+
+    await admin_handlers.admin_move_confirm_cb(callback, state, mock_scheduler)
+
+    state.clear.assert_awaited_once()
+    text = callback_answer_text(callback)
+    assert "Данные потеряны" in text
+    assert "/today" in text
+    callback.answer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_move_confirm_cb_state_lost_message_is_none(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """State lost + callback.message is None → state.clear still called, only
+    message.answer skipped (no message to answer to).
+    """
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.message = None  # type: ignore[assignment]
+    state = _make_move_state()  # empty state — full state loss
+    mock_scheduler = MagicMock()
+
+    await admin_handlers.admin_move_confirm_cb(callback, state, mock_scheduler)
+
+    state.clear.assert_awaited_once()
+    callback.answer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_move_confirm_cb_booking_not_found(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """admin_move_booking raises BookingNotFoundError → callback.answer('Запись не найдена')."""
+    from unittest.mock import AsyncMock, patch
+
+    from bot.services.admin_move import BookingNotFoundError
+
+    callback = _make_callback(ADMIN_TG_ID)
+    state = _make_move_state(booking_id=_BID_MOVE, workday_id=_WID_MOVE, start_minute=15 * 60)
+    mock_scheduler = MagicMock()
+
+    with patch(
+        "bot.handlers.admin.admin_move_booking",
+        new_callable=AsyncMock,
+        side_effect=BookingNotFoundError("no booking"),
+    ):
+        await admin_handlers.admin_move_confirm_cb(callback, state, mock_scheduler)
+
+    args, _ = callback.answer.call_args
+    assert "Запись не найдена" in str(args[0] if args else "")
+
+
+@pytest.mark.asyncio
+async def test_admin_move_confirm_cb_booking_already_cancelled(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """admin_move_booking raises BookingAlreadyCancelledError →
+    callback.answer('Запись уже отменена').
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from bot.services.admin_move import BookingAlreadyCancelledError
+
+    callback = _make_callback(ADMIN_TG_ID)
+    state = _make_move_state(booking_id=_BID_MOVE, workday_id=_WID_MOVE, start_minute=15 * 60)
+    mock_scheduler = MagicMock()
+
+    with patch(
+        "bot.handlers.admin.admin_move_booking",
+        new_callable=AsyncMock,
+        side_effect=BookingAlreadyCancelledError("cancelled"),
+    ):
+        await admin_handlers.admin_move_confirm_cb(callback, state, mock_scheduler)
+
+    args, _ = callback.answer.call_args
+    assert "Запись уже отменена" in str(args[0] if args else "")
+
+
+@pytest.mark.asyncio
+async def test_admin_move_confirm_cb_booking_already_transferred(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """admin_move_booking raises BookingAlreadyTransferredError →
+    message.answer '❌ Запись уже перенесена (конкурентный запрос)'.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from bot.services.admin_move import BookingAlreadyTransferredError
+
+    callback = _make_callback(ADMIN_TG_ID)
+    state = _make_move_state(booking_id=_BID_MOVE, workday_id=_WID_MOVE, start_minute=15 * 60)
+    mock_scheduler = MagicMock()
+
+    with patch(
+        "bot.handlers.admin.admin_move_booking",
+        new_callable=AsyncMock,
+        side_effect=BookingAlreadyTransferredError("already moved"),
+    ):
+        await admin_handlers.admin_move_confirm_cb(callback, state, mock_scheduler)
+
+    text = callback_answer_text(callback)
+    assert "Запись уже перенесена" in text
+    assert "/today" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_move_confirm_cb_slot_already_booked(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """admin_move_booking raises SlotAlreadyBookedError →
+    message.answer '😔 Слот только что заняли' (race condition).
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from bot.services.booking import SlotAlreadyBookedError
+
+    callback = _make_callback(ADMIN_TG_ID)
+    state = _make_move_state(booking_id=_BID_MOVE, workday_id=_WID_MOVE, start_minute=15 * 60)
+    mock_scheduler = MagicMock()
+
+    with patch(
+        "bot.handlers.admin.admin_move_booking",
+        new_callable=AsyncMock,
+        side_effect=SlotAlreadyBookedError("slot taken"),
+    ):
+        await admin_handlers.admin_move_confirm_cb(callback, state, mock_scheduler)
+
+    text = callback_answer_text(callback)
+    assert "Слот только что заняли" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_move_confirm_cb_slot_in_past(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """admin_move_booking raises SlotInPastError → message.answer '❌ Это время уже прошло.'"""
+    from unittest.mock import AsyncMock, patch
+
+    from bot.services.booking import SlotInPastError
+
+    callback = _make_callback(ADMIN_TG_ID)
+    state = _make_move_state(booking_id=_BID_MOVE, workday_id=_WID_MOVE, start_minute=15 * 60)
+    mock_scheduler = MagicMock()
+
+    with patch(
+        "bot.handlers.admin.admin_move_booking",
+        new_callable=AsyncMock,
+        side_effect=SlotInPastError("past slot"),
+    ):
+        await admin_handlers.admin_move_confirm_cb(callback, state, mock_scheduler)
+
+    text = callback_answer_text(callback)
+    assert "Это время уже прошло" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_move_confirm_cb_workday_not_found(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """admin_move_booking raises WorkDayNotFoundError →
+    message.answer '❌ Рабочий день не найден'.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from bot.services.admin_move import WorkDayNotFoundError
+
+    callback = _make_callback(ADMIN_TG_ID)
+    state = _make_move_state(booking_id=_BID_MOVE, workday_id=_WID_MOVE, start_minute=15 * 60)
+    mock_scheduler = MagicMock()
+
+    with patch(
+        "bot.handlers.admin.admin_move_booking",
+        new_callable=AsyncMock,
+        side_effect=WorkDayNotFoundError("no workday"),
+    ):
+        await admin_handlers.admin_move_confirm_cb(callback, state, mock_scheduler)
+
+    text = callback_answer_text(callback)
+    assert "Рабочий день не найден" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_move_confirm_cb_workday_inactive(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """admin_move_booking raises WorkDayInactiveError →
+    message.answer '❌ Этот день закрыт'.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from bot.services.admin_move import WorkDayInactiveError
+
+    callback = _make_callback(ADMIN_TG_ID)
+    state = _make_move_state(booking_id=_BID_MOVE, workday_id=_WID_MOVE, start_minute=15 * 60)
+    mock_scheduler = MagicMock()
+
+    with patch(
+        "bot.handlers.admin.admin_move_booking",
+        new_callable=AsyncMock,
+        side_effect=WorkDayInactiveError("closed day"),
+    ):
+        await admin_handlers.admin_move_confirm_cb(callback, state, mock_scheduler)
+
+    text = callback_answer_text(callback)
+    assert "Этот день закрыт" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_move_confirm_cb_outside_workday(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """admin_move_booking raises BookingOutsideWorkDayError →
+    message.answer '❌ Время вне рабочего окна'.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from bot.services.booking import BookingOutsideWorkDayError
+
+    callback = _make_callback(ADMIN_TG_ID)
+    state = _make_move_state(booking_id=_BID_MOVE, workday_id=_WID_MOVE, start_minute=15 * 60)
+    mock_scheduler = MagicMock()
+
+    with patch(
+        "bot.handlers.admin.admin_move_booking",
+        new_callable=AsyncMock,
+        side_effect=BookingOutsideWorkDayError("outside"),
+    ):
+        await admin_handlers.admin_move_confirm_cb(callback, state, mock_scheduler)
+
+    text = callback_answer_text(callback)
+    assert "Время вне рабочего окна" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_move_confirm_cb_capacity_exceeded(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """admin_move_booking raises WorkDayCapacityExceededError →
+    message.answer '❌ Нет мест — все слоты заняты'.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from bot.services.booking import WorkDayCapacityExceededError
+
+    callback = _make_callback(ADMIN_TG_ID)
+    state = _make_move_state(booking_id=_BID_MOVE, workday_id=_WID_MOVE, start_minute=15 * 60)
+    mock_scheduler = MagicMock()
+
+    with patch(
+        "bot.handlers.admin.admin_move_booking",
+        new_callable=AsyncMock,
+        side_effect=WorkDayCapacityExceededError("no capacity"),
+    ):
+        await admin_handlers.admin_move_confirm_cb(callback, state, mock_scheduler)
+
+    text = callback_answer_text(callback)
+    assert "Нет мест" in text
+    assert "все слоты заняты" in text
+
+
+
 
