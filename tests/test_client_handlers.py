@@ -423,6 +423,45 @@ async def test_mybookings_cancel_cb_happy_path(
 
 
 @pytest.mark.asyncio
+async def test_mybookings_cancel_cb_rebook_keyboard(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+) -> None:
+    """Session 5.59: self-cancel confirmation carries a [💇 Записаться] inline
+    keyboard so the client can immediately rebook. The button reuses
+    ClientMenuBookCallbackData (same handler as the /start menu entry)."""
+    from bot.keyboards.client import ClientMenuBookCallbackData
+
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        future_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=3)
+        future_local = future_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=future_local)
+        booking_id = booking.id
+
+    bot = AsyncMock()
+    cb, cb_data = _make_callback(user_id=111222333, booking_id=booking_id, bot=bot)
+
+    await client_handlers.mybookings_cancel_cb(cb, cb_data, mock_scheduler)
+
+    markup = _answer_reply_markup(cb.message)
+    assert isinstance(markup, InlineKeyboardMarkup), (
+        "self-cancel confirmation must attach a rebook inline keyboard"
+    )
+    buttons = [btn for row in markup.inline_keyboard for btn in row]
+    assert len(buttons) == 1, "rebook keyboard must have a single [Записаться] button"
+    assert "Записаться" in buttons[0].text, (
+        f"rebook button text must be '💇 Записаться', got {buttons[0].text!r}"
+    )
+    # Button routes to the same booking entry as the /start menu button.
+    expected = ClientMenuBookCallbackData().pack()
+    assert buttons[0].callback_data == expected, (
+        "rebook button must reuse ClientMenuBookCallbackData (booking entry point)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_mybookings_cancel_cb_soon_booking(
     session_factory: Any,
     patched_session_factory: Any,
