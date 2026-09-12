@@ -1,11 +1,13 @@
 """Keyboards for master (admin) — inline menu + back-compat reply keyboard.
 
-Spec.md 251 (Вариант B): inline keyboard с 5 кнопками для мастера Екатерины.
-Каждая кнопка триггерит callback → FSM flow (multi-step для 3 из 5):
-- 📅 Открыть день → opening_workday (date → start_time → end_time)
-- ➕ Изменить окно → adding_slots (date → start_time → end_time — MODIFY flow)
+Session 5.62: inline keyboard с 6 кнопками для мастера Екатерины (пункт 2 —
+«Открыть день» удалён, CREATE через «Открыть неделю» или /openday текст).
+Каждая кнопка триггерит callback → FSM flow (multi-step для 3 из 6):
+- ➕ Изменить окно → adding_slots (date → start → end — MODIFY flow)
 - 📅 Сегодня → мгновенный список (no FSM)
 - 🗓 Неделя → мгновенный список (no FSM)
+- 🗓 Открыть неделю → opening_week (batch CREATE, 5.26)
+- 📅 Закрыть день → closing_day (calendar → confirm, 5.26)
 - 💇 Услуги → entering_service (name → duration → price)
 
 /closeslot SHRINK inline flow REMOVED (5.10 simplification) — «Изменить окно»
@@ -43,16 +45,6 @@ class AdminMenuCallbackData(CallbackData, prefix="admin_menu"):
 
     Будет подключён в Этап 1.3 (handlers/start.py) для кнопки '📋 Меню'
     в welcome-сообщении мастера.
-    """
-
-
-class AdminOpendayCallbackData(CallbackData, prefix="admin_openday"):
-    """Trigger opening_workday flow — открыть рабочий день (Этап 5.1).
-
-    Replaces AdminAddslotsCallbackData as the primary 'open window' action —
-    WorkDay [start_time, end_time] instead of per-hour Slot list. addslots
-    button stays as deprecated alias until 5.10 (PLANS.md Plan of Work
-    п.11), then removed from the inline menu.
     """
 
 
@@ -124,26 +116,26 @@ class AdminMoveConfirmCallbackData(CallbackData, prefix="admin_move_confirm"):
 
 
 def admin_inline_menu() -> InlineKeyboardMarkup:
-    """Inline keyboard с 7 кнопками для мастера (spec.md 251, Вариант B + Этап 5.1 + Session 5.26).
+    """Inline keyboard с 6 кнопками для мастера (5.62).
 
-    Layout: 2 + 2 + 2 + 1 (4 rows) — semantic shift 5.10: «Открыть слоты» →
-    «Изменить окно» (/addslots = MODIFY). SHRINK button REMOVED (5.10
-    simplification) — «Изменить окно» handles both shrink+extend+shift via
-    two-phase picker start→end. /openday (CREATE) без изменений.
-    Row 1: 📅 Открыть день (CREATE), ➕ Изменить окно (MODIFY, 5.10).
-    Row 2: 📅 Сегодня, 🗓 Неделя.
-    Row 3: 🗓 Открыть неделю (batch CREATE, 5.26), 📅 Закрыть день (5.26).
-    Row 4: 💇 Услуги (entering_service flow).
+    Session 5.62 (пункт 2 от Екатерины): кнопка «Открыть день» (старый
+    текстовый формат с HH:MM input) УДАЛЕНА. CREATE day теперь только через
+    «🗓 Открыть неделю» (inline picker) или текстовую команду /openday
+    (power-user shortcut, без inline UI). MODIFY остаётся «➕ Изменить окно».
+
+    Layout: 2 + 2 + 2 (3 rows).
+    Row 1: ➕ Изменить окно (MODIFY, 5.10), 📅 Сегодня.
+    Row 2: 🗓 Неделя, 🗓 Открыть неделю (batch CREATE, 5.26).
+    Row 3: 📅 Закрыть день (5.26), 💇 Услуги (entering_service flow).
     """
     builder = InlineKeyboardBuilder()
-    builder.button(text="📅 Открыть день", callback_data=AdminOpendayCallbackData().pack())
     builder.button(text="➕ Изменить окно", callback_data=AdminAddslotsCallbackData().pack())
     builder.button(text="📅 Сегодня", callback_data=AdminTodayCallbackData().pack())
     builder.button(text="🗓 Неделя", callback_data=AdminWeekCallbackData().pack())
     builder.button(text="🗓 Открыть неделю", callback_data=AdminOpenWeekEntryCallbackData().pack())
     builder.button(text="📅 Закрыть день", callback_data=AdminCloseDayEntryCallbackData().pack())
     builder.button(text="💇 Услуги", callback_data=AdminServicesCallbackData().pack())
-    builder.adjust(2, 2, 2, 1)
+    builder.adjust(2, 2, 2)
     return builder.as_markup()
 
 
@@ -335,9 +327,8 @@ class AdminWindowConfirmCallbackData(CallbackData, prefix="admin_win_conf"):
 class AdminOpenWeekEntryCallbackData(CallbackData, prefix="admin_openweek_entry"):
     """Trigger /openweek flow from inline menu (Session 5.26).
 
-    No payload (mirror AdminOpendayCallbackData). Tap → picker start
-    (admin_window_slot_picker_keyboard mode='start' БЕЗ booked_slots — новый
-    день, не modify existing window).
+    No payload — tap → picker start (admin_window_slot_picker_keyboard
+    mode='start' БЕЗ booked_slots — новый день, не modify existing window).
     """
 
 
@@ -395,8 +386,8 @@ class AdminOpenweekEditCallbackData(CallbackData, prefix="admin_openweek_edit"):
 class AdminCloseDayEntryCallbackData(CallbackData, prefix="admin_closeday_entry"):
     """Trigger /closeday flow from inline menu (Session 5.26).
 
-    No payload (mirror AdminOpendayCallbackData). Tap → SimpleCalendar for
-    date selection (next handler admin_closeday_calendar_cb).
+    No payload — tap → SimpleCalendar for date selection (next handler
+    admin_closeday_calendar_cb).
     """
 
 

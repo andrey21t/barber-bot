@@ -38,15 +38,17 @@ class TransferStates(StatesGroup):
 class AdminStates(StatesGroup):
     """FSM states для admin inline-menu flow (Вариант B, spec.md 251).
 
-    Multi-step flows для 3 из 5 кнопок админ-меню:
+    Multi-step flows для админ-меню:
     - adding_slots: date (SimpleCalendar) → pick window start (inline 30-min)
       → pick window end (inline 30-min) → confirm → open_workday (Этап 5.10
       inline-часы; replaces text input "11 12 13" with two-phase inline picker)
-    - opening_workday: date (SimpleCalendar) → start_time (HH:MM text) →
-      end_time (HH:MM text) → open_workday (Этап 5.1, primary CREATE path —
-      /addslots inline = MODIFY only, redirects here if WorkDay missing)
     - entering_service: name → duration → create (price убран в Session 5.10,
       мастер озвучивает цену отдельно в чате; поле Service.price nullable)
+
+    Session 5.62 (пункт 2): opening_workday_* states УДАЛЕНЫ вместе с inline
+    кнопкой "Открыть день" и 4 handlers (admin_openday_cb, calendar_cb,
+    start_msg, end_msg). Текстовая команда /openday осталась как power-user
+    shortcut (без FSM).
 
     Today/week — мгновенные callback handlers БЕЗ FSM (read-only queries).
     """
@@ -55,9 +57,6 @@ class AdminStates(StatesGroup):
     picking_window_start = State()
     picking_window_end = State()
     confirming_window = State()
-    opening_workday_date = State()
-    opening_workday_start = State()
-    opening_workday_end = State()
     entering_service_name = State()
     entering_service_duration = State()
     # /openweek (Session 5.26): batch open week — picker start → picker end →

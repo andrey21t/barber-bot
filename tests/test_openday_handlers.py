@@ -31,7 +31,6 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dt_time
 from typing import Any
-from unittest.mock import AsyncMock, patch
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -46,14 +45,11 @@ from tests.test_admin_handlers import (
     TZ,
     _answer_text,
     _local_to_utc_naive,
-    _make_callback,
     _make_command,
     _make_message,
-    _make_mock_state,
     _seed_admin_stack,
     _seed_booking,
     _seed_slot,
-    callback_answer_text,
 )
 
 # ============================================================
@@ -374,116 +370,3 @@ async def test_openday_accepts_dot_comma_colon_separators(
         assert workdays[0].end_time == dt_time(18, 0)
 
 
-# ============================================================
-# Tests — pre-prompt active bookings on chosen date (BB-PRE-PROMPT)
-# ============================================================
-
-
-@pytest.mark.asyncio
-async def test_admin_openday_calendar_cb_pre_prompts_active_bookings(
-    session_factory: Any,
-    patched_session_factory: Any,
-) -> None:
-    """Day select with active bookings on that date → ask_text shows '📋 Записи
-    на этот день:' block with '• HH:MM <name> — <service>' rows BEFORE
-    'Введите время начала'. Master sees which bookings block a narrow window
-    upfront, doesn't reach WorkDayShrinkError on confirm with UUIDs.
-    """
-
-    from aiogram_calendar import SimpleCalendarCallback
-    from aiogram_calendar.schemas import SimpleCalAct
-    from bot.states import AdminStates
-
-    target = _future(11)
-    async with session_factory() as session:
-        ctx = await _seed_admin_stack(session)
-        await _seed_workday(
-            session,
-            master_id=ctx["master_id"],
-            work_date=target,
-            start_time=dt_time(10, 0),
-            end_time=dt_time(20, 0),
-            is_active=True,
-        )
-        # Booking at 19:00 LOCAL — _seed_booking uses name='Паша', service='Стрижка'
-        slot = await _seed_slot(
-            session, master_id=ctx["master_id"], slot_date=target, hour=19, status="open"
-        )
-        booking_at_19 = datetime.combine(target, dt_time(19, 0), tzinfo=ZoneInfo(TZ))
-        await _seed_booking(
-            session,
-            ctx=ctx,
-            slot=slot,
-            start_at_utc_naive=_local_to_utc_naive(booking_at_19),
-            status="confirmed",
-        )
-
-    cal_cb_data = SimpleCalendarCallback(
-        act=SimpleCalAct.day,
-        year=target.year,
-        month=target.month,
-        day=target.day,
-    )
-    callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
-    callback.message.edit_text = AsyncMock()
-    state = _make_mock_state()
-
-    future_date = datetime.combine(target, datetime.min.time())
-    with patch(
-        "aiogram_calendar.SimpleCalendar.process_selection",
-        return_value=(True, future_date),
-    ):
-        await admin_handlers.admin_openday_calendar_cb(callback, cal_cb_data, state)
-
-    state.set_state.assert_called_once_with(AdminStates.opening_workday_start)
-    if callback.message.edit_text.called:
-        text = str(callback.message.edit_text.call_args.args[0])
-    else:
-        text = callback_answer_text(callback)
-    assert "Записи на этот день" in text
-    assert "19:00" in text
-    assert "Паша" in text and "Стрижка" in text
-    assert "Введите время начала" in text  # ask_text still present
-
-
-@pytest.mark.asyncio
-async def test_admin_openday_calendar_cb_no_bookings_no_block(
-    session_factory: Any,
-    patched_session_factory: Any,
-) -> None:
-    """Day select with NO active bookings → ask_text WITHOUT '📋 Записи на этот
-    день' block (regression: empty case should not show 'Записи:' empty header).
-    """
-
-    from aiogram_calendar import SimpleCalendarCallback
-    from aiogram_calendar.schemas import SimpleCalAct
-    from bot.states import AdminStates
-
-    target = _future(11)
-    async with session_factory() as session:
-        await _seed_admin_stack(session)
-
-    cal_cb_data = SimpleCalendarCallback(
-        act=SimpleCalAct.day,
-        year=target.year,
-        month=target.month,
-        day=target.day,
-    )
-    callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
-    callback.message.edit_text = AsyncMock()
-    state = _make_mock_state()
-
-    future_date = datetime.combine(target, datetime.min.time())
-    with patch(
-        "aiogram_calendar.SimpleCalendar.process_selection",
-        return_value=(True, future_date),
-    ):
-        await admin_handlers.admin_openday_calendar_cb(callback, cal_cb_data, state)
-
-    state.set_state.assert_called_once_with(AdminStates.opening_workday_start)
-    if callback.message.edit_text.called:
-        text = str(callback.message.edit_text.call_args.args[0])
-    else:
-        text = callback_answer_text(callback)
-    assert "Записи на этот день" not in text  # no bookings → no block
-    assert "Введите время начала" in text  # ask_text still present
