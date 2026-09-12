@@ -260,3 +260,79 @@ def test_main_name_block_starts_process_via_subprocess() -> None:
             "timeout but 'Polling started' log absent — process may not have "
             f"reached main(). stdout={e.stdout!r}, stderr={e.stderr!r}"
         )
+
+
+# ============================================================
+# T3.3 — bot/main.py edge branches coverage
+# 1. _build_fsm_storage with postgres URL → PostgresStorage (lines 59-60)
+# 2. main() with TELEGRAM_API_BASE_URL non-empty → proxy log (line 110)
+# ============================================================
+
+
+def test_build_fsm_storage_postgres_url_returns_postgres_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T3.3: _build_fsm_storage with DATABASE_URL=postgresql://... →
+    PostgresStorage (lines 59-60).
+
+    Existing tests use sqlite (test env) → MemoryStorage. This covers the
+    prod branch (postgresql → PostgresStorage(async_session_factory)).
+    """
+    from bot.config import Settings
+    from bot.main import _build_fsm_storage
+
+    settings = Settings(
+        BOT_TOKEN="123:test",
+        ADMIN_ID=1,
+        DATABASE_URL="postgresql://user:pass@host:5432/db",
+    )
+    # Patch async_session_factory to avoid real DB connection in PostgresStorage
+    # constructor (it only stores the reference, doesn't connect at import).
+    monkeypatch.setattr(
+        "bot.main.async_session_factory",
+        MagicMock(name="mock_session_factory"),
+    )
+    storage = _build_fsm_storage(settings)
+    # PostgresStorage imported from bot.fsm_storage (see main.py:36)
+    from bot.fsm_storage import PostgresStorage
+    assert isinstance(storage, PostgresStorage)
+
+
+async def test_main_logs_telegram_api_proxy_when_base_url_non_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T3.3: main() with TELEGRAM_API_BASE_URL non-empty →
+    logger.info "Telegram API via proxy: ..." (line 110).
+
+    Existing test_main_wires_routers uses default (empty) → "direct api.telegram.org"
+    log. This test covers the proxy branch via env override.
+    """
+    import bot.main as main_module
+    from bot.config import Settings
+
+    # Override settings to enable proxy flag
+    proxy_settings = Settings(
+        BOT_TOKEN="123:test",
+        ADMIN_ID=1,
+        TELEGRAM_API_BASE_URL="https://my-worker.workers.dev/secret123",
+    )
+    monkeypatch.setattr(main_module, "get_settings", lambda: proxy_settings)
+
+    mock_bot_instance = MagicMock()
+    mock_bot_instance.session = AsyncMock()
+    mock_dp_instance = MagicMock()
+    mock_dp_instance.start_polling = AsyncMock()
+    monkeypatch.setattr("bot.main.Bot", MagicMock(return_value=mock_bot_instance))
+    monkeypatch.setattr("bot.main.Dispatcher", MagicMock(return_value=mock_dp_instance))
+    monkeypatch.setattr("bot.main.build_session", lambda: MagicMock())
+    monkeypatch.setattr("bot.main.scheduler", MagicMock())
+    monkeypatch.setattr("bot.main.setup_logging", MagicMock())
+
+    with caplog.at_level(logging.INFO, logger="bot.main"):
+        await main()
+
+    assert any(
+        "Telegram API via proxy" in r.message and "my-worker" in r.message
+        for r in caplog.records
+    ), f"expected proxy log, got {[r.message for r in caplog.records]}"
