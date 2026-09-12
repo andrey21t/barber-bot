@@ -5936,3 +5936,369 @@ async def test_transfer_simple_calendar_cb_legacy_empty_no_workday(
     assert isinstance(_answer_reply_markup(cb.message), InlineKeyboardMarkup)
     cb.answer.assert_awaited()
 
+
+# ============================================================
+# T4.1 — book_date_cb + book_date_cancel_cb
+# Covers: book_date_cb parse error (1070-1077), book_date_cancel_cb branches (1103-1114)
+# ============================================================
+
+
+def _make_book_date_callback(
+    work_date: str,
+    *,
+    user_id: int = 111222333,
+) -> tuple[MagicMock, Any]:
+    """Mock CallbackQuery for book_date_cb (BookDateCallbackData filter).
+
+    Builds a real BookDateCallbackData so .filter() matches on dispatch.
+    """
+    from bot.keyboards.client import BookDateCallbackData
+
+    bot = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.from_user = _make_user(user_id)
+    cb.message = _make_message(user_id, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = bot
+    callback_data = BookDateCallbackData(work_date=work_date)
+    return cb, callback_data
+
+
+@pytest.mark.asyncio
+async def test_book_date_cb_invalid_date_returns_error_no_state_change(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T4.1: book_date_cb with malformed work_date → ValueError caught →
+    '❌ Неверная дата' + callback.answer (lines 1070-1077).
+
+    FSM state preserved (state.set_state NOT called) — user can tap another date.
+    """
+    async with session_factory() as session:
+        await _seed_full_stack(session)
+
+    cb, callback_data = _make_book_date_callback(work_date="not-a-date")
+    state = _make_state()
+
+    await client_handlers.book_date_cb(cb, callback_data, state)
+
+    state.set_state.assert_not_awaited()
+    assert "Неверная дата" in _answer_text(cb.message)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_book_date_cb_message_none_silent_answer_only(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """T4.1: book_date_cb invalid date + callback.message is None →
+    no message.answer, only callback.answer (line 1074-1076 message-None branch)."""
+    async with session_factory() as session:
+        await _seed_full_stack(session)
+
+    cb, callback_data = _make_book_date_callback(work_date="bad")
+    cb.message = None  # InaccessibleMessage — no .answer()
+    state = _make_state()
+
+    await client_handlers.book_date_cb(cb, callback_data, state)
+
+    state.set_state.assert_not_awaited()
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_book_date_cancel_cb_book_path_clears_state_with_book_hint(
+    patched_session_factory: Any,
+) -> None:
+    """T4.1: book_date_cancel_cb with is_slots_path=False (or None) →
+    state.clear + '/book чтобы начать заново' hint (lines 1103-1114, 1112)."""
+    cb = _make_string_callback("book_date_cancel")
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={})  # is_slots_path absent → None → falsy
+
+    await client_handlers.book_date_cancel_cb(cb, state)
+
+    state.clear.assert_awaited_once()
+    assert "/book чтобы начать заново" in _answer_text(cb.message)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_book_date_cancel_cb_slots_path_clears_state_with_slots_hint(
+    patched_session_factory: Any,
+) -> None:
+    """T4.1: book_date_cancel_cb with is_slots_path=True →
+    state.clear + '/slots чтобы начать заново' hint (lines 1103-1114, 1110)."""
+    cb = _make_string_callback("book_date_cancel")
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"is_slots_path": True})
+
+    await client_handlers.book_date_cancel_cb(cb, state)
+
+    state.clear.assert_awaited_once()
+    assert "/slots чтобы начать заново" in _answer_text(cb.message)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_book_date_cancel_cb_message_none_no_answer_only_callback_ack(
+    patched_session_factory: Any,
+) -> None:
+    """T4.1: book_date_cancel_cb + callback.message is None →
+    no message.answer, only callback.answer (line 1108 message-None branch)."""
+    cb = _make_string_callback("book_date_cancel")
+    cb.message = None
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={})
+
+    await client_handlers.book_date_cancel_cb(cb, state)
+
+    state.clear.assert_awaited_once()
+    cb.answer.assert_awaited()
+
+
+# ============================================================
+# T4.2 — transfer_slot_30_cb error mappings (lines 2743-2795)
+# Covers 10 exception → user-facing message mappings.
+# Pattern: monkeypatch transfer_booking to raise exception → assert message.
+# ============================================================
+
+
+async def _seed_transfer_slot_30_setup(
+    session_factory: Any,
+) -> tuple[UUID, UUID]:
+    """Seed master + booking (transfer source) + active WorkDay tomorrow
+    for transfer_slot_30_cb tests. Returns (booking_id, workday_id)."""
+    tomorrow = (datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=1)).date()
+    async with session_factory() as session:
+        ctx = await _seed_full_stack(session)
+        future_local = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=3)
+        future_local = future_local.replace(hour=14, minute=0, second=0, microsecond=0)
+        booking = await _seed_booking(session, ctx=ctx, start_at_local=future_local)
+        workday = await _seed_workday(session, ctx, work_date=tomorrow)
+    return booking.id, workday.id
+
+
+def _patch_transfer_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    exc_cls: type[Exception],
+) -> None:
+    """Monkeypatch transfer_booking to raise given exception."""
+    async def _raise(*args: Any, **kwargs: Any) -> None:
+        raise exc_cls("test")
+    monkeypatch.setattr(client_handlers, "transfer_booking", _raise)
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_30_cb_booking_not_found(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4.2: BookingNotFoundError → callback.answer('Запись не найдена') (2743-2745)."""
+    from bot.services.booking import BookingNotFoundError
+    booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
+    _patch_transfer_raises(monkeypatch, BookingNotFoundError)
+    cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_30_cb(cb, callback_data, state, mock_scheduler)
+
+    cb.answer.assert_awaited_once()
+    assert "Запись не найдена" in cb.answer.call_args.args[0]
+    cb.bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_30_cb_booking_already_cancelled(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4.2: BookingAlreadyCancelledError → callback.answer('Запись уже отменена') (2746-2748)."""
+    from bot.services.booking import BookingAlreadyCancelledError
+    booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
+    _patch_transfer_raises(monkeypatch, BookingAlreadyCancelledError)
+    cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_30_cb(cb, callback_data, state, mock_scheduler)
+
+    cb.answer.assert_awaited_once()
+    assert "Запись уже отменена" in cb.answer.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_30_cb_cancel_too_late(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4.2: CancelTooLateError → '❌ Перенос возможен только за 24+ часов' (2749-2753)."""
+    from bot.services.booking import CancelTooLateError
+    booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
+    _patch_transfer_raises(monkeypatch, CancelTooLateError)
+    cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_30_cb(cb, callback_data, state, mock_scheduler)
+
+    assert "Перенос возможен только за 24+ часов" in _answer_text(cb.message)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_30_cb_already_transferred(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4.2: BookingAlreadyTransferredError → '❌ Запись уже перенесена' (2754-2761)."""
+    from bot.services.booking import BookingAlreadyTransferredError
+    booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
+    _patch_transfer_raises(monkeypatch, BookingAlreadyTransferredError)
+    cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_30_cb(cb, callback_data, state, mock_scheduler)
+
+    assert "Запись уже перенесена (конкурентный запрос)" in _answer_text(cb.message)
+    assert "/mybookings" in _answer_text(cb.message)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_30_cb_slot_already_booked(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4.2: SlotAlreadyBookedError → '😔 Это время только что заняли' (2762-2768)."""
+    from bot.services.booking import SlotAlreadyBookedError
+    booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
+    _patch_transfer_raises(monkeypatch, SlotAlreadyBookedError)
+    cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_30_cb(cb, callback_data, state, mock_scheduler)
+
+    assert "Это время только что заняли" in _answer_text(cb.message)
+    assert "/mybookings" in _answer_text(cb.message)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_30_cb_slot_in_past(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4.2: SlotInPastError → '❌ Это время уже прошло' (2769-2773)."""
+    from bot.services.booking import SlotInPastError
+    booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
+    _patch_transfer_raises(monkeypatch, SlotInPastError)
+    cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_30_cb(cb, callback_data, state, mock_scheduler)
+
+    assert "Это время уже прошло" in _answer_text(cb.message)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_30_cb_workday_not_found(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4.2: WorkDayNotFoundError → '❌ Этот день не найден' (2774-2778)."""
+    from bot.services.booking import WorkDayNotFoundError
+    booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
+    _patch_transfer_raises(monkeypatch, WorkDayNotFoundError)
+    cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_30_cb(cb, callback_data, state, mock_scheduler)
+
+    assert "Этот день не найден" in _answer_text(cb.message)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_30_cb_workday_inactive(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4.2: WorkDayInactiveError → '❌ День закрыт мастером' (2779-2783)."""
+    from bot.services.booking import WorkDayInactiveError
+    booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
+    _patch_transfer_raises(monkeypatch, WorkDayInactiveError)
+    cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_30_cb(cb, callback_data, state, mock_scheduler)
+
+    assert "День закрыт мастером" in _answer_text(cb.message)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_30_cb_booking_outside_workday(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4.2: BookingOutsideWorkDayError → '❌ Время вне рабочего дня' (2784-2790)."""
+    from bot.services.booking import BookingOutsideWorkDayError
+    booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
+    _patch_transfer_raises(monkeypatch, BookingOutsideWorkDayError)
+    cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_30_cb(cb, callback_data, state, mock_scheduler)
+
+    assert "Время вне рабочего дня мастера" in _answer_text(cb.message)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transfer_slot_30_cb_workday_capacity_exceeded(
+    session_factory: Any,
+    patched_session_factory: Any,
+    mock_scheduler: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4.2: WorkDayCapacityExceededError → '❌ Нет мест на это время' (2791-2795)."""
+    from bot.services.booking import WorkDayCapacityExceededError
+    booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
+    _patch_transfer_raises(monkeypatch, WorkDayCapacityExceededError)
+    cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"transfer_booking_id": str(booking_id)})
+
+    await client_handlers.transfer_slot_30_cb(cb, callback_data, state, mock_scheduler)
+
+    assert "Нет мест на это время" in _answer_text(cb.message)
+    cb.answer.assert_awaited()
+
