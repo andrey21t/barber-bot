@@ -6440,3 +6440,123 @@ async def test_admin_openweek_edit_start_cb_happy_shows_end_picker(
     assert "окончания" in text
 
 
+# ============================================================
+# admin_today_cb — 5 branches (lines 2065-2093, T2.4)
+# No FSM — callback only. Tests cover non-admin / master not found /
+# no bookings / with bookings / message is None (silent skip answer).
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_admin_today_cb_non_admin_silent(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Non-admin tap → callback.answer() + return (no DB query, no message.answer)."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(NON_ADMIN_TG_ID)
+
+    await admin_handlers.admin_today_cb(callback)
+
+    callback.answer.assert_awaited_once()
+    callback.message.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_admin_today_cb_master_not_found_alert(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Admin telegram_id resolves to no master → alert 'Мастер не найден' + return."""
+    # No _seed_admin_stack → _resolve_master_and_business returns None.
+    callback = _make_callback(ADMIN_TG_ID)
+
+    await admin_handlers.admin_today_cb(callback)
+
+    callback.answer.assert_awaited_once()
+    args, kwargs = callback.answer.call_args
+    assert kwargs.get("show_alert") is True
+    assert "Мастер не найден" in str(args[0] if args else kwargs.get("text", ""))
+    callback.message.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_admin_today_cb_no_bookings_shows_empty(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Master exists but no bookings today → 'На сегодня записей нет.' + callback.answer."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+
+    await admin_handlers.admin_today_cb(callback)
+
+    args, _ = callback.message.answer.call_args
+    text = str(args[0])
+    assert text == "На сегодня записей нет."
+    callback.answer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_today_cb_with_bookings_shows_list(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Master has 1 booking today → '📅 Записи на сегодня:' + reply_markup.
+
+    reply_markup = admin_today_keyboard(bookings, tz).
+    """
+    from zoneinfo import ZoneInfo
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        master_id = ctx["master_id"]
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        slot = await _seed_slot(session, master_id=master_id, slot_date=tomorrow, hour=14)
+
+        # Booking start_at = today LOCAL 14:00 → UTC naive
+        tz = ZoneInfo(TZ)
+        today_local = datetime.now(UTC).astimezone(tz).date()
+        local_dt = datetime.combine(today_local, datetime.min.time().replace(hour=14), tzinfo=tz)
+        start_utc_naive = local_dt.astimezone(UTC).replace(tzinfo=None)
+
+        await _seed_booking(
+            session, ctx=ctx, slot=slot, start_at_utc_naive=start_utc_naive,
+        )
+
+    callback = _make_callback(ADMIN_TG_ID)
+
+    await admin_handlers.admin_today_cb(callback)
+
+    args, kwargs = callback.message.answer.call_args
+    text = str(args[0])
+    assert "Записи на сегодня" in text
+    reply_markup = kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
+    assert reply_markup is not None, "Expected admin_today_keyboard reply_markup"
+    callback.answer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_today_cb_message_is_none_skips_answer(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Edge case: callback.message is None (original message deleted) → skip
+    message.answer, still callback.answer (dismiss spinner).
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.message = None  # type: ignore[assignment]  # simulate deleted inline msg
+
+    await admin_handlers.admin_today_cb(callback)
+
+    # No message.answer call (no message to answer to)
+    callback.answer.assert_awaited_once()
+
+
