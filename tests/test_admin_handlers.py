@@ -886,6 +886,273 @@ async def test_admin_openday_start_msg_happy_transitions_to_end(
 
 
 # ============================================================
+# admin_openday_end_msg — 10 branches (lines 1289-1376)
+# FSM: StateFilter(AdminStates.opening_workday_end), F.text, ~"/"
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_admin_openday_end_msg_non_admin_silent(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Non-admin text in opening_workday_end state → silent return."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=NON_ADMIN_TG_ID, text="18:00")
+    state = _make_mock_state({"selected_date": "2099-01-01", "start_time": "11:00:00"})
+
+    await admin_handlers.admin_openday_end_msg(msg, state)
+
+    assert _answer_call_count(msg) == 0
+    state.clear.assert_not_called()
+    state.set_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_openday_end_msg_missing_state_data_clears(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """State lost (no selected_date or no start_time) → state.clear + 'Данные потеряны'."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="18:00")
+    state = _make_mock_state({"selected_date": "2099-01-01"})  # no start_time
+
+    await admin_handlers.admin_openday_end_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Данные сессии потеряны" in text
+    state.clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_openday_end_msg_bad_iso_in_state_clears(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """selected_date or start_time in state is not ISO-parseable → state.clear + 'Ошибка данных'."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="18:00")
+    state = _make_mock_state({"selected_date": "bad-date", "start_time": "11:00:00"})
+
+    await admin_handlers.admin_openday_end_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Ошибка данных" in text
+    state.clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_openday_end_msg_bad_time_format_keeps_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Bad end_time format → 'Формат ЧЧ:ММ' hint, state STAYS (admin can retry)."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="bad")
+    state = _make_mock_state({"selected_date": "2099-01-01", "start_time": "11:00:00"})
+
+    await admin_handlers.admin_openday_end_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Формат ЧЧ:ММ" in text
+    state.clear.assert_not_called()
+    state.update_data.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_openday_end_msg_master_not_found_clears(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Admin telegram_id resolves to no master → state.clear + 'Мастер не найден'."""
+    # No _seed_admin_stack → _resolve_master_and_business returns None.
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).date().isoformat()
+    msg = _make_message(user_id=ADMIN_TG_ID, text="18:00")
+    state = _make_mock_state({"selected_date": tomorrow, "start_time": "11:00:00"})
+
+    await admin_handlers.admin_openday_end_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Мастер не найден" in text
+    state.clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_openday_end_msg_past_date_clears(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """work_date < today_local → state.clear + 'Нельзя открыть день в прошлом'.
+
+    Edge case: between start_time input and end_time input a day passed (date rolled over).
+    """
+    from datetime import time as dt_time
+
+    from bot.models import WorkDay
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        master_id = ctx["master_id"]
+        # Pre-existing INACTIVE workday for yesterday (so open_workday wouldn't be called)
+        yesterday = (datetime.now(UTC) - timedelta(days=2)).date()
+        session.add(
+            WorkDay(
+                master_id=master_id,
+                work_date=yesterday,
+                start_time=dt_time(9, 0),
+                end_time=dt_time(17, 0),
+                is_active=False,
+            )
+        )
+        await session.commit()
+
+    msg = _make_message(user_id=ADMIN_TG_ID, text="18:00")
+    state = _make_mock_state(
+        {"selected_date": yesterday.isoformat(), "start_time": "11:00:00"}
+    )
+
+    await admin_handlers.admin_openday_end_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Нельзя открыть день в прошлом" in text
+    state.clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_openday_end_msg_value_error_keeps_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """open_workday raises ValueError (end <= start) → '❌ <exc>', state STAYS (retry)."""
+    from unittest.mock import AsyncMock, patch
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).date().isoformat()
+    msg = _make_message(user_id=ADMIN_TG_ID, text="10:00")
+    state = _make_mock_state(
+        {"selected_date": tomorrow, "start_time": "11:00:00"}
+    )
+
+    with patch(
+        "bot.handlers.admin.open_workday",
+        new_callable=AsyncMock,
+        side_effect=ValueError("end must be after start"),
+    ):
+        await admin_handlers.admin_openday_end_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "❌" in text
+    assert "end must be after start" in text
+    state.clear.assert_not_called()  # state stays — admin can retry
+
+
+@pytest.mark.asyncio
+async def test_admin_openday_end_msg_shrink_error_keeps_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """open_workday raises WorkDayShrinkError → 'Нельзя сократить окно', state STAYS."""
+    from unittest.mock import AsyncMock, patch
+
+    from bot.services.workday import WorkDayShrinkError
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).date().isoformat()
+    msg = _make_message(user_id=ADMIN_TG_ID, text="12:00")
+    state = _make_mock_state(
+        {"selected_date": tomorrow, "start_time": "11:00:00"}
+    )
+
+    with patch(
+        "bot.handlers.admin.open_workday",
+        new_callable=AsyncMock,
+        side_effect=WorkDayShrinkError("active booking blocks shrink"),
+    ):
+        await admin_handlers.admin_openday_end_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Нельзя сократить окно" in text
+    state.clear.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_openday_end_msg_sqlalchemy_error_clears(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """open_workday raises SQLAlchemyError → state.clear + 'Ошибка БД' (unrecoverable)."""
+    from unittest.mock import AsyncMock, patch
+
+    from sqlalchemy.exc import SQLAlchemyError
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).date().isoformat()
+    msg = _make_message(user_id=ADMIN_TG_ID, text="18:00")
+    state = _make_mock_state(
+        {"selected_date": tomorrow, "start_time": "11:00:00"}
+    )
+
+    with patch(
+        "bot.handlers.admin.open_workday",
+        new_callable=AsyncMock,
+        side_effect=SQLAlchemyError("simulated DB error"),
+    ):
+        await admin_handlers.admin_openday_end_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "Ошибка БД" in text
+    state.clear.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_openday_end_msg_happy_new_workday(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Happy path — end_time entered, open_workday succeeds → '✅ День открыт' + state.clear."""
+    from bot.models import WorkDay
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).date().isoformat()
+    msg = _make_message(user_id=ADMIN_TG_ID, text="18:00")
+    state = _make_mock_state(
+        {"selected_date": tomorrow, "start_time": "11:00:00"}
+    )
+
+    await admin_handlers.admin_openday_end_msg(msg, state)
+
+    text = _answer_text(msg)
+    assert "✅ День открыт" in text
+    assert "11:00" in text and "18:00" in text
+    # No "открыт заново" suffix — fresh new day
+    assert "открыт заново" not in text
+
+    state.clear.assert_awaited_once()
+
+    async with session_factory() as verify:
+        wd = (await verify.execute(select(WorkDay))).scalars().all()
+        assert len(wd) == 1
+        assert wd[0].is_active is True
+
+
+# ============================================================
 # admin_addslots_cb — 4 branches (lines 925-952)
 # ============================================================
 
