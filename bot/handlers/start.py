@@ -1,13 +1,48 @@
+import html
+import logging
+
 from aiogram import Router
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
+from sqlalchemy import select
 
 from bot.config import get_settings
+from bot.db import async_session_factory
 from bot.keyboards.admin import admin_reply_keyboard
 from bot.keyboards.client import client_reply_keyboard
+from bot.models import Master
 
+logger = logging.getLogger(__name__)
 router = Router(name="start")
+
+
+async def _resolve_master_name(telegram_id: int) -> str:
+    """Lookup master.name from DB by telegram_id. Fallback to "мастер" if:
+    - master not found (new server, migration not applied)
+    - DB error (Postgres down)
+    - master.name empty/whitespace
+
+    HTML-escape to prevent TelegramBadRequest if name contains <, >, &
+    (mirrors scheduler.py:189 pattern).
+    """
+    try:
+        async with async_session_factory() as session:
+            master = (
+                await session.execute(
+                    select(Master).where(Master.telegram_id == telegram_id)
+                )
+            ).scalar_one_or_none()
+            if master and master.name.strip():
+                # escape + newline squash — mirrors scheduler.py:189
+                return html.escape(master.name, quote=False).replace("\n", " ")
+    except Exception:
+        logger.warning(
+            "cmd_start: DB lookup failed for telegram_id=%s, fallback to 'мастер'",
+            telegram_id,
+            exc_info=True,
+        )
+    return "мастер"
 
 
 @router.message(CommandStart())
@@ -36,8 +71,9 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     settings = get_settings()
     if message.from_user and message.from_user.id == settings.ADMIN_ID:
+        master_name = await _resolve_master_name(settings.ADMIN_ID)
         await message.answer(
-            "Привет, Екатерина! 👋\nКнопки внизу — 📋 Меню для остальных действий:",
+            f"Привет, {master_name}! 👋\nКнопки внизу — 📋 Меню для остальных действий:",
             reply_markup=admin_reply_keyboard(),
         )
     else:
