@@ -48,10 +48,12 @@ from bot.keyboards.admin import (
     AdminCloseTodayCallbackData,
     AdminCloseTodayCancelCallbackData,
     AdminCloseTodayConfirmCallbackData,
+    AdminCompleteCallbackData,
     AdminMenuCallbackData,
     AdminMoveCallbackData,
     AdminMoveConfirmCallbackData,
     AdminMoveSlot30CallbackData,
+    AdminNoShowCallbackData,
     AdminOpenWeekCallbackData,
     AdminOpenweekEditCallbackData,
     AdminOpenWeekEntryCallbackData,
@@ -95,12 +97,15 @@ from bot.services.booking import (
     BookingAlreadyCancelledError,
     BookingAlreadyTransferredError,
     BookingNotFoundError,
+    BookingNotStartedYetError,
     BookingOutsideWorkDayError,
+    InvalidStatusTransitionError,
     SlotAlreadyBookedError,
     SlotInPastError,
     WorkDayCapacityExceededError,
     WorkDayInactiveError,
     WorkDayNotFoundError,
+    transition_booking_status,
 )
 from bot.services.slots import (
     SlotAlreadyExistsError,
@@ -3879,6 +3884,129 @@ async def admin_close_today_cancel_cb(
                 reply_markup=admin_inline_menu(),
             )
     await callback.answer()
+
+
+# ============================================================
+# B.3 — 4 статуса booking: admin complete / no_show transitions
+# ============================================================
+
+
+async def _admin_transition_booking(
+    callback: CallbackQuery,
+    callback_data: AdminCompleteCallbackData | AdminNoShowCallbackData,
+    scheduler: AsyncIOScheduler,
+    new_status: str,
+) -> None:
+    """Shared body for admin_complete_cb / admin_no_show_cb (B.3).
+
+    Resolves master_id via _resolve_master_and_business (defense-in-depth —
+    IDOR protection: master_id comes from callback.from_user.id, NOT from
+    callback_data). Calls transition_booking_status, then re-fetches today's
+    bookings + rebuilds keyboard (no stale buttons — deep-analysis iter 2 GAP-A
+    resolution). Catches TelegramBadRequest for edit_text (canonical pattern
+    admin.py:3720-3723).
+
+    Past-only policy (PLANS.md:923-926) enforced in service layer — handler
+    shows friendly UI message "❌ Запись ещё не наступила" on
+    BookingNotStartedYetError.
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    master_id, _business_id, tz = resolved
+
+    booking_id = callback_data.booking_id
+    try:
+        async with async_session_factory() as session:
+            await transition_booking_status(
+                session,
+                booking_id,
+                new_status,
+                master_id,
+                scheduler=scheduler,
+            )
+    except BookingNotFoundError:
+        await callback.answer("❌ Запись не найдена", show_alert=True)
+        return
+    except InvalidStatusTransitionError:
+        await callback.answer("❌ Запись уже в конечном статусе", show_alert=True)
+        return
+    except BookingAlreadyCancelledError:
+        await callback.answer("❌ Запись уже отменена", show_alert=True)
+        return
+    except BookingAlreadyTransferredError:
+        await callback.answer("❌ Запись перенесена — обновите /today", show_alert=True)
+        return
+    except BookingNotStartedYetError:
+        await callback.answer("❌ Запись ещё не наступила", show_alert=True)
+        return
+
+    # Re-fetch today's bookings + rebuild keyboard (no stale buttons).
+    # Mirror cmd_today (admin.py:574) flow: get_today_bookings + select_workday.
+    today_local = datetime.now(ZoneInfo(tz)).date()
+    async with async_session_factory() as session:
+        today_bookings = await get_today_bookings(session, master_id, tz)
+        today_workday = await select_workday(session, master_id, today_local)
+
+    emoji = "✅" if new_status == "completed" else "❌"
+    label = "завершена" if new_status == "completed" else "отмечена как неявка"
+    title = f"{emoji} Запись {label}\n\n📅 Записи на сегодня:"
+    text = _render_bookings(title, today_bookings, tz)
+
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_text(
+                text,
+                reply_markup=admin_today_keyboard(today_bookings, tz, today_workday),
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                text,
+                reply_markup=admin_today_keyboard(today_bookings, tz, today_workday),
+            )
+    await callback.answer()
+
+
+@router.callback_query(AdminCompleteCallbackData.filter(), StateFilter("*"))
+async def admin_complete_cb(
+    callback: CallbackQuery,
+    state: FSMContext,
+    scheduler: AsyncIOScheduler,
+    callback_data: AdminCompleteCallbackData,
+) -> None:
+    """[✅ Завершить] tap from admin_today_keyboard (B.3 — 4 статуса booking).
+
+    Marks booking as 'completed' (terminal). Past-only policy: booking.start_at
+    must be in the past (PLANS.md:923-926). StateFilter("*") — no FSM state
+    cleared (callback_query only, no state mutation, mirror cmd_today:580-582
+    docstring: "not in FSM, callback_query only").
+    """
+    _ = state  # NOT in FSM — state.clear() NOT called (deep-analysis iter 4
+    # GAP-NEW-8: StateFilter("*") doesn't mean state must be cleared. cmd_today
+    # also uses StateFilter("*") and doesn't clear — read-only callback. B.3
+    # transition IS stateful (DB mutation), but FSM state is not involved.)
+    await _admin_transition_booking(callback, callback_data, scheduler, "completed")
+
+
+@router.callback_query(AdminNoShowCallbackData.filter(), StateFilter("*"))
+async def admin_no_show_cb(
+    callback: CallbackQuery,
+    state: FSMContext,
+    scheduler: AsyncIOScheduler,
+    callback_data: AdminNoShowCallbackData,
+) -> None:
+    """[❌ Неявка] tap from admin_today_keyboard (B.3 — 4 статуса booking).
+
+    Marks booking as 'no_show' (terminal). Past-only policy: booking.start_at
+    must be in the past (PLANS.md:923-926). Mirror admin_complete_cb.
+    """
+    _ = state  # NOT in FSM — see admin_complete_cb docstring.
+    await _admin_transition_booking(callback, callback_data, scheduler, "no_show")
 
 
 

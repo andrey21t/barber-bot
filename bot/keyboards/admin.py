@@ -227,21 +227,26 @@ def admin_today_keyboard(
     business_timezone: str = "Europe/Moscow",
     today_workday: WorkDay | None = None,
 ) -> InlineKeyboardMarkup:
-    """Inline keyboard with [🔄 Перенести] button for each today booking (Этап 5.9).
+    """Inline keyboard with [🔄 Перенести] + [✅ Завершить] + [❌ Неявка] buttons per booking (B.3).
 
-    One button per booking, labeled with local time + service title (matches
-    /today text line). admin taps → admin_move flow (calendar → 30-min slot
-    picker → admin_move_booking service).
+    Per booking, 2 rows:
+    - Row 1: [🔄 {time} — {name}, {service}] (single button, AdminMoveCallbackData)
+    - Row 2: [✅ Завершить] [❌ Неявка] (paired buttons, AdminCompleteCallbackData +
+      AdminNoShowCallbackData)
+
+    Uses explicit ``builder.row()`` per booking (NOT ``adjust(1, 2)`` — that
+    would group buttons 1+2+2+... across bookings, mixing buttons from
+    different bookings on the same row). Verified pattern from
+    keyboards/admin.py:734 ``builder.row(*nav_row)``.
 
     Session 5.63 (пункт 3): adds [🔒 Закрыть день] button in a separate row
     IF today_workday is_active=True. Tap → admin_close_today_cb (inline confirm
     → close_workday_with_cancellations). Replaces the old "📅 Закрыть день"
     button that lived in admin_inline_menu (deleted in пункт 3).
 
-    adjust(1) — one button per row (avoid horizontal clutter; Екатерина sees a
-    list, not a grid). Telegram inline keyboard limit 100 buttons/row × N rows
-    — pet-project single-tenant (Екатерина < 10 bookings/day), no pagination
-    needed. If > 30 bookings — would need pagination (defer until pain).
+    Telegram inline keyboard limit 100 buttons/row × N rows — pet-project
+    single-tenant (Екатерина < 10 bookings/day), no pagination needed. If > 30
+    bookings — would need pagination (defer until pain).
 
     today_workday: WorkDay | None — today's WorkDay row. If is_active=True,
     a [🔒 Закрыть день] button is appended as a separate row. If None or
@@ -250,6 +255,11 @@ def admin_today_keyboard(
     NB: workday-only bookings (slot_id is None) AND legacy slot-based bookings
     BOTH get [🔄 Перенести] button — admin_move_booking handles both paths
     (slot_id → NULL for legacy, no slot release for workday-only source).
+
+    B.3: [✅ Завершить] / [❌ Неявка] transitions are admin-only (callback
+    handler resolves master_id from callback.from_user.id, not from
+    callback_data — defense-in-depth against IDOR). Past-only policy enforced
+    in transition_booking_status service (PLANS.md:923-926).
     """
     tz = ZoneInfo(business_timezone)
     builder = InlineKeyboardBuilder()
@@ -263,16 +273,37 @@ def admin_today_keyboard(
         # layout (mirror _render_bookings:564 in admin.py).
         name = b.client_name_snapshot.replace("\n", " ")
         service = b.service_title_snapshot.replace("\n", " ")
-        builder.button(
-            text=f"🔄 {when} — {name}, {service}",
-            callback_data=AdminMoveCallbackData(booking_id=b.id).pack(),
+        # Row 1: transfer button (single per booking) — explicit builder.row()
+        # NOT builder.adjust(1, 2) (deep-analysis iter 3 GAP-H: aiogram
+        # adjust() repeats LAST value for remaining buttons — adjust(1, 2)
+        # would group buttons 1+2+2+... mixing bookings on same row).
+        builder.row(
+            InlineKeyboardButton(
+                text=f"🔄 {when} — {name}, {service}",
+                callback_data=AdminMoveCallbackData(booking_id=b.id).pack(),
+            )
+        )
+        # Row 2: complete + no_show (paired per booking) — B.3 transitions.
+        # Past-only policy enforced in service (transition_booking_status),
+        # not in keyboard — master sees buttons for future bookings too,
+        # but tap raises BookingNotStartedYetError with friendly UI message.
+        builder.row(
+            InlineKeyboardButton(
+                text="✅ Завершить",
+                callback_data=AdminCompleteCallbackData(booking_id=b.id).pack(),
+            ),
+            InlineKeyboardButton(
+                text="❌ Неявка",
+                callback_data=AdminNoShowCallbackData(booking_id=b.id).pack(),
+            ),
         )
     if today_workday is not None and getattr(today_workday, "is_active", False):
-        builder.button(
-            text="🔒 Закрыть день",
-            callback_data=AdminCloseTodayCallbackData().pack(),
+        builder.row(
+            InlineKeyboardButton(
+                text="🔒 Закрыть день",
+                callback_data=AdminCloseTodayCallbackData().pack(),
+            )
         )
-    builder.adjust(1)
     return builder.as_markup()
 
 
@@ -428,6 +459,37 @@ class AdminCloseTodayCancelCallbackData(CallbackData, prefix="admin_close_today_
 
     No payload — handler clears state (if any) and shows admin_inline_menu.
     """
+
+
+class AdminCompleteCallbackData(CallbackData, prefix="admin_complete"):
+    """[✅ Завершить] tap from admin_today_keyboard (B.3 — 4 статуса booking).
+
+    Marks a booking as 'completed' (terminal status) — master confirms the
+    client showed up and the service was performed. Past-only policy: booking
+    start_at must be in the past (PLANS.md:923-926).
+
+    Payload:
+    - booking_id: UUID — booking to mark completed. Handler resolves master_id
+      via _resolve_master_and_business for ownership filter (defense-in-depth
+      against IDOR, deep-analysis iter 4 GAP-NEW-14 fix).
+    """
+
+    booking_id: UUID
+
+
+class AdminNoShowCallbackData(CallbackData, prefix="admin_no_show"):
+    """[❌ Неявка] tap from admin_today_keyboard (B.3 — 4 статуса booking).
+
+    Marks a booking as 'no_show' (terminal status) — master records that the
+    client didn't show up. Past-only policy: booking start_at must be in the
+    past (PLANS.md:923-926).
+
+    Payload:
+    - booking_id: UUID — booking to mark no_show. Same ownership pattern as
+      AdminCompleteCallbackData.
+    """
+
+    booking_id: UUID
 
 
 @dataclass(frozen=True, slots=True)

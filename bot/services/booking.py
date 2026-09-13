@@ -797,6 +797,209 @@ async def cancel_booking(
 
 
 # ============================================================
+# Transition booking status (B.3 — 4 статуса booking, admin UI)
+# ============================================================
+
+
+class InvalidStatusTransitionError(Exception):
+    """Booking is in terminal status, cannot transition to new_status.
+
+    Raised when admin taps [✅ Завершить] / [❌ Неявка] on a booking whose
+    status is already terminal ('cancelled', 'completed', 'no_show') OR
+    when a concurrent transition race (e.g., admin A completed, admin B
+    tries no_show) leaves the booking in the other terminal status.
+    """
+
+
+class BookingNotStartedYetError(Exception):
+    """Booking.start_at is in the future — past-only policy (PLANS.md:923-926).
+
+    'completed' and 'no_show' statuses are reserved for PAST bookings — master
+    can't mark a future booking as completed (semantically wrong, client hasn't
+    shown up yet). Raised by transition_booking_status when now_utc < start_at.
+    """
+
+
+@dataclass(frozen=True)
+class TransitionResult:
+    """Result of transition_booking_status — passed to handler for Telegram I/O.
+
+    Mirrors CancelResult: snapshots already html.escape()'d in DB (no re-escape
+    needed when rendering in HTML parse mode).
+    """
+
+    booking_id: UUID
+    master_id: UUID
+    new_status: str
+    client_name_snapshot: str
+    service_title_snapshot: str
+    start_at: datetime
+
+
+async def transition_booking_status(
+    session: AsyncSession,
+    booking_id: UUID,
+    new_status: str,
+    master_id: UUID,
+    scheduler: AsyncIOScheduler,
+    *,
+    now_utc: datetime | None = None,
+) -> Booking:
+    """Transition booking to terminal 'completed' or 'no_show' status (B.3).
+
+    Atomic within one transaction (booking UPDATE + NotificationLog INSERT).
+    `remove_jobs_for_booking` is called AFTER commit — mirror cancel_booking:793.
+
+    Past-only policy (PLANS.md:923-926): booking.start_at must be in the past.
+    Master can't mark a future booking as completed/no_show — semantically wrong.
+
+    Race protection (mirror transfer_booking:1072-1090): concurrent transition
+    or cancel between SELECT and UPDATE → rowcount=0 → re-SELECT to
+    disambiguate (4-branch logic for 4 race scenarios, deep-analysis iter 4
+    GAP-NEW-1 fix).
+
+    IDOR protection (deep-analysis iter 4 GAP-NEW-14 fix): ``master_id``
+    ownership filter prevents admin A (master X) from crafting callback_data
+    with booking_id belonging to master Y. Mirror cancel_booking:703 and
+    transfer_booking:938 ownership patterns.
+
+    Steps:
+      1. Validate new_status in ('completed', 'no_show')
+      2. SELECT booking WHERE id=? AND master_id=? (ownership + existence)
+      3. If None → BookingNotFoundError (covers not-found AND not-owner)
+      4. If booking.status == new_status → silent return (idempotent)
+      5. If booking.status in ('cancelled', 'completed', 'no_show') →
+         InvalidStatusTransitionError (terminal status, no exit path)
+      6. If now_utc < start_at → BookingNotStartedYetError (past-only policy)
+      7. UPDATE booking SET status=new_status WHERE id=? AND master_id=?
+         AND status IN ('confirmed', 'transferred') AND start_at == old_start_at
+         — race-protection pin (mirror transfer_booking:1051)
+      8. rowcount=0 → re-SELECT → 4-branch disambiguation:
+         - current == new_status → silent return (race won by other admin tap)
+         - current == 'cancelled' → BookingAlreadyCancelledError
+         - current == 'transferred' → BookingAlreadyTransferredError
+         - current in ('completed', 'no_show') → InvalidStatusTransitionError
+           (race lost to other admin transition)
+      9. INSERT NotificationLog(kind=f'admin_{new_status}') — SAVEPOINT
+         idempotency (mirror transfer_booking:1128)
+     10. commit
+     11. remove_jobs_for_booking(scheduler, booking_id) — AFTER commit
+     12. return updated booking (handler reads booking.status for UI)
+    """
+    # Step 1: defensive validation of new_status (callback_data comes from
+    # admin UI, but defense-in-depth: don't trust untrusted input).
+    if new_status not in ("completed", "no_show"):
+        raise ValueError(f"new_status must be 'completed' or 'no_show', got {new_status!r}")
+
+    # Step 2-3: SELECT booking with ownership filter (covers not-found AND not-owner).
+    stmt = select(Booking).where(Booking.id == booking_id, Booking.master_id == master_id)
+    booking = (await session.execute(stmt)).scalar_one_or_none()
+    if booking is None:
+        raise BookingNotFoundError(f"Booking {booking_id} not found for master {master_id}")
+
+    # Step 4: idempotent — same status → silent return (double-tap, race).
+    if booking.status == new_status:
+        return booking
+
+    # Step 5: terminal status — no exit path (cancelled/completed/no_show).
+    if booking.status in ("cancelled", "completed", "no_show"):
+        raise InvalidStatusTransitionError(
+            f"Booking {booking_id} is in terminal status {booking.status!r}, "
+            f"cannot transition to {new_status!r}"
+        )
+
+    # Step 6: past-only policy (PLANS.md:923-926). now_utc default = now.
+    if now_utc is None:
+        now_utc = datetime.now(UTC)
+    # booking.start_at is naive on SQLite, aware on Postgres (models.py:197-199).
+    # Inject tzinfo=UTC if naive before comparison (mirror booking.py:954).
+    start_at_utc = booking.start_at
+    if start_at_utc.tzinfo is None:
+        start_at_utc = start_at_utc.replace(tzinfo=UTC)
+    if now_utc < start_at_utc:
+        raise BookingNotStartedYetError(
+            f"Booking {booking_id} start_at {start_at_utc.isoformat()} is in "
+            f"future, now {now_utc.isoformat()} — past-only policy (PLANS.md:923-926)"
+        )
+
+    # Step 7: UPDATE with race-protection pin (mirror transfer_booking:1051).
+    # old_start_at captured BEFORE UPDATE (booking.start_at mutates after UPDATE
+    # via synchronize_session="auto").
+    old_start_at = booking.start_at
+    upd = (
+        update(Booking)
+        .where(
+            Booking.id == booking_id,
+            Booking.master_id == master_id,
+            Booking.status.in_(("confirmed", "transferred")),
+            Booking.start_at == old_start_at,
+        )
+        .values(status=new_status)
+    )
+    res = await session.execute(upd)
+    if cast("CursorResult[Any]", res).rowcount == 0:
+        # Step 8: rowcount=0 → re-SELECT to disambiguate (4-branch).
+        # Re-SELECT the full Booking (NOT just .status) — session.rollback()
+        # above expired the identity map, so the original `booking` object's
+        # attributes would trigger lazy-load (MissingGreenlet in async
+        # context) if accessed. Return fresh_booking instead of the stale
+        # identity-mapped object.
+        await session.rollback()
+        recheck = await session.execute(
+            select(Booking).where(Booking.id == booking_id)
+        )
+        fresh_booking = recheck.scalar_one_or_none()
+        if fresh_booking is None:
+            # Concurrent delete (shouldn't happen in practice — defense-in-depth).
+            raise BookingNotFoundError(f"Booking {booking_id} not found after rollback")
+        current_status = fresh_booking.status
+        if current_status == new_status:
+            # Race won by other admin tap (idempotent).
+            return fresh_booking
+        if current_status == "cancelled":
+            raise BookingAlreadyCancelledError(
+                f"Booking {booking_id} was cancelled by concurrent request"
+            )
+        if current_status == "transferred":
+            raise BookingAlreadyTransferredError(
+                f"Booking {booking_id} start_at changed between SELECT and UPDATE "
+                "(concurrent transfer — winner's UPDATE already committed)"
+            )
+        # current_status in ('completed', 'no_show') — race lost to other
+        # admin transition. Different from idempotent same-status: this is
+        # the OTHER terminal status, no exit path.
+        raise InvalidStatusTransitionError(
+            f"Booking {booking_id} transitioned to {current_status!r} by "
+            f"concurrent admin tap, cannot transition to {new_status!r}"
+        )
+
+    # Step 9: NotificationLog SAVEPOINT (mirror transfer_booking:1128,
+    # cancel_booking:753-758). ck_notifications_kind extended in models.py +
+    # migration 008 to allow 'admin_completed'/'admin_no_show' kinds.
+    log_entry = NotificationLog(booking_id=booking.id, kind=f"admin_{new_status}")
+    try:
+        async with session.begin_nested():
+            session.add(log_entry)
+            await session.flush()
+    except IntegrityError:
+        # Already logged (idempotent retry) — savepoint rolled back, main tx OK.
+        pass
+
+    # Step 10: commit booking UPDATE + NotificationLog INSERT atomically.
+    await session.commit()
+
+    # Step 11: scheduler cleanup AFTER commit (mirror cancel_booking:793).
+    # remove_jobs_for_booking uses suppress(Exception) internally — idempotent
+    # if jobs already removed. Cancels remind_24h/remind_1h reminders — no
+    # spam for completed/no_show bookings.
+    remove_jobs_for_booking(scheduler, booking_id)
+
+    # Step 12: return updated booking (expire_on_commit=False in
+    # bot/db.py:22 verified, booking object alive with status=new_status).
+    return booking
+
+
+# ============================================================
 # Transfer booking (spec.md 41, 318, 408-409 — Блок 3 часть 3)
 # ============================================================
 
