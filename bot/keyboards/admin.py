@@ -150,7 +150,7 @@ class AdminMoveConfirmCallbackData(CallbackData, prefix="admin_move_confirm"):
 
 
 def admin_inline_menu() -> InlineKeyboardMarkup:
-    """Inline keyboard с 5 кнопками для мастера (5.63).
+    """Inline keyboard с 3 кнопками для мастера (Session 2026-09-13 — упрощение).
 
     Session 5.62 (пункт 2 от Екатерины): кнопка «Открыть день» (старый
     текстовый формат с HH:MM input) УДАЛЕНА. CREATE day теперь только через
@@ -162,18 +162,22 @@ def admin_inline_menu() -> InlineKeyboardMarkup:
     добавляет [🔒 Закрыть день] если есть активный WorkDay) или текстовую
     команду /closeday (power-user shortcut, без inline UI).
 
-    Layout: 2 + 2 + 1 (3 rows).
-    Row 1: ➕ Изменить окно (MODIFY, 5.10), 📅 Сегодня.
-    Row 2: 🗓 Неделя, 🗓 Открыть неделю (batch CREATE, 5.26).
-    Row 3: 💇 Услуги (entering_service flow).
+    Session 2026-09-13 (feedback по дублированию): «📅 Сегодня» и «🗓 Неделя»
+    УДАЛЕНЫ из inline menu — они уже есть в admin_reply_keyboard (always-on
+    внизу экрана), дублирование в inline menu было избыточным. Остались 3
+    уникальных действия, которых нет в reply keyboard:
+    - ➕ Изменить окно (требует StateFilter(None), не может быть reply button)
+    - 🗓 Открыть неделю (требует StateFilter(None), batch CREATE)
+    - 💹 Услуги (entering_service flow, StateFilter(None))
+
+    Layout: 2 + 1 (2 rows). Row 1: ➕ Изменить окно, 🗓 Открыть неделю.
+    Row 2: 💹 Услуги.
     """
     builder = InlineKeyboardBuilder()
     builder.button(text="➕ Изменить окно", callback_data=AdminAddslotsCallbackData().pack())
-    builder.button(text="📅 Сегодня", callback_data=AdminTodayCallbackData().pack())
-    builder.button(text="🗓 Неделя", callback_data=AdminWeekCallbackData().pack())
     builder.button(text="🗓 Открыть неделю", callback_data=AdminOpenWeekEntryCallbackData().pack())
     builder.button(text="💇 Услуги", callback_data=AdminServicesCallbackData().pack())
-    builder.adjust(2, 2, 1)
+    builder.adjust(2, 1)
     return builder.as_markup()
 
 
