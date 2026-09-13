@@ -2792,3 +2792,519 @@ async def test_create_booking_no_username_shows_telegram_id(
 
     assert "123456789" in result.master_notification_text
     assert "@pasha" not in result.master_notification_text
+
+
+# ============================================================
+# B.3: transition_booking_status tests (4 статуса booking)
+# Covers: happy (confirmed→completed/no_show, transferred→completed/no_show),
+#         idempotent (same status), terminal rejection (cancelled/completed/no_show),
+#         concurrent race (same-status idempotent, transfer race), not-found,
+#         past-only policy, CHECK constraint, audit log, scheduler cleanup.
+# Pattern: _seed_confirmed_booking:262 + _mock_scheduler:253 + cancel_booking:288.
+# Key: _seed_confirmed_booking creates FUTURE booking (tomorrow 14:00 MSK = 11:00 UTC).
+# transition_booking_status has past-only policy → now_utc must be > start_at.
+# Use ref 10 days ahead → start_at (tomorrow) is in the past from ref's POV
+# (mirror test_transfer_booking_concurrent_race_runtime:1230 ref=-10d for 24h rule).
+# ============================================================
+
+from bot.services.booking import (  # noqa: E402 — BookingAlreadyTransferredError already imported at line 632
+    BookingNotStartedYetError,
+    InvalidStatusTransitionError,
+    transition_booking_status,
+)
+from sqlalchemy import update  # noqa: E402
+
+
+def _ref_future() -> datetime:
+    """now_utc 10 days ahead — booking.start_at (tomorrow) is in the past from this ref."""
+    return datetime.now(UTC) + timedelta(days=10)
+
+
+def _ref_past() -> datetime:
+    """now_utc 10 days ago — for transfer_booking 24h rule (now < start_at - 24h)."""
+    return datetime.now(UTC) - timedelta(days=10)
+
+
+@pytest.mark.asyncio
+async def test_transition_completed_from_confirmed(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Happy: confirmed → completed. Returns Booking with status='completed'."""
+    booking = await _seed_confirmed_booking(session, seed_data)
+    booking_id = booking.id
+    mock_scheduler = _mock_scheduler()
+
+    result = await transition_booking_status(
+        session,
+        booking_id,
+        "completed",
+        seed_data["master_id"],
+        scheduler=mock_scheduler,
+        now_utc=_ref_future(),
+    )
+
+    assert isinstance(result, Booking)
+    assert result.status == "completed"
+
+    # Re-read after rollback to verify DB state.
+    await session.rollback()
+    stmt = select(Booking.status).where(Booking.id == booking_id)
+    assert (await session.execute(stmt)).scalar_one() == "completed"
+
+
+@pytest.mark.asyncio
+async def test_transition_no_show_from_confirmed(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Happy: confirmed → no_show. Returns Booking with status='no_show'."""
+    booking = await _seed_confirmed_booking(session, seed_data)
+    booking_id = booking.id
+    mock_scheduler = _mock_scheduler()
+
+    result = await transition_booking_status(
+        session,
+        booking_id,
+        "no_show",
+        seed_data["master_id"],
+        scheduler=mock_scheduler,
+        now_utc=_ref_future(),
+    )
+
+    assert isinstance(result, Booking)
+    assert result.status == "no_show"
+
+    await session.rollback()
+    stmt = select(Booking.status).where(Booking.id == booking_id)
+    assert (await session.execute(stmt)).scalar_one() == "no_show"
+
+
+@pytest.mark.asyncio
+async def test_transition_completed_from_transferred(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Happy: transferred → completed. Transfer first, then transition."""
+    booking = await _seed_confirmed_booking(session, seed_data)
+    booking_id = booking.id
+    new_slot = await _make_open_slot(session, seed_data, days_ahead=5, hour_local=15)
+
+    # Transfer booking (status → 'transferred', start_at → new slot's start_at).
+    await transfer_booking(
+        session,
+        booking_id=booking_id,
+        new_slot_id=new_slot.id,
+        client_id=seed_data["client"].id,
+        scheduler=_mock_scheduler(),
+        now_utc=_ref_past(),
+    )
+
+    # Transition to 'completed' (new start_at is 5d ahead, ref 10d ahead > start_at).
+    mock_scheduler = _mock_scheduler()
+    result = await transition_booking_status(
+        session,
+        booking_id,
+        "completed",
+        seed_data["master_id"],
+        scheduler=mock_scheduler,
+        now_utc=_ref_future(),
+    )
+
+    assert isinstance(result, Booking)
+    assert result.status == "completed"
+
+    await session.rollback()
+    stmt = select(Booking.status).where(Booking.id == booking_id)
+    assert (await session.execute(stmt)).scalar_one() == "completed"
+
+
+@pytest.mark.asyncio
+async def test_transition_no_show_from_transferred(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Happy: transferred → no_show. Mirror test_transition_completed_from_transferred."""
+    booking = await _seed_confirmed_booking(session, seed_data)
+    booking_id = booking.id
+    new_slot = await _make_open_slot(session, seed_data, days_ahead=5, hour_local=15)
+
+    await transfer_booking(
+        session,
+        booking_id=booking_id,
+        new_slot_id=new_slot.id,
+        client_id=seed_data["client"].id,
+        scheduler=_mock_scheduler(),
+        now_utc=_ref_past(),
+    )
+
+    mock_scheduler = _mock_scheduler()
+    result = await transition_booking_status(
+        session,
+        booking_id,
+        "no_show",
+        seed_data["master_id"],
+        scheduler=mock_scheduler,
+        now_utc=_ref_future(),
+    )
+
+    assert isinstance(result, Booking)
+    assert result.status == "no_show"
+
+    await session.rollback()
+    stmt = select(Booking.status).where(Booking.id == booking_id)
+    assert (await session.execute(stmt)).scalar_one() == "no_show"
+
+
+@pytest.mark.asyncio
+async def test_transition_idempotent_same_status(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Idempotent: booking.status == new_status → silent return (no UPDATE, no remove_job).
+    Double-tap same status: second call returns booking without side effects.
+    """
+    booking = await _seed_confirmed_booking(session, seed_data)
+    booking_id = booking.id
+    mock_scheduler = _mock_scheduler()
+
+    # First call: confirmed → completed (succeeds, remove_job called 2x).
+    await transition_booking_status(
+        session,
+        booking_id,
+        "completed",
+        seed_data["master_id"],
+        scheduler=mock_scheduler,
+        now_utc=_ref_future(),
+    )
+    assert mock_scheduler.remove_job.call_count == 2
+
+    # Second call: completed → completed (idempotent silent return at line 902).
+    result = await transition_booking_status(
+        session,
+        booking_id,
+        "completed",
+        seed_data["master_id"],
+        scheduler=mock_scheduler,
+        now_utc=_ref_future(),
+    )
+    # No additional remove_job calls (early return, no UPDATE, no commit).
+    assert mock_scheduler.remove_job.call_count == 2
+    assert result.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_transition_from_cancelled_rejected(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Terminal: cancelled → completed rejected with InvalidStatusTransitionError."""
+    booking = await _seed_confirmed_booking(session, seed_data)
+    booking_id = booking.id
+    mock_scheduler = _mock_scheduler()
+
+    # Cancel the booking first (status → 'cancelled').
+    await cancel_booking(
+        session,
+        booking_id=booking_id,
+        client_id=seed_data["client"].id,
+        scheduler=mock_scheduler,
+        now_utc=datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0),
+    )
+
+    # Transition to 'completed' → InvalidStatusTransitionError (terminal status).
+    with pytest.raises(InvalidStatusTransitionError):
+        await transition_booking_status(
+            session,
+            booking_id,
+            "completed",
+            seed_data["master_id"],
+            scheduler=mock_scheduler,
+            now_utc=_ref_future(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_transition_from_completed_rejected(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Terminal: completed → no_show rejected with InvalidStatusTransitionError."""
+    booking = await _seed_confirmed_booking(session, seed_data)
+    booking_id = booking.id
+    mock_scheduler = _mock_scheduler()
+
+    # First transition to 'completed' (succeeds).
+    await transition_booking_status(
+        session,
+        booking_id,
+        "completed",
+        seed_data["master_id"],
+        scheduler=mock_scheduler,
+        now_utc=_ref_future(),
+    )
+
+    # Second transition to 'no_show' → InvalidStatusTransitionError.
+    with pytest.raises(InvalidStatusTransitionError):
+        await transition_booking_status(
+            session,
+            booking_id,
+            "no_show",
+            seed_data["master_id"],
+            scheduler=mock_scheduler,
+            now_utc=_ref_future(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_transition_from_no_show_rejected(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Terminal: no_show → completed rejected with InvalidStatusTransitionError."""
+    booking = await _seed_confirmed_booking(session, seed_data)
+    booking_id = booking.id
+    mock_scheduler = _mock_scheduler()
+
+    # First transition to 'no_show' (succeeds).
+    await transition_booking_status(
+        session,
+        booking_id,
+        "no_show",
+        seed_data["master_id"],
+        scheduler=mock_scheduler,
+        now_utc=_ref_future(),
+    )
+
+    # Second transition to 'completed' → InvalidStatusTransitionError.
+    with pytest.raises(InvalidStatusTransitionError):
+        await transition_booking_status(
+            session,
+            booking_id,
+            "completed",
+            seed_data["master_id"],
+            scheduler=mock_scheduler,
+            now_utc=_ref_future(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_transition_concurrent_taps(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Race: 2 admins tap same status → loser's UPDATE rowcount=0 →
+    recheck shows same status → silent return at line 947-949 (no duplicate side effects).
+
+    Simulates: A's SELECT captures stale status='confirmed' (before B's commit).
+    B wins (DB now has 'completed'). A's UPDATE WHERE status IN ('confirmed','transferred')
+    → rowcount=0. Recheck shows 'completed' == new_status → silent return (line 947-949).
+    """
+    booking = await _seed_confirmed_booking(session, seed_data)
+    booking_id = booking.id
+    master_id = seed_data["master_id"]
+    mock_scheduler = _mock_scheduler()
+
+    # Simulate admin B's concurrent transition: UPDATE DB to 'completed' without
+    # updating identity map (synchronize_session=False). DB now has status='completed'.
+    await session.execute(
+        update(Booking)
+        .where(Booking.id == booking_id)
+        .values(status="completed")
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
+    # expire_on_commit=False → identity-mapped booking NOT expired → stale 'confirmed'.
+
+    # Admin A's transition — SELECT returns stale identity-mapped booking
+    # (status='confirmed'). UPDATE WHERE status IN ('confirmed','transferred') →
+    # rowcount=0 (DB has 'completed'). Rollback. Recheck shows 'completed' == new_status
+    # → silent return at line 947-949 (no remove_job, no duplicate INSERT).
+    result = await transition_booking_status(
+        session,
+        booking_id,
+        "completed",
+        master_id,
+        scheduler=mock_scheduler,
+        now_utc=_ref_future(),
+    )
+    # No remove_job calls (silent return, no commit, no remove_jobs_for_booking).
+    assert mock_scheduler.remove_job.call_count == 0
+    assert result.id == booking_id
+
+
+@pytest.mark.asyncio
+async def test_transition_concurrent_transfer_race(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Concurrent transfer changes start_at → UPDATE rowcount=0 →
+    BookingAlreadyTransferredError, NO retry (mirror transfer_booking:1072-1090).
+
+    Simulates: A's SELECT captures stale start_at (before B's transfer commit).
+    A's UPDATE WHERE start_at == old → rowcount=0 (DB has new start_at).
+    Re-SELECT shows status='transferred' → BookingAlreadyTransferredError.
+    """
+    booking = await _seed_confirmed_booking(session, seed_data)
+    booking_id = booking.id
+    master_id = seed_data["master_id"]
+    old_start_at = booking.start_at  # captured before the "concurrent" UPDATE
+
+    # Simulate concurrent transfer: UPDATE DB without updating identity map
+    # (synchronize_session=False). DB now has status='transferred', start_at=new.
+    # Identity-mapped booking retains stale (status='confirmed', start_at=old).
+    new_start_at = old_start_at + timedelta(hours=2)
+    new_end_at = booking.end_at + timedelta(hours=2)
+    await session.execute(
+        update(Booking)
+        .where(Booking.id == booking_id)
+        .values(start_at=new_start_at, end_at=new_end_at, status="transferred")
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
+    # expire_on_commit=False → identity-mapped booking NOT expired → stale values retained.
+
+    # transition_booking_status: SELECT returns stale identity-mapped booking
+    # (status='confirmed', start_at=old). UPDATE WHERE start_at == old → rowcount=0
+    # (DB has start_at=new). Rollback expires identity map. Re-SELECT shows 'transferred'.
+    mock_scheduler = _mock_scheduler()
+    with pytest.raises(BookingAlreadyTransferredError):
+        await transition_booking_status(
+            session,
+            booking_id,
+            "completed",
+            master_id,
+            scheduler=mock_scheduler,
+            now_utc=_ref_future(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_transition_not_found(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Random uuid4 (no such booking) → BookingNotFoundError (defense-in-depth,
+    covers not-found AND not-owner via master_id ownership filter).
+    """
+    mock_scheduler = _mock_scheduler()
+    with pytest.raises(BookingNotFoundError):
+        await transition_booking_status(
+            session,
+            uuid4(),
+            "completed",
+            seed_data["master_id"],
+            scheduler=mock_scheduler,
+            now_utc=_ref_future(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_transition_before_start_at_rejected(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Past-only policy: now_utc < start_at → BookingNotStartedYetError.
+    Booking start_at is tomorrow 11:00 UTC; now_utc is today (before start_at).
+    """
+    booking = await _seed_confirmed_booking(session, seed_data)
+    booking_id = booking.id
+    mock_scheduler = _mock_scheduler()
+
+    # now_utc = today (before tomorrow's start_at) → past-only policy violated.
+    now_before_start = datetime.now(UTC)
+
+    with pytest.raises(BookingNotStartedYetError):
+        await transition_booking_status(
+            session,
+            booking_id,
+            "completed",
+            seed_data["master_id"],
+            scheduler=mock_scheduler,
+            now_utc=now_before_start,
+        )
+
+
+@pytest.mark.asyncio
+async def test_check_constraint_rejects_invalid_status(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """ck_booking_status CHECK constraint rejects INSERT with status='invalid'
+    → IntegrityError (catches DB-level enforcement gap, mirror models.py:215-218).
+    """
+    slot = seed_data["slot"]
+    start = datetime.now(UTC).replace(tzinfo=None) + timedelta(days=1)
+    booking = Booking(
+        slot_id=slot.id,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        client_id=seed_data["client"].id,
+        service_id=None,
+        service_title_snapshot="Стрижка",
+        service_price_snapshot=None,
+        client_name_snapshot="Паша",
+        start_at=start,
+        end_at=start + timedelta(hours=1),
+        status="invalid",  # not in ck_booking_status
+    )
+    session.add(booking)
+    with pytest.raises(SAIntegrityError):
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_notification_log_kind_admin_completed_inserted(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """After transition to 'completed', NotificationLog has exactly one row
+    with kind='admin_completed' (catches GAP-1 silent audit log loss).
+    """
+    booking = await _seed_confirmed_booking(session, seed_data)
+    booking_id = booking.id
+    mock_scheduler = _mock_scheduler()
+
+    await transition_booking_status(
+        session,
+        booking_id,
+        "completed",
+        seed_data["master_id"],
+        scheduler=mock_scheduler,
+        now_utc=_ref_future(),
+    )
+
+    # Verify NotificationLog has one 'admin_completed' row.
+    await session.rollback()
+    stmt_n = select(NotificationLog).where(
+        NotificationLog.booking_id == booking_id,
+        NotificationLog.kind == "admin_completed",
+    )
+    notif_rows = (await session.execute(stmt_n)).scalars().all()
+    assert len(notif_rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduler_jobs_removed_after_transition(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """After transition to 'completed', scheduler.remove_job called for both
+    remind_24h and remind_1h (INV-4 — scheduler cleanup after terminal transition).
+    """
+    booking = await _seed_confirmed_booking(session, seed_data)
+    booking_id = booking.id
+    mock_scheduler = _mock_scheduler()
+
+    await transition_booking_status(
+        session,
+        booking_id,
+        "completed",
+        seed_data["master_id"],
+        scheduler=mock_scheduler,
+        now_utc=_ref_future(),
+    )
+
+    expected_calls = {f"remind_24h_{booking_id}", f"remind_1h_{booking_id}"}
+    actual_job_ids = {call.args[0] for call in mock_scheduler.remove_job.call_args_list}
+    assert actual_job_ids == expected_calls

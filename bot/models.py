@@ -207,6 +207,15 @@ class Booking(Base):
     )
 
     __table_args__ = (
+        # B.3 (миграция 008): DB-level enforcement of the 5-status lifecycle.
+        # Pre-008 had no CHECK — status was String(20) with default='confirmed'
+        # but no constraint. Mirrored in alembic 008 for prod parity (tests use
+        # Base.metadata.create_all, so this models.py constraint is enforced
+        # in tests too — closes dev/prod parity gap, deep-analysis iter 3 GAP-2).
+        CheckConstraint(
+            "status IN ('confirmed','cancelled','completed','no_show','transferred')",
+            name="ck_booking_status",
+        ),
         CheckConstraint("end_at > start_at", name="ck_booking_duration_positive"),
         # Этап 5.8a (миграция 006): UNIQUE(ux_bookings_slot) убран — slot_id
         # nullable для WorkDay-only bookings. Guard shift на rowcount-check
@@ -233,7 +242,10 @@ class NotificationLog(Base):
         Uuid, ForeignKey("bookings.id", ondelete="CASCADE"), nullable=False
     )
     kind: Mapped[str] = mapped_column(String(30))
-    # remind_24h | remind_1h | master_new | master_cancel | master_transfer | client_moved
+    # remind_24h | remind_1h | master_new | master_cancel | master_transfer |
+    # client_moved | admin_completed | admin_no_show
+    # B.3 (миграция 008): last 2 kinds added for transition_booking_status
+    # audit log (admin taps Завершить / Неявка from /today view).
     sent_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True).with_variant(TIMESTAMP(timezone=True), "postgresql"),
         server_default=func.now(),
@@ -243,7 +255,7 @@ class NotificationLog(Base):
         CheckConstraint(
             "kind IN ("
             "'remind_24h','remind_1h','master_new','master_cancel','master_transfer',"
-            "'client_moved'"
+            "'client_moved','admin_completed','admin_no_show'"
             ")",
             name="ck_notifications_kind",
         ),

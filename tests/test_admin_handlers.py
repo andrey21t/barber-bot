@@ -1311,14 +1311,10 @@ async def test_admin_week_cb_state_none_uses_edit_text(
 
     # edit_text called (preferred path), answer NOT called (no fallback needed).
     assert callback.message.edit_text.called, "edit_text should be called when state is None"
-    assert not callback.message.answer.called, (
-        "answer must NOT be called when edit_text succeeds"
-    )
+    assert not callback.message.answer.called, "answer must NOT be called when edit_text succeeds"
     args, _ = callback.message.edit_text.call_args
     text = str(args[0])
-    assert "Ближайших записей нет" in text, (
-        f"No bookings seeded → empty message; got: {text!r}"
-    )
+    assert "Ближайших записей нет" in text, f"No bookings seeded → empty message; got: {text!r}"
 
 
 @pytest.mark.asyncio
@@ -1343,9 +1339,7 @@ async def test_admin_week_cb_state_active_uses_answer(
     await admin_handlers.admin_week_cb(callback, state)
 
     # answer called (mid-flow path), edit_text NOT called.
-    assert callback.message.answer.called, (
-        "answer should be called when state is active (mid-flow)"
-    )
+    assert callback.message.answer.called, "answer should be called when state is active (mid-flow)"
     assert not callback.message.edit_text.called, (
         "edit_text must NOT be called mid-flow — would replace flow keyboard"
     )
@@ -2905,9 +2899,7 @@ async def test_admin_move_simple_calendar_filters_slots_by_service_duration(
             break
     assert picker_call is not None, "Slot picker message not found"
     reply_markup = picker_call.kwargs["reply_markup"]
-    button_texts = [
-        btn.text for row in reply_markup.inline_keyboard for btn in row
-    ]
+    button_texts = [btn.text for row in reply_markup.inline_keyboard for btn in row]
     # Expected slots: 13:00, 13:30, 14:00, 18:00 (4 slots).
     assert "13:00" in button_texts
     assert "14:00" in button_texts
@@ -3758,9 +3750,7 @@ async def test_openweek_week_picker_nav_cb_next_increments_offset(
     assert callback.message.edit_text.called, "Nav must re-render week picker"
     edit_args, edit_kwargs = callback.message.edit_text.call_args
     text = edit_args[0] if edit_args else edit_kwargs.get("text", "")
-    assert "14.09 – 20.09" in text, (
-        f"Header must show next week range 14.09-20.09; got: {text!r}"
-    )
+    assert "14.09 – 20.09" in text, f"Header must show next week range 14.09-20.09; got: {text!r}"
 
 
 @pytest.mark.asyncio
@@ -3841,9 +3831,7 @@ async def test_openweek_week_picker_nav_cb_state_loss_clears_state(
     state.clear.assert_called_once()
     args, kwargs = callback.answer.call_args
     alert_text = args[0] if args else kwargs.get("text", "")
-    assert "потеряны" in alert_text, (
-        f"State-loss alert must mention data lost; got: {alert_text!r}"
-    )
+    assert "потеряны" in alert_text, f"State-loss alert must mention data lost; got: {alert_text!r}"
 
 
 @pytest.mark.asyncio
@@ -3873,9 +3861,7 @@ async def test_openweek_week_select_cb_transitions_to_start_picker(
     assert callback.message.edit_text.called, "Select must re-render with slot picker"
     edit_args, edit_kwargs = callback.message.edit_text.call_args
     text = edit_args[0] if edit_args else edit_kwargs.get("text", "")
-    assert "Шаг 2" in text, (
-        f"Step 0 → 1 transition message must mention 'Шаг 2'; got: {text!r}"
-    )
+    assert "Шаг 2" in text, f"Step 0 → 1 transition message must mention 'Шаг 2'; got: {text!r}"
     reply_markup = edit_kwargs.get("reply_markup")
     assert reply_markup is not None, "Expected slot picker reply_markup"
 
@@ -3944,8 +3930,7 @@ async def test_admin_openweek_start_cb_saves_start_and_shows_end_picker(
     # 5.64 (W1 fix): header must show week_offset=1 → next week range 14.09-20.09.
     # Pre-fix this would have shown 07.09-13.09 (current week, offset=0 hardcoded).
     assert "14.09 – 20.09" in text, (
-        f"End picker header must show chosen week (offset=1 → 14-20.09); "
-        f"got: {text!r}"
+        f"End picker header must show chosen week (offset=1 → 14-20.09); got: {text!r}"
     )
     # reply_markup is on edit_text (preferred) or answer (fallback).
     if callback.message.edit_text.called:
@@ -4160,15 +4145,10 @@ def test_week_monday_offset_one_plus_seven_days() -> None:
     tz = "Europe/Moscow"
     base = _current_week_monday(tz)
     assert _week_monday(tz, 1) == base + timedelta(days=7), (
-        f"offset=1 must be +7 days from base; base={base}, "
-        f"got={_week_monday(tz, 1)}"
+        f"offset=1 must be +7 days from base; base={base}, got={_week_monday(tz, 1)}"
     )
-    assert _week_monday(tz, 2) == base + timedelta(days=14), (
-        "offset=2 must be +14 days"
-    )
-    assert _week_monday(tz, 4) == base + timedelta(days=28), (
-        "offset=4 (cap) must be +28 days"
-    )
+    assert _week_monday(tz, 2) == base + timedelta(days=14), "offset=2 must be +14 days"
+    assert _week_monday(tz, 4) == base + timedelta(days=28), "offset=4 (cap) must be +28 days"
 
 
 def test_week_monday_negative_offset_raises() -> None:
@@ -4327,8 +4307,7 @@ async def test_admin_openweek_end_cb_preserves_week_offset_from_state(
     data = _state_all_updates(state)
     # end_cb must NOT seed week_offset=0 — preserve the value from step 0.
     assert "week_offset" not in data, (
-        f"end_cb must NOT overwrite week_offset (set on step 0); "
-        f"got: {data.get('week_offset')}"
+        f"end_cb must NOT overwrite week_offset (set on step 0); got: {data.get('week_offset')}"
     )
     assert data["scheduled_weekdays"] == [], (
         f"No WorkDays seeded → scheduled empty; got: {data.get('scheduled_weekdays')}"
@@ -4387,8 +4366,7 @@ async def test_admin_openweek_week_nav_cb_next_increments_offset(
     # Alert about reset should have been shown (selected was non-empty).
     args, kwargs = callback.answer.call_args
     assert "Выбор сброшен" in (args[0] if args else kwargs.get("text", "")), (
-        f"Reset alert must be shown when selected was non-empty; "
-        f"got: {callback.answer.call_args}"
+        f"Reset alert must be shown when selected was non-empty; got: {callback.answer.call_args}"
     )
 
 
@@ -4428,12 +4406,8 @@ async def test_admin_openweek_week_nav_cb_prev_at_zero_no_op(
 
     # No-op: handler must NOT call update_data (state unchanged) and NOT
     # re-render message (edit_text not called).
-    assert not state.update_data.called, (
-        "Clamped no-op must NOT call update_data"
-    )
-    assert not callback.message.edit_text.called, (
-        "Clamped no-op must NOT re-render message"
-    )
+    assert not state.update_data.called, "Clamped no-op must NOT call update_data"
+    assert not callback.message.edit_text.called, "Clamped no-op must NOT re-render message"
     # No-op MUST dismiss loading spinner via callback.answer() — without
     # this, Telegram shows infinite spinner on the button.
     callback.answer.assert_called_once()
@@ -4472,12 +4446,8 @@ async def test_admin_openweek_week_nav_cb_next_at_cap_no_op(
 
     await admin_handlers.admin_openweek_week_nav_cb(callback, cb_data, state)
 
-    assert not state.update_data.called, (
-        "Clamped no-op at cap must NOT call update_data"
-    )
-    assert not callback.message.edit_text.called, (
-        "Clamped no-op at cap must NOT re-render"
-    )
+    assert not state.update_data.called, "Clamped no-op at cap must NOT call update_data"
+    assert not callback.message.edit_text.called, "Clamped no-op at cap must NOT re-render"
     callback.answer.assert_called_once()
     state.clear.assert_not_called()
     state.set_state.assert_not_called()
@@ -6077,7 +6047,6 @@ async def test_admin_close_today_cancel_cb_clears_state(
     assert "отменено" in text.lower()
 
 
-
 # ============================================================
 # Session 5.46 (B.10) — phone in /today + /week render
 # _render_bookings: client_phones dict → "📞 +7..." or "без телефона" suffix
@@ -6391,9 +6360,7 @@ async def test_admin_openweek_edit_start_cb_workday_not_found_clears(
 
     # workday_id in callback_data that doesn't exist in DB
     ghost_workday_id = UUID("00000000-0000-0000-0000-000000000002")
-    cb_data = AdminWindowSlot30CallbackData(
-        workday_id=ghost_workday_id, start_minute=11 * 60
-    )
+    cb_data = AdminWindowSlot30CallbackData(workday_id=ghost_workday_id, start_minute=11 * 60)
     callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
     state = _make_mock_state({"edit_workday_id": str(ghost_workday_id)})
 
@@ -6418,14 +6385,15 @@ async def test_admin_openweek_edit_start_cb_happy_shows_end_picker(
         ctx = await _seed_admin_stack(session)
         tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
         workday = await _seed_workday(
-            session, ctx=ctx, work_date=tomorrow,
-            start_time_str="10:00", end_time_str="19:00",
+            session,
+            ctx=ctx,
+            work_date=tomorrow,
+            start_time_str="10:00",
+            end_time_str="19:00",
         )
 
     picked_start_minute = 11 * 60  # 11:00
-    cb_data = AdminWindowSlot30CallbackData(
-        workday_id=workday.id, start_minute=picked_start_minute
-    )
+    cb_data = AdminWindowSlot30CallbackData(workday_id=workday.id, start_minute=picked_start_minute)
     callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
     state = _make_mock_state({"edit_workday_id": str(workday.id)})
 
@@ -6435,9 +6403,7 @@ async def test_admin_openweek_edit_start_cb_happy_shows_end_picker(
     update = _state_data_passed(state)
     assert update["edit_picked_start_minute"] == picked_start_minute
 
-    state.set_state.assert_awaited_once_with(
-        admin_handlers.AdminStates.opening_week_edit_end
-    )
+    state.set_state.assert_awaited_once_with(admin_handlers.AdminStates.opening_week_edit_end)
     state.clear.assert_not_called()
 
     # answer with end-picker keyboard
@@ -6533,7 +6499,10 @@ async def test_admin_today_cb_with_bookings_shows_list(
         start_utc_naive = local_dt.astimezone(UTC).replace(tzinfo=None)
 
         await _seed_booking(
-            session, ctx=ctx, slot=slot, start_at_utc_naive=start_utc_naive,
+            session,
+            ctx=ctx,
+            slot=slot,
+            start_at_utc_naive=start_utc_naive,
         )
 
     callback = _make_callback(ADMIN_TG_ID)
@@ -6638,9 +6607,7 @@ async def test_admin_services_cb_happy_enters_name_step(
     await admin_handlers.admin_services_cb(callback, state)
 
     state.clear.assert_awaited_once()
-    state.set_state.assert_awaited_once_with(
-        admin_handlers.AdminStates.entering_service_name
-    )
+    state.set_state.assert_awaited_once_with(admin_handlers.AdminStates.entering_service_name)
     update = _state_data_passed(state)
     assert update["business_id"] == str(business_id)
 
@@ -6776,9 +6743,7 @@ async def test_admin_service_name_msg_happy_transitions_to_duration(
 
     update = _state_data_passed(state)
     assert update["name"] == "Стрижка мужская"
-    state.set_state.assert_awaited_once_with(
-        admin_handlers.AdminStates.entering_service_duration
-    )
+    state.set_state.assert_awaited_once_with(admin_handlers.AdminStates.entering_service_duration)
     state.clear.assert_not_called()
 
 
@@ -6975,9 +6940,9 @@ async def test_admin_service_duration_msg_happy_creates_service(
 # ============================================================
 
 
-def _make_move_state(*, booking_id: str | None = None,
-                     workday_id: str | None = None,
-                     start_minute: int | None = None) -> MagicMock:
+def _make_move_state(
+    *, booking_id: str | None = None, workday_id: str | None = None, start_minute: int | None = None
+) -> MagicMock:
     """Build state for admin_move_confirm_cb with the 3 keys it reads.
 
     Pass None for any key to simulate that key missing (state loss branch).
@@ -7294,5 +7259,178 @@ async def test_admin_move_confirm_cb_capacity_exceeded(
     assert "все слоты заняты" in text
 
 
+# ============================================================
+# B.3: admin_complete_cb / admin_no_show_cb handler tests
+# Pattern: test_admin_close_today_cb_no_bookings_closes_immediately:5904
+#   (handler test with patched_session_factory, _make_callback, _make_mock_state,
+#    scheduler=MagicMock()) + test_admin_move_confirm_cb_booking_already_cancelled:7082
+#   (exception handler test: patch transition_booking_status with side_effect).
+# ============================================================
 
 
+@pytest.mark.asyncio
+async def test_admin_complete_cb_happy_path(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[✅ Завершить] tap → transition succeeds → edit_text with '✅ Запись завершена'."""
+    from unittest.mock import AsyncMock, patch
+
+    from bot.keyboards.admin import AdminCompleteCallbackData
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cb_data = AdminCompleteCallbackData(booking_id=UUID("33333333-3333-3333-3333-333333333333"))
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+    scheduler = MagicMock()
+
+    with patch(
+        "bot.handlers.admin.transition_booking_status",
+        new_callable=AsyncMock,
+    ) as mock_svc:
+        await admin_handlers.admin_complete_cb(callback, state, scheduler, cb_data)
+
+    # Verify service called with correct args (IDOR: master_id from callback, not callback_data).
+    mock_svc.assert_called_once()
+    call_kwargs = mock_svc.call_args.kwargs
+    assert call_kwargs["scheduler"] is scheduler
+    # positional: session, booking_id, new_status, master_id
+    assert mock_svc.call_args.args[2] == "completed"
+
+    assert callback.message.edit_text.called
+    text = str(callback.message.edit_text.call_args.args[0])
+    assert "✅" in text
+    assert "завершена" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_no_show_cb_happy_path(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[❌ Неявка] tap → transition succeeds → edit_text with '❌ ... неявка'."""
+    from unittest.mock import AsyncMock, patch
+
+    from bot.keyboards.admin import AdminNoShowCallbackData
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cb_data = AdminNoShowCallbackData(booking_id=UUID("33333333-3333-3333-3333-333333333333"))
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+    scheduler = MagicMock()
+
+    with patch(
+        "bot.handlers.admin.transition_booking_status",
+        new_callable=AsyncMock,
+    ) as mock_svc:
+        await admin_handlers.admin_no_show_cb(callback, state, scheduler, cb_data)
+
+    mock_svc.assert_called_once()
+    assert mock_svc.call_args.args[2] == "no_show"
+
+    assert callback.message.edit_text.called
+    text = str(callback.message.edit_text.call_args.args[0])
+    assert "❌" in text
+    assert "неявк" in text  # "отмечена как неявка"
+
+
+@pytest.mark.asyncio
+async def test_admin_complete_cb_already_completed(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """InvalidStatusTransitionError → callback.answer('❌ Запись уже в конечном статусе')."""
+    from unittest.mock import AsyncMock, patch
+
+    from bot.keyboards.admin import AdminCompleteCallbackData
+    from bot.services.booking import InvalidStatusTransitionError
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cb_data = AdminCompleteCallbackData(booking_id=UUID("33333333-3333-3333-3333-333333333333"))
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state()
+    scheduler = MagicMock()
+
+    with patch(
+        "bot.handlers.admin.transition_booking_status",
+        new_callable=AsyncMock,
+        side_effect=InvalidStatusTransitionError("already completed"),
+    ):
+        await admin_handlers.admin_complete_cb(callback, state, scheduler, cb_data)
+
+    args, _ = callback.answer.call_args
+    assert "уже в конечном статусе" in str(args[0] if args else "")
+
+
+@pytest.mark.asyncio
+async def test_admin_complete_cb_invalid_state_cancelled(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """BookingAlreadyCancelledError → callback.answer('❌ Запись уже отменена')."""
+    from unittest.mock import AsyncMock, patch
+
+    from bot.keyboards.admin import AdminCompleteCallbackData
+    from bot.services.booking import BookingAlreadyCancelledError
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cb_data = AdminCompleteCallbackData(booking_id=UUID("33333333-3333-3333-3333-333333333333"))
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    state = _make_mock_state()
+    scheduler = MagicMock()
+
+    with patch(
+        "bot.handlers.admin.transition_booking_status",
+        new_callable=AsyncMock,
+        side_effect=BookingAlreadyCancelledError("already cancelled"),
+    ):
+        await admin_handlers.admin_complete_cb(callback, state, scheduler, cb_data)
+
+    args, _ = callback.answer.call_args
+    assert "уже отменена" in str(args[0] if args else "")
+
+
+@pytest.mark.asyncio
+async def test_admin_complete_cb_refreshes_keyboard_after_transition(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """GAP-A: after transition, edit_text called with admin_today_keyboard
+    reply_markup (no stale buttons — fresh keyboard reflecting new status).
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from aiogram.types import InlineKeyboardMarkup
+    from bot.keyboards.admin import AdminCompleteCallbackData
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cb_data = AdminCompleteCallbackData(booking_id=UUID("33333333-3333-3333-3333-333333333333"))
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+    scheduler = MagicMock()
+
+    with patch(
+        "bot.handlers.admin.transition_booking_status",
+        new_callable=AsyncMock,
+    ):
+        await admin_handlers.admin_complete_cb(callback, state, scheduler, cb_data)
+
+    # edit_text called with reply_markup (fresh keyboard, no stale buttons).
+    assert callback.message.edit_text.called
+    kwargs = callback.message.edit_text.call_args.kwargs
+    assert "reply_markup" in kwargs
+    rm = kwargs["reply_markup"]
+    assert isinstance(rm, InlineKeyboardMarkup)
