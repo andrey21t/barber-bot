@@ -30,10 +30,12 @@ class BookingCreate(BaseModel):
     via _select_or_create_client(telegram_id) (booking.py:101-112).
 
     telegram_username: str | None = None — @username from Telegram profile
-    (callback.from_user.username). Passed to master notification so master can
-    tap the @username to contact the client. None if user has no @username
-    (hidden or not set) — notification shows telegram_id as fallback.
-    NOT persisted on Client (usernames change, read fresh each booking).
+    (callback.from_user.username). Passed to master notification AND persisted
+    on Client.telegram_username (миграция 009) for render in admin lists
+    (cmd_today, cmd_week). None if user has no @username (hidden or not set) —
+    notification shows telegram_id as fallback; admin list shows no @username
+    suffix. NOT overwritten with None when user deletes @username (stale-but-
+    valid preferred over missing — see booking.py:513 comment).
     """
 
     model_config = ConfigDict(frozen=True)

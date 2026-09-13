@@ -5890,22 +5890,113 @@ def test_render_bookings_client_phones_none_omits_suffix() -> None:
     assert "без телефона" not in bullet_line, "no 'без телефона' when caller didn't pass dict"
 
 
+# ============================================================
+# Миграция 009 — @username в _render_bookings (mirror of B.10 phone tests)
+# ============================================================
+
+
+def test_render_bookings_with_username_suffix() -> None:
+    """Миграция 009: _render_bookings(client_usernames={client_id: "OlessandraOlesya"}) →
+    booking line shows " (@OlessandraOlesya)" suffix after name. Telegram auto-linkify
+    @username в parse_mode=HTML makes it clickable — no <a href> needed.
+    """
+    from typing import cast
+
+    client_id = UUID("44444444-4444-4444-4444-444444444444")
+    bookings = cast(
+        list[Booking],
+        [
+            MagicMock(
+                start_at=datetime(2026, 3, 17, 11, 0, tzinfo=UTC),
+                client_name_snapshot="Olesya",
+                service_title_snapshot="Стрижка",
+                client_id=client_id,
+            ),
+        ],
+    )
+
+    result = admin_handlers._render_bookings(
+        "📅 Записи:", bookings, TZ, client_usernames={client_id: "OlessandraOlesya"}
+    )
+
+    bullet_line = [line for line in result.split("\n") if line.startswith("•")][0]
+    assert "(@OlessandraOlesya)" in bullet_line, "@username suffix shown when set"
+    assert "Olesya (@OlessandraOlesya)" in bullet_line
+
+
+def test_render_bookings_without_username_omits_suffix() -> None:
+    """Миграция 009: _render_bookings(client_usernames={client_id: None}) → booking line
+    has NO "(@...)" suffix (no brackets, no @). Edge case: client.deleted @username
+    in Telegram → Client.telegram_username stays None (we don't overwrite with None,
+    see test_create_booking_does_not_overwrite_username_with_none in test_booking.py).
+    """
+    from typing import cast
+
+    client_id = UUID("55555555-5555-5555-5555-555555555555")
+    bookings = cast(
+        list[Booking],
+        [
+            MagicMock(
+                start_at=datetime(2026, 3, 17, 11, 0, tzinfo=UTC),
+                client_name_snapshot="Иван",
+                service_title_snapshot="Стрижка",
+                client_id=client_id,
+            ),
+        ],
+    )
+
+    result = admin_handlers._render_bookings(
+        "📅 Записи:", bookings, TZ, client_usernames={client_id: None}
+    )
+
+    bullet_line = [line for line in result.split("\n") if line.startswith("•")][0]
+    assert "(@" not in bullet_line, "no @username suffix when value is None"
+    assert "Иван" in bullet_line
+
+
+def test_render_bookings_client_usernames_none_omits_suffix() -> None:
+    """Миграция 009 backwards compat: _render_bookings(client_usernames=None) →
+    no @username suffix in render. Legacy callers (3 alert messages: WorkDayShrink
+    error admin.py:495, delete-day confirm :2019, close-day confirm :4180)
+    intentionally NOT updated (out of user request scope — plan step 9).
+    """
+    from typing import cast
+
+    bookings = cast(
+        list[Booking],
+        [
+            MagicMock(
+                start_at=datetime(2026, 3, 17, 11, 0, tzinfo=UTC),
+                client_name_snapshot="Олег",
+                service_title_snapshot="Укладка",
+                client_id=UUID("66666666-6666-6666-6666-666666666666"),
+            ),
+        ],
+    )
+
+    result = admin_handlers._render_bookings("📅 Записи:", bookings, TZ, client_usernames=None)
+
+    bullet_line = [line for line in result.split("\n") if line.startswith("•")][0]
+    assert "(@" not in bullet_line, "no @username suffix when client_usernames=None (legacy)"
+    assert "Олег" in bullet_line
+
+
 @pytest.mark.asyncio
-async def test_cmd_today_with_client_phone(
+async def test_cmd_today_with_telegram_username(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """B.10 end-to-end: /today shows "📞 +7999..." when Client.phone is set.
-    Seed a booking with a Client that has phone='+79991234567', invoke
-    cmd_today → render shows the phone suffix in the bullet line.
+    """Миграция 009 end-to-end: /today shows "(@username)" when Client.telegram_username
+    is set. Telegram auto-linkify @username в parse_mode=HTML — кликабельно без <a href>.
+    cmd_today больше не показывает phone ("без телефона" — "фигня" per user),
+    только @username (если есть).
     """
     async with session_factory() as session:
         ctx = await _seed_admin_stack(session)
-        # Set phone on the client (mirror what create_booking would do via
-        # payload.phone — direct UPDATE here, no create_booking needed since
-        # we test the render, not the booking flow).
+        # Set telegram_username on the client (mirror what create_booking would
+        # persist via payload.telegram_username — direct UPDATE here).
         client = ctx["client"]
-        client.phone = "+79991234567"
+        client.telegram_username = "OlessandraOlesya"
         await session.commit()
 
         # Today's booking at 14:00 Moscow.
@@ -5930,21 +6021,25 @@ async def test_cmd_today_with_client_phone(
     await admin_handlers.cmd_today(msg, _make_mock_state())
 
     text = _answer_text(msg)
-    assert "📞 +79991234567" in text, "phone shown in /today when Client.phone set"
+    assert "(@OlessandraOlesya)" in text, (
+        "@username shown in /today when Client.telegram_username set"
+    )
+    assert "без телефона" not in text, "phone suffix removed from cmd_today (user: фигня)"
 
 
 @pytest.mark.asyncio
-async def test_cmd_today_without_phone_shows_bez_telefona(
+async def test_cmd_today_without_telegram_username_omits_suffix(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """B.10 end-to-end: /today shows "без телефона" when Client.phone is None.
-    Mirror of test_cmd_today_with_client_phone, but Client.phone stays None
-    (the conftest default — no fixture value). Render shows "без телефона" suffix.
+    """Миграция 009 end-to-end: /today shows NO @username suffix when
+    Client.telegram_username is None (user has no @username in Telegram, or
+    deleted it). Render shows client name without "(@...)" suffix. Mirror of
+    test_cmd_today_with_telegram_username, but telegram_username stays None.
     """
     async with session_factory() as session:
         ctx = await _seed_admin_stack(session)
-        # Client.phone stays None (default — no UPDATE)
+        # Client.telegram_username stays None (default — no UPDATE)
         now_local = datetime.now(ZoneInfo(TZ))
         today_local_at_15 = now_local.replace(hour=15, minute=0, second=0, microsecond=0)
         slot = await _seed_slot(
@@ -5966,8 +6061,9 @@ async def test_cmd_today_without_phone_shows_bez_telefona(
     await admin_handlers.cmd_today(msg, _make_mock_state())
 
     text = _answer_text(msg)
-    assert "без телефона" in text, "phone=None → 'без телефона' in /today render"
-    assert "📞 None" not in text, "no literal 'None' in render"
+    assert "(@" not in text, "no @username suffix when telegram_username is None"
+    assert "без телефона" not in text, "phone suffix removed from cmd_today (user: фигня)"
+    assert "Паша" in text, "client name shown even without @username"
 
 
 # ============================================================

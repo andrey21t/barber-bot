@@ -97,6 +97,9 @@ class Client(Base):
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True)
     name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # Migration 009: persisted for render in admin lists (cmd_today/cmd_week).
+    # Updated only when payload.telegram_username is non-None — see booking.py:513.
+    telegram_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True).with_variant(TIMESTAMP(timezone=True), "postgresql"),
         server_default=func.now(),

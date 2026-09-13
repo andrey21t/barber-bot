@@ -512,6 +512,15 @@ async def create_booking(
 
     client = await _select_or_create_client(session, telegram_id)
 
+    # Persist @username в Client для рендера в списках admin (миграция 009).
+    # НЕ затираем None'ом — если пользователь удалил @username в Telegram
+    # (privacy setting), payload.telegram_username будет None, но мы НЕ
+    # обнуляем client.telegram_username (сознательное решение: лучше валидный
+    # старый, чем отсутствие — иначе admin видит запись без @username у
+    # клиента, который раньше его имел). Обновляем только если non-None.
+    if payload.telegram_username:
+        client.telegram_username = payload.telegram_username
+
     # Multi-client capacity check (Этап 5.5, B1 fix): acquire advisory lock + count
     # overlapping active bookings AFTER _select_or_create_client (rollback-prone
     # above) but BEFORE Booking INSERT (line below). workday_id/capacity captured

@@ -605,10 +605,9 @@ async def cmd_today(message: Message, state: FSMContext) -> None:
 
     async with async_session_factory() as session:
         bookings = await get_today_bookings(session, master_id, tz)
-        # Session 5.46 (B.10): bulk-fetch client phones for the bookings.
-        # Single SELECT — not N+1 (one query per booking). Phone is an attribute
-        # of Client, not a snapshot in Booking, so we resolve via Client.id.
-        client_phones = await _fetch_client_phones(session, bookings) if bookings else {}
+        # Миграция 009: bulk-fetch @username для рендера "(@username)" в списке.
+        # Single SELECT — not N+1 (mirror _fetch_client_phones pattern).
+        client_usernames = await _fetch_client_usernames(session, bookings) if bookings else {}
         # Session 5.63 (пункт 3): fetch today's WorkDay to gate [🔒 Закрыть день]
         # button in admin_today_keyboard. None if no workday, is_active=False if
         # already closed — both hide the close button.
@@ -629,7 +628,7 @@ async def cmd_today(message: Message, state: FSMContext) -> None:
         return
 
     await message.answer(
-        _render_bookings("📅 Записи на сегодня:", bookings, tz, client_phones=client_phones),
+        _render_bookings("📅 Записи на сегодня:", bookings, tz, client_usernames=client_usernames),
         reply_markup=admin_today_keyboard(bookings, tz, today_workday=today_workday),
     )
 
@@ -657,15 +656,15 @@ async def cmd_week(message: Message, state: FSMContext) -> None:
 
     async with async_session_factory() as session:
         bookings = await get_all_future_bookings(session, master_id, tz)
-        # Session 5.46 (B.10): bulk-fetch client phones (mirrors cmd_today).
-        client_phones = await _fetch_client_phones(session, bookings) if bookings else {}
+        # Миграция 009: bulk-fetch @username (mirror cmd_today).
+        client_usernames = await _fetch_client_usernames(session, bookings) if bookings else {}
 
     if not bookings:
         await message.answer("Ближайших записей нет.")
         return
 
     await message.answer(
-        _render_bookings("📅 Ближайшие записи:", bookings, tz, client_phones=client_phones)
+        _render_bookings("📅 Ближайшие записи:", bookings, tz, client_usernames=client_usernames)
     )
 
 
@@ -899,12 +898,41 @@ async def _fetch_client_phones(
     return {row[0]: row[1] for row in rows}
 
 
+async def _fetch_client_usernames(
+    session: AsyncSession, bookings: list[Booking]
+) -> dict[UUID, str | None]:
+    """Bulk-fetch Client.telegram_username for a list of bookings (миграция 009).
+
+    Mirror _fetch_client_phones pattern. Single SELECT — not N+1. Returns
+    {client_id: telegram_username | None}. Used by /today and /week to render
+    "(@username)" suffix after client name (Telegram auto-linkify в HTML mode).
+
+    Args:
+        session: async SQLAlchemy session (caller-managed — same session as
+            the bookings query).
+        bookings: list of Booking rows (must have .client_id populated).
+
+    Returns:
+        dict {client_id: telegram_username | None}. Missing Client rows →
+        not in dict; renderer treats missing keys as "no @username".
+    """
+    if not bookings:
+        return {}
+    from bot.models import Client
+
+    client_ids = {b.client_id for b in bookings}
+    stmt = select(Client.id, Client.telegram_username).where(Client.id.in_(client_ids))
+    rows = (await session.execute(stmt)).all()
+    return {row[0]: row[1] for row in rows}
+
+
 def _render_bookings(
     title: str,
     bookings: list[Booking],
     business_timezone: str,
     *,
     client_phones: dict[UUID, str | None] | None = None,
+    client_usernames: dict[UUID, str | None] | None = None,
 ) -> str:
     """Render bookings list. client_name_snapshot + service_title_snapshot
     are already html.escape()'d in DB — no re-escape needed.
@@ -913,16 +941,29 @@ def _render_bookings(
     2026-08-21). A multi-line client_name_snapshot would break list formatting.
     We replace `\n` with space here (display-only, DB stays intact).
 
-    Session 5.46 (B.10): phone column added. If ``client_phones`` dict is
-    provided (caller fetched via _fetch_client_phones), each row shows
-    "📞 +79991234567" or "без телефона". If dict is None (legacy callers
-    that haven't been updated), phone is omitted entirely — backwards
-    compat for /closeday and other callers that don't pass client_phones.
+    Session 5.46 (B.10): phone column. If ``client_phones`` dict is provided
+    (caller fetched via _fetch_client_phones), each row shows
+    "📞 +79991234567" or "без телефона". If dict is None (legacy callers that
+    haven't been updated), phone is omitted entirely — backwards compat for
+    legacy callers (e.g. cmd_openday/admin_move pre-009). cmd_today/cmd_week
+    no longer pass client_phones (user: "без телефона" — фигня), only
+    client_usernames (миграция 009).
+
+    Миграция 009: @username column. If ``client_usernames`` dict is provided
+    (caller fetched via _fetch_client_usernames), each row shows
+    "(@username)" suffix after name (Telegram auto-linkify в parse_mode=HTML,
+    no <a href> needed). If dict is None → backwards compat, no suffix.
 
     Phone is rendered RAW (no escape) — it's digits and '+' only, no HTML
-    metacharacters. Phone column is deprecated (phone step removed in 5.50,
-    existing rows were normalized by the former normalize_phone gatekeeper).
-    html.parse_mode would still treat any text inside the line as text (no < >).
+    metacharacters. telegram_username stored RAW in DB (booking.py:522
+    assigns payload.telegram_username directly), escaped exactly once at
+    render time (admin.py:990 `html.escape(username, quote=False)`) — no
+    double-escape risk.
+
+    Note: 3 alert messages (admin.py:495 WorkDayShrink, :2019 delete-day
+    confirm, :4180 close-day confirm) intentionally NOT updated to show
+    @username — user requested list format only for cmd_today/cmd_week,
+    alert/error messages stay as-is (not daily-use views).
     """
     from zoneinfo import ZoneInfo
 
@@ -937,13 +978,23 @@ def _render_bookings(
         # Strip newlines from already-escaped snapshots to preserve list layout
         name = b.client_name_snapshot.replace("\n", " ")
         service = b.service_title_snapshot.replace("\n", " ")
+        # Миграция 009: "(@username)" suffix after name. Telegram auto-linkify
+        # @username в parse_mode=HTML — кликабельно без <a href>. Пропускаем
+        # если dict не передан (backwards compat) или username is None/empty.
+        username_suffix = ""
+        if client_usernames is not None:
+            username = client_usernames.get(b.client_id)
+            if username:
+                # @username из Telegram spec: alphanumeric + underscore only.
+                # html.escape defensively (на случай stored injection через БД).
+                username_suffix = f" (@{html.escape(username, quote=False)})"
         # Session 5.46 (B.10): phone suffix — "📞 +79991234567" or "без телефона"
-        # (only if client_phones dict was passed by the caller).
+        # (only if client_phones dict was passed by the caller — legacy callers).
         phone_suffix = ""
         if client_phones is not None:
             phone = client_phones.get(b.client_id)
             phone_suffix = f", 📞 {phone}" if phone else ", без телефона"
-        lines.append(f"• {when} — {name}, {service}{phone_suffix}")
+        lines.append(f"• {when} — {name}{username_suffix}, {service}{phone_suffix}")
     return "\n".join(lines)
 
 
@@ -3609,9 +3660,13 @@ async def _apply_openweek(
     # (see get_bookings_for_date_range docstring — strict match to header).
     async with async_session_factory() as session:
         bookings = await get_bookings_for_date_range(session, master_id, tz, monday, sunday)
+        # Миграция 009: @username для консистентности с cmd_today/cmd_week.
+        client_usernames = await _fetch_client_usernames(session, bookings) if bookings else {}
     bookings_block = ""
     if bookings:
-        bookings_block = "\n\n" + _render_bookings("📅 Записи на неделю:", bookings, tz)
+        bookings_block = "\n\n" + _render_bookings(
+            "📅 Записи на неделю:", bookings, tz, client_usernames=client_usernames
+        )
 
     text = f"🗓 <b>Открыть неделю ({week_range})</b>\n\n{summary}{bookings_block}"
     return text, opened_days
@@ -4356,11 +4411,15 @@ async def _admin_transition_booking(
     async with async_session_factory() as session:
         today_bookings = await get_today_bookings(session, master_id, tz)
         today_workday = await select_workday(session, master_id, today_local)
+        # Миграция 009: @username для консистентности с cmd_today.
+        client_usernames = (
+            await _fetch_client_usernames(session, today_bookings) if today_bookings else {}
+        )
 
     emoji = "✅" if new_status == "completed" else "❌"
     label = "завершена" if new_status == "completed" else "отмечена как неявка"
     title = f"{emoji} Запись {label}\n\n📅 Записи на сегодня:"
-    text = _render_bookings(title, today_bookings, tz)
+    text = _render_bookings(title, today_bookings, tz, client_usernames=client_usernames)
 
     if isinstance(callback.message, Message):
         try:

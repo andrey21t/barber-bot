@@ -2794,6 +2794,89 @@ async def test_create_booking_no_username_shows_telegram_id(
     assert "@pasha" not in result.master_notification_text
 
 
+@pytest.mark.asyncio
+async def test_create_booking_persists_telegram_username(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Миграция 009: telegram_username сохраняется в Client.telegram_username
+    при create_booking (для рендера в cmd_today/cmd_week без Bot API get_chat()).
+
+    Acceptance: после create_booking с telegram_username="OlessandraOlesya",
+    Client.telegram_username == "OlessandraOlesya" в БД.
+    """
+    workday = seed_data["workday"]
+    payload = BookingCreate(
+        workday_id=workday.id,
+        start_time_local=dt_time(16, 0),
+        client_name="Olesya",
+        service_title="Окрашивание и стрижка",
+        service_id=None,
+        telegram_username="OlessandraOlesya",
+    )
+
+    await create_booking(
+        session,
+        payload,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=seed_data["client_telegram_id"],
+    )
+
+    # Re-read Client from DB to verify persist.
+    stmt = select(Client).where(Client.telegram_id == seed_data["client_telegram_id"])
+    client = (await session.execute(stmt)).scalar_one()
+    assert client.telegram_username == "OlessandraOlesya", (
+        "telegram_username must be persisted on Client after create_booking"
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_booking_does_not_overwrite_username_with_none(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """Edge case (миграция 009): если Client уже имеет telegram_username, а новый
+    BookingCreate приходит с telegram_username=None (user удалил @username в
+    Telegram privacy settings), существующий telegram_username НЕ затирается.
+
+    Сознательное решение (booking.py:513 comment): лучше валидный старый, чем
+    отсутствие — иначе admin видит запись без @username у клиента, который
+    раньше его имел (silent regression).
+    """
+    workday = seed_data["workday"]
+    client_telegram_id = seed_data["client_telegram_id"]
+
+    # Pre-populate telegram_username directly (simulating prior booking persisted it).
+    client = seed_data["client"]
+    client.telegram_username = "OlessandraOlesya"
+    await session.commit()
+
+    # create_booking with telegram_username=None (user deleted @username).
+    payload = BookingCreate(
+        workday_id=workday.id,
+        start_time_local=dt_time(11, 0),  # 11:00 to avoid overlap with 14:00 seed slot
+        client_name="Паша",
+        service_title="Стрижка",
+        service_id=None,
+        telegram_username=None,  # Edge case: user deleted @username
+    )
+    await create_booking(
+        session,
+        payload,
+        business_id=seed_data["business_id"],
+        master_id=seed_data["master_id"],
+        telegram_id=client_telegram_id,
+    )
+
+    # Re-read Client — telegram_username must NOT be overwritten with None.
+    stmt = select(Client).where(Client.telegram_id == client_telegram_id)
+    refreshed = (await session.execute(stmt)).scalar_one()
+    assert refreshed.telegram_username == "OlessandraOlesya", (
+        "Edge case: telegram_username None in payload must NOT overwrite existing"
+    )
+
+
 # ============================================================
 # B.3: transition_booking_status tests (4 статуса booking)
 # Covers: happy (confirmed→completed/no_show, transferred→completed/no_show),
