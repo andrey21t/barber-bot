@@ -9,3 +9,17 @@ __pycache__/
 .coverage
 htmlcov/
 .scratch/
+
+# IDE
+.idea/
+.cursor/
+
+# Personal AI artifacts (local only, not for commit)
+SESSION_PROMPT.md
+MY-VIBE-RULES.md
+NEXT_COVERAGE_GAPS.md
+PLANS.md
+uv.lock
+coverage.json
+AUTONOMOUS_COVERAGE_PROMPT.md
+NEXT_SESSION_PROMPT.md
