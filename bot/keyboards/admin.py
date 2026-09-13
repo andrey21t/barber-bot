@@ -822,8 +822,9 @@ def admin_week_days_keyboard(
     showing 🟡/⚪). Future day with active WorkDay → ` 🟡`. Future day with
     closed WorkDay → ` ⚪`.
 
-    Layout: 7 weekday buttons (row 1, adjust(7) compresses to ≤8/row Telegram
-    inline limit 8 buttons/row), then [✅ Открыть] + [❌ Отмена] row (adjust(2)).
+    Layout: 7 weekday buttons split 4+3 (adjust(4, 3) — 7 in one row обрезает
+    labels на iOS до "В..."/"С...", 4+3 даёт каждой кнопке ~25% ширины), then
+    [✅ Открыть] + [❌ Отмена] row (adjust(2)).
 
     Selected weekdays помечены ✅ prefix; unselected — без prefix.
     «✅ Открыть» callback_data="admin_openweek_confirm" (string).
@@ -852,7 +853,7 @@ def admin_week_days_keyboard(
         )
     builder.button(text="✅ Открыть", callback_data="admin_openweek_confirm")
     builder.button(text="❌ Отмена", callback_data="admin_openweek_cancel")
-    builder.adjust(7, 2)
+    builder.adjust(4, 3, 2)
     return builder.as_markup()
 
 
