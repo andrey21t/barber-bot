@@ -888,7 +888,9 @@ def admin_openweek_overwrite_keyboard(
         callback_data="admin_openweek_overwrite_yes",
     )
     builder.button(text="❌ Нет, отмена", callback_data="admin_openweek_overwrite_no")
-    builder.adjust(2)
+    # adjust(1) — каждая кнопка на всю ширину. adjust(2) обрезало
+    # «✅ Да, перезаписать» на iOS до «✅ Да, п...аписать».
+    builder.adjust(1)
     return builder.as_markup()
 
 

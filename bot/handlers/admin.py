@@ -3201,7 +3201,6 @@ async def _apply_openweek(
     """
     today_local = datetime.now(ZoneInfo(tz)).date()
 
-    success_lines: list[str] = []
     fail_lines: list[str] = []
     opened_days: list[OpenedDay] = []
     for weekday in sorted(selected):
@@ -3222,10 +3221,6 @@ async def _apply_openweek(
                 # Query workday_id back for edit keyboard (UPCERT created or
                 # updated — select_workday returns the row either way).
                 wd = await select_workday(session, master_id, work_date)
-            success_lines.append(
-                f"📅 {day_label} {date_label} "
-                f"{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}"
-            )
             if wd is not None:
                 opened_days.append(
                     OpenedDay(
@@ -3248,7 +3243,24 @@ async def _apply_openweek(
         except SQLAlchemyError:
             fail_lines.append(f"❌ {day_label} {date_label}: ошибка БД")
 
-    summary_lines = success_lines + fail_lines
+    # После apply — запросить ВСЕ активные WorkDays недели (существующие + только
+    # что открытые). Summary показывает полное расписание недели, не только
+    # выбранные дни (fix UX: мастер видит все открытые дни, включая те что не
+    # менял — Request Екатерины 2026-09-13).
+    all_open_lines: list[str] = []
+    for weekday in range(7):
+        work_date = monday + timedelta(days=weekday)
+        if work_date < today_local:
+            continue
+        async with async_session_factory() as session:
+            wd = await select_workday(session, master_id, work_date)
+        if wd is not None and wd.is_active:
+            day_label = _WEEKDAY_LABELS_HANDLER[weekday]
+            date_label = work_date.strftime("%d.%m")
+            window = f"{wd.start_time.strftime('%H:%M')}–{wd.end_time.strftime('%H:%M')}"
+            all_open_lines.append(f"📅 {day_label} {date_label} {window}")
+
+    summary_lines = all_open_lines + fail_lines
     summary = "\n".join(summary_lines) if summary_lines else "Ничего не открыто."
 
     sunday = monday + timedelta(days=6)
