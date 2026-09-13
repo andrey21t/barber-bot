@@ -1,161 +1,214 @@
-# NEXT_SESSION_PROMPT — barber-bot, admin UX refactor (5 пунктов от Екатерины)
+# NEXT_SESSION_PROMPT — barber-bot, 7 коммитов на проде (6 UX-fix + delete-day)
 
 ## Контекст
 
-Екатерина потестировала 5.61 (week nav) и дала 5 пунктов UX-улучшений.
-Продолжаем работу в `~/PycharmProjects/barber-bot/` (личный pet-проект, коммитить свободно, AGENTS.md § git-repo-categories).
+7 коммитов в 2 сессиях. 6 UX-фиксов Екатерины (PLANS.md:1749) + 1 фича delete-day
+(«хочу удалить полностью день в процессе редактирования» — feedback по 6 правкам
+на проде). Все 736 тестов зелёные, ruff чистый, mypy baseline 16 (0 новых).
+**ДЕПЛОИРОВАНО на prod** (Timeweb, `d2c78e6` = origin/main).
 
-**Репо:** `~/PycharmProjects/barber-bot/`
-**Стек:** Python 3.12, aiogram 3.x, SQLAlchemy 2.0 async, SQLite (dev), APScheduler, freezegun.
-**Правила:** `MY-VIBE-RULES.md` — dev-режим (код сразу, без педагогики), гейты: deep-analysis на нетривиальное → реализация → verify → code-review.
-**Деплой:** VPS через ssh+git pull+systemctl restart (детали в `~/.config/opencode/references/barber-bot-deploy-credentials.md`).
+**Репо:** `~/PycharmProjects/barber-bot/` (личный pet-проект, коммитить свободно — AGENTS.md § git-repo-categories)
+**Last commit:** `d2c78e6` (pushed to origin/main, prod на Timeweb)
+**Working tree:** чисто (только NEXT_SESSION_PROMPT.md modified — AI-артефакт, в коммиты не входит)
+**Предыдущий commit до сессии:** `cb5fd77` (B.3 — 4 статуса booking)
 
-## Проверь себя (ОБЯЗАТЕЛЬНО в начале сессии)
+## Что сделано (6 коммитов, хронологически)
 
-1. `cd ~/PycharmProjects/barber-bot && git log --oneline -5` — последний коммит `a642e41`.
-2. `uv run pytest --cov=bot --cov-report=term 2>&1 | tail -5` — TOTAL 89%, admin.py 81%, client.py 90%.
-3. `uv run ruff check .` — All checks passed.
-4. `uv run mypy bot tests 2>&1 | grep -c error:` — 17 (pre-existing, НЕ наши).
+### 1. `7a42a70` — 3 UX-бага от Екатерины (исходные)
 
-Если что-то не так — откатись к `a642e41` (`git reset --hard a642e41`), рапорт INCOMPLETE.
+**Баг 1 — `/services` показывает список вместо FSM add:**
+- `bot/keyboards/admin.py`: `AdminServiceDeleteCallbackData`, `AdminServiceAddEntryCallbackData`, `admin_services_list_keyboard` (🗑 per row + ➕ Добавить новую)
+- `bot/handlers/admin.py`: `admin_services_cb` → list render; `admin_service_add_entry_cb` (FSM flow); `admin_service_delete_cb` (IDOR guard + active bookings guard + plural form)
+- Тесты: 29 тестов Баг 1
 
-## Что сделано в прошлой сессии (coverage Tier 2+3+4)
+**Баг 2 — На шаге 3 /openweek осталась навигация по неделям:**
+- `bot/keyboards/admin.py`: `admin_week_days_keyboard` — убраны `can_go_prev`/`can_go_next`, nav row [← Пред.]/[След. →] больше не рендерится
+- `bot/handlers/admin.py`: удалён `admin_openweek_week_nav_cb` для state=opening_week_days
+- Тесты: -4 теста nav, +1 test `test_admin_week_days_keyboard_no_nav_buttons_after_bug2`
 
-- **T2.1-T2.7** (admin.py + client.py edges, 7 коммитов): admin.py 66%→81%, client.py 79%→90%
-- **T3.1-T3.3** (config.py + keyboards/admin.py + main.py, 1 коммит `51ddc01`): config.py 100%, keyboards/admin.py 100%, main.py 97%
-- **T4.1-T4.2** (book_date_cb + transfer_slot_30_cb error mappings, 1 коммит `a642e41`): +15 тестов
-- **Итог:** TOTAL 80%→89% (−389 stmts miss), 601→694 тестов (+93)
+**Баг 3 — Summary /openweek после apply выглядит как кнопки:**
+- `bot/handlers/admin.py`: `_render_openweek_edit_summary:1494` и `_apply_openweek:3225` — префикс ✅ → 📅 в per-day lines
+- Тесты: 4 теста обновлены (✅ → 📅 в assertions)
 
-## Задачи сессии: 5 UX-улучшений от Екатерины
+### 2. `08deb2b` — greeting master.name from DB (multi-tenant задел)
 
-ЕКАТЕРИНА ПРОСИЛА. Порядок её запросов (по приоритету):
+- `bot/handlers/start.py`: замена hardcoded "Привет, Екатерина!" на DB lookup `Master.name by telegram_id`. Fallback "мастер" в 3 edge cases: master not found, DB error, name empty/whitespace. HTML-escape (mirrors `scheduler.py:189`)
+- Тесты: +4 теста (found/not found/DB error/HTML escape)
+- Функция `_resolve_master_name(telegram_id)` — задел для multi-tenant (при втором мастере greeting подхватится автоматически)
 
-### Пункт 1: Навигация по неделям на Шаге 1 (не на Шаге 3)
+### 3. `df8a977` — шаг 3 дни в 2 ряда (4+3), не обрезаются на iOS
 
-**Сейчас:** `/openweek` flow: Шаг 1 (выбор start_time) → Шаг 2 (выбор end_time) → Шаг 3 (выбор дней недели с навигацией ← Пред. / След. →). Навигация по неделям только на шаге 3.
+- `bot/keyboards/admin.py`: `admin_week_days_keyboard` — `adjust(7, 2)` → `adjust(4, 3, 2)`. 7 кнопок в 1 ряд обрезало labels до "В...", "С..." на iOS. Теперь 4+3+2 (дни/дни/actions)
 
-**Хочет:** Навигацию по неделям на шаге 1 (до выбора времени окна). Логика — сначала выбрал неделю, потом время, потом дни.
+### 4. `94b54bf` — summary показывает ВСЕ дни недели + кнопка перезаписи на всю ширину
 
-**Файлы:**
-- `bot/handlers/admin.py:2882-2922` — `admin_openweek_entry_cb` (Шаг 1, показывает `admin_window_slot_picker_keyboard` mode="start")
-- `bot/handlers/admin.py:2925-3063` — `admin_openweek_start_cb` → `admin_openweek_end_cb` (Шаг 2 → Шаг 3, тут `admin_week_days_keyboard` с навигацией)
-- `bot/keyboards/admin.py:588-` — `admin_week_days_keyboard` (кнопки ← Пред. / След. → через `AdminOpenWeekNavCallbackData`)
-- `bot/states.py:65-67` — `opening_week_start`, `opening_week_end`, `opening_week_days`
+- `bot/handlers/admin.py`: `_apply_openweek` — после apply запросит ВСЕ активные WorkDays недели (существующие + новые), summary показывает полное расписание, не только selected
+- `bot/keyboards/admin.py`: `admin_openweek_overwrite_keyboard` — `adjust(2)` → `adjust(1)`. Кнопка "✅ Да, перезаписать" на всю ширину, не обрезается
 
-**Архитектурное решение (обдумать):** Сейчас week_offset хранится в FSM state и читается на шаге 3. Чтобы дать навигацию на шаге 1 — нужно добавить nav-кнопки в `admin_window_slot_picker_keyboard` ИЛИ показывать отдельную week-picker клавиатуру ПЕРЕД slot picker. Второй вариант чище: новый шаг 0 "выбор недели" → шаг 1 (start_time) → шаг 2 (end_time) → шаг 3 (дни).
+### 5. `a606dcf` — ✏️ для ВСЕХ активных дней + ✅ Готово layout
 
-### Пункт 2: Убрать кнопку "Открыть день" (старый текстовый формат)
+- `bot/handlers/admin.py`: `_apply_openweek` — `opened_days` теперь через `_refresh_opened_days` (ВСЕ активные WorkDays недели), не только selected. Мастер видит ✏️ для каждого открытого дня
+- `bot/keyboards/admin.py`: `admin_openweek_edit_keyboard` — `adjust(7, 1)` → `adjust(4, 3, 1)`
 
-**Сейчас:** Кнопка "📅 Открыть день" (`admin_inline_menu` row 1) → `AdminOpendayCallbackData` → `admin_openday_cb` → `SimpleCalendar` → текстовый ввод `ЧЧ:ММ` для start_time и end_time. Старый UX с ручным вводом времени.
+### 6. `68246ed` — ✅ Готово ВСЕГДА на отдельной строке
 
-**Хочет:** Убрать кнопку "Открыть день" совсем. Оставить одну кнопку "Открыть запись" (переименовать "Открыть неделю").
+- `bot/keyboards/admin.py`: `admin_openweek_edit_keyboard` — заменил `adjust(4, 3)` на явные `builder.row()` per chunk. ✅ Готово всегда на отдельной строке, для 1-7 дней
+- При 3 днях `adjust(4, 3, 1)` пихал Готово в 1 ряд с ✏️ → обрезалось "...ово". Теперь: ✏️ в рядах по 4 (builder.row), ✅ Готово в отдельном ряду (builder.row)
 
-**Файлы:**
-- `bot/keyboards/admin.py:139` — кнопка "📅 Открыть день" (`AdminOpendayCallbackData`)
-- `bot/handlers/admin.py:1121-1147` — `admin_openday_cb` (entry point)
-- `bot/handlers/admin.py:1150-1245` — `admin_openday_calendar_cb` + `admin_openday_start_msg` + `admin_openday_end_msg` (весь текстовый flow)
-- `bot/states.py:58-60` — `opening_workday_date`, `opening_workday_start`, `opening_workday_end`
+### 7. `d2c78e6` — /openweek delete-day flow (feedback Екатерина 2026-09-13)
 
-**Что сохранить:** `cmd_openday` (текстовая команда `/openday 2026-09-18 11:00 18:00`) — оставляем как power-user shortcut, не трогаем. Удаляем только inline-кнопку + `admin_openday_cb` + FSM flow (calendar + text message handlers). Тесты на эти handlers — удалить или адаптировать.
+**Фича:** «хочу удалить полностью день в процессе редактирования. Например я
+выбрал что у меня открыто 5 дней. Но я хочу удалить полностью субботу».
 
-### Пункт 3: Убрать кнопку "Закрыть день"
+Flow: `[🗑 Удалить день]` в `admin_openweek_edit_keyboard` (post-/openweek apply) →
+delete picker (`[🗑 Пн] [🗑 Вт] ... [← Назад]`) → если 0 записей — close сразу,
+иначе confirm (`[✅ Да, удалить] / [❌ Отмена]`) →
+`close_workday_with_cancellations` + notify cancelled clients + remove scheduler
+jobs + re-render edit keyboard (без удалённого дня).
 
-**Сейчас:** Кнопка "📅 Закрыть день" (`admin_inline_menu` row 3) → `AdminCloseDayEntryCallbackData` → отдельный flow.
+- **5 новых CallbackData** (stateless — race-safe vs FSM state loss):
+  `AdminOpenweekDeleteEntryCallbackData`, `AdminOpenweekDeleteDayCallbackData`,
+  `AdminOpenweekDeleteConfirmCallbackData`, `AdminOpenweekDeleteCancelCallbackData`,
+  `AdminOpenweekDeleteBackCallbackData`
+- **5 новых handlers** в `bot/handlers/admin.py`
+- **2 новые keyboards** в `bot/keyboards/admin.py`:
+  `admin_openweek_delete_picker_keyboard`, `admin_openweek_delete_confirm_keyboard`
+- **`admin_openweek_edit_keyboard` обновлён**: `[🗑 Удалить день]` в отдельном ряду
+  (only if `opened_days` non-empty — monday_iso из `opened_days[0].work_date_iso`)
+- **Bug fix в `admin_openweek_delete_confirm_cb`**: проверка
+  `result is None or result.was_already_closed` (close_workday_with_cancellations
+  возвращает `ClosedDayResult(was_already_closed=True)` при `is_active=False`,
+  НЕ None — None только если row нет в DB)
+- **13 новых тестов**: edit keyboard 🗑 button (presence/absence), picker
+  keyboard layout, confirm keyboard layout, entry cb (picker/alert/race/non-admin/master-not-found),
+  day cb (0 bookings/race), confirm cb (close+notify/race), cancel cb, back cb
 
-**Хочет:** Убрать кнопку "Закрыть день". Закрытие дня сделать внутри flow "Открыть запись" (когда день уже открыт — показывать опцию "закрыть" рядом с "изменить окно").
+### Wire format (64-byte aiogram limit)
 
-**Файлы:**
-- `bot/keyboards/admin.py:144` — кнопка "📅 Закрыть день"
-- `bot/handlers/admin.py` — `cmd_closeday` + `admin_closeday_*` handlers (найти через grep `closeday\|CloseDay`)
-- `bot/states.py` — closing_day states (если есть)
+| Callback | Wire | Bytes |
+|---|---|---|
+| `admin_ow_del:<YYYY-MM-DD>` | entry | 22 |
+| `admin_ow_del_day:<YYYY-MM-DD>:<32hex>` | day | 64 (точно лимит) |
+| `admin_ow_del_conf:<32hex>` | confirm | 54 |
+| `admin_ow_del_cancel:<YYYY-MM-DD>` | cancel | 30 |
+| `admin_ow_del_back:<YYYY-MM-DD>` | back | 27 |
 
-**Архитектура:** "Закрыть день" — это `update_workday(is_active=False)`. Можно встроить в "Сегодня" view (показать кнопку "Закрыть" рядом с каждым активным днём) ИЛИ в "Изменить окно" flow. Обдумать.
+work_date_iso НЕ в confirm callback (экономия 11 байт) — handler кверит WorkDay
+по workday_id. weekday НЕ в day callback (экономия 2 байт) — handler вычисляет
+из work_date.
 
-### Пункт 4: Цветовое обозначение дней с записью в календаре
+**Проблема:** первые 3 деплоя (`7a42a70`, `08deb2b`, `df8a977`) ушли в void — prod работал на старом коде `cb5fd77`. `docker-compose.yml` использует `build: .` (код копируется в image при сборке, не volume mount). `--force-recreate` пересоздаёт контейнер из старого image.
 
-**Сейчас:** В `admin_week_days_keyboard` уже есть маркеры `🟡` (active WorkDay) и `⚪` (closed WorkDay) — сделаны в 5.61, но Екатерина их НЕ видит. Возможные причины:
-- Не задеплоено (проверить: `git log --oneline -3` на VPS, сравнить с локальным main)
-- Маркеры только в /openweek flow (шаг 3), а не в обычном календаре
-- Екатерина смотрит на SimpleCalendar (cmd_openday / admin_addslots), а там нет маркеров
+**Фикс:** начиная с `df8a977` — `docker compose up -d --build bot` (с `--build` для пересборки image).
 
-**Хочет:** В календаре (где выбираешь дату) дни с уже открытой записью — выделить цветом/эмодзи, чтобы было видно где уже открыто.
+**Запомнить для будущих деплоев:** ВСЕГДА `docker compose up -d --build bot`, не `--force-recreate`.
 
-**Файлы:**
-- `bot/keyboards/admin.py:588-` — `admin_week_days_keyboard` (маркеры есть, но только в /openweek шаг 3)
-- `bot/keyboards/admin.py:150-165` — `admin_calendar_keyboard` (SimpleCalendar — НЕТ маркеров, это для /addslots и /openday)
-- `bot/handlers/admin.py` — `_scheduled_closed_weekdays` helper (gather active/closed WorkDays for week)
+## Verify status (ВСЁ ЗЕЛЁНОЕ)
 
-**Проблема:** aiogram_calendar (SimpleCalendar) НЕ поддерживает кастомные маркеры на днях из коробки. Нужно либо:
-- (A) Свой date-picker с маркерами (как BB-110 BookDateCallbackData в client.py — там свой picker с callback_data на каждый день)
-- (B) Перед показом календаря — текстовое сообщение "Уже открыто: Пн 15:00-18:00, Ср 10:00-20:00" + потом календарь
-- (C) Свой inline keyboard с днями месяца (grid 7 колонок) + эмодзи на открытых днях
+- `ruff check bot/ tests/` → All checks passed!
+- `mypy bot/ tests/` → 16 errors (pre-existing baseline, 0 новых)
+- `pytest tests/` → **736 passed, 2 skipped** (skipped — Postgres-only race tests)
+- `git diff --stat cb5fd77..HEAD` → 9 файлов, +2179 -413 строк
 
-### Пункт 5: Плавающее меню для админа (как у клиента)
+## Deploy status (ПРОД ОБНОВЛЁН)
 
-**Сейчас:** Админ получает inline keyboard (`admin_inline_menu`) — она уезжает вверх по чату, нужно скроллить или вводить `/menu` чтобы вернуть. Клиент имеет reply keyboard (`client_reply_keyboard`) — всегда видна внизу.
+- Timeweb VPS `188.225.82.248`, `/opt/barber-bot`
+- Prod git: `d2c78e6` = origin/main (синхронизировано)
+- Bot: Up, polling active на `@My_Barber_hair_bot`
+- Команда деплоя: `docker compose up -d --build bot` (ВНИМАНИЕ: `--build`, не `--force-recreate`)
 
-**Хочет:** Чтобы админ тоже имел всегда видимое меню внизу (reply keyboard), не нужно вводить `/menu` или рандомные буквы.
+## Осталось (СЛЕДУЮЩАЯ СЕССИЯ)
 
-**Файлы:**
-- `bot/handlers/start.py:39-47` — админ-ветка cmd_start (отправляет `ReplyKeyboardRemove` + inline menu)
-- `bot/handlers/start.py:48-53` — клиент-ветка (отправляет `client_reply_keyboard` — reply keyboard, всегда видна)
-- `bot/keyboards/admin.py:168-184` — `admin_keyboard()` — deprecated reply keyboard (5 кнопок `/addslots /closeslot /today /week /services add`)
-- `bot/keyboards/admin.py:126-147` — `admin_inline_menu()` — текущий inline menu (7 кнопок)
+### 0. Cleanup branch `cleanup/orphan-handlers-and-test-names` (готова, не на main)
 
-**Архитектурное решение (обдумать):**
-- (A) Reply keyboard с одной кнопкой "📋 Меню" → тап → показывает inline menu в сообщении (максимально просто, но inline menu всё равно уедет вверх)
-- (B) Reply keyboard с 2-3 главными кнопками ("Открыть запись", "Сегодня", "Меню") → "Меню" разворачивает полный inline menu. Compromise.
-- (C) Полностью перейти на reply keyboard для админа (как клиент) — но тогда нельзя показать inline picker'ы (calendar, slot picker) одновременно с reply keyboard. aiogram позволяет комбинировать, но UX сложнее.
+**Ветка создана:** `cleanup/orphan-handlers-and-test-names` (от `2a3c13f` на main).
+**Чекаут:** `git checkout cleanup/orphan-handlers-and-test-names`
 
-**Важно:** `admin_keyboard()` (deprecated reply keyboard) уже существует — можно адаптировать. Но её кнопки (`/addslots /closeslot`) устарели после пунктов 2-3.
+**Задача:** почистить orphan handlers + переименовать тесты (W1 + W2 из code review `[REDACTED-SESSION-ID]`).
 
-## Порядок работы (MY-VIBE-RULES.md)
+**W1 — Orphan handlers (dead code):**
+- `bot/handlers/admin.py:2302-2333` — `admin_today_cb` (зарегистрирован, но ни одна кнопка не пакует `AdminTodayCallbackData`)
+- `bot/handlers/admin.py:2334-2403` — `admin_week_cb` (то же для `AdminWeekCallbackData`)
+- `bot/keyboards/admin.py:64-69` — классы `AdminTodayCallbackData` / `AdminWeekCallbackData` (не используются ни в одном `.pack()`)
+- Тесты (6 шт., инвокируют напрямую, не через UI routing):
+  - `tests/test_admin_handlers.py:6274-6388` — 5 тестов `test_admin_today_cb_*`
+  - `tests/test_admin_handlers.py:1294-1385` — 3 теста `test_admin_week_cb_*`
+- **Решение:** удалить handlers + классы + тесты. НЕ оставлять dead code (вариант "b" из review — не выбран, путает maintainer).
+- **Альтернатива:** если хочешь оставить кнопки сегодня/неделя в каком-то inline под-меню в будущем — помечай как `# Dead code, kept for potential future re-introduction` (но это не наш кейс — они в reply keyboard).
 
-Для **каждой** задачи:
-1. **Deep-analysis Pass 1-4** (risk: logic — FSM state-переходы, UX flow change; обязательно для п.1 и п.5, medium для п.2-4)
-2. **Реализация** — код + тесты. Один блок = один коммит.
-3. **Verify** — `uv run pytest tests/ -x && uv run ruff check . && uv run mypy bot tests 2>&1 | grep -c error:`
-4. **Code-review** через `task(subagent_type="code-reviewer")` — обязательно (logic change, не trivial)
-5. **Коммит** — свободный (личный репо). Формат: `feat(admin): <что> (пункт N)` или `refactor(admin): <что> (пункт N)`
-6. **Push** после каждого коммита: `git push origin main`
-7. **Деплой** на VPS после всех 5 пунктов (или после блока связанных): ssh+git pull+systemctl restart. Live-тест с Екатериной.
+**W2 — Устаревшие имена тестов:**
+- `tests/test_admin_handlers.py:2457` — `test_admin_inline_menu_has_6_buttons_no_openday` (asserts 3) → переименовать в `test_admin_inline_menu_has_3_buttons_after_duplication_cleanup`
+- `tests/test_admin_handlers.py:5477` — `test_admin_inline_menu_has_5_buttons_no_closeday` (asserts 3) → то же
+- Комментарий-секция `# Session 5.62 (пункт 2)...` (test_admin_handlers.py:2453) устарел — обновить или заменить на `# Session 2026-09-13 — упрощение`
 
-**Один коммит на одну задачу** (пункт 1, 2, ... — отдельные коммиты).
+**Verify после cleanup:**
+- `uv run ruff check bot/ tests/` → All checks passed
+- `uv run mypy bot/ tests/` → 16 baseline (0 новых)
+- `uv run pytest tests/` → ожидаем 730 passed, 2 skipped (736 - 6 удалённых orphan тестов = 730)
+- После verify → `git commit` на ветке `cleanup/orphan-handlers-and-test-names` → PR или merge в main (на усмотрение пользователя)
 
-## Порядок приоритета (зависимости)
+### 1. Получить feedback Екатерины
 
-Пункт 2 (убрать "Открыть день") и Пункт 3 (убрать "Закрыть день") — зависят от renaming в пункте 5. Логичный порядок:
+Проверить на проде 7 правок:
+1. `/services` → список услуг с 🗑 + ➕ Добавить новую (вместо FSM add)
+2. Шаг 3 `/openweek` → дни в 2 ряда (4+3), нет nav row
+3. Summary `/openweek` после apply → 📅 prefix (не ✅)
+4. Greeting `/start` → "Привет, {master.name}!" из DB (для Екатерины = "Привет, Екатерина!")
+5. Summary `/openweek` → показывает ВСЕ открытые дни недели (не только выбранные)
+6. Edit keyboard `/openweek` → ✏️ для всех активных дней + ✅ Готово на отдельной строке
+7. Edit keyboard `/openweek` → `[🗑 Удалить день]` → picker → confirm (если записи) → close + notify + re-render без удалённого дня
 
-1. **Пункт 5** (reply keyboard для админа) — фундамент, меняет start.py + keyboards
-2. **Пункт 2** (убрать "Открыть день") — заодно убираем кнопку из нового reply keyboard
-3. **Пункт 3** (убрать "Закрыть день") — встраиваем закрытие в "Сегодня" view
-4. **Пункт 1** (навигация по неделям на шаге 1) — refactor /openweek flow
-5. **Пункт 4** (цветовые маркеры в календаре) — последний, требует решения по aiogram_calendar vs custom picker
+### 2. Возможные follow-up (по feedback)
 
-## Что НЕ делать
+- Если Екатерина хочет изменить окно для дня НЕ через ✏️, а через другую точку входа — обсудить UX
+- Multi-tenant рефакторинг (high-stakes, separate task): остальные `if user.id == settings.ADMIN_ID` в коде — полный рефакторинг с PLANS.md + deep-analysis-critic
 
-- ❌ Не ломать `cmd_openday` (текстовая команда `/openday 2026-09-18 11:00 18:00`) — power-user shortcut, оставляем
-- ❌ Не трогать клиентский flow (bot/handlers/client.py) — только admin UX
-- ❌ Не чинить 17 pre-existing mypy errors (см. выше список) — не наши
-- ❌ Не коммитить IP-адреса / креды VPS (pre-push hook: IP regex)
-- ❌ Не деплоить промежуточные коммиты — только после блока связанных пунктов
+### 3. PLANS.md — обновить (после feedback)
 
-## Телеметрия после каждой задачи
+Записать Session log в PLANS.md (строка 1749 «Сессия 2026-09-13 — UX-баги от Екатерины»): статус → ✅ все 6 коммитов в prod, feedback pending.
 
-После каждого коммита — записывай в PLANS.md:
+## Промпт для следующей сессии
+
 ```
-### Пункт N — <что> (commit <hash>, pushed)
-- Что изменилось: <кратко>
-- Файлов изменено: N
-- Тестов: +N (новых) / -N (удалённых) / изменившихся: N
-- Coverage: TOTAL X% → Y%
-- Время: ~XX мин
+Продолжаем barber-bot (~/PycharmProjects/barber-bot, origin/main на 68246ed,
+прод на Timeweb @My_Barber_hair_bot). 6 UX-фиксов от Екатерины ДЕПЛОИРОВАНО
+в prod (3 исходных бага + 3 доп. по ходу тестирования: дни в 2 ряда, summary
+все дни, ✏️ для всех активных дней, ✅ Готово на отдельной строке).
+
+Все 720 тестов зелёные, ruff чистый, mypy baseline 16 errors (0 новых).
+
+Жду feedback Екатерины по 6 правкам на проде. Возможны follow-up по UX.
+Деплоить через `docker compose up -d --build bot` (ВНИМАНИЕ: --build, не
+--force-recreate — иначе image не пересобирается, prod работает на старом
+коде, инцидент в начале сессии 2026-09-13).
+
+NEXT_SESSION_PROMPT.md в корне репо содержит детали каждого коммита +
+deploy instructions. Только факты, без воды.
 ```
 
-## Финальный отчёт сессии
+## Технические детали (для справки)
 
-В конце — резюме:
-- Какие пункты сделаны (1-5)
-- Деплой: да/нет
-- Live-тест: да/нет (если да — что сказала Екатерина)
-- Что НЕ сделано — конкретные file:line + причина
+### Коммиты и файлы
+
+| Commit | Files | + Lines | - Lines |
+|---|---|---|---|
+| `7a42a70` | admin.py, keyboards/admin.py, test_admin_handlers.py, test_integration_admin_flows.py | 691 | 358 |
+| `08deb2b` | start.py, test_start_handlers.py | 198 | 13 |
+| `df8a977` | keyboards/admin.py | 4 | 3 |
+| `94b54bf` | admin.py, keyboards/admin.py | 21 | 7 |
+| `a606dcf` | admin.py, keyboards/admin.py | 19 | 30 |
+| `68246ed` | keyboards/admin.py | 23 | 16 |
+| **Итого** | 6 файлов | **934** | **405** |
+
+### Deploy credentials
+
+`~/.config/opencode/references/barber-bot-deploy-credentials.md` (forbidden к git по AGENTS.md § git-repo-categories). HOST: 188.225.82.248, USER: root.
+
+### Креды для деплоя (НЕ выводить в чат)
+
+```bash
+SSHPASS=$(grep -E '^PASS:' ~/.config/opencode/references/barber-bot-deploy-credentials.md | sed 's/^PASS: //') \
+sshpass -e ssh -o ConnectTimeout=10 -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+root@188.225.82.248 \
+'cd /opt/barber-bot && git pull origin main && docker compose up -d --build bot && sleep 5 && docker compose logs --tail=5 bot'
+```
