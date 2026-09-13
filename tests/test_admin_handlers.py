@@ -4211,62 +4211,21 @@ def test_admin_week_days_keyboard_past_overrides_scheduled() -> None:
     assert "Пн 🟡" not in labels, "Past day must NOT show 🟡"
 
 
-def test_admin_week_days_keyboard_nav_buttons_default_present() -> None:
-    """5.61: by default both ← Пред. and След. → buttons are present."""
+def test_admin_week_days_keyboard_no_nav_buttons_after_bug2() -> None:
+    """Session 2026-09-13, Баг 2: nav row [← Пред.]/[След. →] убран из
+    admin_week_days_keyboard (шаг 3). Неделя выбирается только на шаге 1
+    через admin_week_picker_keyboard + admin_openweek_week_picker_nav_cb.
+    """
     from bot.keyboards.admin import admin_week_days_keyboard
 
     kb = admin_week_days_keyboard(set())
     buttons = [btn for row in kb.inline_keyboard for btn in row]
     labels = [btn.text for btn in buttons]
 
-    assert "← Пред." in labels, "Default: prev button present"
-    assert "След. →" in labels, "Default: next button present"
-
-
-def test_admin_week_days_keyboard_nav_prev_hidden_at_offset_zero() -> None:
-    """5.61: at week_offset=0 (current week), ← Пред. is hidden — previous
-    week is fully in past, no point navigating there."""
-    from bot.keyboards.admin import admin_week_days_keyboard
-
-    kb = admin_week_days_keyboard(set(), can_go_prev=False)
-    buttons = [btn for row in kb.inline_keyboard for btn in row]
-    labels = [btn.text for btn in buttons]
-
-    assert "← Пред." not in labels, "can_go_prev=False → prev hidden"
-    assert "След. →" in labels, "can_go_next default True → next present"
-
-
-def test_admin_week_days_keyboard_nav_next_hidden_at_cap() -> None:
-    """5.61: at week_offset=MAX (4), След. → is hidden — can't go beyond cap."""
-    from bot.keyboards.admin import admin_week_days_keyboard
-
-    kb = admin_week_days_keyboard(set(), can_go_next=False)
-    buttons = [btn for row in kb.inline_keyboard for btn in row]
-    labels = [btn.text for btn in buttons]
-
-    assert "След. →" not in labels, "can_go_next=False → next hidden"
-    assert "← Пред." in labels, "can_go_prev default True → prev present"
-
-
-def test_admin_week_days_keyboard_nav_callback_data_packs_delta() -> None:
-    """5.61: nav buttons use AdminOpenWeekNavCallbackData with delta=-1/+1."""
-    from bot.keyboards.admin import (
-        AdminOpenWeekNavCallbackData,
-        admin_week_days_keyboard,
-    )
-
-    kb = admin_week_days_keyboard(set())
-    buttons = [btn for row in kb.inline_keyboard for btn in row]
-    nav_buttons = [btn for btn in buttons if btn.text in ("← Пред.", "След. →")]
-
-    assert len(nav_buttons) == 2, f"Expected 2 nav buttons; got: {len(nav_buttons)}"
-    deltas = []
-    for btn in nav_buttons:
-        assert btn.callback_data is not None
-        unpacked = AdminOpenWeekNavCallbackData.unpack(btn.callback_data)
-        deltas.append(unpacked.delta)
-    assert -1 in deltas, "← Пред. must have delta=-1"
-    assert 1 in deltas, "След. → must have delta=+1"
+    assert "← Пред." not in labels, "Баг 2: ← Пред. убран из шага 3"
+    assert "След. →" not in labels, "Баг 2: След. → убран из шага 3"
+    # Only 7 weekday buttons + ✅ Открыть + ❌ Отмена = 9 buttons.
+    assert len(buttons) == 9, f"Expected 9 buttons (7 weekdays + 2 actions); got: {len(buttons)}"
 
 
 @pytest.mark.asyncio
@@ -4317,140 +4276,12 @@ async def test_admin_openweek_end_cb_preserves_week_offset_from_state(
     )
 
 
-@pytest.mark.asyncio
-@freeze_time("2026-09-11 14:00:00", tz_offset=0)  # Friday 11.09 MSK 17:00
-async def test_admin_openweek_week_nav_cb_next_increments_offset(
-    session_factory: Any,
-    patched_session_factory: Any,
-) -> None:
-    """5.61: tap След. → (delta=+1) from week_offset=0 → week_offset=1,
-    selected_weekdays reset to [].
 
-    Friday 11.09: base monday=07.09. Next week (offset=1) monday=14.09, all
-    7 days future → past_weekdays=[]. No WorkDays seeded → scheduled/closed=[].
-    """
-    from bot.keyboards.admin import AdminOpenWeekNavCallbackData
-
-    async with session_factory() as session:
-        await _seed_admin_stack(session)
-
-    cb_data = AdminOpenWeekNavCallbackData(delta=1)
-    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
-    callback.message.edit_text = AsyncMock()
-    state = _make_mock_state(
-        {
-            "business_tz": TZ,
-            "picked_start_minute": 600,
-            "picked_end_minute": 1080,
-            "selected_weekdays": [1, 3],  # Tue + Thu selected — will reset
-            "past_weekdays": [0, 1, 2, 3],
-            "scheduled_weekdays": [],
-            "closed_weekdays": [],
-            "week_offset": 0,
-        }
-    )
-
-    await admin_handlers.admin_openweek_week_nav_cb(callback, cb_data, state)
-
-    data = _state_all_updates(state)
-    assert data["week_offset"] == 1, (
-        f"Next from offset=0 → offset=1; got: {data.get('week_offset')}"
-    )
-    assert data["selected_weekdays"] == [], (
-        f"Selected must reset on week change; got: {data.get('selected_weekdays')}"
-    )
-    # Friday 11.09 + 1 week = 14-20.09, all future → past_weekdays=[]
-    assert data["past_weekdays"] == [], (
-        f"Next week all future → no past; got: {data.get('past_weekdays')}"
-    )
-    # Alert about reset should have been shown (selected was non-empty).
-    args, kwargs = callback.answer.call_args
-    assert "Выбор сброшен" in (args[0] if args else kwargs.get("text", "")), (
-        f"Reset alert must be shown when selected was non-empty; got: {callback.answer.call_args}"
-    )
-
-
-@pytest.mark.asyncio
-@freeze_time("2026-09-11 14:00:00", tz_offset=0)  # Friday 11.09 MSK 17:00
-async def test_admin_openweek_week_nav_cb_prev_at_zero_no_op(
-    session_factory: Any,
-    patched_session_factory: Any,
-) -> None:
-    """5.61: tap ← Пред. (delta=-1) at week_offset=0 → no-op (clamped to 0).
-
-    Defense-in-depth: keyboard hides ← Пред. at offset=0, but if stale callback
-    slips through (rapid tap, race), handler clamps and does nothing.
-    """
-    from bot.keyboards.admin import AdminOpenWeekNavCallbackData
-
-    async with session_factory() as session:
-        await _seed_admin_stack(session)
-
-    cb_data = AdminOpenWeekNavCallbackData(delta=-1)
-    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
-    callback.message.edit_text = AsyncMock()
-    state = _make_mock_state(
-        {
-            "business_tz": TZ,
-            "picked_start_minute": 600,
-            "picked_end_minute": 1080,
-            "selected_weekdays": [],
-            "past_weekdays": [0, 1, 2, 3],
-            "scheduled_weekdays": [],
-            "closed_weekdays": [],
-            "week_offset": 0,
-        }
-    )
-
-    await admin_handlers.admin_openweek_week_nav_cb(callback, cb_data, state)
-
-    # No-op: handler must NOT call update_data (state unchanged) and NOT
-    # re-render message (edit_text not called).
-    assert not state.update_data.called, "Clamped no-op must NOT call update_data"
-    assert not callback.message.edit_text.called, "Clamped no-op must NOT re-render message"
-    # No-op MUST dismiss loading spinner via callback.answer() — without
-    # this, Telegram shows infinite spinner on the button.
-    callback.answer.assert_called_once()
-    # Defense-in-depth: no-op must not mutate FSM state (no clear, no set_state).
-    state.clear.assert_not_called()
-    state.set_state.assert_not_called()
-
-
-@pytest.mark.asyncio
-@freeze_time("2026-09-11 14:00:00", tz_offset=0)  # Friday 11.09 MSK 17:00
-async def test_admin_openweek_week_nav_cb_next_at_cap_no_op(
-    session_factory: Any,
-    patched_session_factory: Any,
-) -> None:
-    """5.61: tap След. → (delta=+1) at week_offset=MAX (4) → no-op (clamped)."""
-    from bot.keyboards.admin import AdminOpenWeekNavCallbackData
-
-    async with session_factory() as session:
-        await _seed_admin_stack(session)
-
-    cb_data = AdminOpenWeekNavCallbackData(delta=1)
-    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
-    callback.message.edit_text = AsyncMock()
-    state = _make_mock_state(
-        {
-            "business_tz": TZ,
-            "picked_start_minute": 600,
-            "picked_end_minute": 1080,
-            "selected_weekdays": [],
-            "past_weekdays": [],
-            "scheduled_weekdays": [],
-            "closed_weekdays": [],
-            "week_offset": 4,  # at cap
-        }
-    )
-
-    await admin_handlers.admin_openweek_week_nav_cb(callback, cb_data, state)
-
-    assert not state.update_data.called, "Clamped no-op at cap must NOT call update_data"
-    assert not callback.message.edit_text.called, "Clamped no-op at cap must NOT re-render"
-    callback.answer.assert_called_once()
-    state.clear.assert_not_called()
-    state.set_state.assert_not_called()
+# Баг 2 (Session 2026-09-13): admin_openweek_week_nav_cb для state=opening_week_days
+# удалён — nav row убран из admin_week_days_keyboard (шаг 3). Тесты этого handler'а
+# (test_admin_openweek_week_nav_cb_next_increments_offset, prev_at_zero_no_op,
+# next_at_cap_no_op) удалены — нет кнопок → нет тапов. Навигация по неделям теперь
+# только на шаге 1 через admin_openweek_week_picker_nav_cb (state=opening_week_week).
 
 
 @pytest.mark.asyncio
@@ -4665,7 +4496,7 @@ async def test_admin_openweek_confirm_cb_sunday_targets_next_week(
 
     text = callback_answer_text(callback)
     assert "прошедшая дата" not in text, f"Sunday must target next week (all future); got: {text!r}"
-    assert "✅ Пн" in text and "✅ Вт" in text and "✅ Ср" in text
+    assert "📅 Пн" in text and "📅 Вт" in text and "📅 Ср" in text
     # Verify WorkDay created for next week's Mon/Tue/Wed (31 Aug, 1, 2 Sep).
     today_local = datetime.now(ZoneInfo(TZ)).date()
     monday_this = today_local - timedelta(days=today_local.weekday())
@@ -4714,7 +4545,9 @@ async def test_admin_openweek_confirm_cb_opens_days(
 
     state.clear.assert_called_once()
     text = callback_answer_text(callback)
-    assert "✅" in text
+    # Баг 3 (Session 2026-09-13): success_lines используют 📅 prefix (не ✅),
+    # чтобы визуально отличать summary от inline-кнопок ✏️.
+    assert "📅" in text
     # Compute expected Wed/Fri of frozen week.
     today_local = datetime.now(ZoneInfo(TZ)).date()
     monday = today_local - timedelta(days=today_local.weekday())
@@ -4786,7 +4619,9 @@ async def test_admin_openweek_confirm_cb_partial_failure_shrinks_lines(
 
     text = callback_answer_text(callback)
     assert "Ср" in text and "Пт" in text
-    assert "❌" in text and "✅" in text
+    # Баг 3 (Session 2026-09-13): success_lines используют 📅 prefix (не ✅),
+    # mixed с fail_lines (❌ prefix). Проверяем наличие обоих.
+    assert "❌" in text and "📅" in text
 
 
 @pytest.mark.asyncio
@@ -6589,13 +6424,173 @@ async def test_admin_services_cb_master_not_found_alert(
 
 
 @pytest.mark.asyncio
-async def test_admin_services_cb_happy_enters_name_step(
+async def test_admin_services_cb_happy_shows_list_with_services(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """Happy: admin tap → state.clear + state.update_data(business_id) +
+    """Happy: admin tap → state.clear + edit_text 'Услуги (N):' + inline keyboard
+    with [🗑] per service + [➕ Добавить новую] (Session 2026-09-13, Баг 1).
+
+    Was: set_state(entering_service_name) + 'Введите название услуги'.
+    Now: shows list of existing services (list_services, is_active=True).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        session.add(Service(business_id=ctx["business_id"], name="Стрижка", duration_minutes=60))
+        session.add(
+            Service(
+                business_id=ctx["business_id"],
+                name="Борода",
+                duration_minutes=30,
+                price=500,
+            )
+        )
+        await session.commit()
+
+    callback = _make_callback(ADMIN_TG_ID)
+    state = _make_mock_state()
+
+    await admin_handlers.admin_services_cb(callback, state)
+
+    state.clear.assert_awaited_once()
+    state.set_state.assert_not_called()
+
+    # edit_text preferred (replaces inline menu message with services list).
+    assert callback.message.edit_text.await_count == 1
+    args, kwargs = callback.message.edit_text.call_args
+    text = str(args[0]) if args else str(kwargs.get("text", ""))
+    assert text.startswith("Услуги (2):")
+    reply_markup = kwargs.get("reply_markup") or (args[1] if len(args) > 1 else None)
+    assert reply_markup is not None
+    callback.answer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_services_cb_no_services_shows_add_only(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Edge case: no active services → text 'У вас нет активных услуг.' +
+    keyboard with only [➕ Добавить новую].
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    state = _make_mock_state()
+
+    await admin_handlers.admin_services_cb(callback, state)
+
+    state.clear.assert_awaited_once()
+    args, kwargs = callback.message.edit_text.call_args
+    text = str(args[0]) if args else str(kwargs.get("text", ""))
+    assert text == "У вас нет активных услуг."
+
+
+@pytest.mark.asyncio
+async def test_admin_services_cb_edit_text_fallback_to_answer_on_bad_request(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """TelegramBadRequest on edit_text (>48h or message deleted) → fallback to
+    answer (new message) with same text + keyboard.
+    """
+    from aiogram.exceptions import TelegramBadRequest
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        session.add(Service(business_id=ctx["business_id"], name="Стрижка", duration_minutes=60))
+        await session.commit()
+
+    callback = _make_callback(ADMIN_TG_ID)
+    # TelegramBadRequest requires (method, message) — pass MagicMock as method.
+    callback.message.edit_text = AsyncMock(
+        side_effect=TelegramBadRequest(
+            method=MagicMock(),
+            message="Bad Request: message to edit not found",
+        )
+    )
+    state = _make_mock_state()
+
+    await admin_handlers.admin_services_cb(callback, state)
+
+    callback.message.answer.assert_awaited_once()
+    args, _ = callback.message.answer.call_args
+    assert "Услуги (1):" in str(args[0])
+    callback.answer.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_admin_services_cb_message_is_none_skips_render(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Edge case: callback.message is None (deleted inline msg) → state.clear
+    still proceeds (list is stateless), but message render skipped (no edit_text
+    or answer calls).
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.message = None  # type: ignore[assignment]
+    state = _make_mock_state()
+
+    await admin_handlers.admin_services_cb(callback, state)
+
+    state.clear.assert_awaited_once()
+    callback.answer.assert_awaited_once()
+
+
+# --- admin_service_add_entry_cb (3 branches) -------------------------------
+# Session 2026-09-13, Баг 1: [➕ Добавить новую] → entering_service FSM.
+
+
+@pytest.mark.asyncio
+async def test_admin_service_add_entry_cb_non_admin_silent(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Non-admin tap on [➕] → callback.answer() + return (no state changes)."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    callback = _make_callback(NON_ADMIN_TG_ID)
+    state = _make_mock_state()
+
+    await admin_handlers.admin_service_add_entry_cb(callback, state)
+
+    callback.answer.assert_awaited_once()
+    state.clear.assert_not_called()
+    state.set_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_service_add_entry_cb_master_not_found_alert(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Admin telegram_id resolves to no master → alert 'Мастер не найден' + return."""
+    callback = _make_callback(ADMIN_TG_ID)  # no _seed_admin_stack
+    state = _make_mock_state()
+
+    await admin_handlers.admin_service_add_entry_cb(callback, state)
+
+    callback.answer.assert_awaited_once()
+    args, kwargs = callback.answer.call_args
+    assert kwargs.get("show_alert") is True
+    assert "Мастер не найден" in str(args[0] if args else kwargs.get("text", ""))
+    state.clear.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_service_add_entry_cb_happy_enters_name_step(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Happy: [➕] tap → state.clear + state.update_data(business_id) +
     set_state(entering_service_name) + answer '💇 Введите название услуги' +
-    callback.answer.
+    callback.answer (прежний flow admin_services_cb до Бага 1).
     """
     async with session_factory() as session:
         ctx = await _seed_admin_stack(session)
@@ -6604,7 +6599,7 @@ async def test_admin_services_cb_happy_enters_name_step(
     callback = _make_callback(ADMIN_TG_ID)
     state = _make_mock_state()
 
-    await admin_handlers.admin_services_cb(callback, state)
+    await admin_handlers.admin_service_add_entry_cb(callback, state)
 
     state.clear.assert_awaited_once()
     state.set_state.assert_awaited_once_with(admin_handlers.AdminStates.entering_service_name)
@@ -6617,25 +6612,252 @@ async def test_admin_services_cb_happy_enters_name_step(
     callback.answer.assert_awaited_once()
 
 
+# --- admin_service_delete_cb (8 branches) -----------------------------------
+# Session 2026-09-13, Баг 1: [🗑] → deactivate_service with active bookings
+# protection (built into service) + IDOR guard (fetch by id+business_id).
+
+
 @pytest.mark.asyncio
-async def test_admin_services_cb_message_is_none_skips_answer(
+async def test_admin_service_delete_cb_non_admin_silent(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """Edge case: callback.message is None (deleted inline msg) → state flow
-    still proceeds (clear+set_state+update_data), only message.answer skipped.
-    """
+    """Non-admin tap on [🗑] → callback.answer() + return (no state changes)."""
+    from bot.keyboards.admin import AdminServiceDeleteCallbackData
+
     async with session_factory() as session:
         await _seed_admin_stack(session)
 
-    callback = _make_callback(ADMIN_TG_ID)
-    callback.message = None  # type: ignore[assignment]
+    callback = _make_callback(NON_ADMIN_TG_ID)
+    cb_data = AdminServiceDeleteCallbackData(
+        service_id=UUID("00000000-0000-0000-0000-000000000099")
+    )
     state = _make_mock_state()
 
-    await admin_handlers.admin_services_cb(callback, state)
+    await admin_handlers.admin_service_delete_cb(callback, cb_data, state)
+
+    callback.answer.assert_awaited_once()
+    state.clear.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admin_service_delete_cb_master_not_found_alert(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Admin telegram_id resolves to no master → state.clear + alert + return."""
+    from bot.keyboards.admin import AdminServiceDeleteCallbackData
+
+    callback = _make_callback(ADMIN_TG_ID)  # no _seed_admin_stack
+    cb_data = AdminServiceDeleteCallbackData(
+        service_id=UUID("00000000-0000-0000-0000-000000000099")
+    )
+    state = _make_mock_state()
+
+    await admin_handlers.admin_service_delete_cb(callback, cb_data, state)
 
     state.clear.assert_awaited_once()
-    state.set_state.assert_awaited_once()
+    callback.answer.assert_awaited_once()
+    args, kwargs = callback.answer.call_args
+    assert kwargs.get("show_alert") is True
+    assert "Мастер не найден" in str(args[0] if args else kwargs.get("text", ""))
+
+
+@pytest.mark.asyncio
+async def test_admin_service_delete_cb_idor_other_business_not_found(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """IDOR guard: service_id belongs to another business → fetch by
+    (id, business_id) returns None → alert 'Услуга не найдена' + return.
+    """
+    from bot.keyboards.admin import AdminServiceDeleteCallbackData
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        # Service under admin's business (correct path — unused here, just
+        # ensures admin's business has at least one service row).
+        session.add(
+            Service(business_id=ctx["business_id"], name="Стрижка", duration_minutes=60)
+        )
+        await session.commit()
+
+    callback = _make_callback(ADMIN_TG_ID)
+    # Pass a service_id that doesn't exist under admin's business (random UUID).
+    cb_data = AdminServiceDeleteCallbackData(
+        service_id=UUID("00000000-0000-0000-0000-000000000099")
+    )
+    state = _make_mock_state()
+
+    await admin_handlers.admin_service_delete_cb(callback, cb_data, state)
+
+    state.clear.assert_awaited_once()
+    callback.answer.assert_awaited_once()
+    args, kwargs = callback.answer.call_args
+    assert kwargs.get("show_alert") is True
+    assert "Услуга не найдена" in str(args[0] if args else kwargs.get("text", ""))
+
+
+@pytest.mark.asyncio
+async def test_admin_service_delete_cb_already_inactive_idempotent(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Service was already soft-deleted (is_active=False from prior call) →
+    result.deactivated=[] and result.already_inactive=[svc] → alert 'уже удалена'
+    (no re-render, no state change after clear).
+    """
+    from bot.keyboards.admin import AdminServiceDeleteCallbackData
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        svc = Service(business_id=ctx["business_id"], name="Стрижка", duration_minutes=60)
+        svc.is_active = False
+        session.add(svc)
+        await session.commit()
+        svc_id = svc.id
+
+    callback = _make_callback(ADMIN_TG_ID)
+    cb_data = AdminServiceDeleteCallbackData(service_id=svc_id)
+    state = _make_mock_state()
+
+    await admin_handlers.admin_service_delete_cb(callback, cb_data, state)
+
+    state.clear.assert_awaited_once()
+    callback.answer.assert_awaited_once()
+    args, kwargs = callback.answer.call_args
+    assert kwargs.get("show_alert") is True
+    assert "уже удалена" in str(args[0] if args else kwargs.get("text", ""))
+
+
+@pytest.mark.asyncio
+async def test_admin_service_delete_cb_blocked_by_active_bookings(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Active booking on the service → deactivate_service returns
+    blocked_bookings=1 → alert 'Сначала отмените 1 запись на услугу «X»' +
+    return (no re-render, no edit_text).
+    """
+    from bot.keyboards.admin import AdminServiceDeleteCallbackData
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        biz_id = ctx["business_id"]
+        master_id = ctx["master_id"]
+        client_id = ctx["client_id"]
+
+        svc = Service(business_id=biz_id, name="Стрижка", duration_minutes=60)
+        session.add(svc)
+        await session.flush()
+
+        slot = Slot(master_id=master_id, slot_date=date(2026, 9, 20), slot_hour=14, status="booked")
+        session.add(slot)
+        await session.flush()
+
+        booking = Booking(
+            slot_id=slot.id,
+            business_id=biz_id,
+            master_id=master_id,
+            client_id=client_id,
+            service_id=svc.id,
+            service_title_snapshot="Стрижка",
+            service_price_snapshot=None,
+            client_name_snapshot="Паша",
+            start_at=datetime(2026, 9, 20, 11, 0),
+            end_at=datetime(2026, 9, 20, 12, 0),
+            status="confirmed",
+        )
+        session.add(booking)
+        await session.commit()
+        svc_id = svc.id
+
+    callback = _make_callback(ADMIN_TG_ID)
+    cb_data = AdminServiceDeleteCallbackData(service_id=svc_id)
+    state = _make_mock_state()
+
+    await admin_handlers.admin_service_delete_cb(callback, cb_data, state)
+
+    state.clear.assert_awaited_once()
+    callback.answer.assert_awaited_once()
+    args, kwargs = callback.answer.call_args
+    assert kwargs.get("show_alert") is True
+    text = str(args[0] if args else kwargs.get("text", ""))
+    assert "Сначала отмените 1 запись" in text
+    assert "Стрижка" in text
+    callback.message.edit_text.assert_not_awaited()
+    callback.message.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_admin_service_delete_cb_happy_deactivates_and_rerenders(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Happy path: no active bookings → deactivate_service flips is_active=False,
+    handler re-renders list (edit_text 'Услуги (N-1):' or 'У вас нет активных услуг.'),
+    toast '✅ Удалено: Стрижка'.
+    """
+    from bot.keyboards.admin import AdminServiceDeleteCallbackData
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        svc = Service(business_id=ctx["business_id"], name="Стрижка", duration_minutes=60)
+        session.add(svc)
+        await session.commit()
+        svc_id = svc.id
+
+    callback = _make_callback(ADMIN_TG_ID)
+    cb_data = AdminServiceDeleteCallbackData(service_id=svc_id)
+    state = _make_mock_state()
+
+    await admin_handlers.admin_service_delete_cb(callback, cb_data, state)
+
+    state.clear.assert_awaited_once()
+    # Verify DB state — service is now is_active=False.
+    async with session_factory() as session:
+        from sqlalchemy import select as _select
+        result = await session.execute(_select(Service).where(Service.id == svc_id))
+        deactivated = result.scalar_one()
+        assert deactivated.is_active is False
+
+    # Re-rendered list (no services left → 'У вас нет активных услуг.').
+    assert callback.message.edit_text.await_count == 1
+    args, kwargs = callback.message.edit_text.call_args
+    text = str(args[0]) if args else str(kwargs.get("text", ""))
+    assert text == "У вас нет активных услуг."
+
+    # Toast '✅ Удалено: Стрижка'.
+    callback.answer.assert_awaited_once()
+    args, _ = callback.answer.call_args
+    assert "Удалено: Стрижка" in str(args[0] if args else "")
+
+
+@pytest.mark.asyncio
+async def test_admin_service_delete_cb_message_is_none_skips_render(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Edge case: callback.message is None (deleted inline msg) → state.clear +
+    deactivate still proceed, but render (edit_text/answer) skipped.
+    """
+    from bot.keyboards.admin import AdminServiceDeleteCallbackData
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        svc = Service(business_id=ctx["business_id"], name="Стрижка", duration_minutes=60)
+        session.add(svc)
+        await session.commit()
+        svc_id = svc.id
+
+    callback = _make_callback(ADMIN_TG_ID)
+    callback.message = None  # type: ignore[assignment]
+    cb_data = AdminServiceDeleteCallbackData(service_id=svc_id)
+    state = _make_mock_state()
+
+    await admin_handlers.admin_service_delete_cb(callback, cb_data, state)
+
+    state.clear.assert_awaited_once()
     callback.answer.assert_awaited_once()
 
 

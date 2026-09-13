@@ -453,7 +453,9 @@ async def test_openweek_full_flow_creates_workday(
         await dp.feed_update(bot, _make_callback_update_from_button(confirm_button))
 
         summary = _extract_send_text(bot)
-        assert "✅" in summary, f"Expected ✅ in summary, got: {summary!r}"
+        # Баг 3 (Session 2026-09-13): success_lines используют 📅 prefix (не ✅),
+        # чтобы визуально отличать summary от inline-кнопок ✏️.
+        assert "📅" in summary, f"Expected 📅 in summary, got: {summary!r}"
         assert "Ср" in summary, f"Expected 'Ср' in summary, got: {summary!r}"
 
         # Verify WorkDay created for Wed of frozen week.

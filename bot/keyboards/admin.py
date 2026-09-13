@@ -39,7 +39,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram_calendar import SimpleCalendar
 
-from bot.models import Booking, WorkDay
+from bot.models import Booking, Service, WorkDay
 
 
 class AdminMenuCallbackData(CallbackData, prefix="admin_menu"):
@@ -69,7 +69,38 @@ class AdminWeekCallbackData(CallbackData, prefix="admin_week"):
 
 
 class AdminServicesCallbackData(CallbackData, prefix="admin_services"):
-    """Trigger entering_service flow — добавить услугу."""
+    """Show services list (Session 2026-09-13, Баг 1 от Екатерины).
+
+    Was: trigger entering_service flow (FSM add). Now: tap → show list of
+    existing services with [🗑] inline button per service + [➕ Добавить новую]
+    below. Delete button is AdminServiceDeleteCallbackData; add entry button
+    is AdminServiceAddEntryCallbackData. state.clear() — list is stateless,
+    shown from StateFilter("*") (escape hatch from any mid-FSM tap).
+    """
+
+
+class AdminServiceDeleteCallbackData(CallbackData, prefix="admin_service_del"):
+    """[🗑] tap on a service in the list (Session 2026-09-13, Баг 1).
+
+    Payload:
+    - service_id: UUID — Service row to soft-delete.
+
+    Handler fetches Service, calls deactivate_service(by name) which already
+    protects against active bookings (returns blocked_bookings > 0 → reject).
+    Stateless (state.clear before delete — no FSM mid-flow for delete).
+    """
+
+    service_id: UUID
+
+
+class AdminServiceAddEntryCallbackData(CallbackData, prefix="admin_service_add"):
+    """[➕ Добавить новую] tap from services list → entering_service FSM (Баг 1).
+
+    No payload — handler resolves business_id from callback.from_user.id (mirror
+    AdminServicesCallbackData pattern). state.clear + state.set_state
+    (entering_service_name) — same flow that admin_services_cb USED to do before
+    Баг 1 (now admin_services_cb shows list, this callback starts add FSM).
+    """
 
 
 class AdminMoveCallbackData(CallbackData, prefix="admin_move"):
@@ -142,6 +173,49 @@ def admin_inline_menu() -> InlineKeyboardMarkup:
     builder.button(text="🗓 Открыть неделю", callback_data=AdminOpenWeekEntryCallbackData().pack())
     builder.button(text="💇 Услуги", callback_data=AdminServicesCallbackData().pack())
     builder.adjust(2, 2, 1)
+    return builder.as_markup()
+
+
+def admin_services_list_keyboard(services: list[Service]) -> InlineKeyboardMarkup:
+    """List services with [🗑] inline button per service + [➕ Добавить новую]
+    (Session 2026-09-13, Баг 1 от Екатерины).
+
+    Layout: one [🗑 {name} — {duration} мин[, {price}₽]] button per service
+    (explicit ``builder.row()`` per service — mirror admin_today_keyboard:280
+    pattern, NOT ``adjust(1)`` — explicit row avoids aiogram adjust() quirks
+    if we later add a second button per service). [➕ Добавить новую] as the
+    last row.
+
+    Label format mirrors _services_list text rendering (admin.py:779-786):
+    ``{idx}. {name} — {duration} мин[, {price}₽]``. We drop idx (button row
+    conveys order visually) and prefix with 🗑 emoji. price omitted if None
+    (Session 5.10 — price is nullable, master quotes verbally).
+
+    Args:
+        services: list of active Service rows for the business (already
+            filtered by list_services, is_active=True). Empty list is
+            allowed → keyboard with only [➕ Добавить новую].
+
+    Telegram inline limit 100 buttons/row × N rows — pet-project single-tenant
+    (Екатерина < 10 services), no pagination needed.
+    """
+    builder = InlineKeyboardBuilder()
+    for svc in services:
+        label_parts = [f"🗑 {svc.name}", f"{svc.duration_minutes} мин"]
+        if svc.price is not None:
+            label_parts.append(f"{svc.price}₽")
+        builder.row(
+            InlineKeyboardButton(
+                text=" — ".join(label_parts),
+                callback_data=AdminServiceDeleteCallbackData(service_id=svc.id).pack(),
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(
+            text="➕ Добавить новую",
+            callback_data=AdminServiceAddEntryCallbackData().pack(),
+        )
+    )
     return builder.as_markup()
 
 
@@ -722,12 +796,11 @@ def admin_week_days_keyboard(
     past_weekdays: frozenset[int] = frozenset(),
     scheduled_weekdays: frozenset[int] = frozenset(),
     closed_weekdays: frozenset[int] = frozenset(),
-    can_go_prev: bool = True,
-    can_go_next: bool = True,
 ) -> InlineKeyboardMarkup:
-    """7 toggle-кнопок дней недели + навигация по неделям + «✅ Открыть» + «❌ Отмена»
-    (Session 5.26; 5.60 P2 — past_weekdays `❌` suffix; 5.61 — scheduled/closed
-    weekday markers + week navigation).
+    """7 toggle-кнопок дней недели + «✅ Открыть» + «❌ Отмена» (Session 5.26;
+    5.60 P2 — past_weekdays `❌` suffix; 5.61 — scheduled/closed weekday markers;
+    Session 2026-09-13 — Баг 2 от Екатерины: nav row [← Пред.]/[След. →] убран,
+    неделя выбирается на шаге 1 через admin_week_picker_keyboard).
 
     Args:
         selected: set of weekday ints (0=Mon..6=Sun) currently toggled ON.
@@ -743,10 +816,6 @@ def admin_week_days_keyboard(
         closed_weekdays: frozenset of weekday ints with a closed WorkDay
             (is_active=False). Gets ` ⚪` suffix — "day was open then closed via
             /closeday, re-open action". 5.61.
-        can_go_prev: show «← Пред.» button. False when week_offset=0 (current
-            week — prev week is fully in past, no point navigating there).
-        can_go_next: show «След. →» button. False when week_offset >= MAX
-            (4 weeks ahead cap).
 
     Suffix priority: ` ❌` (past) > ` 🟡` (active WorkDay) > ` ⚪` (closed WorkDay).
     Past day with WorkDay → ` ❌` wins (apply will filter it anyway, no point
@@ -754,12 +823,16 @@ def admin_week_days_keyboard(
     closed WorkDay → ` ⚪`.
 
     Layout: 7 weekday buttons (row 1, adjust(7) compresses to ≤8/row Telegram
-    inline limit 8 buttons/row), then nav row (← Пред. / След. →, adjust(2)),
-    then [✅ Открыть] + [❌ Отмена] row (adjust(2)).
+    inline limit 8 buttons/row), then [✅ Открыть] + [❌ Отмена] row (adjust(2)).
 
     Selected weekdays помечены ✅ prefix; unselected — без prefix.
     «✅ Открыть» callback_data="admin_openweek_confirm" (string).
     «❌ Отмена» callback_data="admin_openweek_cancel" (string).
+
+    Баг 2 (Session 2026-09-13): nav row [← Пред.]/[След. →] убран — неделя уже
+    выбрана на шаге 1 (admin_week_picker_keyboard + admin_openweek_week_picker_nav_cb).
+    Handler admin_openweek_week_nav_cb для state=opening_week_days удалён — нет
+    кнопок → нет тапов. can_go_prev/can_go_next параметры удалены.
     """
     builder = InlineKeyboardBuilder()
     for weekday in range(7):
@@ -777,23 +850,6 @@ def admin_week_days_keyboard(
             text=f"{prefix}{label}{past_suffix}",
             callback_data=AdminOpenWeekCallbackData(weekday=weekday).pack(),
         )
-    nav_row: list[InlineKeyboardButton] = []
-    if can_go_prev:
-        nav_row.append(
-            InlineKeyboardButton(
-                text="← Пред.",
-                callback_data=AdminOpenWeekNavCallbackData(delta=-1).pack(),
-            )
-        )
-    if can_go_next:
-        nav_row.append(
-            InlineKeyboardButton(
-                text="След. →",
-                callback_data=AdminOpenWeekNavCallbackData(delta=1).pack(),
-            )
-        )
-    if nav_row:
-        builder.row(*nav_row)
     builder.button(text="✅ Открыть", callback_data="admin_openweek_confirm")
     builder.button(text="❌ Отмена", callback_data="admin_openweek_cancel")
     builder.adjust(7, 2)

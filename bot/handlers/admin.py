@@ -58,6 +58,8 @@ from bot.keyboards.admin import (
     AdminOpenweekEditCallbackData,
     AdminOpenWeekEntryCallbackData,
     AdminOpenWeekNavCallbackData,
+    AdminServiceAddEntryCallbackData,
+    AdminServiceDeleteCallbackData,
     AdminServicesCallbackData,
     AdminTodayCallbackData,
     AdminWeekCallbackData,
@@ -71,6 +73,7 @@ from bot.keyboards.admin import (
     admin_move_confirm_keyboard,
     admin_openweek_edit_keyboard,
     admin_openweek_overwrite_keyboard,
+    admin_services_list_keyboard,
     admin_today_keyboard,
     admin_week_days_keyboard,
     admin_week_picker_keyboard,
@@ -1478,6 +1481,12 @@ def _render_openweek_edit_summary(
     opened_days must be REFRESHED from DB after edit (caller re-queries
     WorkDay rows) — not the pre-edit list, otherwise summary shows stale
     windows.
+
+    Session 2026-09-13 (Баг 3 от Екатерины): префикс изменён с `✅` на `📅`.
+    Был `✅ Вт 22.09 10:30–19:30` — визуально путался с inline-кнопками ✏️ ниже
+    (user тыкал в текст summary, ожидая что это кнопка). Теперь `📅 Вт ...` —
+    визуально отличный от ✏️ prefix, ясно что это informational text, а не кнопка.
+    Вариант A из PLANS.md (минимальный — кнопки ✏️ без изменений).
     """
     sunday = monday + timedelta(days=6)
     week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
@@ -1488,7 +1497,7 @@ def _render_openweek_edit_summary(
     for od in sorted(opened_days, key=lambda d: d.weekday):
         day_label = _WEEKDAY_LABELS_HANDLER[od.weekday]
         date_label = date.fromisoformat(od.work_date_iso).strftime("%d.%m")
-        lines.append(f"✅ {day_label} {date_label} {od.start_time_str}–{od.end_time_str}")
+        lines.append(f"📅 {day_label} {date_label} {od.start_time_str}–{od.end_time_str}")
     return "\n".join(lines)
 
 
@@ -1936,22 +1945,69 @@ async def admin_week_cb(
 
 @router.callback_query(AdminServicesCallbackData.filter(), StateFilter("*"))
 async def admin_services_cb(callback: CallbackQuery, state: FSMContext) -> None:
-    """Menu tap: добавить услугу — start entering_service flow (2 шага).
+    """Показать список услуг (Session 2026-09-13, Баг 1 от Екатерины).
 
-    UX-edge: tap mid-FSM → state.clear() + set_state(entering_service_name).
-    Next handlers (1.3d) ask for name → duration → create_service.
+    Was: tap → сразу FSM entering_service_name (admin service add). Now: tap →
+    state.clear (escape hatch из mid-FSM) + список активных услуг с [🗑] inline
+    кнопкой на каждой + [➕ Добавить новую] внизу.
 
-    NB W1 (code-review 1.3a): resolve master+business на entry (НЕ в последнем
-    handler duration_msg) — business_id нужен для create_service в конце flow.
-    Сохраняем в state, чтобы duration_msg не делал повторный DB lookup.
+    [➕] → admin_service_add_entry_cb → state.set_state(entering_service_name)
+    (прежний flow, теперь за отдельным callback, не за tap по menu).
 
-    Price убран в Session 5.10 — мастер озвучивает цену отдельно в чате.
+    [🗑] → admin_service_delete_cb (stateless, deactivate_service с защитой от
+    active bookings уже встроена — возвращает blocked_bookings > 0 → reject).
+
+    NB: business_id resolve на entry (нужен для list_services). НЕ сохраняем
+    в state (list stateless, delete handler резолвит business_id заново).
     """
     if not _is_admin_callback(callback):
         await callback.answer()
         return
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    _master_id, business_id, _tz = resolved
 
-    # _is_admin_callback guarantees callback.from_user is not None (type narrowing).
+    await state.clear()
+
+    async with async_session_factory() as session:
+        services = await list_services(session, business_id)
+
+    text = f"Услуги ({len(services)}):" if services else "У вас нет активных услуг."
+    kb = admin_services_list_keyboard(services)
+
+    if callback.message is not None:
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(text, reply_markup=kb)
+            except TelegramBadRequest:
+                # message нельзя edit (>48h, удалено) — fallback на новое сообщение.
+                await callback.message.answer(text, reply_markup=kb)
+        else:
+            # InaccessibleMessage — нельзя edit, только answer в новом сообщении.
+            await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(
+    AdminServiceAddEntryCallbackData.filter(),
+    StateFilter("*"),
+)
+async def admin_service_add_entry_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    """[➕ Добавить новую] → entering_service FSM (Баг 1).
+
+    Was: admin_services_cb did state.set_state(entering_service_name) on tap.
+    Now: tap [➕ Добавить новую] in services list → same FSM (прежний flow
+    admin_services_cb до Бага 1, теперь за отдельным callback).
+
+    NB: callback.from_user is fresh — _resolve_master_and_business снова (НЕ
+    кэшируем из state — list был stateless, business_id в state не сохранён).
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
     assert callback.from_user is not None
     resolved = await _resolve_master_and_business(callback.from_user.id)
     if resolved is None:
@@ -1968,12 +2024,113 @@ async def admin_services_cb(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+@router.callback_query(
+    AdminServiceDeleteCallbackData.filter(),
+    StateFilter("*"),
+)
+async def admin_service_delete_cb(
+    callback: CallbackQuery,
+    callback_data: AdminServiceDeleteCallbackData,
+    state: FSMContext,
+) -> None:
+    """[🗑 {name}] → soft-delete service with active bookings protection (Баг 1).
+
+    Stateless: state.clear before delete (escape hatch из mid-FSM if admin
+    tapped [🗑] while in another flow — state shouldn't linger).
+
+    Steps:
+    1. Resolve master+business (defense-in-depth — business_id is the security
+       boundary, not service_id alone — admin can only delete services of
+       their own business). IDOR guard: fetch Service by (id, business_id).
+    2. Call deactivate_service(session, business_id, name) — built-in active
+       bookings check (returns ServiceDeactivationResult.blocked_bookings > 0
+       → reject with alert, no list re-render — state unchanged).
+    3. Re-render services list (refresh from list_services) — auto-update UI
+       without extra tap. Toast "✅ Удалено: {name}" on success.
+
+    NB: deactivate_service takes NAME (not id) — service_id from callback_data
+    → fetch Service → pass Service.name. Two SELECTs (fetch + deactivate's
+    internal SELECT by name). Acceptable for pet-project (< 10 services, no
+    perf concern). Alternative: add deactivate_service_by_id — defer until pain.
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await state.clear()
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    _master_id, business_id, _tz = resolved
+
+    await state.clear()
+
+    async with async_session_factory() as session:
+        # IDOR guard: fetch by (service_id, business_id) — prevents admin A
+        # deleting admin B's services via forged callback_data.
+        stmt = select(Service).where(
+            Service.id == callback_data.service_id,
+            Service.business_id == business_id,
+        )
+        svc = (await session.execute(stmt)).scalar_one_or_none()
+        if svc is None:
+            await callback.answer("❌ Услуга не найдена", show_alert=True)
+            return
+
+        result = await deactivate_service(session, business_id, svc.name)
+
+    if result.blocked_bookings > 0:
+        # Plural form — Russian "запись/записи/записей" by count.
+        n = result.blocked_bookings
+        word = "запись" if n % 10 == 1 and n % 100 != 11 else (
+            "записи" if 2 <= n % 10 <= 4 and (n % 100 < 10 or n % 100 >= 20) else "записей"
+        )
+        await callback.answer(
+            f"Сначала отмените {n} {word} на услугу «{svc.name}»",
+            show_alert=True,
+        )
+        return
+
+    if not result.deactivated and result.already_inactive:
+        # Idempotent case — service was already soft-deleted (e.g. via /services
+        # del command in parallel session). No state change — alert + return.
+        await callback.answer(
+            f"Услуга «{svc.name}» уже удалена",
+            show_alert=True,
+        )
+        return
+
+    # Success — re-render list with refreshed services (svc удалена из active).
+    async with async_session_factory() as session:
+        services = await list_services(session, business_id)
+
+    text = f"Услуги ({len(services)}):" if services else "У вас нет активных услуг."
+    kb = admin_services_list_keyboard(services)
+
+    if callback.message is not None:
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(text, reply_markup=kb)
+            except TelegramBadRequest:
+                await callback.message.answer(text, reply_markup=kb)
+        else:
+            await callback.message.answer(text, reply_markup=kb)
+    await callback.answer(f"✅ Удалено: {svc.name}")
+
+
 # ============================================================
 # FSM services (Вариант B, spec.md 251) — Этап 1.3d
 #
 # 2 шага: name → duration → create_service (price убран в Session 5.10).
 # Re-use cmd_services logic (parse name/duration, validate, create_service).
 # State terminal в duration_msg success — state.clear().
+#
+# Session 2026-09-13 (Баг 1 от Екатерины): admin_services_cb больше НЕ
+# запускает FSM (показывает список услуг + [➕ Добавить новую]). Вход в FSM
+# теперь через admin_service_add_entry_cb (tap [➕] из списка услуг). Сами
+# handlers name_msg / duration_msg не изменились — state.entering_service_name
+# → state.entering_service_duration → state.clear (success).
 #
 # NB INL-001 НЕ ПРИМЕНИМ для 1.3d: edit_message_text работает только для
 # callback→text переходов (calendar→ask hour в 1.3b/c), где edit убирает
@@ -2698,10 +2855,13 @@ async def admin_openweek_week_picker_nav_cb(
     reset needed (week picker has no weekday buttons — selection is just the
     current week_offset).
 
-    Distinct from admin_openweek_week_nav_cb (state=opening_week_days) which
-    handles nav on step 3 (days keyboard with weekday toggles + WorkDay
-    markers). Same callback_data (AdminOpenWeekNavCallbackData) — dispatched
-    by StateFilter.
+    Was distinct from admin_openweek_week_nav_cb (state=opening_week_days)
+    which handled nav on step 3 — that handler was removed in Session
+    2026-09-13 (Баг 2 от Екатерины): nav row [← Пред.]/[След. →] убран из
+    admin_week_days_keyboard (шаг 3), неделя выбирается только на шаге 1
+    (этот handler). Same callback_data (AdminOpenWeekNavCallbackData) — was
+    dispatched by StateFilter between two handlers; now only this one
+    (state=opening_week_week) catches it.
 
     Edge cases:
     - delta=-1 at offset=0: clamp to 0, no-op (silent re-render of same week).
@@ -2761,9 +2921,10 @@ async def admin_openweek_week_select_cb(
     (start_time picker, Session 5.64, пункт 1).
 
     Reads week_offset from state (already set by cmd_openweek or
-    admin_openweek_week_nav_cb) and transitions to AdminStates.opening_week_start.
-    The week picker message is replaced with the slot picker (edit_text) —
-    same UX pattern as admin_openweek_start_cb transitioning to step 2.
+    admin_openweek_week_picker_nav_cb) and transitions to
+    AdminStates.opening_week_start. The week picker message is replaced with
+    the slot picker (edit_text) — same UX pattern as admin_openweek_start_cb
+    transitioning to step 2.
 
     Sentinel workday_id (UUID(int=0)) — picker is for /openweek (no existing
     WorkDay context), mirrors the pre-5.64 cmd_openweek behavior.
@@ -2930,8 +3091,9 @@ async def admin_openweek_end_cb(
         scheduled_weekdays=sorted(scheduled_wd),
         closed_weekdays=sorted(closed_wd),
         # 5.64 (пункт 1): week_offset уже в state (установлен на шаге 0).
-        # НЕ перезатираем — иначе навигация по неделям на шаге 3 теряла бы
-        # выбранную неделю (cм. admin_openweek_week_nav_cb для шага 3).
+        # НЕ перезатираем — шаг 3 больше не меняет неделю (Баг 2 от Екатерины,
+        # Session 2026-09-13: nav row убран из admin_week_days_keyboard, handler
+        # admin_openweek_week_nav_cb удалён — неделя выбирается только на шаге 1).
     )
 
     if callback.message is not None:
@@ -2945,8 +3107,6 @@ async def admin_openweek_end_cb(
             past_weekdays=past_weekdays,
             scheduled_weekdays=scheduled_wd,
             closed_weekdays=closed_wd,
-            can_go_prev=False,
-            can_go_next=True,
         )
         # edit_text заменяет picker Шага 2 на days keyboard в том же сообщении —
         # старая клавиатура исчезает, нельзя тапнуть две таблицы одновременно.
@@ -2997,18 +3157,17 @@ async def admin_openweek_days_cb(
     if callback.message is not None:
         # 5.60 P2 — past_weekdays из state (закеширован в admin_openweek_end_cb
         # на входе в шаг 3). frozenset для O(1) lookup в keyboard loop.
-        # 5.61 — scheduled/closed weekdays + nav flags тоже из state.
+        # 5.61 — scheduled/closed weekdays тоже из state.
+        # Баг 2 (Session 2026-09-13): week_offset больше не нужен — nav row
+        # убран из admin_week_days_keyboard (неделя выбирается на шаге 1).
         past_wd_storage: list[int] = list(data.get("past_weekdays", []))
         sched_wd_storage: list[int] = list(data.get("scheduled_weekdays", []))
         closed_wd_storage: list[int] = list(data.get("closed_weekdays", []))
-        week_offset: int = int(data.get("week_offset", 0))
         new_kb = admin_week_days_keyboard(
             set(selected),
             past_weekdays=frozenset(past_wd_storage),
             scheduled_weekdays=frozenset(sched_wd_storage),
             closed_weekdays=frozenset(closed_wd_storage),
-            can_go_prev=week_offset > 0,
-            can_go_next=week_offset < _OPENWEEK_MAX_OFFSET,
         )
         if isinstance(callback.message, Message):
             try:
@@ -3019,112 +3178,6 @@ async def admin_openweek_days_cb(
                     "Дни недели обновлены. Тапните ещё раз чтобы отметить/снять:",
                     reply_markup=new_kb,
                 )
-
-
-@router.callback_query(
-    AdminOpenWeekNavCallbackData.filter(),
-    StateFilter(AdminStates.opening_week_days),
-)
-async def admin_openweek_week_nav_cb(
-    callback: CallbackQuery,
-    callback_data: AdminOpenWeekNavCallbackData,
-    state: FSMContext,
-) -> None:
-    """[← Пред.] / [След. →] → navigate between weeks in step 3 (Session 5.61).
-
-    Updates week_offset in state (clamped to 0.._OPENWEEK_MAX_OFFSET), resets
-    selected_weekdays (old selection invalid for new week), recomputes
-    past_weekdays / scheduled_weekdays / closed_weekdays for the new monday,
-    and re-renders step 3 text + keyboard.
-
-    Alert "Выбор сброшен — новая неделя" signals the reset (only when
-    selected_weekdays was non-empty — avoids noise on first nav when user
-    hasn't selected anything yet).
-
-    Edge cases:
-    - delta=-1 with week_offset=0: clamp to 0, no change (also blocked by
-      can_go_prev=False on keyboard, but defense-in-depth here).
-    - delta=+1 with week_offset=MAX: clamp to MAX, no change (same defense).
-    - Selected days non-empty → alert shown. Empty → silent re-render.
-    """
-    if not _is_admin_callback(callback):
-        await callback.answer()
-        return
-    assert callback.from_user is not None
-    resolved = await _resolve_master_and_business(callback.from_user.id)
-    if resolved is None:
-        await state.clear()
-        await callback.answer("❌ Мастер не найден", show_alert=True)
-        return
-    master_id, _business_id, tz = resolved
-
-    data = await state.get_data()
-    business_tz = data.get("business_tz") or tz
-    current_offset: int = int(data.get("week_offset", 0))
-    new_offset = current_offset + callback_data.delta
-    # Clamp to valid range (defense-in-depth — keyboard already hides
-    # disabled buttons, but stale callbacks or rapid taps could slip through).
-    new_offset = max(0, min(new_offset, _OPENWEEK_MAX_OFFSET))
-    if new_offset == current_offset:
-        # No-op (already at boundary) — silent, just dismiss loading.
-        await callback.answer()
-        return
-
-    monday = _week_monday(business_tz, new_offset)
-    sunday = monday + timedelta(days=6)
-    week_range = f"{monday.strftime('%d.%m')} – {sunday.strftime('%d.%m')}"
-
-    today_local = datetime.now(ZoneInfo(business_tz)).date()
-    past_wd = _past_weekdays_for_week(monday, today_local)
-    sched_wd, closed_wd = await _scheduled_closed_weekdays(
-        master_id, business_tz, monday
-    )
-
-    selected_was_nonempty = bool(list(data.get("selected_weekdays", [])))
-    await state.update_data(
-        selected_weekdays=[],
-        past_weekdays=sorted(past_wd),
-        scheduled_weekdays=sorted(sched_wd),
-        closed_weekdays=sorted(closed_wd),
-        week_offset=new_offset,
-    )
-
-    # picked_start_minute / picked_end_minute stay in state — window time is
-    # common for all weeks, no need to re-enter.
-    picked_start_minute = data.get("picked_start_minute")
-    picked_end_minute = data.get("picked_end_minute")
-    if picked_start_minute is None or picked_end_minute is None:
-        await state.clear()
-        await callback.answer("❌ Данные сессии потеряны", show_alert=True)
-        return
-    start_time = dt_time(int(picked_start_minute) // 60, int(picked_start_minute) % 60)
-    end_time = dt_time(picked_end_minute // 60, picked_end_minute % 60)
-
-    step3_text = (
-        f"Шаг 3: выберите дни недели (тап → ✅).\n\n"
-        f"Окно: <b>{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}</b>\n"
-        f"Неделя <b>{week_range}</b>"
-    )
-    new_kb = admin_week_days_keyboard(
-        set(),
-        past_weekdays=past_wd,
-        scheduled_weekdays=sched_wd,
-        closed_weekdays=closed_wd,
-        can_go_prev=new_offset > 0,
-        can_go_next=new_offset < _OPENWEEK_MAX_OFFSET,
-    )
-    if callback.message is not None:
-        if isinstance(callback.message, Message):
-            try:
-                await callback.message.edit_text(step3_text, reply_markup=new_kb)
-            except TelegramBadRequest:
-                await callback.message.answer(step3_text, reply_markup=new_kb)
-        else:
-            await callback.message.answer(step3_text, reply_markup=new_kb)
-    if selected_was_nonempty:
-        await callback.answer("Выбор сброшен — новая неделя", show_alert=True)
-    else:
-        await callback.answer()
 
 
 async def _apply_openweek(
@@ -3170,7 +3223,7 @@ async def _apply_openweek(
                 # updated — select_workday returns the row either way).
                 wd = await select_workday(session, master_id, work_date)
             success_lines.append(
-                f"✅ {day_label} {date_label} "
+                f"📅 {day_label} {date_label} "
                 f"{start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}"
             )
             if wd is not None:
