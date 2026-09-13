@@ -610,9 +610,7 @@ async def _seed_today_with_booking(
         session.add(wd)
         await session.flush()
 
-        svc = Service(
-            business_id=biz.id, name="Стрижка", duration_minutes=60, price=Decimal("0")
-        )
+        svc = Service(business_id=biz.id, name="Стрижка", duration_minutes=60, price=Decimal("0"))
         session.add(svc)
         await session.flush()
 
@@ -765,9 +763,7 @@ async def test_booking_flow_with_service_picker_creates_booking(
         bot.reset()
         await dp.feed_update(bot, _make_text_update("Паша", user_id=client_tg))
         step5 = _extract_send_text(bot)
-        assert "Подтвердите запись" in step5, (
-            f"name_msg → confirming (summary). Got: {step5!r}"
-        )
+        assert "Подтвердите запись" in step5, f"name_msg → confirming (summary). Got: {step5!r}"
         assert "Окрашивание" in step5
         assert "Паша" in step5
 
@@ -793,9 +789,9 @@ async def test_booking_flow_with_service_picker_creates_booking(
             if isinstance(c, SendMessage) and "Вы записаны" in (getattr(c, "text", "") or "")
         ]
         assert success_calls, "success SendMessage call must be recorded"
-        assert all(
-            getattr(c, "reply_markup", None) is None for c in success_calls
-        ), "5.51: 'Вы записаны' must be bare text — no inline post_booking_keyboard"
+        assert all(getattr(c, "reply_markup", None) is None for c in success_calls), (
+            "5.51: 'Вы записаны' must be bare text — no inline post_booking_keyboard"
+        )
 
         # Verify Booking persisted with correct service_id + duration.
         from bot.models import Booking
@@ -879,9 +875,7 @@ async def test_booking_flow_typed_text_in_service_step_hints_and_flow_continues(
         bot.reset()
         await dp.feed_update(bot, _make_text_update("Борода + стрижка", user_id=client_tg))
         step3 = _extract_send_text(bot)
-        assert "выберите услугу кнопкой" in step3, (
-            f"5.51: typed text → button hint. Got: {step3!r}"
-        )
+        assert "выберите услугу кнопкой" in step3, f"5.51: typed text → button hint. Got: {step3!r}"
         from aiogram.methods import EditMessageReplyMarkup
 
         strip_calls = [c for c in bot.calls if isinstance(c, EditMessageReplyMarkup)]
@@ -912,9 +906,7 @@ async def test_booking_flow_typed_text_in_service_step_hints_and_flow_continues(
         bot.reset()
         await dp.feed_update(bot, _make_text_update("Паша", user_id=client_tg))
         step6 = _extract_send_text(bot)
-        assert "Подтвердите запись" in step6, (
-            f"name_msg → confirming (summary). Got: {step6!r}"
-        )
+        assert "Подтвердите запись" in step6, f"name_msg → confirming (summary). Got: {step6!r}"
         # Summary shows the TAPPED service, not the typed text.
         assert "Стрижка" in step6
         assert "Борода + стрижка" not in step6
@@ -1079,6 +1071,93 @@ async def test_cancel_button_text_works_in_admin_move_selecting_date_state(
         assert "/menu" in post_text or "Меню" in post_text, (
             "After ❌ Отмена the FSM must be State(None) — admin plain text hits "
             f"admin_no_state_catchall_text. Got: {post_text!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_admin_state_catchall_text_works_in_admin_move_selecting_date_state(
+    integration_dispatcher: tuple[Dispatcher, MagicMock],
+    session_factory: Any,
+) -> None:
+    """Session 2026-09-13 (W5 fix): arbitrary text в AdminMoveStates.selecting_date
+    → admin_state_catchall_text wins (hint "Используйте /cancel"), NOT silent
+    failure (bot молчит, без fix нет handler для text в AdminMoveStates).
+
+    Pre-fix: admin_state_catchall_text filter был `StateFilter(AdminStates)` only
+    (admin.py:4711) — НЕ покрывал AdminMoveStates (3 states: selecting_date/
+    selecting_slot/confirming). arbitrary text в admin_move flow НЕ матчит ни
+    одного @router.message в admin_router (все AdminMoveStates handlers
+    callback_query — calendar 2742, slot 2901, confirm 2985, cancel 3156) И НЕ
+    матчит client_router no_state_fallback (StateFilter(None), client.py:2423 —
+    НЕ StateFilter("*")) → бот МОЛЧАЛ (silent failure). Fix: admin_state_catchall_text
+    filter расширен на StateFilter(AdminStates, AdminMoveStates) — mirror W4 fix
+    (admin_cancel_msg line 4657).
+
+    Test mirror W4 test_cancel_button_text_works_in_admin_move_selecting_date_state
+    но с arbitrary text "12" (НЕ "❌ Отмена", НЕ /cmd).
+
+    Regression guards:
+    1. Bot отвечает "Используйте /cancel" (НЕ молчит, НЕ client hint "/book")
+    2. State сохраняется AdminMoveStates.selecting_date (catchall НЕ чистит state —
+       "❌ Отмена" в следующем step всё ещё попадает в admin_cancel_msg →
+       "Админ-режим отменён", НЕ в admin_no_state_catchall_text → "/menu")
+    3. Catchall НЕ поглощает legitimate calendar tap (callback vs message —
+       разные buckets в aiogram 3.x dispatch, явно отмечено в W4 docstring)
+    """
+    from freezegun import freeze_time
+
+    with freeze_time("2026-08-25 14:00:00", tz_offset=0):
+        dp, bot = integration_dispatcher
+        await _seed_today_with_booking(session_factory)
+
+        # Step 1: /today → admin_today_keyboard with [🔄 Перенести] button.
+        await dp.feed_update(bot, _make_text_update("/today", user_id=ADMIN_TG_ID))
+        today_text = _extract_send_text(bot)
+        assert "Записи на сегодня" in today_text, f"expected today list, got: {today_text!r}"
+
+        # Step 2: tap [🔄 Перенести] → AdminMoveStates.selecting_date (calendar).
+        move_btn = await _find_button_by_label(bot, "🔄")
+        assert move_btn is not None, (
+            f"Expected [🔄 Перенести] button. Got markup: {bot.last_reply_markup!r}"
+        )
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(move_btn, user_id=ADMIN_TG_ID))
+        cal_text = _extract_send_text(bot)
+        assert "Выберите новую дату" in cal_text or "Выберите дату" in cal_text, (
+            f"After [🔄 Перенести] tap must be in AdminMoveStates.selecting_date. Got: {cal_text!r}"
+        )
+
+        # Step 3 (THE TEST): type arbitrary text "12" → admin_state_catchall_text
+        # wins (NOT silent failure, NOT client_router no_state_fallback "/book").
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("12", user_id=ADMIN_TG_ID))
+        texts = _extract_all_send_texts(bot)
+        assert texts, (
+            "W5: arbitrary text в AdminMoveStates must NOT be silent — bot должен "
+            f"ответить hint. Pre-fix бот молчал. Got: {texts!r}"
+        )
+        assert any("Используйте /cancel" in t for t in texts), (
+            "W5: arbitrary text в AdminMoveStates must reach admin_state_catchall_text "
+            f"(hint 'Используйте /cancel'). Got: {texts!r}"
+        )
+        # CRITICAL: arbitrary text НЕ должно попасть в client_router no_state_fallback
+        # (booking-specific hint "Начните запись через /book" — misleading для admin).
+        assert not any("Начните запись через /book" in t for t in texts), (
+            "W5: arbitrary text в AdminMoveStates must NOT fall through to "
+            f"client_router no_state_fallback. Got: {texts!r}"
+        )
+
+        # Step 4 (regression guard): state preserved — "❌ Отмена" в следующем
+        # step всё ещё попадает в admin_cancel_msg (W4) → "Админ-режим отменён",
+        # НЕ в admin_no_state_catchall_text → "/menu для меню" без "Админ-режим"
+        # (state был бы очищен если catchall его чистил, но catchall НЕ трогает state).
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("❌ Отмена", user_id=ADMIN_TG_ID))
+        post_texts = _extract_all_send_texts(bot)
+        assert any("Админ-режим отменён" in t for t in post_texts), (
+            "W5 regression: after arbitrary text hint, state must still be "
+            "AdminMoveStates — '❌ Отмена' must reach admin_cancel_msg (W4). "
+            f"Got: {post_texts!r}"
         )
 
 

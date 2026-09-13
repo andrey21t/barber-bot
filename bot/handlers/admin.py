@@ -777,8 +777,7 @@ async def _services_list(message: Message) -> None:
 
     if not services:
         await message.answer(
-            "У вас нет активных услуг.\n"
-            "Добавьте: <code>/services add Стрижка 60</code>",
+            "У вас нет активных услуг.\nДобавьте: <code>/services add Стрижка 60</code>",
             reply_markup=admin_inline_menu(),
         )
         return
@@ -836,8 +835,10 @@ async def _services_del(message: Message, args: list[str]) -> None:
     if result.blocked_bookings > 0:
         # Plural form — Russian "запись/записи/записей" by count.
         n = result.blocked_bookings
-        word = "запись" if n % 10 == 1 and n % 100 != 11 else (
-            "записи" if 2 <= n % 10 <= 4 and (n % 100 < 10 or n % 100 >= 20) else "записей"
+        word = (
+            "запись"
+            if n % 10 == 1 and n % 100 != 11
+            else ("записи" if 2 <= n % 10 <= 4 and (n % 100 < 10 or n % 100 >= 20) else "записей")
         )
         await message.answer(
             f"❌ Сначала отмените {n} {word} на услугу «{html.escape(name, quote=False)}»",
@@ -2020,14 +2021,10 @@ async def admin_openweek_delete_day_cb(
         # confirm step, mirror admin_close_today_cb "no bookings" branch).
         async with async_session_factory() as session:
             try:
-                result = await close_workday_with_cancellations(
-                    session, workday.id, business_tz=tz
-                )
+                result = await close_workday_with_cancellations(session, workday.id, business_tz=tz)
             except SQLAlchemyError:
                 if isinstance(callback.message, Message):
-                    await callback.message.answer(
-                        "❌ Ошибка БД. Попробуйте позже через /menu"
-                    )
+                    await callback.message.answer("❌ Ошибка БД. Попробуйте позже через /menu")
                 await callback.answer()
                 return
         if result is None:
@@ -2041,9 +2038,8 @@ async def admin_openweek_delete_day_cb(
             )
         monday = work_date - timedelta(days=work_date.weekday())
         opened_days = await _refresh_opened_days(master_id, tz, monday)
-        full_summary = (
-            _render_openweek_edit_summary(monday, opened_days)
-            + (f"\n\n{summary_line}" if summary_line else "")
+        full_summary = _render_openweek_edit_summary(monday, opened_days) + (
+            f"\n\n{summary_line}" if summary_line else ""
         )
         if isinstance(callback.message, Message):
             try:
@@ -2149,9 +2145,7 @@ async def admin_openweek_delete_confirm_cb(
 
     async with async_session_factory() as session:
         try:
-            result = await close_workday_with_cancellations(
-                session, workday_id, business_tz=tz
-            )
+            result = await close_workday_with_cancellations(session, workday_id, business_tz=tz)
         except SQLAlchemyError:
             if isinstance(callback.message, Message):
                 await callback.message.answer("❌ Ошибка БД. Попробуйте позже через /menu")
@@ -2189,15 +2183,12 @@ async def admin_openweek_delete_confirm_cb(
         result.cancelled_bookings, tz, callback.bot, scheduler
     )
     cancelled_count = len(result.cancelled_bookings)
-    summary_line = _format_closeday_summary(
-        result.work_date, cancelled_count, notified_count
-    )
+    summary_line = _format_closeday_summary(result.work_date, cancelled_count, notified_count)
 
     monday = work_date - timedelta(days=work_date.weekday())
     opened_days = await _refresh_opened_days(master_id, tz, monday)
-    full_summary = (
-        _render_openweek_edit_summary(monday, opened_days)
-        + (f"\n\n{summary_line}" if summary_line else "")
+    full_summary = _render_openweek_edit_summary(monday, opened_days) + (
+        f"\n\n{summary_line}" if summary_line else ""
     )
     if isinstance(callback.message, Message):
         try:
@@ -2488,8 +2479,10 @@ async def admin_service_delete_cb(
     if result.blocked_bookings > 0:
         # Plural form — Russian "запись/записи/записей" by count.
         n = result.blocked_bookings
-        word = "запись" if n % 10 == 1 and n % 100 != 11 else (
-            "записи" if 2 <= n % 10 <= 4 and (n % 100 < 10 or n % 100 >= 20) else "записей"
+        word = (
+            "запись"
+            if n % 10 == 1 and n % 100 != 11
+            else ("записи" if 2 <= n % 10 <= 4 and (n % 100 < 10 or n % 100 >= 20) else "записей")
         )
         await callback.answer(
             f"Сначала отмените {n} {word} на услугу «{svc.name}»",
@@ -2832,9 +2825,7 @@ async def admin_move_simple_calendar_cb(
             from sqlalchemy import select as sa_select
 
             booking = (
-                await session.execute(
-                    sa_select(Booking).where(Booking.id == UUID(booking_id_str))
-                )
+                await session.execute(sa_select(Booking).where(Booking.id == UUID(booking_id_str)))
             ).scalar_one_or_none()
             if booking is None:
                 await state.clear()
@@ -4495,7 +4486,6 @@ async def admin_no_show_cb(
     await _admin_transition_booking(callback, callback_data, scheduler, "no_show")
 
 
-
 # Constants for /openweek summary labels (Python date.weekday() — Mon=0).
 _WEEKDAY_LABELS_HANDLER: tuple[str, ...] = (
     "Пн",
@@ -4564,9 +4554,7 @@ def _past_weekdays_for_week(monday: date, today_local: date) -> frozenset[int]:
     Sunday-rule: when monday is next week (sunday today), monday > today_local
     → all 7 days are future → returns empty set. No past days to mark.
     """
-    return frozenset(
-        wd for wd in range(7) if (monday + timedelta(days=wd)) < today_local
-    )
+    return frozenset(wd for wd in range(7) if (monday + timedelta(days=wd)) < today_local)
 
 
 async def _scheduled_closed_weekdays(
@@ -4708,7 +4696,7 @@ async def admin_cancel_no_state(message: Message) -> None:
     await message.answer("Нечего отменять — вы не в режиме ввода.")
 
 
-@router.message(StateFilter(AdminStates), F.text, ~F.text.startswith("/"))
+@router.message(StateFilter(AdminStates, AdminMoveStates), F.text, ~F.text.startswith("/"))
 async def admin_state_catchall_text(message: Message) -> None:
     """Catch-all для non-/ текста в admin FSM state.
 
@@ -4716,6 +4704,18 @@ async def admin_state_catchall_text(message: Message) -> None:
     (например, юзер в entering_service_name, но ввёл что-то не то) — бот
     НЕ молчит, а подсказывает /cancel. ~F.text.startswith("/") — /commands
     (включая /cancel) НЕ ловит, проваливаются в свои handlers.
+
+    W5 fix (Session 2026-09-13): до расширения AdminMoveStates НЕ покрывались
+    (3 states: selecting_date/selecting_slot/confirming, bot/states.py:85-108).
+    arbitrary text в admin_move flow НЕ матчит ни одного @router.message в
+    admin_router (все AdminMoveStates handlers callback_query — calendar 2742,
+    slot 2901, confirm 2985, cancel 3156) И НЕ матчит client_router
+    no_state_fallback (StateFilter(None), client.py:2423 — НЕ StateFilter("*"))
+    → бот МОЛЧАЛ (silent failure). Fix: расширить StateFilter как W4 (admin_cancel_msg
+    line 4657) — единый catchall для всех 15 admin FSM states. Catchall НЕ поглощает
+    legitimate input (AdminMoveStates — callback-driven), НЕ меняет state, НЕ
+    триггерит DB writes. /cancel и "❌ Отмена" матчат admin_cancel_msg (registered
+    раньше, top-down first-match в aiogram 3.x).
     """
     if not _is_admin(message):
         return
