@@ -1435,7 +1435,7 @@ async def name_msg(message: Message, state: FSMContext) -> None:
     StateFilter("*")). Non-text messages (photo/sticker) still land here —
     message.text is None → "Имя не может быть пустым" prompt.
 
-    Session 2026-09-13 (admin cancel button): добавлено ~F.text == "❌ Отмена"
+    Session 2026-09-13 (admin cancel button): добавлено F.text != "❌ Отмена"
     exclusion. Без него admin тап ❌ Отмена в entering_name матчится здесь
     (registration order — name_msg ПЕРЕД cancel_msg) → client_name = "❌ Отмена"
     → data corruption. Теперь ❌ Отмена проваливается в cancel_msg (расширенный
@@ -1778,7 +1778,7 @@ async def service_msg(message: Message, state: FSMContext) -> None:
     """Free-text service input is DISABLED (Session 5.51) — but the hint
     is self-healing (Session 5.52, review S3).
 
-    Session 2026-09-13 (admin cancel button): добавлено ~F.text == "❌ Отмена"
+    Session 2026-09-13 (admin cancel button): добавлено F.text != "❌ Отмена"
     exclusion (mirror of name_msg:1417). Без него admin тап ❌ Отмена в
     entering_service матчится здесь первым (registration order — service_msg
     ПЕРЕД cancel_msg) → re-renders service picker (НЕ cancel). Теперь проваливается
@@ -2117,7 +2117,7 @@ async def cancel_msg(message: Message, state: FSMContext) -> None:
     же сессии для защиты от того же бага).
 
     NB: registered ПОСЛЕ name_msg (1417) и service_msg (1762). Оба имеют
-    ~F.text == "❌ Отмена" exclusion (Session 2026-09-13) — без exclusion они
+    F.text != "❌ Отмена" exclusion (Session 2026-09-13) — без exclusion они
     сматчат «❌ Отмена» первыми (registration order), cancel_msg не успеет.
 
     Registered BEFORE /mybookings handler (spec.md 491) — /cancel from /mybookings

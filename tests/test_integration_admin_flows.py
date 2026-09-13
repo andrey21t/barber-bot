@@ -1018,3 +1018,96 @@ async def test_cancel_button_text_works_in_entering_name_state(
         assert "Начните запись через /book" in _extract_send_text(bot), (
             "After ❌ Отмена the FSM must be State(None) — plain text hits the fallback"
         )
+
+
+@pytest.mark.asyncio
+async def test_cancel_button_text_works_in_entering_service_name_state(
+    integration_dispatcher: tuple[Dispatcher, MagicMock],
+    session_factory: Any,
+) -> None:
+    """Session 2026-09-13 (admin cancel button, code-review pass 2 F1+F2 fix):
+    ❌ Отмена tap в AdminStates.entering_service_name → admin_cancel_msg wins
+    dispatch (state.clear() + «Админ-режим отменён»), NOT admin_service_name_msg
+    (data corruption — услуга с именем «❌ Отмена» создавалась в БД).
+
+    Pre-fix (pass 2 F1): admin_service_name_msg (admin.py:2559) had filter
+    `StateFilter(AdminStates.entering_service_name), F.text, ~F.text.startswith("/")`
+    — «❌ Отмена» это текст, не начинается с "/", admin_service_name_msg
+    сматчит первым (registration order: admin_service_name_msg ПЕРЕД
+    admin_cancel_msg 4630) → service name = "❌ Отмена" → state.set_state(
+    entering_service_duration) → если admin введёт число, create_service
+    создаст услугу «❌ Отмена» в БД.
+
+    Fix: admin_service_name_msg filter расширен F.text != "❌ Отмена". Mirror
+    fix для admin_service_duration_msg (pass 2 F2 — без exclusion admin
+    зависал на int("❌ Отмена") ValueError, state stays, escape hatch сломан).
+
+    Regression guard: integration test через dp.feed_update ловит
+    filter-matching баги которые unit tests (direct handler invocation) не
+    ловят (reviewer S1 — unit test вызывает admin_cancel_msg напрямую, не
+    через router dispatch).
+    """
+    from freezegun import freeze_time
+
+    with freeze_time("2026-08-25 14:00:00", tz_offset=0):
+        dp, bot = integration_dispatcher
+        await _seed_admin(session_factory)
+
+        # Step 1: /menu → admin inline menu (содержит «➕ Добавить услугу»).
+        await dp.feed_update(bot, _make_text_update("/menu", user_id=ADMIN_TG_ID))
+        menu_text = _extract_send_text(bot)
+        assert "Меню" in menu_text, f"expected menu, got: {menu_text!r}"
+
+        # Step 2: tap «➕ Добавить услугу» (или аналогичная) → entering_service_name.
+        # admin_inline_menu callback «service_add» → admin_service_add_entry_cb
+        # → state.set_state(AdminStates.entering_service_name).
+        add_btn = await _find_button_by_label(bot, "Услуги")
+        assert add_btn is not None, "«Услуги» button in admin menu"
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(add_btn, user_id=ADMIN_TG_ID))
+        # После тапа «Услуги» должен появиться список услуг + кнопка ➕ для добавления.
+        services_screen = _extract_send_text(bot)
+        # Если кнопка ➕ прямо здесь — тапаем её. Иначе ищем во втором сообщении.
+        add_service_btn = await _find_button_by_label(bot, "➕")
+        if add_service_btn is None:
+            # Может быть «Добавить услугу» или аналогичный label.
+            add_service_btn = await _find_button_by_label(bot, "Добавить услугу")
+        assert add_service_btn is not None, (
+            f"Add-service button (➕ or 'Добавить услугу') not found. "
+            f"Services screen: {services_screen!r}"
+        )
+        bot.reset()
+        await dp.feed_update(
+            bot, _make_callback_update_from_button(add_service_btn, user_id=ADMIN_TG_ID)
+        )
+        name_prompt = _extract_send_text(bot)
+        assert "название" in name_prompt.lower() or "Введите" in name_prompt, (
+            f"After ➕ tap must be in entering_service_name. Got: {name_prompt!r}"
+        )
+
+        # Step 3 (THE TEST): type «❌ Отмена» → admin_cancel_msg wins.
+        # НЕ admin_service_name_msg (data corruption — услуга «❌ Отмена»).
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("❌ Отмена", user_id=ADMIN_TG_ID))
+        texts = _extract_all_send_texts(bot)
+        assert any("Админ-режим отменён" in t for t in texts), (
+            f"F1 fix: ❌ Отмена in entering_service_name must reach admin_cancel_msg. "
+            f"Got: {texts!r}"
+        )
+        # CRITICAL: «❌ Отмена» НЕ должно стать service name (data corruption).
+        assert not any("Введите длительность" in t for t in texts), (
+            "F1: ❌ Отмена must NOT reach admin_service_name_msg — that would "
+            f"set service name to '❌ Отмена'. Got: {texts!r}"
+        )
+        assert not any("❌ Отмена" in t and "Название:" in t for t in texts), (
+            "F1: ❌ Отмена must NOT appear as service name in duration prompt"
+        )
+
+        # State is cleared: plain text now hits admin_no_state_catchall_text.
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("ещё текст", user_id=ADMIN_TG_ID))
+        post_text = _extract_send_text(bot)
+        assert "/menu" in post_text or "Меню" in post_text, (
+            "After ❌ Отмена the FSM must be State(None) — admin plain text hits "
+            f"admin_no_state_catchall_text. Got: {post_text!r}"
+        )

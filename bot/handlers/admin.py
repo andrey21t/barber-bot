@@ -2556,12 +2556,24 @@ async def admin_service_delete_cb(
 # ============================================================
 
 
-@router.message(StateFilter(AdminStates.entering_service_name), F.text, ~F.text.startswith("/"))
+@router.message(
+    StateFilter(AdminStates.entering_service_name),
+    F.text,
+    ~F.text.startswith("/"),
+    F.text != "❌ Отмена",
+)
 async def admin_service_name_msg(message: Message, state: FSMContext) -> None:
     """User typed service name → save + ask duration.
 
     State stays в empty-name (ask again). set_state(entering_service_duration)
     в success. /cancel через client_router escape hatch (W1 analog).
+
+    Session 2026-09-13 (admin cancel button): добавлено F.text != "❌ Отмена"
+    exclusion. Без него admin тап ❌ Отмена в entering_service_name матчится
+    здесь первым (registration order: admin_service_name_msg ПЕРЕД
+    admin_cancel_msg) → service name = "❌ Отмена" → data corruption (услуга
+    «❌ Отмена» создавалась в БД). Теперь ❌ Отмена проваливается в
+    admin_cancel_msg → state.clear + «Админ-режим отменён».
     """
     if not _is_admin(message):
         return  # silently ignore non-admin
@@ -2592,13 +2604,24 @@ async def admin_service_name_msg(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(StateFilter(AdminStates.entering_service_duration), F.text, ~F.text.startswith("/"))
+@router.message(
+    StateFilter(AdminStates.entering_service_duration),
+    F.text,
+    ~F.text.startswith("/"),
+    F.text != "❌ Отмена",
+)
 async def admin_service_duration_msg(message: Message, state: FSMContext) -> None:
     """User typed duration → parse + validate + create_service + render result.
 
     Terminal step (Session 5.10): price убран, после duration сразу создаём
     услугу. State.clear() в success и unrecoverable error. State stays в
     parse-error / <=0 (ask again). /cancel через client_router escape hatch.
+
+    Session 2026-09-13 (admin cancel button): добавлено F.text != "❌ Отмена"
+    exclusion. Без него admin тап ❌ Отмена в entering_service_duration матчится
+    здесь первым → int("❌ Отмена") ValueError → «❌ Длительность должна быть
+    числом» + state stays → admin зависал (повторный тап → тот же error).
+    Теперь ❌ Отмена проваливается в admin_cancel_msg → state.clear.
     """
     if not _is_admin(message):
         return  # silently ignore non-admin
