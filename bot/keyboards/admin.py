@@ -905,8 +905,9 @@ def admin_openweek_edit_keyboard(opened_days: list[OpenedDay]) -> InlineKeyboard
         opened_days: list of OpenedDay (only successfully opened — failed
             days don't get an edit button, no WorkDay to update).
 
-    Layout: 7 [✏️] buttons in adjust(7), then [✅ Готово] alone. Telegram
-    inline limit 8 buttons/row, adjust(7, 1) packs weekdays into one row.
+    Layout: ✏️ buttons split 4+3 (adjust(4, 3) — 7 in one row обрезает labels
+    на iOS), then [✅ Готово] alone (adjust(1)). adjust(4, 3, 1) keeps Готово
+    on its own row, not squished with ✏️ buttons.
     """
     builder = InlineKeyboardBuilder()
     for od in sorted(opened_days, key=lambda d: d.weekday):
@@ -919,7 +920,10 @@ def admin_openweek_edit_keyboard(opened_days: list[OpenedDay]) -> InlineKeyboard
             ).pack(),
         )
     builder.button(text="✅ Готово", callback_data="admin_openweek_done")
-    builder.adjust(7, 1)
+    # adjust(4, 3, 1) — ✏️ в 2 ряда (4+3), ✅ Готово на отдельной строке.
+    # adjust(7, 1) обрезало «✅ Готово» на iOS до «✅...ОВО» (7 ✏️ в ряд + Готово
+    # в той же строке если дней < 7 — Telegram layout quirk).
+    builder.adjust(4, 3, 1)
     return builder.as_markup()
 
 

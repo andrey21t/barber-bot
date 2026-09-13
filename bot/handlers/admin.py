@@ -3202,7 +3202,6 @@ async def _apply_openweek(
     today_local = datetime.now(ZoneInfo(tz)).date()
 
     fail_lines: list[str] = []
-    opened_days: list[OpenedDay] = []
     for weekday in sorted(selected):
         work_date = monday + timedelta(days=weekday)
         day_label = _WEEKDAY_LABELS_HANDLER[weekday]
@@ -3218,19 +3217,6 @@ async def _apply_openweek(
                 await open_workday(
                     session, master_id, work_date, start_time, end_time, business_tz=tz
                 )
-                # Query workday_id back for edit keyboard (UPCERT created or
-                # updated — select_workday returns the row either way).
-                wd = await select_workday(session, master_id, work_date)
-            if wd is not None:
-                opened_days.append(
-                    OpenedDay(
-                        weekday=weekday,
-                        work_date_iso=work_date.isoformat(),
-                        workday_id=str(wd.id),
-                        start_time_str=start_time.strftime("%H:%M"),
-                        end_time_str=end_time.strftime("%H:%M"),
-                    )
-                )
         except WorkDayShrinkError as exc:
             # Показываем КАКАЯ бронь блокирует (имя, время, услуга) — пользователь
             # видит что мешает и решает: отменить, перенести или выбрать окно пошире.
@@ -3245,20 +3231,19 @@ async def _apply_openweek(
 
     # После apply — запросить ВСЕ активные WorkDays недели (существующие + только
     # что открытые). Summary показывает полное расписание недели, не только
-    # выбранные дни (fix UX: мастер видит все открытые дни, включая те что не
-    # менял — Request Екатерины 2026-09-13).
+    # выбранные дни. opened_days включает ВСЕ активные дни — мастер видит ✏️
+    # для каждого открытого дня, может тапнуть и изменить любой (fix UX:
+    # Request Екатерины 2026-09-13 — «хочу поменять другие дни, не только те
+    # что только что открыл»).
+    opened_days = await _refresh_opened_days(master_id, tz, monday)
+
+    # Summary lines из opened_days (полное расписание недели).
     all_open_lines: list[str] = []
-    for weekday in range(7):
-        work_date = monday + timedelta(days=weekday)
-        if work_date < today_local:
-            continue
-        async with async_session_factory() as session:
-            wd = await select_workday(session, master_id, work_date)
-        if wd is not None and wd.is_active:
-            day_label = _WEEKDAY_LABELS_HANDLER[weekday]
-            date_label = work_date.strftime("%d.%m")
-            window = f"{wd.start_time.strftime('%H:%M')}–{wd.end_time.strftime('%H:%M')}"
-            all_open_lines.append(f"📅 {day_label} {date_label} {window}")
+    for od in opened_days:
+        work_date = date.fromisoformat(od.work_date_iso)
+        day_label = _WEEKDAY_LABELS_HANDLER[od.weekday]
+        date_label = work_date.strftime("%d.%m")
+        all_open_lines.append(f"📅 {day_label} {date_label} {od.start_time_str}–{od.end_time_str}")
 
     summary_lines = all_open_lines + fail_lines
     summary = "\n".join(summary_lines) if summary_lines else "Ничего не открыто."
