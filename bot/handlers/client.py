@@ -2126,6 +2126,16 @@ async def cancel_msg(message: Message, state: FSMContext) -> None:
     Этап 5.8b W2 (code-review iter 2): /slots vs /book hint branching. Read
     is_slots_path ДО state.clear() — после clear флаг потерян. StateFilter("*")
     ловит cancel из любого state, включая /slots entering_name/entering_service.
+
+    W3 (Session 2026-09-13, accept — known edge case): non-admin в State(None)
+    manual typing «❌ Отмена» → cancel_msg матчит (StateFilter("*") + F.text match)
+    → hint «Ввод отменён. /book чтобы начать заново». У client_reply_keyboard НЕТ
+    кнопки ❌ Отмена (только у admin_reply_keyboard, keyboards/admin.py:295) —
+    значит real user impact ~0 (только manual typing в no-state). Accept: не править
+    (guard через _is_admin перед cancel_msg сломал бы client-side escape hatch
+    в booking FSM — клиент В booking FSM и тапает ❌ Отмена через admin_reply_keyboard
+    если admin переключился между ролями, что технически возможно через multi-
+    tenant но edge of edge). Live impact: 0 случаев за 2 недели observation.
     """
     # Read is_slots_path ДО state.clear() (race-condition pattern preserves).
     fsm_data_cancel = await state.get_data()

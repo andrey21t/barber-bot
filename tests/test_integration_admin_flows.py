@@ -574,6 +574,73 @@ async def _seed_workday_tomorrow(
         }
 
 
+async def _seed_today_with_booking(
+    session_factory: Any,
+    *,
+    admin_id: int = ADMIN_TG_ID,
+) -> dict[str, Any]:
+    """Seed business + master + workday TODAY (10-12) + service + client + booking
+    TODAY 11:00-12:00 (confirmed). Returns booking_id for /today → [🔄 Перенести].
+
+    Used by W4 integration test: admin_move flow requires a booking on /today
+    so cmd_today renders admin_today_keyboard with [🔄 Перенести] button.
+    """
+    from datetime import time as dt_time
+    from decimal import Decimal
+
+    from bot.models import Booking, Service
+
+    async with session_factory() as session:
+        biz = Business(name="Test", telegram_owner_id=admin_id, timezone=TZ)
+        session.add(biz)
+        await session.flush()
+        master = Master(business_id=biz.id, name="T", telegram_id=admin_id, role="owner")
+        session.add(master)
+        await session.flush()
+
+        today_local = datetime.now(ZoneInfo(TZ)).date()
+        wd = WorkDay(
+            master_id=master.id,
+            work_date=today_local,
+            start_time=dt_time(10, 0),
+            end_time=dt_time(12, 0),
+            is_active=True,
+            max_concurrent_clients=1,
+        )
+        session.add(wd)
+        await session.flush()
+
+        svc = Service(
+            business_id=biz.id, name="Стрижка", duration_minutes=60, price=Decimal("0")
+        )
+        session.add(svc)
+        await session.flush()
+
+        client = Client(telegram_id=999888777, name="Test Client")
+        session.add(client)
+        await session.flush()
+
+        # Booking today 11:00-12:00 LOCAL → UTC (TZ-aware). freeze_time in tests
+        # is 2026-08-25 14:00 UTC; today_local computed from TZ (Europe/Moscow).
+        start_local = datetime.combine(today_local, dt_time(11, 0), tzinfo=ZoneInfo(TZ))
+        end_local = datetime.combine(today_local, dt_time(12, 0), tzinfo=ZoneInfo(TZ))
+        booking = Booking(
+            business_id=biz.id,
+            master_id=master.id,
+            client_id=client.id,
+            service_id=svc.id,
+            service_title_snapshot="Стрижка",
+            service_price_snapshot=Decimal("0"),
+            client_name_snapshot="Test Client",
+            start_at=start_local.astimezone(UTC),
+            end_at=end_local.astimezone(UTC),
+            status="confirmed",
+        )
+        session.add(booking)
+        await session.commit()
+        return {"booking_id": booking.id, "client_telegram_id": 999888777}
+
+
 def _make_calendar_day_update(
     target_date: Any,
     *,
@@ -937,7 +1004,81 @@ async def test_cancel_command_works_in_service_step(
         bot.reset()
         await dp.feed_update(bot, _make_text_update("ещё текст", user_id=client_tg))
         assert "Начните запись через /book" in _extract_send_text(bot), (
-            "After /cancel the FSM must be State(None) — plain text hits the fallback"
+            "After ❌ Отмена the FSM must be State(None) — plain text hits the fallback"
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancel_button_text_works_in_admin_move_selecting_date_state(
+    integration_dispatcher: tuple[Dispatcher, MagicMock],
+    session_factory: Any,
+) -> None:
+    """Session 2026-09-13 (W4 fix): ❌ Отмена tap в AdminMoveStates.selecting_date
+    → admin_cancel_msg wins dispatch (state.clear() + «Админ-режим отменён»), NOT
+    client_router cancel_msg (booking-specific «Ввод отменён. /book» hint —
+    misleading для admin который делал /today → 🔄 Перенести, не /book).
+
+    Pre-fix: admin_cancel_msg filter был `StateFilter(AdminStates)` only — НЕ
+    покрывал AdminMoveStates (3 states: selecting_date/selecting_slot/confirming).
+    ❌ Отмена в admin_move flow проваливался в client_router cancel_msg (StateFilter("*")
+    матчит AdminMoveStates) → hint «Ввод отменён. /book чтобы начать заново»
+    (booking-specific, misleading). Escape работал (state.clear срабатывал), но
+    hint был неточный. Fix: admin_cancel_msg filter расширен на
+    or_f(StateFilter(AdminStates), StateFilter(AdminMoveStates)) — единый escape
+    hatch для всех 15 admin FSM states.
+
+    Admin_move flow — callback-driven (4 callback handlers admin.py:2742/2901/
+    2985/3156), text input НЕ expected. ❌ Отмена как text — единственный message
+    path. or_f НЕ перехватит admin_move callback handlers (callback vs message —
+    разные buckets в aiogram 3.x dispatch).
+
+    Regression guard: integration test через dp.feed_update ловит filter-matching
+    баги которые unit tests не ловят.
+    """
+    from freezegun import freeze_time
+
+    with freeze_time("2026-08-25 14:00:00", tz_offset=0):
+        dp, bot = integration_dispatcher
+        await _seed_today_with_booking(session_factory)
+
+        # Step 1: /today → admin_today_keyboard with [🔄 Перенести] button.
+        await dp.feed_update(bot, _make_text_update("/today", user_id=ADMIN_TG_ID))
+        today_text = _extract_send_text(bot)
+        assert "Записи на сегодня" in today_text, f"expected today list, got: {today_text!r}"
+
+        # Step 2: tap [🔄 Перенести] → AdminMoveStates.selecting_date (calendar).
+        move_btn = await _find_button_by_label(bot, "🔄")
+        assert move_btn is not None, (
+            f"Expected [🔄 Перенести] button. Got markup: {bot.last_reply_markup!r}"
+        )
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(move_btn, user_id=ADMIN_TG_ID))
+        cal_text = _extract_send_text(bot)
+        assert "Выберите новую дату" in cal_text or "Выберите дату" in cal_text, (
+            f"After [🔄 Перенести] tap must be in AdminMoveStates.selecting_date. Got: {cal_text!r}"
+        )
+
+        # Step 3 (THE TEST): type "❌ Отмена" → admin_cancel_msg wins (NOT client cancel_msg).
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("❌ Отмена", user_id=ADMIN_TG_ID))
+        texts = _extract_all_send_texts(bot)
+        assert any("Админ-режим отменён" in t for t in texts), (
+            f"W4: ❌ Отмена in AdminMoveStates must reach admin_cancel_msg. Got: {texts!r}"
+        )
+        # CRITICAL: «❌ Отмена» НЕ должно попасть в client_router cancel_msg
+        # (booking-specific hint «Ввод отменён. /book» — misleading для admin).
+        assert not any("Ввод отменён" in t and "/book" in t for t in texts), (
+            "W4: ❌ Отмена in AdminMoveStates must NOT fall through to client_router "
+            f"cancel_msg (booking-specific hint). Got: {texts!r}"
+        )
+
+        # State is cleared: plain text now hits admin_no_state_catchall_text.
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("ещё текст", user_id=ADMIN_TG_ID))
+        post_text = _extract_send_text(bot)
+        assert "/menu" in post_text or "Меню" in post_text, (
+            "After ❌ Отмена the FSM must be State(None) — admin plain text hits "
+            f"admin_no_state_catchall_text. Got: {post_text!r}"
         )
 
 
@@ -1110,4 +1251,62 @@ async def test_cancel_button_text_works_in_entering_service_name_state(
         assert "/menu" in post_text or "Меню" in post_text, (
             "After ❌ Отмена the FSM must be State(None) — admin plain text hits "
             f"admin_no_state_catchall_text. Got: {post_text!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancel_button_text_works_in_entering_service_state(
+    integration_dispatcher: tuple[Dispatcher, MagicMock],
+    session_factory: Any,
+) -> None:
+    """Session 2026-09-13 (S1 — mirror test 945 для BookingStates.entering_service):
+    ❌ Отмена tap в BookingStates.entering_service → cancel_msg wins dispatch
+    (state.clear() + «Ввод отменён»), NOT service_msg (data corruption — service
+    picker re-render вместо cancel).
+
+    Pre-fix: service_msg (client.py:1772) filter был `~F.text.startswith("/")` only
+    — «❌ Отмена» это text, не начинается с "/", service_msg сматчит первым
+    (registration order: service_msg 1772 ПЕРЕД cancel_msg 2086) → re-renders
+    service picker (НЕ cancel). Fix: service_msg filter расширен
+    `F.text != "❌ Отмена"` (mirror name_msg:1417). Теперь ❌ Отмена проваливается
+    через service_msg (не матчит) → cancel_msg (матчит) → state.clear().
+
+    Regression guard: integration test через dp.feed_update ловит filter-matching
+    баги которые unit tests (direct handler invocation) не ловят (reviewer S1).
+    """
+    from freezegun import freeze_time
+
+    with freeze_time("2026-08-25 14:00:00", tz_offset=0):
+        dp, bot = integration_dispatcher
+        await _seed_workday_tomorrow(session_factory)
+        client_tg = 999_888_777
+
+        # Step 1: /book → date picker (selecting_date).
+        await dp.feed_update(bot, _make_text_update("/book", user_id=client_tg))
+        assert "Выберите дату" in _extract_send_text(bot)
+
+        # Step 2: tap tomorrow → service picker (entering_service).
+        tomorrow = (datetime.now(ZoneInfo(TZ)) + timedelta(days=1)).date()
+        bot.reset()
+        await dp.feed_update(bot, _make_calendar_day_update(tomorrow, user_id=client_tg))
+        assert "Выберите услугу" in _extract_send_text(bot), "must be in entering_service"
+
+        # Step 3 (THE TEST): type "❌ Отмена" → cancel_msg wins (NOT service_msg).
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("❌ Отмена", user_id=client_tg))
+        texts = _extract_all_send_texts(bot)
+        assert any("Ввод отменён" in t for t in texts), (
+            f"S1: ❌ Отмена in entering_service must reach cancel_msg. Got: {texts!r}"
+        )
+        # CRITICAL: «❌ Отмена» НЕ должно триггерить service_msg (re-render picker).
+        assert not any("выберите услугу кнопкой" in t for t in texts), (
+            "S1: ❌ Отмена must NOT reach service_msg — that would re-render the "
+            f"service picker instead of cancelling. Got: {texts!r}"
+        )
+
+        # State is cleared: plain text now hits no_state_fallback (State(None)).
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("ещё текст", user_id=client_tg))
+        assert "Начните запись через /book" in _extract_send_text(bot), (
+            "After ❌ Отмена the FSM must be State(None) — plain text hits the fallback"
         )

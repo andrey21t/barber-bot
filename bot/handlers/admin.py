@@ -4641,7 +4641,9 @@ def _openweek_week_header(tz: str, offset: int = 0) -> str:
 #   2. Menu callbacks (admin_addslots_cb и др.) — StateFilter("*") + callback filter
 #   3. FSM handlers (calendar_cb, hours_msg, hour_msg, name_msg,
 #      duration_msg) — StateFilter(specific)
-#   4. /cancel (admin_cancel_msg) — StateFilter(AdminStates) + Command("cancel")
+#   4. /cancel + ❌ Отмена (admin_cancel_msg) — or_f(F.text == "❌ Отмена",
+#      Command("cancel")) + StateFilter(AdminStates, AdminMoveStates) (W4 fix
+#      Session 2026-09-13: расширен с AdminStates-only на 15 admin FSM states).
 #   5. Catch-all text — StateFilter(AdminStates) + F.text + ~startswith("/")
 #   6. Catch-all callback — StateFilter(AdminStates)
 # admin_router включается ПЕРЕД client_router (main.py:118-119), поэтому
@@ -4650,17 +4652,37 @@ def _openweek_week_header(tz: str, offset: int = 0) -> str:
 # ============================================================
 
 
-@router.message(or_f(F.text == "❌ Отмена", Command("cancel")), StateFilter(AdminStates))
+@router.message(
+    or_f(F.text == "❌ Отмена", Command("cancel")),
+    StateFilter(AdminStates, AdminMoveStates),
+)
 async def admin_cancel_msg(message: Message, state: FSMContext) -> None:
     """Cancel admin FSM flow — clears state, admin-specific message.
 
     Triggers: /cancel command OR tap на reply keyboard кнопку "❌ Отмена" (Session
-    5.62+). StateFilter(AdminStates) матчит ЛЮБОЙ admin state (12 states в
-    bot/states.py:56-75 — 6 addslots/services + 6 openweek). В BookingStates
-    или StateFilter(None) НЕ матчится — проваливается в client_router cancel_msg
-    (client.py:2086, расширен в Session 2026-09-13 на or_f с F.text == "❌ Отмена")
-    для booking-FSM, либо в admin_cancel_no_state для no-FSM.
-    state.clear() BEFORE answer (race condition, MY-VIBE-RULES.md 24).
+    5.62+). Filter покрывает ВСЕ 15 admin FSM states: 12 в AdminStates (6
+    addslots/services + 6 openweek, bot/states.py:56-75) + 3 в AdminMoveStates
+    (selecting_date/selecting_slot/confirming, bot/states.py:106-108).
+
+    W4 fix (Session 2026-09-13): до расширения AdminMoveStates НЕ покрывались →
+    ❌ Отмена в admin_move flow проваливался в client_router cancel_msg (client.py:2086,
+    StateFilter("*") матчит AdminMoveStates) → hint "Ввод отменён. /book" (booking-
+    specific, misleading для admin который делал /today → 🔄 Перенести, не /book).
+    Escape работал (state.clear срабатывал), но hint был неточный. Теперь
+    admin_cancel_msg ловит первым (admin_router ПЕРЕД client_router, main.py:118)
+    → hint "Админ-режим отменён. /menu для меню".
+
+    callback vs message: admin_move flow — callback-driven (4 callback handlers
+    admin.py:2742/2901/2985/3156), text input НЕ expected. ❌ Отмена как text —
+    единственный message path в этом flow. StateFilter(AdminStates, AdminMoveStates)
+    НЕ перехватит admin_move callback handlers (callback vs message — разные buckets
+    в aiogram 3.x dispatch).
+
+    В BookingStates или StateFilter(None) НЕ матчится — проваливается в
+    client_router cancel_msg для booking-FSM, либо в admin_cancel_no_state для
+    no-FSM. state.clear() BEFORE answer (race condition, MY-VIBE-RULES.md 24);
+    state.clear() = set_state(None) + set_data({}) (aiogram fsm/context.py:42-44,
+    полностью WIPES state AND data — booking_id/new_workday_id не остаются).
     """
     if not _is_admin(message):
         return  # non-admin в admin state — edge case (storage isolation), silent
