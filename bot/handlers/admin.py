@@ -66,8 +66,6 @@ from bot.keyboards.admin import (
     AdminServiceAddEntryCallbackData,
     AdminServiceDeleteCallbackData,
     AdminServicesCallbackData,
-    AdminTodayCallbackData,
-    AdminWeekCallbackData,
     AdminWindowConfirmCallbackData,
     AdminWindowSlot30CallbackData,
     BookedSlot,
@@ -2297,109 +2295,6 @@ async def admin_window_booked_cb(callback: CallbackQuery) -> None:
         "• /closeday — для массовой отмены дня",
         show_alert=True,
     )
-
-
-@router.callback_query(AdminTodayCallbackData.filter(), StateFilter("*"))
-async def admin_today_cb(callback: CallbackQuery) -> None:
-    """Menu tap: сегодня — мгновенный список записей (no FSM).
-
-    State НЕ трогаем — админ может посмотреть расписание mid-flow без отмены.
-    """
-    if not _is_admin_callback(callback):
-        await callback.answer()
-        return
-
-    # _is_admin_callback guarantees callback.from_user is not None (type narrowing).
-    assert callback.from_user is not None
-    resolved = await _resolve_master_and_business(callback.from_user.id)
-    if resolved is None:
-        await callback.answer("❌ Мастер не найден", show_alert=True)
-        return
-    master_id, _business_id, tz = resolved
-
-    async with async_session_factory() as session:
-        bookings = await get_today_bookings(session, master_id, tz)
-
-    if callback.message is not None:
-        if not bookings:
-            await callback.message.answer("На сегодня записей нет.")
-        else:
-            await callback.message.answer(
-                _render_bookings("📅 Записи на сегодня:", bookings, tz),
-                reply_markup=admin_today_keyboard(bookings, tz),
-            )
-    await callback.answer()
-
-
-@router.callback_query(AdminWeekCallbackData.filter(), StateFilter("*"))
-async def admin_week_cb(
-    callback: CallbackQuery,
-    state: FSMContext,
-) -> None:
-    """Menu tap: неделя — мгновенный список записей на 7 дней (no FSM).
-
-    State НЕ трогаем — админ может посмотреть расписание mid-flow без отмены.
-    Только ИНСПЕКТИРУЕМ state (read-only) для решения edit_text vs answer.
-
-    5.60 P3 (variant A): используем edit_text вместо answer, когда admin НЕ
-    mid-flow (state is None) — это заменяет старое «Ближайшие записи» на новое
-    в том же сообщении, не оставляя осадка в чате. Если admin mid-flow
-    (state is not None) → answer в новом сообщении (не ломаем flow message,
-    иначе edit_text заменил бы клавиатуру шага 3 на «Ближайшие записи»).
-    Если edit_text упадёт (TelegramBadRequest — сообщение старше 48ч или
-    удалено) → answer в новом сообщении как fallback.
-
-    Race с другими callback'ами: aiogram serializes callbacks per-user, нет
-    concurrent edit_text на одном message. state.get_state() — read-only,
-    не меняет state (текущий инвариант сохранён).
-    """
-    if not _is_admin_callback(callback):
-        await callback.answer()
-        return
-
-    # _is_admin_callback guarantees callback.from_user is not None (type narrowing).
-    assert callback.from_user is not None
-    resolved = await _resolve_master_and_business(callback.from_user.id)
-    if resolved is None:
-        await callback.answer("❌ Мастер не найден", show_alert=True)
-        return
-    master_id, _business_id, tz = resolved
-
-    async with async_session_factory() as session:
-        bookings = await get_all_future_bookings(session, master_id, tz)
-
-    if callback.message is None:
-        await callback.answer()
-        return
-
-    if not bookings:
-        text = "Ближайших записей нет."
-    else:
-        text = _render_bookings("📅 Ближайшие записи:", bookings, tz)
-
-    # 5.60 P3 — edit_text if FSM state is None (admin NOT mid-flow). Avoid
-    # replacing a flow message with «Ближайшие записи» — flow keyboard would
-    # be lost and admin would see stale message without ✅ Открыть button.
-    current_state = await state.get_state()
-    if current_state is not None:
-        # Mid-flow (e.g. opening_week_days) → answer в новом сообщении.
-        # State НЕ трогаем (existing invariant preserved).
-        await callback.message.answer(text)
-        await callback.answer()
-        return
-
-    # State is None — admin is in main menu, message is the inline menu.
-    # edit_text replaces menu content with «Ближайшие записи» in same message
-    # (no chat clutter). Fallback на answer если edit упал (>48h, удалено).
-    if isinstance(callback.message, Message):
-        try:
-            await callback.message.edit_text(text)
-        except TelegramBadRequest:
-            await callback.message.answer(text)
-    else:
-        # InaccessibleMessage — нельзя edit, только answer в новом сообщении.
-        await callback.message.answer(text)
-    await callback.answer()
 
 
 @router.callback_query(AdminServicesCallbackData.filter(), StateFilter("*"))

@@ -61,14 +61,6 @@ class AdminAddslotsCallbackData(CallbackData, prefix="admin_addslots"):
     """
 
 
-class AdminTodayCallbackData(CallbackData, prefix="admin_today"):
-    """Trigger today bookings list — мгновенный callback, no FSM."""
-
-
-class AdminWeekCallbackData(CallbackData, prefix="admin_week"):
-    """Trigger week bookings list — мгновенный callback, no FSM."""
-
-
 class AdminServicesCallbackData(CallbackData, prefix="admin_services"):
     """Show services list (Session 2026-09-13, Баг 1 от Екатерины).
 
