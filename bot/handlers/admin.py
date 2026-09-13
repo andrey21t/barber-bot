@@ -55,6 +55,11 @@ from bot.keyboards.admin import (
     AdminMoveSlot30CallbackData,
     AdminNoShowCallbackData,
     AdminOpenWeekCallbackData,
+    AdminOpenweekDeleteBackCallbackData,
+    AdminOpenweekDeleteCancelCallbackData,
+    AdminOpenweekDeleteConfirmCallbackData,
+    AdminOpenweekDeleteDayCallbackData,
+    AdminOpenweekDeleteEntryCallbackData,
     AdminOpenweekEditCallbackData,
     AdminOpenWeekEntryCallbackData,
     AdminOpenWeekNavCallbackData,
@@ -71,6 +76,8 @@ from bot.keyboards.admin import (
     admin_close_today_confirm_keyboard,
     admin_inline_menu,
     admin_move_confirm_keyboard,
+    admin_openweek_delete_confirm_keyboard,
+    admin_openweek_delete_picker_keyboard,
     admin_openweek_edit_keyboard,
     admin_openweek_overwrite_keyboard,
     admin_services_list_keyboard,
@@ -1814,6 +1821,458 @@ async def admin_openweek_done_cb(
     await state.clear()
     if callback.message is not None:
         await callback.message.answer("📋 /menu для действий", reply_markup=admin_inline_menu())
+    await callback.answer()
+
+
+# ============================================================
+# /openweek delete-day flow (Session 2026-09-13 — feedback Екатерина)
+# Entry: [🗑 Удалить день] in admin_openweek_edit_keyboard.
+# Flow: entry → day-picker → confirm (if bookings) → close + notify + re-render.
+# Reuses close_workday_with_cancellations (same as /closeday text command +
+# admin_close_today inline flow). Stateless — all context in callback_data
+# (race-safe vs FSM state loss, mirror AdminCloseTodayConfirmCallbackData).
+# ============================================================
+
+
+@router.callback_query(
+    AdminOpenweekDeleteEntryCallbackData.filter(),
+    StateFilter(None),
+)
+async def admin_openweek_delete_entry_cb(
+    callback: CallbackQuery,
+    callback_data: AdminOpenweekDeleteEntryCallbackData,
+) -> None:
+    """[🗑 Удалить день] → show delete-day picker (re-queried opened_days).
+
+    State=None (post-apply) — re-queries opened_days from DB by monday_iso.
+    Shows delete picker with [🗑 <Day>] buttons + [← Назад]. If no opened
+    days (race: all closed between apply and tap) → alert "нечего удалять"
+    + return to edit keyboard.
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    master_id, _business_id, tz = resolved
+
+    try:
+        monday = date.fromisoformat(callback_data.monday_iso)
+    except ValueError:
+        await callback.answer("❌ Ошибка данных кнопки. /openweek заново", show_alert=True)
+        return
+
+    opened_days = await _refresh_opened_days(master_id, tz, monday)
+    if not opened_days:
+        # Race: all days were closed between apply and this tap (e.g. via
+        # /closeday in another tab). Alert + re-render empty edit keyboard.
+        # НЕ вызываем callback.answer() повторно — alert выше уже ответил.
+        await callback.answer("❌ Нечего удалять — все дни уже закрыты", show_alert=True)
+        summary = _render_openweek_edit_summary(monday, opened_days)
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(
+                    summary,
+                    reply_markup=admin_openweek_edit_keyboard(opened_days),
+                )
+            except TelegramBadRequest:
+                await callback.message.answer(
+                    summary,
+                    reply_markup=admin_openweek_edit_keyboard(opened_days),
+                )
+        return
+
+    # Show delete picker.
+    picker_text = (
+        "🗑 <b>Удалить день</b>\n\n"
+        "Выберите день для удаления. Все записи на этот день будут отменены, "
+        "клиентам придёт уведомление."
+    )
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_text(
+                picker_text,
+                reply_markup=admin_openweek_delete_picker_keyboard(opened_days),
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                picker_text,
+                reply_markup=admin_openweek_delete_picker_keyboard(opened_days),
+            )
+    await callback.answer()
+
+
+@router.callback_query(
+    AdminOpenweekDeleteDayCallbackData.filter(),
+    StateFilter(None),
+)
+async def admin_openweek_delete_day_cb(
+    callback: CallbackQuery,
+    callback_data: AdminOpenweekDeleteDayCallbackData,
+) -> None:
+    """[🗑 Пн] in delete picker → branch on active bookings.
+
+    Mirror admin_close_today_cb pattern:
+    - WorkDay not found / not active → alert + return to edit keyboard.
+    - 0 bookings → close immediately + summary + re-render edit keyboard.
+    - >0 bookings → show booking list + [✅ Да, удалить] / [❌ Отмена] confirm.
+
+    State=None — all context from callback_data (race-safe).
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    master_id, _business_id, tz = resolved
+
+    try:
+        work_date = date.fromisoformat(callback_data.work_date_iso)
+        workday_id = UUID(callback_data.workday_id)
+    except (ValueError, TypeError):
+        await callback.answer("❌ Ошибка данных кнопки. /openweek заново", show_alert=True)
+        return
+
+    async with async_session_factory() as session:
+        workday = await session.get(WorkDay, workday_id)
+    if workday is None or not workday.is_active:
+        # Race: closed between delete picker render and this tap (e.g. via
+        # /closeday in another tab). Alert + re-render edit keyboard without
+        # this day. НЕ вызываем callback.answer() повторно — alert выше уже
+        # ответил (Telegram take only first answerCallbackQuery per query).
+        await callback.answer("❌ День уже закрыт", show_alert=True)
+        monday = work_date - timedelta(days=work_date.weekday())
+        opened_days = await _refresh_opened_days(master_id, tz, monday)
+        summary = _render_openweek_edit_summary(monday, opened_days)
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(
+                    summary,
+                    reply_markup=admin_openweek_edit_keyboard(opened_days),
+                )
+            except TelegramBadRequest:
+                await callback.message.answer(
+                    summary,
+                    reply_markup=admin_openweek_edit_keyboard(opened_days),
+                )
+        return
+
+    async with async_session_factory() as session:
+        active_bookings = await get_active_bookings_for_workday(session, workday, tz)
+
+    if not active_bookings:
+        # No bookings — close immediately + re-render edit keyboard (skip
+        # confirm step, mirror admin_close_today_cb "no bookings" branch).
+        async with async_session_factory() as session:
+            try:
+                result = await close_workday_with_cancellations(
+                    session, workday.id, business_tz=tz
+                )
+            except SQLAlchemyError:
+                if isinstance(callback.message, Message):
+                    await callback.message.answer(
+                        "❌ Ошибка БД. Попробуйте позже через /menu"
+                    )
+                await callback.answer()
+                return
+        if result is None:
+            # Race: closed between SELECT and UPDATE (idempotent no-op).
+            await callback.answer("❌ День уже закрыт", show_alert=True)
+            summary_line = ""
+        else:
+            # 0 bookings → no notifications needed (cancelled_bookings empty).
+            summary_line = _format_closeday_summary(
+                result.work_date, len(result.cancelled_bookings), 0
+            )
+        monday = work_date - timedelta(days=work_date.weekday())
+        opened_days = await _refresh_opened_days(master_id, tz, monday)
+        full_summary = (
+            _render_openweek_edit_summary(monday, opened_days)
+            + (f"\n\n{summary_line}" if summary_line else "")
+        )
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(
+                    full_summary,
+                    reply_markup=admin_openweek_edit_keyboard(opened_days),
+                )
+            except TelegramBadRequest:
+                await callback.message.answer(
+                    full_summary,
+                    reply_markup=admin_openweek_edit_keyboard(opened_days),
+                )
+        await callback.answer()
+        return
+
+    # Active bookings → show confirm step with booking list (mirror
+    # admin_close_today_cb pattern).
+    tz_obj = ZoneInfo(tz)
+    bookings_text_lines: list[str] = []
+    for b in active_bookings:
+        local_time = b.start_at.replace(tzinfo=UTC).astimezone(tz_obj)
+        when = local_time.strftime("%H:%M")
+        bookings_text_lines.append(
+            f"• {when} — {b.client_name_snapshot}, {b.service_title_snapshot}"
+        )
+    bookings_list = "\n".join(bookings_text_lines)
+    # weekday в callback_data не передаётся (экономия 2 байт для 64-byte лимита
+    # aiogram) — вычисляем из work_date (тот же результат).
+    day_label = _WEEKDAY_LABELS_HANDLER[work_date.weekday()]
+    date_label = work_date.strftime("%d.%m")
+    confirm_text = (
+        f"🗑 <b>Удалить {day_label} {date_label}?</b>\n\n"
+        f"В этот день {len(active_bookings)} запис(ь/и/ей):\n"
+        f"{bookings_list}\n\n"
+        f"Все записи будут отменены, клиентам придёт уведомление."
+    )
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_text(
+                confirm_text,
+                reply_markup=admin_openweek_delete_confirm_keyboard(
+                    callback_data.work_date_iso,
+                    callback_data.workday_id,
+                ),
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                confirm_text,
+                reply_markup=admin_openweek_delete_confirm_keyboard(
+                    callback_data.work_date_iso,
+                    callback_data.workday_id,
+                ),
+            )
+    await callback.answer()
+
+
+@router.callback_query(
+    AdminOpenweekDeleteConfirmCallbackData.filter(),
+    StateFilter(None),
+)
+async def admin_openweek_delete_confirm_cb(
+    callback: CallbackQuery,
+    scheduler: AsyncIOScheduler,
+    callback_data: AdminOpenweekDeleteConfirmCallbackData,
+) -> None:
+    """[✅ Да, удалить] in delete-day confirm step.
+
+    Race-safe (workday_id in callback_data, no FSM state). close_workday_with_cancellations
+    + notify cancelled clients + remove scheduler jobs. After close: re-query
+    opened_days for the same week (monday from work_date_iso) and re-render
+    summary + edit keyboard (deleted day no longer in ✏️ list).
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    master_id, _business_id, tz = resolved
+
+    try:
+        workday_id = UUID(callback_data.workday_id)
+    except (ValueError, TypeError):
+        if isinstance(callback.message, Message):
+            await callback.message.answer("❌ Ошибка данных кнопки. /closeday чтобы закрыть день")
+        await callback.answer()
+        return
+
+    # work_date_iso НЕ в callback_data (экономия 11 байт для 64-byte лимита
+    # aiogram). Кверим WorkDay по workday_id — close_workday_with_cancellations
+    # ставит is_active=False, не удаляет row, поэтому session.get вернёт row
+    # даже после close. Если row не найдена (extremely unlikely race — row
+    # удалена), fallback на текущую неделю monday.
+    async with async_session_factory() as session:
+        workday = await session.get(WorkDay, workday_id)
+    if workday is not None:
+        work_date = workday.work_date
+    else:
+        today = datetime.now(ZoneInfo(tz)).date()
+        work_date = today - timedelta(days=today.weekday())
+
+    async with async_session_factory() as session:
+        try:
+            result = await close_workday_with_cancellations(
+                session, workday_id, business_tz=tz
+            )
+        except SQLAlchemyError:
+            if isinstance(callback.message, Message):
+                await callback.message.answer("❌ Ошибка БД. Попробуйте позже через /menu")
+            await callback.answer()
+            return
+
+    summary_line = ""
+    if result is None or result.was_already_closed:
+        # Race: closed between confirm render and tap (e.g. /closeday in
+        # another tab). close_workday_with_cancellations возвращает
+        # ClosedDayResult(was_already_closed=True) при is_active=False
+        # (idempotent no-op), НЕ None — None только если row нет в DB.
+        # В обоих случаях alert + re-render без summary_line.
+        await callback.answer("❌ День уже закрыт", show_alert=True)
+        # Return — не падаем в else-ветку с _notify (cancelled_bookings=[]
+        # всё равно 0 уведомлений, но лишний вызов) и не зовём финальный
+        # callback.answer() (уже ответили alert'ом — aiogram allows only
+        # one answerCallbackQuery per query, 2-й silent no-op).
+        monday = work_date - timedelta(days=work_date.weekday())
+        opened_days = await _refresh_opened_days(master_id, tz, monday)
+        full_summary = _render_openweek_edit_summary(monday, opened_days)
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(
+                    full_summary,
+                    reply_markup=admin_openweek_edit_keyboard(opened_days),
+                )
+            except TelegramBadRequest:
+                await callback.message.answer(
+                    full_summary,
+                    reply_markup=admin_openweek_edit_keyboard(opened_days),
+                )
+        return
+    notified_count = await _notify_cancelled_clients(
+        result.cancelled_bookings, tz, callback.bot, scheduler
+    )
+    cancelled_count = len(result.cancelled_bookings)
+    summary_line = _format_closeday_summary(
+        result.work_date, cancelled_count, notified_count
+    )
+
+    monday = work_date - timedelta(days=work_date.weekday())
+    opened_days = await _refresh_opened_days(master_id, tz, monday)
+    full_summary = (
+        _render_openweek_edit_summary(monday, opened_days)
+        + (f"\n\n{summary_line}" if summary_line else "")
+    )
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_text(
+                full_summary,
+                reply_markup=admin_openweek_edit_keyboard(opened_days),
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                full_summary,
+                reply_markup=admin_openweek_edit_keyboard(opened_days),
+            )
+    await callback.answer()
+
+
+@router.callback_query(
+    AdminOpenweekDeleteCancelCallbackData.filter(),
+    StateFilter(None),
+)
+async def admin_openweek_delete_cancel_cb(
+    callback: CallbackQuery,
+    callback_data: AdminOpenweekDeleteCancelCallbackData,
+) -> None:
+    """[❌ Отмена] in delete-day confirm — return to delete picker.
+
+    Re-queries opened_days for the week (monday from callback_data) and
+    re-renders delete picker. User can pick a different day or [← Назад].
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    master_id, _business_id, tz = resolved
+
+    try:
+        monday = date.fromisoformat(callback_data.monday_iso)
+    except ValueError:
+        await callback.answer("❌ Ошибка данных кнопки. /openweek заново", show_alert=True)
+        return
+
+    opened_days = await _refresh_opened_days(master_id, tz, monday)
+    if not opened_days:
+        # Race: all days closed between confirm and cancel tap. Re-render
+        # edit keyboard (empty).
+        summary = _render_openweek_edit_summary(monday, opened_days)
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(
+                    summary,
+                    reply_markup=admin_openweek_edit_keyboard(opened_days),
+                )
+            except TelegramBadRequest:
+                await callback.message.answer(
+                    summary,
+                    reply_markup=admin_openweek_edit_keyboard(opened_days),
+                )
+        await callback.answer()
+        return
+
+    picker_text = (
+        "🗑 <b>Удалить день</b>\n\n"
+        "Выберите день для удаления. Все записи на этот день будут отменены, "
+        "клиентам придёт уведомление."
+    )
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_text(
+                picker_text,
+                reply_markup=admin_openweek_delete_picker_keyboard(opened_days),
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                picker_text,
+                reply_markup=admin_openweek_delete_picker_keyboard(opened_days),
+            )
+    await callback.answer()
+
+
+@router.callback_query(
+    AdminOpenweekDeleteBackCallbackData.filter(),
+    StateFilter(None),
+)
+async def admin_openweek_delete_back_cb(
+    callback: CallbackQuery,
+    callback_data: AdminOpenweekDeleteBackCallbackData,
+) -> None:
+    """[← Назад] in delete picker — return to /openweek edit keyboard.
+
+    Re-queries opened_days and re-renders summary + edit keyboard (mirror
+    admin_openweek_done_cb but instead of /menu shows edit keyboard).
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    master_id, _business_id, tz = resolved
+
+    try:
+        monday = date.fromisoformat(callback_data.monday_iso)
+    except ValueError:
+        await callback.answer("❌ Ошибка данных кнопки. /openweek заново", show_alert=True)
+        return
+
+    opened_days = await _refresh_opened_days(master_id, tz, monday)
+    summary = _render_openweek_edit_summary(monday, opened_days)
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_text(
+                summary,
+                reply_markup=admin_openweek_edit_keyboard(opened_days),
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                summary,
+                reply_markup=admin_openweek_edit_keyboard(opened_days),
+            )
     await callback.answer()
 
 

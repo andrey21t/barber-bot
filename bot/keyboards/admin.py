@@ -23,7 +23,8 @@ AdminMoveSlot30CallbackData, AdminMoveConfirmCallbackData).
 """
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from datetime import date as dt_date
 from datetime import time as dt_time
 from typing import cast
 from uuid import UUID
@@ -509,6 +510,97 @@ class AdminOpenweekEditCallbackData(CallbackData, prefix="admin_openweek_edit"):
     work_date_iso: str
 
 
+class AdminOpenweekDeleteEntryCallbackData(CallbackData, prefix="admin_ow_del"):
+    """[🗑 Удалить день] inline button — open day-delete picker.
+
+    Session 2026-09-13 (feedback Екатерина): добавить удаление дня целиком
+    из edit-keyboard (post-/openweek apply). Раньше приходилось выходить из
+    flow и звать /closeday YYYY-MM-DD.
+
+    Payload:
+    - monday_iso: str YYYY-MM-DD — Monday of the week being edited. Handler
+      re-queries opened_days from DB for this week (race-safe vs stale
+      keyboard: if week rotated, picker shows the actual week the user was
+      editing, not current week).
+
+    Wire format: "admin_ow_del:<YYYY-MM-DD>" = 22 bytes < 64.
+    Short prefix (admin_ow_*) shared across 5 delete-day callbacks to fit
+    the 64-byte aiogram callback_data limit when payload includes UUID.
+    """
+
+    monday_iso: str
+
+
+class AdminOpenweekDeleteDayCallbackData(CallbackData, prefix="admin_ow_del_day"):
+    """[🗑 Пн] inline button in delete-day picker — open confirm step.
+
+    Payload:
+    - work_date_iso: str YYYY-MM-DD — for confirm message + monday re-compute
+      after delete (handler derives monday = work_date - work_date.weekday()
+      and weekday = work_date.weekday() for label rendering).
+    - workday_id: str (UUID hex) — for close_workday_with_cancellations call.
+
+    weekday вычисляется в handler из work_date (без него в callback_data)
+    — экономит 2 байта для попадания в 64-byte лимит aiogram.
+
+    Wire format: "admin_ow_del_day:<YYYY-MM-DD>:<32hex>" = 64 bytes (точно
+    лимит). Distinct prefix from edit and entry callbacks.
+    """
+
+    work_date_iso: str
+    workday_id: str
+
+
+class AdminOpenweekDeleteConfirmCallbackData(CallbackData, prefix="admin_ow_del_conf"):
+    """[✅ Да, удалить] in delete-day confirm step.
+
+    Race-safe vs FSM state loss (mirror AdminCloseTodayConfirmCallbackData):
+    workday_id is in callback_data, no state to lose between confirm render
+    and tap. After close: handler queries WorkDay by workday_id to get
+    work_date (close sets is_active=False, не удаляет row — query вернёт row
+    даже после close), derives monday = work_date - work_date.weekday(),
+    re-queries opened_days and re-renders edit keyboard.
+
+    work_date_iso НЕ в callback_data — handler кверит WorkDay по workday_id
+    (один SELECT), чтобы влезть в 64-byte лимит aiogram. Если workday
+    не найден (extremely unlikely race — row удалена), fallback на текущую
+    неделю monday.
+
+    Payload:
+    - workday_id: str (UUID hex) — for close_workday_with_cancellations +
+      work_date lookup.
+
+    Wire format: "admin_ow_del_conf:<32hex>" = 54 bytes < 64.
+    """
+
+    workday_id: str
+
+
+class AdminOpenweekDeleteCancelCallbackData(CallbackData, prefix="admin_ow_del_cancel"):
+    """[❌ Отмена] in delete-day confirm step — return to delete picker.
+
+    monday_iso: str YYYY-MM-DD — Monday of the week, to re-query opened_days
+    and re-render delete picker (one step back, not all the way to edit
+    keyboard — user may want to delete a different day).
+
+    Wire format: "admin_ow_del_cancel:<YYYY-MM-DD>" = 30 bytes < 64.
+    """
+
+    monday_iso: str
+
+
+class AdminOpenweekDeleteBackCallbackData(CallbackData, prefix="admin_ow_del_back"):
+    """[← Назад] in delete-day picker — return to /openweek edit keyboard.
+
+    monday_iso: str YYYY-MM-DD — Monday of the week being edited. Handler
+    re-queries opened_days and re-renders summary + edit keyboard.
+
+    Wire format: "admin_ow_del_back:<YYYY-MM-DD>" = 27 bytes < 64.
+    """
+
+    monday_iso: str
+
+
 class AdminCloseTodayCallbackData(CallbackData, prefix="admin_close_today"):
     """[🔒 Закрыть день] tap from admin_today_keyboard (Session 5.63, пункт 3).
 
@@ -895,20 +987,26 @@ def admin_openweek_overwrite_keyboard(
 
 
 def admin_openweek_edit_keyboard(opened_days: list[OpenedDay]) -> InlineKeyboardMarkup:
-    """[✏️ Пн] [✏️ Вт] ... [✅ Готово] — per-day window edit after /openweek
-    apply (Session 5.28 D).
+    """[✏️ Пн] [✏️ Вт] ... [🗑 Удалить день] [✅ Готово] — per-day window edit
+    after /openweek apply (Session 5.28 D + 2026-09-13 delete-day feedback).
 
-    One [✏️ <Day>] button per opened day (sorted by weekday). [✅ Готово]
-    below to exit edit flow (state.clear + /menu).
+    One [✏️ <Day>] button per opened day (sorted by weekday). [🗑 Удалить день]
+    below — opens delete picker (full-width button, deliberate destructive
+    action, harder to mis-tap). [✅ Готово] below to exit edit flow.
 
     Args:
         opened_days: list of OpenedDay (only successfully opened — failed
             days don't get an edit button, no WorkDay to update).
 
     Layout: ✏️ buttons в рядах по 4 (builder.row() — явные ряды, не adjust()
-    который перетасовывает Готово в тот же ряд). [✅ Готово] в отдельном ряду
-    через builder.row(). fix UX: adjust(4, 3, 1) при 3 ✏️ пихал Готово в 1
-    ряд → обрезалось «...ово».
+    который перетасовывает Готово в тот же ряд). [🗑 Удалить день] в отдельном
+    ряду (only if opened_days non-empty — nothing to delete otherwise). [✅
+    Готово] в отдельном ряду через builder.row(). fix UX: adjust(4, 3, 1) при
+    3 ✏️ пихал Готово в 1 ряд → обрезалось «...ово».
+
+    monday_iso for [🗑 Удалить день] derived from opened_days[0].work_date_iso
+    (all opened_days share same week by construction — _refresh_opened_days
+    iterates Mon..Sun of one monday). If opened_days empty → no delete button.
     """
     builder = InlineKeyboardBuilder()
     sorted_days = sorted(opened_days, key=lambda d: d.weekday)
@@ -927,10 +1025,112 @@ def admin_openweek_edit_keyboard(opened_days: list[OpenedDay]) -> InlineKeyboard
                 for od in chunk
             ]
         )
+    # 🗑 Удалить день — только если есть что удалять (opened_days non-empty).
+    # monday_iso из opened_days[0] (все дни одной недели — _refresh_opened_days
+    # итерирует Mon..Sun одного monday). Передаётся в callback_data —
+    # delete-entry handler ре-запрашивает opened_days для этой недели.
+    if sorted_days:
+        first_date = dt_date.fromisoformat(sorted_days[0].work_date_iso)
+        monday = first_date - timedelta(days=first_date.weekday())
+        builder.row(
+            InlineKeyboardButton(
+                text="🗑 Удалить день",
+                callback_data=AdminOpenweekDeleteEntryCallbackData(
+                    monday_iso=monday.isoformat(),
+                ).pack(),
+            )
+        )
     # ✅ Готово в отдельном ряду — builder.row() гарантирует отдельную строку.
     builder.row(
         InlineKeyboardButton(text="✅ Готово", callback_data="admin_openweek_done")
     )
+    return builder.as_markup()
+
+
+def admin_openweek_delete_picker_keyboard(opened_days: list[OpenedDay]) -> InlineKeyboardMarkup:
+    """[🗑 Пн] [🗑 Вт] ... [← Назад] — pick day to delete (2026-09-13 feedback).
+
+    Mirrors admin_openweek_edit_keyboard layout but with 🗑 prefix and
+    AdminOpenweekDeleteDayCallbackData (carries workday_id for confirm step).
+    [← Назад] returns to edit keyboard (AdminOpenweekDeleteBackCallbackData
+    with monday_iso — handler re-queries opened_days, re-renders summary +
+    edit keyboard).
+
+    Args:
+        opened_days: list of OpenedDay (same as edit keyboard — re-queried
+            by handler from DB, race-safe vs stale keyboard).
+
+    Layout: 🗑 buttons в рядах по 4 (mirror edit keyboard). [← Назад] в
+    отдельном ряду (full-width — easy target).
+    """
+    builder = InlineKeyboardBuilder()
+    sorted_days = sorted(opened_days, key=lambda d: d.weekday)
+    # 🗑 в рядах по 4 (mirror admin_openweek_edit_keyboard).
+    for i in range(0, len(sorted_days), 4):
+        chunk = sorted_days[i : i + 4]
+        builder.row(
+            *[
+                InlineKeyboardButton(
+                    text=f"🗑 {_WEEKDAY_LABELS[od.weekday]}",
+                    callback_data=AdminOpenweekDeleteDayCallbackData(
+                        work_date_iso=od.work_date_iso,
+                        workday_id=od.workday_id,
+                    ).pack(),
+                )
+                for od in chunk
+            ]
+        )
+    # [← Назад] — full-width, easy target. monday_iso derived from
+    # opened_days[0] (same logic as edit keyboard — all days share week).
+    if sorted_days:
+        first_date = dt_date.fromisoformat(sorted_days[0].work_date_iso)
+        monday = first_date - timedelta(days=first_date.weekday())
+        builder.row(
+            InlineKeyboardButton(
+                text="← Назад",
+                callback_data=AdminOpenweekDeleteBackCallbackData(
+                    monday_iso=monday.isoformat(),
+                ).pack(),
+            )
+        )
+    return builder.as_markup()
+
+
+def admin_openweek_delete_confirm_keyboard(
+    work_date_iso: str,
+    workday_id: str,
+) -> InlineKeyboardMarkup:
+    """[✅ Да, удалить] / [❌ Отмена] keyboard for /openweek delete-day confirm.
+
+    Mirror admin_close_today_confirm_keyboard pattern: workday_id in
+    callback_data (race-safe vs FSM state loss). [❌ Отмена] returns to delete
+    picker (one step back) — needs monday_iso derived from work_date_iso.
+
+    Args:
+        work_date_iso: str YYYY-MM-DD — date of the day being deleted (for
+            AdminOpenweekDeleteConfirmCallbackData + monday re-compute in
+            cancel handler via AdminOpenweekDeleteCancelCallbackData).
+        workday_id: str (UUID hex) — for close_workday_with_cancellations.
+
+    Layout: adjust(1) — каждая кнопка на всю ширину (mirror
+    admin_close_today_confirm_keyboard, prevents iOS truncation).
+    """
+    work_date = dt_date.fromisoformat(work_date_iso)
+    monday = work_date - timedelta(days=work_date.weekday())
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="✅ Да, удалить",
+        callback_data=AdminOpenweekDeleteConfirmCallbackData(
+            workday_id=workday_id,
+        ).pack(),
+    )
+    builder.button(
+        text="❌ Отмена",
+        callback_data=AdminOpenweekDeleteCancelCallbackData(
+            monday_iso=monday.isoformat(),
+        ).pack(),
+    )
+    builder.adjust(1)
     return builder.as_markup()
 
 

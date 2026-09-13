@@ -7656,3 +7656,581 @@ async def test_admin_complete_cb_refreshes_keyboard_after_transition(
     assert "reply_markup" in kwargs
     rm = kwargs["reply_markup"]
     assert isinstance(rm, InlineKeyboardMarkup)
+
+
+# ============================================================
+# /openweek delete-day flow (Session 2026-09-13 — feedback Екатерина)
+# [🗑 Удалить день] in edit-keyboard → picker → confirm (if bookings) →
+# close + notify + re-render. Reuses close_workday_with_cancellations
+# (mirror admin_close_today_cb / cmd_closeday).
+# ============================================================
+
+
+def test_admin_openweek_edit_keyboard_has_delete_button() -> None:
+    """Edit keyboard includes [🗑 Удалить день] when opened_days non-empty."""
+    from bot.keyboards.admin import OpenedDay, admin_openweek_edit_keyboard
+
+    opened = [
+        OpenedDay(
+            weekday=0,
+            work_date_iso="2026-09-07",
+            workday_id="11111111-1111-1111-1111-111111111111",
+            start_time_str="09:00",
+            end_time_str="18:00",
+        ),
+        OpenedDay(
+            weekday=5,
+            work_date_iso="2026-09-12",
+            workday_id="22222222-2222-2222-2222-222222222222",
+            start_time_str="09:00",
+            end_time_str="18:00",
+        ),
+    ]
+    kb = admin_openweek_edit_keyboard(opened)
+    buttons = [btn for row in kb.inline_keyboard for btn in row]
+    texts = [btn.text for btn in buttons]
+    assert any("🗑 Удалить день" in t for t in texts), f"Missing 🗑 button; got: {texts}"
+    assert any("✅ Готово" in t for t in texts), f"Missing Готово; got: {texts}"
+
+
+def test_admin_openweek_edit_keyboard_no_delete_when_empty() -> None:
+    """No [🗑 Удалить день] when opened_days empty (nothing to delete)."""
+    from bot.keyboards.admin import admin_openweek_edit_keyboard
+
+    kb = admin_openweek_edit_keyboard([])
+    buttons = [btn for row in kb.inline_keyboard for btn in row]
+    texts = [btn.text for btn in buttons]
+    assert not any("🗑" in t for t in texts), f"Should not have 🗑 when empty; got: {texts}"
+    assert any("✅ Готово" in t for t in texts), f"Should still have Готово; got: {texts}"
+
+
+def test_admin_openweek_edit_keyboard_delete_callback_carries_monday_iso() -> None:
+    """[🗑 Удалить день] callback_data contains monday_iso derived from
+    opened_days[0].work_date_iso (Monday of same week)."""
+    from bot.keyboards.admin import (
+        AdminOpenweekDeleteEntryCallbackData,
+        OpenedDay,
+        admin_openweek_edit_keyboard,
+    )
+
+    # Wed 09.09 → monday 07.09.
+    opened = [
+        OpenedDay(
+            weekday=2,
+            work_date_iso="2026-09-09",
+            workday_id="33333333-3333-3333-3333-333333333333",
+            start_time_str="09:00",
+            end_time_str="18:00",
+        ),
+    ]
+    kb = admin_openweek_edit_keyboard(opened)
+    buttons = [btn for row in kb.inline_keyboard for btn in row]
+    del_btn = next((b for b in buttons if "🗑" in b.text), None)
+    assert del_btn is not None
+    assert del_btn.callback_data is not None
+    parsed = AdminOpenweekDeleteEntryCallbackData.unpack(del_btn.callback_data)
+    assert parsed.monday_iso == "2026-09-07", (
+        f"monday_iso should be 2026-09-07 (Mon of Wed 09.09); got: {parsed.monday_iso}"
+    )
+
+
+def test_admin_openweek_delete_picker_keyboard_shows_days_and_back() -> None:
+    """Delete picker renders [🗑 <Day>] per opened_day + [← Назад]."""
+    from bot.keyboards.admin import (
+        AdminOpenweekDeleteBackCallbackData,
+        OpenedDay,
+        admin_openweek_delete_picker_keyboard,
+    )
+
+    opened = [
+        OpenedDay(
+            weekday=0,
+            work_date_iso="2026-09-07",
+            workday_id="11111111-1111-1111-1111-111111111111",
+            start_time_str="09:00",
+            end_time_str="18:00",
+        ),
+        OpenedDay(
+            weekday=5,
+            work_date_iso="2026-09-12",
+            workday_id="22222222-2222-2222-2222-222222222222",
+            start_time_str="09:00",
+            end_time_str="18:00",
+        ),
+    ]
+    kb = admin_openweek_delete_picker_keyboard(opened)
+    buttons = [btn for row in kb.inline_keyboard for btn in row]
+    texts = [btn.text for btn in buttons]
+    assert any("🗑 Пн" in t for t in texts), f"Missing 🗑 Пн; got: {texts}"
+    assert any("🗑 Сб" in t for t in texts), f"Missing 🗑 Сб; got: {texts}"
+    back_btn = next((b for b in buttons if "Назад" in b.text), None)
+    assert back_btn is not None, f"Missing ← Назад; got: {texts}"
+    assert back_btn.callback_data is not None
+    parsed = AdminOpenweekDeleteBackCallbackData.unpack(back_btn.callback_data)
+    assert parsed.monday_iso == "2026-09-07"
+
+
+def test_admin_openweek_delete_confirm_keyboard_has_confirm_and_cancel() -> None:
+    """Confirm keyboard: [✅ Да, удалить] / [❌ Отмена] with workday_id and monday_iso."""
+    from bot.keyboards.admin import (
+        AdminOpenweekDeleteCancelCallbackData,
+        AdminOpenweekDeleteConfirmCallbackData,
+        admin_openweek_delete_confirm_keyboard,
+    )
+
+    kb = admin_openweek_delete_confirm_keyboard(
+        "2026-09-12",  # Saturday
+        "22222222-2222-2222-2222-222222222222",
+    )
+    buttons = [btn for row in kb.inline_keyboard for btn in row]
+    texts = [btn.text for btn in buttons]
+    assert any("✅ Да, удалить" in t for t in texts), f"Missing ✅ Да; got: {texts}"
+    assert any("❌ Отмена" in t for t in texts), f"Missing ❌ Отмена; got: {texts}"
+    confirm_btn = next(b for b in buttons if "✅" in b.text)
+    cancel_btn = next(b for b in buttons if "❌" in b.text)
+    assert confirm_btn.callback_data is not None
+    assert cancel_btn.callback_data is not None
+    confirm_parsed = AdminOpenweekDeleteConfirmCallbackData.unpack(confirm_btn.callback_data)
+    assert confirm_parsed.workday_id == "22222222-2222-2222-2222-222222222222"
+    cancel_parsed = AdminOpenweekDeleteCancelCallbackData.unpack(cancel_btn.callback_data)
+    # Saturday 12.09 → Monday 07.09.
+    assert cancel_parsed.monday_iso == "2026-09-07"
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_delete_entry_cb_shows_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[🗑 Удалить день] → edit_text with delete picker keyboard."""
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        await _seed_workday(
+            session, ctx=ctx, work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00", end_time_str="19:00",
+        )
+        await _seed_workday(
+            session, ctx=ctx, work_date=datetime(2026, 9, 12).date(),
+            start_time_str="10:00", end_time_str="19:00",
+        )
+
+    from bot.keyboards.admin import AdminOpenweekDeleteEntryCallbackData
+
+    cb_data = AdminOpenweekDeleteEntryCallbackData(monday_iso="2026-09-07")
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+
+    await admin_handlers.admin_openweek_delete_entry_cb(callback, cb_data)
+
+    assert callback.message.edit_text.called
+    text = str(callback.message.edit_text.call_args.args[0])
+    assert "Удалить день" in text
+    rm = callback.message.edit_text.call_args.kwargs.get("reply_markup")
+    assert rm is not None
+    buttons = [btn for row in rm.inline_keyboard for btn in row]
+    texts = [btn.text for btn in buttons]
+    assert any("🗑 Пн" in t for t in texts), f"Should have 🗑 Пн; got: {texts}"
+    assert any("🗑 Сб" in t for t in texts), f"Should have 🗑 Сб; got: {texts}"
+    assert any("Назад" in t for t in texts), f"Should have ← Назад; got: {texts}"
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_delete_entry_cb_no_days_alert(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Race: all days closed between apply and [🗑 Удалить день] tap → alert
+    + re-render empty edit keyboard (no days to delete)."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+    # No WorkDays seeded — _refresh_opened_days returns [].
+
+    from bot.keyboards.admin import AdminOpenweekDeleteEntryCallbackData
+
+    cb_data = AdminOpenweekDeleteEntryCallbackData(monday_iso="2026-09-07")
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+
+    await admin_handlers.admin_openweek_delete_entry_cb(callback, cb_data)
+
+    # Alert shown (callback.answer with show_alert=True).
+    callback.answer.assert_called_once()
+    args, kwargs = callback.answer.call_args
+    alert_text = args[0] if args else kwargs.get("text", "")
+    assert "нечего удалять" in alert_text.lower(), f"Should alert no days; got: {alert_text!r}"
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_delete_day_cb_no_bookings_closes_immediately(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[🗑 Сб] with 0 bookings → close immediately + re-render edit keyboard
+    (without Сб). Mirror admin_close_today_cb no-bookings branch."""
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        wd_mon = await _seed_workday(
+            session, ctx=ctx, work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00", end_time_str="19:00",
+        )
+        wd_sat = await _seed_workday(
+            session, ctx=ctx, work_date=datetime(2026, 9, 12).date(),
+            start_time_str="10:00", end_time_str="19:00",
+        )
+
+    from bot.keyboards.admin import AdminOpenweekDeleteDayCallbackData
+
+    cb_data = AdminOpenweekDeleteDayCallbackData(
+        work_date_iso="2026-09-12", workday_id=str(wd_sat.id),
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+
+    await admin_handlers.admin_openweek_delete_day_cb(callback, cb_data)
+
+    assert callback.message.edit_text.called
+    text = str(callback.message.edit_text.call_args.args[0])
+    assert "✅" in text and "закрыт" in text, f"Should show close summary; got: {text!r}"
+    rm = callback.message.edit_text.call_args.kwargs.get("reply_markup")
+    assert rm is not None
+    buttons = [btn for row in rm.inline_keyboard for btn in row]
+    texts = [btn.text for btn in buttons]
+    # Сб button gone (closed), Пн button still there.
+    assert any("✏️ Пн" in t for t in texts), f"Should still have ✏️ Пн; got: {texts}"
+    assert not any("✏️ Сб" in t for t in texts), f"Should not have ✏️ Сб; got: {texts}"
+
+    async with session_factory() as session:
+        from bot.models import WorkDay as _WD
+
+        wd = await session.get(_WD, wd_sat.id)
+    assert wd is not None and wd.is_active is False, "Sat should be closed"
+    async with session_factory() as session:
+        wd2 = await session.get(_WD, wd_mon.id)
+    assert wd2 is not None and wd2.is_active is True, "Mon should still be active"
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_delete_day_cb_with_bookings_shows_confirm(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[🗑 Сб] with active bookings → show confirm with booking list +
+    admin_openweek_delete_confirm_keyboard (carries workday_id)."""
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        wd_sat = await _seed_workday(
+            session, ctx=ctx, work_date=datetime(2026, 9, 12).date(),
+            start_time_str="10:00", end_time_str="19:00",
+        )
+        slot = await _seed_slot(
+            session, master_id=ctx["master_id"],
+            slot_date=datetime(2026, 9, 12).date(), hour=14, status="booked",
+        )
+        local_noon = datetime(2026, 9, 12, 14, 0, tzinfo=ZoneInfo(TZ))
+        await _seed_booking(
+            session, ctx=ctx, slot=slot,
+            start_at_utc_naive=local_noon.astimezone(UTC).replace(tzinfo=None),
+            status="confirmed",
+        )
+
+    from bot.keyboards.admin import (
+        AdminOpenweekDeleteConfirmCallbackData,
+        AdminOpenweekDeleteDayCallbackData,
+    )
+
+    cb_data = AdminOpenweekDeleteDayCallbackData(
+        work_date_iso="2026-09-12", workday_id=str(wd_sat.id),
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+
+    await admin_handlers.admin_openweek_delete_day_cb(callback, cb_data)
+
+    assert callback.message.edit_text.called
+    text = str(callback.message.edit_text.call_args.args[0])
+    assert "Удалить" in text and "Сб" in text
+    assert "14:00" in text, f"Should show booking time; got: {text!r}"
+    rm = callback.message.edit_text.call_args.kwargs.get("reply_markup")
+    assert rm is not None
+    buttons = [btn for row in rm.inline_keyboard for btn in row]
+    confirm_btn = next((b for b in buttons if "✅ Да" in b.text), None)
+    assert confirm_btn is not None, f"Missing ✅ Да; got: {[b.text for b in buttons]}"
+    parsed = AdminOpenweekDeleteConfirmCallbackData.unpack(confirm_btn.callback_data)
+    assert parsed.workday_id == str(wd_sat.id)
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_delete_day_cb_already_closed_race(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Race: WorkDay closed between delete picker render and [🗑 Сб] tap →
+    alert 'День уже закрыт' + re-render edit keyboard (without Сб)."""
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        await _seed_workday(
+            session, ctx=ctx, work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00", end_time_str="19:00",
+        )
+        wd_sat = await _seed_workday(
+            session, ctx=ctx, work_date=datetime(2026, 9, 12).date(),
+            start_time_str="10:00", end_time_str="19:00", is_active=False,
+        )
+
+    from bot.keyboards.admin import AdminOpenweekDeleteDayCallbackData
+
+    cb_data = AdminOpenweekDeleteDayCallbackData(
+        work_date_iso="2026-09-12", workday_id=str(wd_sat.id),
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+
+    await admin_handlers.admin_openweek_delete_day_cb(callback, cb_data)
+
+    callback.answer.assert_called_once()
+    args, _ = callback.answer.call_args
+    assert "уже закрыт" in args[0], f"Should alert already closed; got: {args[0]!r}"
+    # Re-rendered edit keyboard without Sat (only Mon).
+    assert callback.message.edit_text.called
+    rm = callback.message.edit_text.call_args.kwargs.get("reply_markup")
+    buttons = [btn for row in rm.inline_keyboard for btn in row]
+    texts = [btn.text for btn in buttons]
+    assert any("✏️ Пн" in t for t in texts)
+    assert not any("✏️ Сб" in t for t in texts)
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_delete_confirm_cb_closes_and_notifies(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[✅ Да, удалить] → close_workday_with_cancellations + notify clients +
+    re-render edit keyboard (without deleted day)."""
+    from unittest.mock import patch
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        await _seed_workday(
+            session, ctx=ctx, work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00", end_time_str="19:00",
+        )
+        wd_sat = await _seed_workday(
+            session, ctx=ctx, work_date=datetime(2026, 9, 12).date(),
+            start_time_str="10:00", end_time_str="19:00",
+        )
+        slot = await _seed_slot(
+            session, master_id=ctx["master_id"],
+            slot_date=datetime(2026, 9, 12).date(), hour=14, status="booked",
+        )
+        local_noon = datetime(2026, 9, 12, 14, 0, tzinfo=ZoneInfo(TZ))
+        await _seed_booking(
+            session, ctx=ctx, slot=slot,
+            start_at_utc_naive=local_noon.astimezone(UTC).replace(tzinfo=None),
+            status="confirmed",
+        )
+
+    from bot.keyboards.admin import AdminOpenweekDeleteConfirmCallbackData
+
+    cb_data = AdminOpenweekDeleteConfirmCallbackData(
+        workday_id=str(wd_sat.id),
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.bot.send_message = AsyncMock()
+    callback.message.edit_text = AsyncMock()
+    scheduler = MagicMock()
+
+    with patch("bot.handlers.admin.remove_jobs_for_booking") as rm_jobs:
+        await admin_handlers.admin_openweek_delete_confirm_cb(callback, scheduler, cb_data)
+
+    # Sat closed in DB.
+    async with session_factory() as session:
+        from bot.models import WorkDay as _WD
+
+        wd = await session.get(_WD, wd_sat.id)
+    assert wd is not None and wd.is_active is False, "Sat should be closed"
+
+    # Notification sent to client.
+    assert callback.bot.send_message.called, "Should send notification to client"
+    rm_jobs.assert_called_once()
+
+    # Edit keyboard re-rendered without Sat.
+    assert callback.message.edit_text.called
+    rm = callback.message.edit_text.call_args.kwargs.get("reply_markup")
+    buttons = [btn for row in rm.inline_keyboard for btn in row]
+    texts = [btn.text for btn in buttons]
+    assert any("✏️ Пн" in t for t in texts)
+    assert not any("✏️ Сб" in t for t in texts), f"Sat should be gone; got: {texts}"
+
+    # Summary text includes close line.
+    text = str(callback.message.edit_text.call_args.args[0])
+    assert "закрыт" in text or "отменено" in text.lower(), (
+        f"Should include close summary; got: {text!r}"
+    )
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_delete_confirm_cb_already_closed_race(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Race: close_workday_with_cancellations returns None (already closed
+    by /closeday in another tab between confirm render and tap) → alert +
+    re-render edit keyboard (without summary_line)."""
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        await _seed_workday(
+            session, ctx=ctx, work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00", end_time_str="19:00",
+        )
+        wd_sat = await _seed_workday(
+            session, ctx=ctx, work_date=datetime(2026, 9, 12).date(),
+            start_time_str="10:00", end_time_str="19:00", is_active=False,
+        )
+
+    from bot.keyboards.admin import AdminOpenweekDeleteConfirmCallbackData
+
+    cb_data = AdminOpenweekDeleteConfirmCallbackData(
+        workday_id=str(wd_sat.id),
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+    scheduler = MagicMock()
+
+    await admin_handlers.admin_openweek_delete_confirm_cb(callback, scheduler, cb_data)
+
+    callback.answer.assert_called_once()
+    args, _ = callback.answer.call_args
+    assert "уже закрыт" in args[0], f"Should alert already closed; got: {args[0]!r}"
+    # Re-rendered edit keyboard (Mon only, no Sat).
+    assert callback.message.edit_text.called
+    text = str(callback.message.edit_text.call_args.args[0])
+    assert "Пн" in text, f"Should include Mon in summary; got: {text!r}"
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_delete_cancel_cb_returns_to_picker(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[❌ Отмена] in confirm step → re-render delete picker (one step back,
+    not all the way to edit keyboard). User can pick a different day."""
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        await _seed_workday(
+            session, ctx=ctx, work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00", end_time_str="19:00",
+        )
+        await _seed_workday(
+            session, ctx=ctx, work_date=datetime(2026, 9, 12).date(),
+            start_time_str="10:00", end_time_str="19:00",
+        )
+
+    from bot.keyboards.admin import AdminOpenweekDeleteCancelCallbackData
+
+    cb_data = AdminOpenweekDeleteCancelCallbackData(monday_iso="2026-09-07")
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+
+    await admin_handlers.admin_openweek_delete_cancel_cb(callback, cb_data)
+
+    assert callback.message.edit_text.called
+    text = str(callback.message.edit_text.call_args.args[0])
+    assert "Удалить день" in text
+    rm = callback.message.edit_text.call_args.kwargs.get("reply_markup")
+    assert rm is not None
+    buttons = [btn for row in rm.inline_keyboard for btn in row]
+    texts = [btn.text for btn in buttons]
+    assert any("🗑 Пн" in t for t in texts)
+    assert any("🗑 Сб" in t for t in texts)
+    assert any("Назад" in t for t in texts)
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_delete_back_cb_returns_to_edit_keyboard(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[← Назад] in delete picker → re-render summary + edit keyboard."""
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        await _seed_workday(
+            session, ctx=ctx, work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00", end_time_str="19:00",
+        )
+        await _seed_workday(
+            session, ctx=ctx, work_date=datetime(2026, 9, 12).date(),
+            start_time_str="10:00", end_time_str="19:00",
+        )
+
+    from bot.keyboards.admin import AdminOpenweekDeleteBackCallbackData
+
+    cb_data = AdminOpenweekDeleteBackCallbackData(monday_iso="2026-09-07")
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+
+    await admin_handlers.admin_openweek_delete_back_cb(callback, cb_data)
+
+    assert callback.message.edit_text.called
+    text = str(callback.message.edit_text.call_args.args[0])
+    # Summary text includes week header + days.
+    assert "Открыть неделю" in text
+    assert "Пн" in text and "Сб" in text
+    rm = callback.message.edit_text.call_args.kwargs.get("reply_markup")
+    assert rm is not None
+    buttons = [btn for row in rm.inline_keyboard for btn in row]
+    texts = [btn.text for btn in buttons]
+    assert any("✏️ Пн" in t for t in texts)
+    assert any("✏️ Сб" in t for t in texts)
+    assert any("🗑 Удалить день" in t for t in texts)
+    assert any("✅ Готово" in t for t in texts)
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_delete_entry_cb_non_admin_silent(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Non-admin tap [🗑 Удалить день] → silent return (callback.answer, no edit)."""
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    from bot.keyboards.admin import AdminOpenweekDeleteEntryCallbackData
+
+    cb_data = AdminOpenweekDeleteEntryCallbackData(monday_iso="2026-09-07")
+    callback = _make_callback(NON_ADMIN_TG_ID, callback_data=cb_data)
+
+    await admin_handlers.admin_openweek_delete_entry_cb(callback, cb_data)
+
+    callback.answer.assert_called_once()
+    assert not callback.message.edit_text.called, "Non-admin should not edit message"
+
+
+@pytest.mark.asyncio
+@freeze_time("2026-09-06 14:00:00", tz_offset=0)
+async def test_openweek_delete_entry_cb_master_not_found(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Admin tap but master not in DB → alert 'Мастер не найден'."""
+    # No seed — admin resolves, but master not in DB.
+
+    from bot.keyboards.admin import AdminOpenweekDeleteEntryCallbackData
+
+    cb_data = AdminOpenweekDeleteEntryCallbackData(monday_iso="2026-09-07")
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+
+    await admin_handlers.admin_openweek_delete_entry_cb(callback, cb_data)
+
+    callback.answer.assert_called_once()
+    args, _ = callback.answer.call_args
+    assert "Мастер не найден" in args[0]
