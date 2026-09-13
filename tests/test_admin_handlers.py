@@ -2260,7 +2260,9 @@ async def test_cmd_menu_matches_reply_keyboard_text(
 ) -> None:
     """'📋 Меню' (reply keyboard button text) → same handler as /menu command.
 
-    Session 5.62: admin_reply_keyboard() имеет 3 кнопки с emoji+text label'ами.
+    Session 5.62: admin_reply_keyboard() имеет 4 кнопки с emoji+text label'ами
+    (📋 Меню / 📅 Сегодня / 🗓 Неделя / ❌ Отмена — Session 2026-09-13 добавила 4-ю
+    кнопку как escape hatch из mid-FSM).
     Handler декорирован or_f(F.text == "📋 Меню", Command("menu")) — оба триггера
     идут в один handler. Это regression guard: если убрать F.text match — reply
     keyboard кнопка станет "мёртвой" (tap → no handler → silent).
@@ -2348,6 +2350,125 @@ async def test_cmd_today_non_admin_silent_with_state(
 
     assert _answer_call_count(msg) == 0
     state.clear.assert_not_called()  # silent return before state.clear()
+
+
+# ============================================================
+# Session 2026-09-13 (вариант A): кнопка ❌ Отмена в reply keyboard
+# ============================================================
+# 4-я кнопка «❌ Отмена» в admin_reply_keyboard — universal escape hatch из
+# mid-FSM (Екатерина не понимала как выйти из зависшего состояния). Handler
+# admin_cancel_msg расширен с Command("cancel") до or_f(F.text == "❌ Отмена",
+# Command("cancel")). Новый handler admin_cancel_no_state для ❌ Отмена ВНЕ
+# admin FSM — вежливое «Нечего отменять» вместо молчания/catch-all.
+# Донор-ресёрч (winnerxxx13, UznetDev) — dedicated cancel button не standard
+# у single-master ботов, наша инновация для elderly-user UX.
+# ============================================================
+
+
+def test_admin_reply_keyboard_has_4_buttons_in_one_row() -> None:
+    """admin_reply_keyboard() имеет 4 кнопки в 1 ряду (regression guard).
+
+    Session 2026-09-13: добавлена 4-я кнопка ❌ Отмена. Guard от случайного
+    удаления кнопки или изменения layout (например, переход на 2 ряда).
+    resize_keyboard=True shrink'нет до компактных кнопок, 4 кнопки в 1 ряду
+    умещаются на обычных телефонах.
+    """
+    from bot.keyboards.admin import admin_reply_keyboard
+
+    kb = admin_reply_keyboard()
+    # 1 ряд (len(kb.keyboard) == 1) с 4 кнопками
+    assert len(kb.keyboard) == 1, (
+        f"expected 1 row, got {len(kb.keyboard)} rows: "
+        f"{[[btn.text for btn in row] for row in kb.keyboard]}"
+    )
+    row = kb.keyboard[0]
+    assert len(row) == 4, (
+        f"expected 4 buttons in 1 row, got {len(row)}: {[btn.text for btn in row]}"
+    )
+    button_texts = [btn.text for btn in row]
+    assert button_texts == ["📋 Меню", "📅 Сегодня", "🗓 Неделя", "❌ Отмена"], (
+        f"unexpected button order/text: {button_texts}"
+    )
+    assert kb.is_persistent, "always-on reply keyboard (is_persistent=True)"
+
+
+@pytest.mark.asyncio
+async def test_admin_cancel_button_in_fsm_state_clears_state_and_shows_message(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """❌ Отмена тап в admin FSM state → state.clear() + «Админ-режим отменён».
+
+    Session 2026-09-13: admin_cancel_msg расширен с Command("cancel") до
+    or_f(F.text == "❌ Отмена", Command("cancel")). Handler тело не меняется
+    (state.clear() + answer). Тест проверяет что F.text match триггерит
+    тот же flow что /cancel command.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(ADMIN_TG_ID, text="❌ Отмена")
+    state = _make_mock_state()
+
+    await admin_handlers.admin_cancel_msg(msg, state)
+
+    state.clear.assert_awaited_once()
+    text = _answer_text(msg)
+    assert "Админ-режим отменён" in text, f"expected cancel message, got: {text!r}"
+    assert "/menu" in text, "must hint /menu for next action"
+
+
+@pytest.mark.asyncio
+async def test_admin_cancel_button_in_no_state_shows_polite_nothing_to_cancel(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """❌ Отмена тап ВНЕ admin FSM (StateFilter(None)) → «Нечего отменять».
+
+    Session 2026-09-13: новый handler admin_cancel_no_state. Без него кнопка
+    в no-state проваливается в admin_no_state_catchall_text → «📋 /menu для
+    действий» — confusing (пользователь жмёт Отмена, получает hint про /menu).
+    Handler возвращает вежливое «Нечего отменять — вы не в режиме ввода».
+
+    Non-admin → SkipHandler (dispatch continues to client_router no_state_fallback).
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(ADMIN_TG_ID, text="❌ Отмена")
+
+    await admin_handlers.admin_cancel_no_state(msg)
+
+    assert _answer_call_count(msg) == 1
+    text = _answer_text(msg)
+    assert "Нечего отменять" in text, (
+        f"expected polite 'nothing to cancel' message, got: {text!r}"
+    )
+    assert "не в режиме ввода" in text, "must explain why nothing to cancel"
+
+
+@pytest.mark.asyncio
+async def test_admin_cancel_no_state_non_admin_raises_skip_handler(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Non-admin тап ❌ Отмена в StateFilter(None) → SkipHandler.
+
+    Без SkipHandler — silent swallow (aiogram treats matched+returned as
+    handled; no fall-through). Non-admin text должен идти в client_router
+    no_state_fallback («Начните запись через /book»), а не теряться.
+    """
+    from aiogram.dispatcher.event.bases import SkipHandler
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    msg = _make_message(user_id=NON_ADMIN_TG_ID, text="❌ Отмена")
+
+    with pytest.raises(SkipHandler):
+        await admin_handlers.admin_cancel_no_state(msg)
+    # Non-admin НЕ получает answer — dispatch продолжается в client_router
+    assert _answer_call_count(msg) == 0
 
 
 # ============================================================

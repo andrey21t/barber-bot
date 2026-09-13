@@ -4623,23 +4623,44 @@ def _openweek_week_header(tz: str, offset: int = 0) -> str:
 #   6. Catch-all callback — StateFilter(AdminStates)
 # admin_router включается ПЕРЕД client_router (main.py:118-119), поэтому
 # /cancel из admin FSM states ловится ЗДЕСЬ, не в client_router cancel_msg
-# (client.py:443, booking-specific "Ввод отменён. /book чтобы начать заново").
+# (client.py:2086, booking-specific "Ввод отменён. /book чтобы начать заново").
 # ============================================================
 
 
-@router.message(Command("cancel"), StateFilter(AdminStates))
+@router.message(or_f(F.text == "❌ Отмена", Command("cancel")), StateFilter(AdminStates))
 async def admin_cancel_msg(message: Message, state: FSMContext) -> None:
     """Cancel admin FSM flow — clears state, admin-specific message.
 
-    StateFilter(AdminStates) матчит ЛЮБОЙ из 6 admin states. /cancel в
-    BookingStates или StateFilter(None) НЕ матчится — проваливается в
-    client_router cancel_msg (client.py:443).
+    Triggers: /cancel command OR tap на reply keyboard кнопку "❌ Отмена" (Session
+    5.62+). StateFilter(AdminStates) матчит ЛЮБОЙ admin state (12 states в
+    bot/states.py:56-75 — 6 addslots/services + 6 openweek). В BookingStates
+    или StateFilter(None) НЕ матчится — проваливается в client_router cancel_msg
+    (client.py:2086, расширен в Session 2026-09-13 на or_f с F.text == "❌ Отмена")
+    для booking-FSM, либо в admin_cancel_no_state для no-FSM.
     state.clear() BEFORE answer (race condition, MY-VIBE-RULES.md 24).
     """
     if not _is_admin(message):
         return  # non-admin в admin state — edge case (storage isolation), silent
     await state.clear()
     await message.answer("Админ-режим отменён. /menu для меню")
+
+
+@router.message(F.text == "❌ Отмена", StateFilter(None))
+async def admin_cancel_no_state(message: Message) -> None:
+    """❌ Отмена тап ВНЕ admin FSM state — вежливое "нечего отменять".
+
+    Без этого handler'а кнопка в no-state проваливается в
+    admin_no_state_catchall_text → "📋 /menu для действий" — confusing,
+    пользователь жмёт "Отмена" ожидая отмены действия, получает "/menu hint"
+    (looks like menu не открывается).
+
+    StateFilter(None) НЕ трогает admin FSM states (там admin_cancel_msg).
+    НЕ трогает booking FSM (там client_router cancel_msg в client.py:2086,
+    расширен в Session 2026-09-13 на or_f с F.text == "❌ Отмена").
+    """
+    if not _is_admin(message):
+        raise SkipHandler
+    await message.answer("Нечего отменять — вы не в режиме ввода.")
 
 
 @router.message(StateFilter(AdminStates), F.text, ~F.text.startswith("/"))

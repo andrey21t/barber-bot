@@ -260,7 +260,7 @@ def admin_reply_keyboard() -> ReplyKeyboardMarkup:
     или вводить /menu чтобы вернуть. Аналогично client_reply_keyboard (5.36 B.13)
     — делаем always-on reply keyboard снизу экрана.
 
-    Layout: 3 кнопки на одном ряду (resize_keyboard=True shrink'нет до компактных
+    Layout: 4 кнопки на одном ряду (resize_keyboard=True shrink'нет до компактных
     кнопок после первого тапа, как в client_reply_keyboard).
 
     Кнопки:
@@ -270,6 +270,12 @@ def admin_reply_keyboard() -> ReplyKeyboardMarkup:
       сегодня. Read-only, безопасно чистит FSM state если admin был mid-flow.
     - 🗓 Неделя → cmd_week (F.text match, StateFilter("*")) — список записей на
       ближайшие 7 дней. Read-only, безопасно чистит FSM state.
+    - ❌ Отмена → admin_cancel_msg (F.text match, StateFilter(AdminStates)) +
+      admin_cancel_no_state (F.text match, StateFilter(None)). Universal escape
+      hatch из mid-FSM (Session 5.62+) и вежливое "Нечего отменять" вне FSM.
+      Донор-ресёрч (winnerxxx13, UznetDev) — dedicated cancel button не standard
+      у single-master ботов, это наша инновация для elderly-user UX (Екатерина
+      не понимала как выйти из зависшего FSM состояния).
 
     Остальные actions (/addslots, /openday, /openweek, /closeday, /services) —
     через inline menu (tap "📋 Меню" → inline keyboard в сообщении). Они требуют
@@ -286,6 +292,7 @@ def admin_reply_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton(text="📋 Меню"),
                 KeyboardButton(text="📅 Сегодня"),
                 KeyboardButton(text="🗓 Неделя"),
+                KeyboardButton(text="❌ Отмена"),
             ]
         ],
         resize_keyboard=True,

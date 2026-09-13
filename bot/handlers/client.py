@@ -54,7 +54,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command, StateFilter, or_f
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State
 from aiogram.types import (
@@ -1414,7 +1414,11 @@ async def book_back_to_service_cb(callback: CallbackQuery, state: FSMContext) ->
 # ============================================================
 # 4. name_msg — user typed name → ask for service
 # ============================================================
-@router.message(StateFilter(BookingStates.entering_name), ~F.text.startswith("/"))
+@router.message(
+    StateFilter(BookingStates.entering_name),
+    ~F.text.startswith("/"),
+    F.text != "❌ Отмена",
+)
 async def name_msg(message: Message, state: FSMContext) -> None:
     """User typed client name — save, transition to confirming.
 
@@ -1430,6 +1434,12 @@ async def name_msg(message: Message, state: FSMContext) -> None:
     confirmable). Commands now fall through to cancel_msg (Command filter,
     StateFilter("*")). Non-text messages (photo/sticker) still land here —
     message.text is None → "Имя не может быть пустым" prompt.
+
+    Session 2026-09-13 (admin cancel button): добавлено ~F.text == "❌ Отмена"
+    exclusion. Без него admin тап ❌ Отмена в entering_name матчится здесь
+    (registration order — name_msg ПЕРЕД cancel_msg) → client_name = "❌ Отмена"
+    → data corruption. Теперь ❌ Отмена проваливается в cancel_msg (расширенный
+    filter, StateFilter("*")) → state.clear + booking-cancel message.
     """
     name = message.text.strip() if message.text else ""
     if not name:
@@ -1759,10 +1769,20 @@ async def book_back_to_date_cb(callback: CallbackQuery, state: FSMContext) -> No
 # ============================================================
 # 5. service_msg — user typed text while service picker is on screen
 # ============================================================
-@router.message(StateFilter(BookingStates.entering_service), ~F.text.startswith("/"))
+@router.message(
+    StateFilter(BookingStates.entering_service),
+    ~F.text.startswith("/"),
+    F.text != "❌ Отмена",
+)
 async def service_msg(message: Message, state: FSMContext) -> None:
     """Free-text service input is DISABLED (Session 5.51) — but the hint
     is self-healing (Session 5.52, review S3).
+
+    Session 2026-09-13 (admin cancel button): добавлено ~F.text == "❌ Отмена"
+    exclusion (mirror of name_msg:1417). Без него admin тап ❌ Отмена в
+    entering_service матчится здесь первым (registration order — service_msg
+    ПЕРЕД cancel_msg) → re-renders service picker (НЕ cancel). Теперь проваливается
+    в cancel_msg (расширенный filter) → state.clear + booking-cancel message.
 
     Old behavior (5.51): typed text → bare hint «выберите услугу кнопкой 👇»
     that assumed the picker message is still in the chat above. If the user
@@ -2083,9 +2103,22 @@ async def cancel_flow_cb(callback: CallbackQuery, state: FSMContext) -> None:
 # ============================================================
 # 7. cancel_msg — /cancel inside FSM (StateFilter("*"))
 # ============================================================
-@router.message(Command("cancel"), StateFilter("*"))
+@router.message(or_f(F.text == "❌ Отмена", Command("cancel")), StateFilter("*"))
 async def cancel_msg(message: Message, state: FSMContext) -> None:
     """Cancel booking flow — clears FSM state (works in any state).
+
+    Session 2026-09-13 (admin cancel button): filter расширен с Command("cancel")
+    до or_f(F.text == "❌ Отмена", Command("cancel")). admin_reply_keyboard (4-я
+    кнопка ❌ Отмена) теперь работает как universal escape hatch И из booking FSM
+    тоже — не только из admin FSM (admin_cancel_msg). Без расширения admin
+    в selecting_date тапал ❌ Отмена → silent drop (no handler matched) или worse
+    data corruption в entering_name (name_msg swallow'ил «❌ Отмена» как client
+    name — name_msg на client.py:1417 имеет ~F.text == "❌ Отмена" exclusion с этой
+    же сессии для защиты от того же бага).
+
+    NB: registered ПОСЛЕ name_msg (1417) и service_msg (1762). Оба имеют
+    ~F.text == "❌ Отмена" exclusion (Session 2026-09-13) — без exclusion они
+    сматчат «❌ Отмена» первыми (registration order), cancel_msg не успеет.
 
     Registered BEFORE /mybookings handler (spec.md 491) — /cancel from /mybookings
     will be added in Урок 2.5 with StateFilter(None).

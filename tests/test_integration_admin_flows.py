@@ -939,3 +939,82 @@ async def test_cancel_command_works_in_service_step(
         assert "Начните запись через /book" in _extract_send_text(bot), (
             "After /cancel the FSM must be State(None) — plain text hits the fallback"
         )
+
+
+@pytest.mark.asyncio
+async def test_cancel_button_text_works_in_entering_name_state(
+    integration_dispatcher: tuple[Dispatcher, MagicMock],
+    session_factory: Any,
+) -> None:
+    """Session 2026-09-13 (admin cancel button F1 fix): ❌ Отмена tap в
+    BookingStates.entering_name → cancel_msg wins dispatch (state.clear() +
+    «Ввод отменён»), NOT name_msg (data corruption — booking named «❌ Отмена»).
+
+    Pre-fix: name_msg had filter `~F.text.startswith("/")` only — «❌ Отмена»
+    не начинается с "/", name_msg сматчит первым (registration order: name_msg
+    1417 ПЕРЕД cancel_msg 2086) → client_name = "❌ Отмена" → data corruption.
+
+    Fix: name_msg filter расширен `F.text != "❌ Отмена"` (mirror для service_msg
+    на 1762). cancel_msg filter расширен `or_f(F.text == "❌ Отмена",
+    Command("cancel"))`. Теперь ❌ Отмена в entering_name проваливается через
+    name_msg (не матчит) → cancel_msg (матчит) → state.clear() + booking-cancel
+    message.
+
+    Regression guard: integration test через dp.feed_update ловит
+    filter-matching баги которые unit tests (direct handler invocation) не
+    ловят (reviewer S1 — unit test вызывает admin_cancel_msg напрямую, не
+    через router dispatch, поэтому F1 изначально не был пойман).
+    """
+    from freezegun import freeze_time
+
+    with freeze_time("2026-08-25 14:00:00", tz_offset=0):
+        dp, bot = integration_dispatcher
+        await _seed_workday_tomorrow(session_factory)
+        client_tg = 999_888_777
+
+        # Step 1: /book → date picker (selecting_date).
+        await dp.feed_update(bot, _make_text_update("/book", user_id=client_tg))
+        assert "Выберите дату" in _extract_send_text(bot)
+
+        # Step 2: tap tomorrow → service picker.
+        tomorrow = (datetime.now(ZoneInfo(TZ)) + timedelta(days=1)).date()
+        bot.reset()
+        await dp.feed_update(bot, _make_calendar_day_update(tomorrow, user_id=client_tg))
+        assert "Выберите услугу" in _extract_send_text(bot)
+
+        # Step 3: tap first service → slot picker.
+        svc_btn = await _find_button_by_label(bot, "Стрижка")
+        assert svc_btn is not None, "Стрижка service button"
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(svc_btn, user_id=client_tg))
+        assert "Выберите время" in _extract_send_text(bot)
+
+        # Step 4: tap 10:00 slot → entering_name prompt.
+        slot_btn = await _find_button_by_label(bot, "10:00")
+        assert slot_btn is not None, "10:00 slot button"
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(slot_btn, user_id=client_tg))
+        assert "На чьё имя" in _extract_send_text(bot), "must be in entering_name state"
+
+        # Step 5 (THE TEST): type "❌ Отмена" → cancel_msg wins (NOT name_msg).
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("❌ Отмена", user_id=client_tg))
+        texts = _extract_all_send_texts(bot)
+        assert any("Ввод отменён" in t for t in texts), (
+            f"F1 fix: ❌ Отмена in entering_name must reach cancel_msg. Got: {texts!r}"
+        )
+        # CRITICAL: «❌ Отмена» НЕ должно стать client_name (data corruption).
+        assert not any("Подтвердите запись" in t for t in texts), (
+            "F1: ❌ Отмена must NOT reach name_msg — that would create a booking "
+            f"named '❌ Отмена'. Got summary text: {texts!r}"
+        )
+        assert not any("❌ Отмена" in t and "Подтвердите" in t for t in texts), (
+            "F1: ❌ Отмена must NOT appear as client_name in booking summary"
+        )
+
+        # State is cleared: plain text now hits no_state_fallback (State(None)).
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("ещё текст", user_id=client_tg))
+        assert "Начните запись через /book" in _extract_send_text(bot), (
+            "After ❌ Отмена the FSM must be State(None) — plain text hits the fallback"
+        )
