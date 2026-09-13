@@ -905,25 +905,32 @@ def admin_openweek_edit_keyboard(opened_days: list[OpenedDay]) -> InlineKeyboard
         opened_days: list of OpenedDay (only successfully opened — failed
             days don't get an edit button, no WorkDay to update).
 
-    Layout: ✏️ buttons split 4+3 (adjust(4, 3) — 7 in one row обрезает labels
-    на iOS), then [✅ Готово] alone (adjust(1)). adjust(4, 3, 1) keeps Готово
-    on its own row, not squished with ✏️ buttons.
+    Layout: ✏️ buttons в рядах по 4 (builder.row() — явные ряды, не adjust()
+    который перетасовывает Готово в тот же ряд). [✅ Готово] в отдельном ряду
+    через builder.row(). fix UX: adjust(4, 3, 1) при 3 ✏️ пихал Готово в 1
+    ряд → обрезалось «...ово».
     """
     builder = InlineKeyboardBuilder()
-    for od in sorted(opened_days, key=lambda d: d.weekday):
-        day_label = _WEEKDAY_LABELS[od.weekday]
-        builder.button(
-            text=f"✏️ {day_label}",
-            callback_data=AdminOpenweekEditCallbackData(
-                weekday=od.weekday,
-                work_date_iso=od.work_date_iso,
-            ).pack(),
+    sorted_days = sorted(opened_days, key=lambda d: d.weekday)
+    # ✏️ в рядах по 4 (явный row() — adjust() не нужен, layout детерминирован).
+    for i in range(0, len(sorted_days), 4):
+        chunk = sorted_days[i : i + 4]
+        builder.row(
+            *[
+                InlineKeyboardButton(
+                    text=f"✏️ {_WEEKDAY_LABELS[od.weekday]}",
+                    callback_data=AdminOpenweekEditCallbackData(
+                        weekday=od.weekday,
+                        work_date_iso=od.work_date_iso,
+                    ).pack(),
+                )
+                for od in chunk
+            ]
         )
-    builder.button(text="✅ Готово", callback_data="admin_openweek_done")
-    # adjust(4, 3, 1) — ✏️ в 2 ряда (4+3), ✅ Готово на отдельной строке.
-    # adjust(7, 1) обрезало «✅ Готово» на iOS до «✅...ОВО» (7 ✏️ в ряд + Готово
-    # в той же строке если дней < 7 — Telegram layout quirk).
-    builder.adjust(4, 3, 1)
+    # ✅ Готово в отдельном ряду — builder.row() гарантирует отдельную строку.
+    builder.row(
+        InlineKeyboardButton(text="✅ Готово", callback_data="admin_openweek_done")
+    )
     return builder.as_markup()
 
 
