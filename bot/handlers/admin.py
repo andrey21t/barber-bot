@@ -1860,8 +1860,9 @@ async def admin_openweek_done_cb(
 ) -> None:
     """[✅ Готово] → exit /openweek edit flow, show /menu.
 
-    State=None (post-apply) — nothing to clear, just render menu. Distinct
-    from admin_openweek_cancel_cb (state=opening_week_days, mid-flow cancel).
+    State=None (post-apply) — nothing to clear, just render menu. Mid-flow
+    cancel via reply keyboard ❌ Отмена (W4 admin_cancel_msg StateFilter(AdminStates,
+    AdminMoveStates)) — UX-баг 4 (Session 2026-09-14): inline ❌ Отмена removed.
     """
     if not _is_admin_callback(callback):
         await callback.answer()
@@ -3922,31 +3923,12 @@ async def admin_openweek_overwrite_no_cb(
     callback: CallbackQuery,
     state: FSMContext,
 ) -> None:
-    """[❌ Нет, отмена] → clear state, answer. Mirror admin_openweek_cancel_cb
-    semantics but distinct string (triggered from overwrite alert, not days
-    keyboard)."""
-    if not _is_admin_callback(callback):
-        await callback.answer()
-        return
-    await state.clear()
-    if callback.message is not None:
-        await callback.message.answer(
-            "❌ Открытие недели отменено. /menu для меню",
-            reply_markup=admin_inline_menu(),
-        )
-    await callback.answer()
-
-
-@router.callback_query(
-    F.data == "admin_openweek_cancel",
-    StateFilter(AdminStates),
-)
-async def admin_openweek_cancel_cb(callback: CallbackQuery, state: FSMContext) -> None:
-    """[❌ Отмена] string callback in opening_week_* states — clear FSM, answer.
-
-    Distinct from admin_window_cancel_cb (F.data == "admin_window_cancel") —
-    different string, different message text.
-    """
+    """[❌ Нет, отмена] → clear state, answer. Triggered from overwrite alert
+    (Session 5.27 B) — separate from reply keyboard ❌ Отмена (W4 admin_cancel_msg)
+    which is the universal escape hatch for all AdminStates including
+    opening_week_*. Inline ❌ Отмена on week picker / days keyboard removed
+    in UX-баг 4 (Session 2026-09-14) — overwrite_no stays because it's part of
+    the overwrite confirm alert, not a standalone cancel button."""
     if not _is_admin_callback(callback):
         await callback.answer()
         return

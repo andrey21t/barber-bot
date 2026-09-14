@@ -480,13 +480,15 @@ async def test_openweek_cancel_clears_state(
     integration_dispatcher: tuple[Dispatcher, MagicMock],
     session_factory: Any,
 ) -> None:
-    """/openweek → step 0 (week picker) → [❌ Отмена] → state cleared +
-    'Открытие недели отменено' message + menu shown.
+    """/openweek → step 1 (week picker) → tap reply keyboard ❌ Отмена →
+    state cleared + 'Админ-режим отменён' message + fresh /openweek re-enters.
 
-    Verifies admin_openweek_cancel_cb dispatch on F.data == 'admin_openweek_cancel'
-    with StateFilter(AdminStates) — catches all admin FSM states including
-    opening_week_week (Session 5.64, пункт 1). Pre-5.64 the [❌ Отмена] button
-    only appeared on Шаг 3 days keyboard — now it's on week picker too.
+    UX-баг 4 (Session 2026-09-14): inline ❌ Отмена removed from week picker
+    (keyboards/admin.py:admin_week_picker_keyboard) and days keyboard
+    (admin_week_days_keyboard) — escape via always-on reply keyboard ❌ Отмена
+    (W4 admin_cancel_msg StateFilter(AdminStates, AdminMoveStates)) and
+    📋 Меню (cmd_menu StateFilter("*")). This test verifies the new flow:
+    reply keyboard tap, not inline callback.
     """
     dp, bot = integration_dispatcher
     await _seed_admin(session_factory)
@@ -497,14 +499,16 @@ async def test_openweek_cancel_clears_state(
     assert "Шаг 1: выберите неделю" in step0_text, (
         f"Step 0 must show week picker prompt; got: {step0_text!r}"
     )
-    cancel_btn = await _find_button_by_label(bot, "❌ Отмена")
-    assert cancel_btn is not None, "❌ Отмена button on week picker (step 0)"
 
-    # Tap [❌ Отмена] → 'Открытие недели отменено' + menu.
+    # Tap reply keyboard ❌ Отмена (text message, not inline callback).
+    # W4 admin_cancel_msg catches it via F.text == "❌ Отмена" + StateFilter(AdminStates).
     bot.reset()
-    await dp.feed_update(bot, _make_callback_update_from_button(cancel_btn))
+    await dp.feed_update(bot, _make_text_update("❌ Отмена"))
     text = _extract_send_text(bot)
-    assert "Открытие недели отменено" in text
+    assert "Админ-режим отменён" in text, (
+        f"Reply keyboard ❌ Отмена must clear state + show 'Админ-режим отменён'; "
+        f"got: {text!r}"
+    )
 
     # State cleared — fresh /openweek re-enters cleanly.
     bot.reset()

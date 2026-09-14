@@ -4248,6 +4248,10 @@ def test_admin_week_days_keyboard_no_nav_buttons_after_bug2() -> None:
     """Session 2026-09-13, Баг 2: nav row [← Пред.]/[След. →] убран из
     admin_week_days_keyboard (шаг 3). Неделя выбирается только на шаге 1
     через admin_week_picker_keyboard + admin_openweek_week_picker_nav_cb.
+
+    Session 2026-09-14, UX-баг 4: inline ❌ Отмена убрана из шага 3 — escape
+    через always-on reply keyboard (W4 admin_cancel_msg, cmd_menu). Кнопок
+    8 (7 weekdays + ✅ Открыть), не 9.
     """
     from bot.keyboards.admin import admin_week_days_keyboard
 
@@ -4257,8 +4261,9 @@ def test_admin_week_days_keyboard_no_nav_buttons_after_bug2() -> None:
 
     assert "← Пред." not in labels, "Баг 2: ← Пред. убран из шага 3"
     assert "След. →" not in labels, "Баг 2: След. → убран из шага 3"
-    # Only 7 weekday buttons + ✅ Открыть + ❌ Отмена = 9 buttons.
-    assert len(buttons) == 9, f"Expected 9 buttons (7 weekdays + 2 actions); got: {len(buttons)}"
+    assert "❌ Отмена" not in labels, "UX-баг 4: inline ❌ Отмена убрана из шага 3"
+    # 7 weekday buttons + ✅ Открыть = 8 buttons (❌ Отмена removed in UX-баг 4).
+    assert len(buttons) == 8, f"Expected 8 buttons (7 weekdays + 1 action); got: {len(buttons)}"
 
 
 @pytest.mark.asyncio
@@ -4710,28 +4715,6 @@ async def test_admin_openweek_confirm_cb_ignores_past_week_bookings(
     assert "06 сен" not in text, (
         f"Past-week booking 06.09 must NOT appear in next-week block; got: {text!r}"
     )
-
-
-@pytest.mark.asyncio
-async def test_admin_openweek_cancel_cb_clears_state(
-    session_factory: Any,
-    patched_session_factory: Any,
-) -> None:
-    """[❌ Отмена] (string F.data == 'admin_openweek_cancel') → state.clear +
-    answer 'Открытие недели отменено'.
-    """
-    async with session_factory() as session:
-        await _seed_admin_stack(session)
-
-    callback = _make_callback(ADMIN_TG_ID)
-    callback.data = "admin_openweek_cancel"
-    state = _make_mock_state()
-
-    await admin_handlers.admin_openweek_cancel_cb(callback, state)
-
-    state.clear.assert_called_once()
-    text = callback_answer_text(callback)
-    assert "Открытие недели отменено" in text
 
 
 # ============================================================

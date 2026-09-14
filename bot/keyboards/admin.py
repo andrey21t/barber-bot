@@ -892,8 +892,8 @@ def admin_week_days_keyboard(
     scheduled_weekdays: frozenset[int] = frozenset(),
     closed_weekdays: frozenset[int] = frozenset(),
 ) -> InlineKeyboardMarkup:
-    """7 toggle-кнопок дней недели + «✅ Открыть» + «❌ Отмена» (Session 5.26;
-    5.60 P2 — past_weekdays `❌` suffix; 5.61 — scheduled/closed weekday markers;
+    """7 toggle-кнопок дней недели + «✅ Открыть» (Session 5.26; 5.60 P2 —
+    past_weekdays `❌` suffix; 5.61 — scheduled/closed weekday markers;
     Session 2026-09-13 — Баг 2 от Екатерины: nav row [← Пред.]/[След. →] убран,
     неделя выбирается на шаге 1 через admin_week_picker_keyboard).
 
@@ -919,16 +919,20 @@ def admin_week_days_keyboard(
 
     Layout: 7 weekday buttons split 4+3 (adjust(4, 3) — 7 in one row обрезает
     labels на iOS до "В..."/"С...", 4+3 даёт каждой кнопке ~25% ширины), then
-    [✅ Открыть] + [❌ Отмена] row (adjust(2)).
+    [✅ Открыть] single button on its own row (adjust(4, 3, 1)).
 
     Selected weekdays помечены ✅ prefix; unselected — без prefix.
     «✅ Открыть» callback_data="admin_openweek_confirm" (string).
-    «❌ Отмена» callback_data="admin_openweek_cancel" (string).
 
     Баг 2 (Session 2026-09-13): nav row [← Пред.]/[След. →] убран — неделя уже
     выбрана на шаге 1 (admin_week_picker_keyboard + admin_openweek_week_picker_nav_cb).
     Handler admin_openweek_week_nav_cb для state=opening_week_days удалён — нет
     кнопок → нет тапов. can_go_prev/can_go_next параметры удалены.
+
+    UX-баг 4 (Session 2026-09-14): inline ❌ Отмена убрана — escape через always-on
+    reply keyboard с ❌ Отмена (W4 admin_cancel_msg) и 📋 Меню (cmd_menu, оба с
+    StateFilter("*")). Inline-кнопка ❌ Отмена дублировала reply keyboard — убрали
+    для consistency (на шаге 2 slot picker inline ❌ Отмена и так отсутствовала).
     """
     builder = InlineKeyboardBuilder()
     for weekday in range(7):
@@ -947,8 +951,7 @@ def admin_week_days_keyboard(
             callback_data=AdminOpenWeekCallbackData(weekday=weekday).pack(),
         )
     builder.button(text="✅ Открыть", callback_data="admin_openweek_confirm")
-    builder.button(text="❌ Отмена", callback_data="admin_openweek_cancel")
-    builder.adjust(4, 3, 2)
+    builder.adjust(4, 3, 1)
     return builder.as_markup()
 
 
@@ -1169,8 +1172,6 @@ def admin_week_picker_keyboard(
     nav row: [← Пред.] [След. →] (uses AdminOpenWeekNavCallbackData — same
     callback as step 3, dispatched by StateFilter to a different handler).
     row 2: [✅ Выбрать эту неделю] (string "admin_openweek_week_select").
-    row 3: [❌ Отмена] (string "admin_openweek_cancel" — caught by
-    admin_openweek_cancel_cb which uses StateFilter(AdminStates)).
 
     No weekday buttons — week picker is a single-selection step (user picks
     a week via nav, then taps "Выбрать" to confirm). Selected week is tracked
@@ -1181,6 +1182,12 @@ def admin_week_picker_keyboard(
             week — prev week is fully in past, no point navigating there).
         can_go_next: show «След. →» button. False when week_offset >=
             _OPENWEEK_MAX_OFFSET (4 weeks ahead cap).
+
+    UX-баг 4 (Session 2026-09-14): inline ❌ Отмена убрана — escape через always-on
+    reply keyboard с ❌ Отмена (W4 admin_cancel_msg) и 📋 Меню (cmd_menu, оба с
+    StateFilter("*")). Inline-кнопка дублировала reply keyboard — убрали для
+    consistency с шагами 2/3, где inline ❌ Отмена отсутствовала (шаг 2 slot
+    picker) или была лишней (шаг 3 days keyboard — убрана тоже).
     """
     builder = InlineKeyboardBuilder()
     nav_row: list[InlineKeyboardButton] = []
@@ -1201,6 +1208,5 @@ def admin_week_picker_keyboard(
     if nav_row:
         builder.row(*nav_row)
     builder.button(text="✅ Выбрать эту неделю", callback_data="admin_openweek_week_select")
-    builder.button(text="❌ Отмена", callback_data="admin_openweek_cancel")
     builder.adjust(1)
     return builder.as_markup()
