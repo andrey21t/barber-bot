@@ -2487,8 +2487,9 @@ async def test_admin_cancel_no_state_non_admin_raises_skip_handler(
 
 
 def test_admin_inline_menu_has_3_buttons_after_duplication_cleanup() -> None:
-    """admin_inline_menu() имеет 3 кнопки (не 5/6) и НЕ содержит «Открыть день»,
-    «Закрыть день», и дубликатов «Сегодня»/«Неделя» из reply keyboard.
+    """admin_inline_menu() имеет 5 кнопок (3 base + 2 shift, layout 2+2+1) и НЕ
+    содержит «Открыть день», «Закрыть день», и дубликатов «Сегодня»/«Неделя»
+    из reply keyboard.
 
     Session 5.62 (пункт 2 от Екатерины): кнопка «📅 Открыть день» (старый
     текстовый формат с HH:MM input) удалена из inline menu. CREATE day теперь
@@ -2503,6 +2504,9 @@ def test_admin_inline_menu_has_3_buttons_after_duplication_cleanup() -> None:
     Session 2026-09-13 (упрощение): «📅 Сегодня» и «🗓 Неделя» удалены из
     inline menu — они уже в admin_reply_keyboard (always-on внизу экрана),
     дублирование было избыточным (feedback после тестирования на проде).
+
+    Session 2026-09-14 (UX-баг 5): добавлены 2 кнопки «⬅️ Расширить влево» /
+    «➡️ Расширить вправо» — quick shift today's window по 30 мин. Layout 2+2+1.
 
     Regression guard: если кто-то вернёт любую из удалённых кнопок — тест
     упадёт с понятным сообщением про соответствующую сессию.
@@ -2525,17 +2529,20 @@ def test_admin_inline_menu_has_3_buttons_after_duplication_cleanup() -> None:
     assert "🗓 Неделя" not in flat_texts, (
         "2026-09-13: 'Неделя' removed from inline menu — duplicate of admin_reply_keyboard button"
     )
-    assert len(flat_texts) == 3, (
-        f"2026-09-13: expected 3 buttons (layout 2+1), got {len(flat_texts)}: {flat_texts}"
+    assert len(flat_texts) == 5, (
+        f"2026-09-14: expected 5 buttons (layout 2+2+1, UX-баг 5 added 2 shift "
+        f"buttons), got {len(flat_texts)}: {flat_texts}"
     )
-    # Ожидаемые 3 кнопки (порядок имеет значение — layout 2+1)
+    # Ожидаемые 5 кнопок (порядок имеет значение — layout 2+2+1)
     expected = [
         "➕ Изменить окно",
         "🗓 Открыть неделю",
+        "⬅️ Расширить влево",
+        "➡️ Расширить вправо",
         "💇 Услуги",
     ]
     assert flat_texts == expected, (
-        f"2026-09-13: inline menu buttons mismatch. Got {flat_texts}, expected {expected}"
+        f"inline menu buttons mismatch. Got {flat_texts}, expected {expected}"
     )
 
 
@@ -5502,8 +5509,10 @@ async def test_admin_inline_menu_has_3_buttons_after_duplication_cleanup_members
     patched_session_factory: Any,
 ) -> None:
     """Regression guard (Session 2026-09-13 — упрощение): admin_inline_menu
-    имеет 3 кнопки (не 5), НЕТ дубликатов reply keyboard. Кнопки:
-    [➕ Изменить окно] [🗓 Открыть неделю] [💇 Услуги]
+    имеет 5 кнопок (3 base + 2 shift, layout 2+2+1), НЕТ дубликатов reply keyboard.
+
+    Session 2026-09-14 (UX-баг 5): добавлены 2 кнопки «⬅️ Расширить влево» /
+    «➡️ Расширить вправо» — quick shift today's window по 30 мин.
 
     «📅 Сегодня» и «🗓 Неделя» удалены из inline menu — они уже в
     admin_reply_keyboard (always-on внизу экрана), дублирование было
@@ -5515,13 +5524,17 @@ async def test_admin_inline_menu_has_3_buttons_after_duplication_cleanup_members
     # InlineKeyboardMarkup.flatten_buttons() returns list[InlineKeyboardButton].
     buttons = kb.inline_keyboard
     flat = [btn for row in buttons for btn in row]
-    assert len(flat) == 3, f"Expected 3 buttons, got {len(flat)}: {[b.text for b in flat]}"
+    assert len(flat) == 5, (
+        f"Expected 5 buttons (UX-баг 5 added 2 shift), got {len(flat)}: {[b.text for b in flat]}"
+    )
     texts = [b.text for b in flat]
     assert "📅 Закрыть день" not in texts, f"Closeday button still in menu: {texts}"
     assert "📅 Сегодня" not in texts, f"Сегодня should be removed (in reply keyboard): {texts}"
     assert "🗓 Неделя" not in texts, f"Неделя should be removed (in reply keyboard): {texts}"
     assert "➕ Изменить окно" in texts
     assert "🗓 Открыть неделю" in texts
+    assert "⬅️ Расширить влево" in texts
+    assert "➡️ Расширить вправо" in texts
     assert "💇 Услуги" in texts
 
 
