@@ -260,8 +260,9 @@ def admin_reply_keyboard() -> ReplyKeyboardMarkup:
     или вводить /menu чтобы вернуть. Аналогично client_reply_keyboard (5.36 B.13)
     — делаем always-on reply keyboard снизу экрана.
 
-    Layout: 4 кнопки на одном ряду (resize_keyboard=True shrink'нет до компактных
-    кнопок после первого тапа, как в client_reply_keyboard).
+    Layout: 3 кнопки на одном ряду (resize_keyboard=True shrink'нет до компактных
+    кнопок после первого тапа, как в client_reply_keyboard). Ранее 4 кнопок —
+    ❌ Отмена убрана в UX-баг 4 (Session 2026-09-14).
 
     Кнопки:
     - 📋 Меню → cmd_menu (F.text match, StateFilter("*")) — escape hatch из любого

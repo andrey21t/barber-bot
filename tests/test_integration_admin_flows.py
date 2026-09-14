@@ -480,15 +480,16 @@ async def test_openweek_cancel_clears_state(
     integration_dispatcher: tuple[Dispatcher, MagicMock],
     session_factory: Any,
 ) -> None:
-    """/openweek → step 1 (week picker) → tap reply keyboard ❌ Отмена →
-    state cleared + 'Админ-режим отменён' message + fresh /openweek re-enters.
+    """/openweek → step 1 (week picker) → /cancel command → state cleared +
+    'Админ-режим отменён' message + fresh /openweek re-enters.
 
-    UX-баг 4 (Session 2026-09-14): inline ❌ Отмена removed from week picker
-    (keyboards/admin.py:admin_week_picker_keyboard) and days keyboard
-    (admin_week_days_keyboard) — escape via always-on reply keyboard ❌ Отмена
-    (W4 admin_cancel_msg StateFilter(AdminStates, AdminMoveStates)) and
-    📋 Меню (cmd_menu StateFilter("*")). This test verifies the new flow:
-    reply keyboard tap, not inline callback.
+    UX-баг 4 (Session 2026-09-14, final): inline ❌ Отмена removed from week
+    picker (keyboards/admin.py:admin_week_picker_keyboard) and days keyboard
+    (admin_week_days_keyboard), AND reply keyboard ❌ Отмена button removed
+    (📋 Меню берёт функцию «отмена + меню»). /cancel command remains as power-
+    user text escape — caught by admin_cancel_msg (W4 or_f(F.text == "❌ Отмена",
+    Command("cancel")) + StateFilter(AdminStates, AdminMoveStates)). This test
+    verifies the /cancel path (text input, not inline button).
     """
     dp, bot = integration_dispatcher
     await _seed_admin(session_factory)
@@ -500,13 +501,13 @@ async def test_openweek_cancel_clears_state(
         f"Step 0 must show week picker prompt; got: {step0_text!r}"
     )
 
-    # Tap reply keyboard ❌ Отмена (text message, not inline callback).
-    # W4 admin_cancel_msg catches it via F.text == "❌ Отмена" + StateFilter(AdminStates).
+    # Type /cancel command (power-user escape, no UI-кнопки ❌ Отмена после UX-баг 4).
+    # W4 admin_cancel_msg catches it via Command("cancel") + StateFilter(AdminStates).
     bot.reset()
-    await dp.feed_update(bot, _make_text_update("❌ Отмена"))
+    await dp.feed_update(bot, _make_text_update("/cancel"))
     text = _extract_send_text(bot)
     assert "Админ-режим отменён" in text, (
-        f"Reply keyboard ❌ Отмена must clear state + show 'Админ-режим отменён'; "
+        f"/cancel command must clear state + show 'Админ-режим отменён'; "
         f"got: {text!r}"
     )
 

@@ -1861,8 +1861,9 @@ async def admin_openweek_done_cb(
     """[✅ Готово] → exit /openweek edit flow, show /menu.
 
     State=None (post-apply) — nothing to clear, just render menu. Mid-flow
-    cancel via reply keyboard ❌ Отмена (W4 admin_cancel_msg StateFilter(AdminStates,
-    AdminMoveStates)) — UX-баг 4 (Session 2026-09-14): inline ❌ Отмена removed.
+    cancel via 📋 Меню (cmd_menu state.clear + inline menu, StateFilter("*")) OR
+    /cancel command (W4 admin_cancel_msg StateFilter(AdminStates, AdminMoveStates)).
+    UX-баг 4 (Session 2026-09-14): inline ❌ Отмена removed.
     """
     if not _is_admin_callback(callback):
         await callback.answer()
@@ -3924,11 +3925,11 @@ async def admin_openweek_overwrite_no_cb(
     state: FSMContext,
 ) -> None:
     """[❌ Нет, отмена] → clear state, answer. Triggered from overwrite alert
-    (Session 5.27 B) — separate from reply keyboard ❌ Отмена (W4 admin_cancel_msg)
-    which is the universal escape hatch for all AdminStates including
-    opening_week_*. Inline ❌ Отмена on week picker / days keyboard removed
-    in UX-баг 4 (Session 2026-09-14) — overwrite_no stays because it's part of
-    the overwrite confirm alert, not a standalone cancel button."""
+    (Session 5.27 B) — separate from /cancel command (W4 admin_cancel_msg) which
+    is the universal escape hatch for all AdminStates including opening_week_*.
+    Inline ❌ Отмена on week picker / days keyboard removed in UX-баг 4
+    (Session 2026-09-14) — overwrite_no stays because it's part of the overwrite
+    confirm alert, not a standalone cancel button."""
     if not _is_admin_callback(callback):
         await callback.answer()
         return
@@ -4629,10 +4630,13 @@ def _openweek_week_header(tz: str, offset: int = 0) -> str:
 async def admin_cancel_msg(message: Message, state: FSMContext) -> None:
     """Cancel admin FSM flow — clears state, admin-specific message.
 
-    Triggers: /cancel command OR tap на reply keyboard кнопку "❌ Отмена" (Session
-    5.62+). Filter покрывает ВСЕ 15 admin FSM states: 12 в AdminStates (6
-    addslots/services + 6 openweek, bot/states.py:56-75) + 3 в AdminMoveStates
-    (selecting_date/selecting_slot/confirming, bot/states.py:106-108).
+    Triggers: /cancel command OR manual text input '❌ Отмена' (defensive —
+    UI-кнопка reply keyboard ❌ Отмена убрана в UX-баг 4, Session 2026-09-14;
+    📋 Меню берёт на себя функцию «отмена + меню» через cmd_menu). Ранее:
+    tap на reply keyboard кнопку ❌ Отмена (Session 5.62+). Filter покрывает
+    ВСЕ 15 admin FSM states: 12 в AdminStates (6 addslots/services + 6 openweek,
+    bot/states.py:56-75) + 3 в AdminMoveStates (selecting_date/selecting_slot/
+    confirming, bot/states.py:106-108).
 
     W4 fix (Session 2026-09-13): до расширения AdminMoveStates НЕ покрывались →
     ❌ Отмена в admin_move flow проваливался в client_router cancel_msg (client.py:2086,
@@ -4642,11 +4646,17 @@ async def admin_cancel_msg(message: Message, state: FSMContext) -> None:
     admin_cancel_msg ловит первым (admin_router ПЕРЕД client_router, main.py:118)
     → hint "Админ-режим отменён. /menu для меню".
 
+    UX-баг 4 (Session 2026-09-14): reply keyboard кнопка ❌ Отмена убрана —
+    📋 Меню (cmd_menu StateFilter("*")) теперь единственный UI escape (state.clear
+    + inline menu в одном тапе). Handler admin_cancel_msg ОСТАЁТСЯ для /cancel
+    command (power-user text command) и defensive F.text == "❌ Отмена" (если
+    user введёт вручную из привычки — без UI-кнопки, но текст всё ещё ловится).
+
     callback vs message: admin_move flow — callback-driven (4 callback handlers
-    admin.py:2742/2901/2985/3156), text input НЕ expected. ❌ Отмена как text —
-    единственный message path в этом flow. StateFilter(AdminStates, AdminMoveStates)
-    НЕ перехватит admin_move callback handlers (callback vs message — разные buckets
-    в aiogram 3.x dispatch).
+    admin.py:2742/2901/2985/3156), text input НЕ expected. /cancel или текст
+    "❌ Отмена" — единственный message path в этом flow. StateFilter(AdminStates,
+    AdminMoveStates) НЕ перехватит admin_move callback handlers (callback vs
+    message — разные buckets в aiogram 3.x dispatch).
 
     В BookingStates или StateFilter(None) НЕ матчится — проваливается в
     client_router cancel_msg для booking-FSM, либо в admin_cancel_no_state для
@@ -4662,15 +4672,21 @@ async def admin_cancel_msg(message: Message, state: FSMContext) -> None:
 
 @router.message(F.text == "❌ Отмена", StateFilter(None))
 async def admin_cancel_no_state(message: Message) -> None:
-    """❌ Отмена тап ВНЕ admin FSM state → показать меню (не «нечего отменять»).
+    """Manual text '❌ Отмена' ВНЕ admin FSM state → показать меню (defensive).
 
-    UX fix (Session 2026-09-14, feedback Екатерины): ❌ Отмена в always-on
-    reply keyboard — universal escape hatch. В mid-FSM работает (admin_cancel_msg
-    line 4645 → state.clear() + «Админ-режим отменён»). В no-state раньше отвечал
-    «Нечего отменять — вы не в режиме ввода» — confusing, пользователь жмёт
-    Отмена ожидая действие, получает отказ. Fix: в no-state ❌ Отмена = показать
-    inline меню (как 📋 Меню / cmd_menu line 243). Кнопка работает ВСЕГДА — либо
-    отменяет FSM (mid), либо открывает меню (no-state). Не «отказ».
+    UX fix (Session 2026-09-14, feedback Екатерины): изначально — ❌ Отмена в
+    always-on reply keyboard, universal escape hatch. В mid-FSM работает
+    (admin_cancel_msg line 4645 → state.clear() + «Админ-режим отменён»). В
+    no-state раньше отвечал «Нечего отменять — вы не в режиме ввода» — confusing,
+    пользователь жмёт Отмена ожидая действие, получает отказ. Fix: в no-state
+    ❌ Отмена = показать inline меню (как 📋 Меню / cmd_menu line 243).
+
+    UX-баг 4 (Session 2026-09-14, final): reply keyboard кнопка ❌ Отмена убрана
+    (📋 Меню берёт функцию «отмена + меню»). Handler admin_cancel_no_state
+    ОСТАЁТСЯ defensive — если user наберёт текст «❌ Отмена» вручную (из привычки,
+    без UI-кнопки) в no-state, получит inline меню (не «Нечего отменять»).
+    Handler ловит ТОЛЬКО F.text == "❌ Отмена" (не /cancel) — /cancel в no-state
+    проваливается в client_router cancel_msg.
 
     StateFilter(None) НЕ трогает admin FSM states (там admin_cancel_msg).
     НЕ трогает booking FSM (там client_router cancel_msg в client.py:2086,
