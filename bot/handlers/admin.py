@@ -4680,12 +4680,15 @@ async def admin_cancel_msg(message: Message, state: FSMContext) -> None:
 
 @router.message(F.text == "❌ Отмена", StateFilter(None))
 async def admin_cancel_no_state(message: Message) -> None:
-    """❌ Отмена тап ВНЕ admin FSM state — вежливое "нечего отменять".
+    """❌ Отмена тап ВНЕ admin FSM state → показать меню (не «нечего отменять»).
 
-    Без этого handler'а кнопка в no-state проваливается в
-    admin_no_state_catchall_text → "📋 /menu для действий" — confusing,
-    пользователь жмёт "Отмена" ожидая отмены действия, получает "/menu hint"
-    (looks like menu не открывается).
+    UX fix (Session 2026-09-14, feedback Екатерины): ❌ Отмена в always-on
+    reply keyboard — universal escape hatch. В mid-FSM работает (admin_cancel_msg
+    line 4645 → state.clear() + «Админ-режим отменён»). В no-state раньше отвечал
+    «Нечего отменять — вы не в режиме ввода» — confusing, пользователь жмёт
+    Отмена ожидая действие, получает отказ. Fix: в no-state ❌ Отмена = показать
+    inline меню (как 📋 Меню / cmd_menu line 243). Кнопка работает ВСЕГДА — либо
+    отменяет FSM (mid), либо открывает меню (no-state). Не «отказ».
 
     StateFilter(None) НЕ трогает admin FSM states (там admin_cancel_msg).
     НЕ трогает booking FSM (там client_router cancel_msg в client.py:2086,
@@ -4693,7 +4696,7 @@ async def admin_cancel_no_state(message: Message) -> None:
     """
     if not _is_admin(message):
         raise SkipHandler
-    await message.answer("Нечего отменять — вы не в режиме ввода.")
+    await message.answer("📋 Меню:", reply_markup=admin_inline_menu())
 
 
 @router.message(StateFilter(AdminStates, AdminMoveStates), F.text, ~F.text.startswith("/"))

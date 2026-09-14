@@ -2359,7 +2359,8 @@ async def test_cmd_today_non_admin_silent_with_state(
 # mid-FSM (Екатерина не понимала как выйти из зависшего состояния). Handler
 # admin_cancel_msg расширен с Command("cancel") до or_f(F.text == "❌ Отмена",
 # Command("cancel")). Новый handler admin_cancel_no_state для ❌ Отмена ВНЕ
-# admin FSM — вежливое «Нечего отменять» вместо молчания/catch-all.
+# admin FSM — показать inline меню (UX fix 2026-09-14: раньше «Нечего отменять»,
+# сейчас меню — кнопка работает всегда, либо отменяет FSM, либо открывает меню).
 # Донор-ресёрч (winnerxxx13, UznetDev) — dedicated cancel button не standard
 # у single-master ботов, наша инновация для elderly-user UX.
 # ============================================================
@@ -2419,16 +2420,17 @@ async def test_admin_cancel_button_in_fsm_state_clears_state_and_shows_message(
 
 
 @pytest.mark.asyncio
-async def test_admin_cancel_button_in_no_state_shows_polite_nothing_to_cancel(
+async def test_admin_cancel_button_in_no_state_shows_menu(
     session_factory: Any,
     patched_session_factory: Any,
 ) -> None:
-    """❌ Отмена тап ВНЕ admin FSM (StateFilter(None)) → «Нечего отменять».
+    """❌ Отмена тап ВНЕ admin FSM (StateFilter(None)) → показать inline меню.
 
-    Session 2026-09-13: новый handler admin_cancel_no_state. Без него кнопка
-    в no-state проваливается в admin_no_state_catchall_text → «📋 /menu для
-    действий» — confusing (пользователь жмёт Отмена, получает hint про /menu).
-    Handler возвращает вежливое «Нечего отменять — вы не в режиме ввода».
+    UX fix (Session 2026-09-14, feedback Екатерины): раньше отвечал «Нечего
+    отменять — вы не в режиме ввода» — confusing, пользователь жмёт Отмена
+    ожидая действие, получает отказ. Fix: в no-state ❌ Отмена = показать
+    inline меню (как 📋 Меню / cmd_menu). Кнопка работает ВСЕГДА — либо
+    отменяет FSM (mid), либо открывает меню (no-state). Не «отказ».
 
     Non-admin → SkipHandler (dispatch continues to client_router no_state_fallback).
     """
@@ -2441,10 +2443,10 @@ async def test_admin_cancel_button_in_no_state_shows_polite_nothing_to_cancel(
 
     assert _answer_call_count(msg) == 1
     text = _answer_text(msg)
-    assert "Нечего отменять" in text, (
-        f"expected polite 'nothing to cancel' message, got: {text!r}"
+    assert "📋 Меню" in text, f"❌ Отмена в no-state must show menu (UX fix). Got: {text!r}"
+    assert "Нечего отменять" not in text, (
+        f"UX fix removed 'Нечего отменять' — must show menu instead. Got: {text!r}"
     )
-    assert "не в режиме ввода" in text, "must explain why nothing to cancel"
 
 
 @pytest.mark.asyncio
@@ -2510,12 +2512,10 @@ def test_admin_inline_menu_has_3_buttons_after_duplication_cleanup() -> None:
         "admin_today_keyboard [🔒 Закрыть день] or /closeday text command)"
     )
     assert "📅 Сегодня" not in flat_texts, (
-        "2026-09-13: 'Сегодня' removed from inline menu — "
-        "duplicate of admin_reply_keyboard button"
+        "2026-09-13: 'Сегодня' removed from inline menu — duplicate of admin_reply_keyboard button"
     )
     assert "🗓 Неделя" not in flat_texts, (
-        "2026-09-13: 'Неделя' removed from inline menu — "
-        "duplicate of admin_reply_keyboard button"
+        "2026-09-13: 'Неделя' removed from inline menu — duplicate of admin_reply_keyboard button"
     )
     assert len(flat_texts) == 3, (
         f"2026-09-13: expected 3 buttons (layout 2+1), got {len(flat_texts)}: {flat_texts}"
@@ -4307,7 +4307,6 @@ async def test_admin_openweek_end_cb_preserves_week_offset_from_state(
     assert data["closed_weekdays"] == [], (
         f"No WorkDays seeded → closed empty; got: {data.get('closed_weekdays')}"
     )
-
 
 
 # Баг 2 (Session 2026-09-13): admin_openweek_week_nav_cb для state=opening_week_days
@@ -6687,9 +6686,7 @@ async def test_admin_service_delete_cb_idor_other_business_not_found(
         ctx = await _seed_admin_stack(session)
         # Service under admin's business (correct path — unused here, just
         # ensures admin's business has at least one service row).
-        session.add(
-            Service(business_id=ctx["business_id"], name="Стрижка", duration_minutes=60)
-        )
+        session.add(Service(business_id=ctx["business_id"], name="Стрижка", duration_minutes=60))
         await session.commit()
 
     callback = _make_callback(ADMIN_TG_ID)
@@ -6827,6 +6824,7 @@ async def test_admin_service_delete_cb_happy_deactivates_and_rerenders(
     # Verify DB state — service is now is_active=False.
     async with session_factory() as session:
         from sqlalchemy import select as _select
+
         result = await session.execute(_select(Service).where(Service.id == svc_id))
         deactivated = result.scalar_one()
         assert deactivated.is_active is False
@@ -7817,12 +7815,18 @@ async def test_openweek_delete_entry_cb_shows_picker(
     async with session_factory() as session:
         ctx = await _seed_admin_stack(session)
         await _seed_workday(
-            session, ctx=ctx, work_date=datetime(2026, 9, 7).date(),
-            start_time_str="10:00", end_time_str="19:00",
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
         )
         await _seed_workday(
-            session, ctx=ctx, work_date=datetime(2026, 9, 12).date(),
-            start_time_str="10:00", end_time_str="19:00",
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 12).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
         )
 
     from bot.keyboards.admin import AdminOpenweekDeleteEntryCallbackData
@@ -7883,18 +7887,25 @@ async def test_openweek_delete_day_cb_no_bookings_closes_immediately(
     async with session_factory() as session:
         ctx = await _seed_admin_stack(session)
         wd_mon = await _seed_workday(
-            session, ctx=ctx, work_date=datetime(2026, 9, 7).date(),
-            start_time_str="10:00", end_time_str="19:00",
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
         )
         wd_sat = await _seed_workday(
-            session, ctx=ctx, work_date=datetime(2026, 9, 12).date(),
-            start_time_str="10:00", end_time_str="19:00",
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 12).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
         )
 
     from bot.keyboards.admin import AdminOpenweekDeleteDayCallbackData
 
     cb_data = AdminOpenweekDeleteDayCallbackData(
-        work_date_iso="2026-09-12", workday_id=str(wd_sat.id),
+        work_date_iso="2026-09-12",
+        workday_id=str(wd_sat.id),
     )
     callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
     callback.message.edit_text = AsyncMock()
@@ -7933,16 +7944,24 @@ async def test_openweek_delete_day_cb_with_bookings_shows_confirm(
     async with session_factory() as session:
         ctx = await _seed_admin_stack(session)
         wd_sat = await _seed_workday(
-            session, ctx=ctx, work_date=datetime(2026, 9, 12).date(),
-            start_time_str="10:00", end_time_str="19:00",
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 12).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
         )
         slot = await _seed_slot(
-            session, master_id=ctx["master_id"],
-            slot_date=datetime(2026, 9, 12).date(), hour=14, status="booked",
+            session,
+            master_id=ctx["master_id"],
+            slot_date=datetime(2026, 9, 12).date(),
+            hour=14,
+            status="booked",
         )
         local_noon = datetime(2026, 9, 12, 14, 0, tzinfo=ZoneInfo(TZ))
         await _seed_booking(
-            session, ctx=ctx, slot=slot,
+            session,
+            ctx=ctx,
+            slot=slot,
             start_at_utc_naive=local_noon.astimezone(UTC).replace(tzinfo=None),
             status="confirmed",
         )
@@ -7953,7 +7972,8 @@ async def test_openweek_delete_day_cb_with_bookings_shows_confirm(
     )
 
     cb_data = AdminOpenweekDeleteDayCallbackData(
-        work_date_iso="2026-09-12", workday_id=str(wd_sat.id),
+        work_date_iso="2026-09-12",
+        workday_id=str(wd_sat.id),
     )
     callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
     callback.message.edit_text = AsyncMock()
@@ -7984,18 +8004,26 @@ async def test_openweek_delete_day_cb_already_closed_race(
     async with session_factory() as session:
         ctx = await _seed_admin_stack(session)
         await _seed_workday(
-            session, ctx=ctx, work_date=datetime(2026, 9, 7).date(),
-            start_time_str="10:00", end_time_str="19:00",
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
         )
         wd_sat = await _seed_workday(
-            session, ctx=ctx, work_date=datetime(2026, 9, 12).date(),
-            start_time_str="10:00", end_time_str="19:00", is_active=False,
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 12).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
+            is_active=False,
         )
 
     from bot.keyboards.admin import AdminOpenweekDeleteDayCallbackData
 
     cb_data = AdminOpenweekDeleteDayCallbackData(
-        work_date_iso="2026-09-12", workday_id=str(wd_sat.id),
+        work_date_iso="2026-09-12",
+        workday_id=str(wd_sat.id),
     )
     callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
     callback.message.edit_text = AsyncMock()
@@ -8027,20 +8055,31 @@ async def test_openweek_delete_confirm_cb_closes_and_notifies(
     async with session_factory() as session:
         ctx = await _seed_admin_stack(session)
         await _seed_workday(
-            session, ctx=ctx, work_date=datetime(2026, 9, 7).date(),
-            start_time_str="10:00", end_time_str="19:00",
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
         )
         wd_sat = await _seed_workday(
-            session, ctx=ctx, work_date=datetime(2026, 9, 12).date(),
-            start_time_str="10:00", end_time_str="19:00",
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 12).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
         )
         slot = await _seed_slot(
-            session, master_id=ctx["master_id"],
-            slot_date=datetime(2026, 9, 12).date(), hour=14, status="booked",
+            session,
+            master_id=ctx["master_id"],
+            slot_date=datetime(2026, 9, 12).date(),
+            hour=14,
+            status="booked",
         )
         local_noon = datetime(2026, 9, 12, 14, 0, tzinfo=ZoneInfo(TZ))
         await _seed_booking(
-            session, ctx=ctx, slot=slot,
+            session,
+            ctx=ctx,
+            slot=slot,
             start_at_utc_naive=local_noon.astimezone(UTC).replace(tzinfo=None),
             status="confirmed",
         )
@@ -8096,12 +8135,19 @@ async def test_openweek_delete_confirm_cb_already_closed_race(
     async with session_factory() as session:
         ctx = await _seed_admin_stack(session)
         await _seed_workday(
-            session, ctx=ctx, work_date=datetime(2026, 9, 7).date(),
-            start_time_str="10:00", end_time_str="19:00",
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
         )
         wd_sat = await _seed_workday(
-            session, ctx=ctx, work_date=datetime(2026, 9, 12).date(),
-            start_time_str="10:00", end_time_str="19:00", is_active=False,
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 12).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
+            is_active=False,
         )
 
     from bot.keyboards.admin import AdminOpenweekDeleteConfirmCallbackData
@@ -8135,12 +8181,18 @@ async def test_openweek_delete_cancel_cb_returns_to_picker(
     async with session_factory() as session:
         ctx = await _seed_admin_stack(session)
         await _seed_workday(
-            session, ctx=ctx, work_date=datetime(2026, 9, 7).date(),
-            start_time_str="10:00", end_time_str="19:00",
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
         )
         await _seed_workday(
-            session, ctx=ctx, work_date=datetime(2026, 9, 12).date(),
-            start_time_str="10:00", end_time_str="19:00",
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 12).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
         )
 
     from bot.keyboards.admin import AdminOpenweekDeleteCancelCallbackData
@@ -8173,12 +8225,18 @@ async def test_openweek_delete_back_cb_returns_to_edit_keyboard(
     async with session_factory() as session:
         ctx = await _seed_admin_stack(session)
         await _seed_workday(
-            session, ctx=ctx, work_date=datetime(2026, 9, 7).date(),
-            start_time_str="10:00", end_time_str="19:00",
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 7).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
         )
         await _seed_workday(
-            session, ctx=ctx, work_date=datetime(2026, 9, 12).date(),
-            start_time_str="10:00", end_time_str="19:00",
+            session,
+            ctx=ctx,
+            work_date=datetime(2026, 9, 12).date(),
+            start_time_str="10:00",
+            end_time_str="19:00",
         )
 
     from bot.keyboards.admin import AdminOpenweekDeleteBackCallbackData
