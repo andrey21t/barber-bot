@@ -70,14 +70,19 @@ class AdminShiftWindowCallbackData(CallbackData, prefix="admin_shift_window"):
 
     Single handler admin_shift_window_cb (admin.py) — мгновенный callback, no
     FSM. Bounds checks:
-    - left: new_start_time >= 00:00 (минимум). Если start_time уже 00:00 →
-      alert "Старт уже в 00:00, нельзя расширить влево".
+    - left: new_start_time >= 00:30 (need >= 30 min for safe -30min subtraction;
+      sub-30-min start would OverflowError on date.min - 30min). Если
+      start_time < 00:30 → alert "Старт уже в HH:MM, нельзя расширить влево".
+      (Code-reviewer W1 fix Session 2026-09-14: < dt_time(0, 30) вместо
+      == dt_time(0, 0) — ловит sub-30-min start_time.)
     - right: new_end_time < 24:00 (через datetime arithmetics — time + 30min
-      не должно перейти на следующий день). Если end_time уже 23:30 → alert
-      "Конец уже в 23:30, нельзя расширить вправо".
+      не должно перейти на следующий день). Если end_time >= 23:30 → alert
+      "Конец уже в HH:MM, нельзя расширить вправо".
 
-    Works ONLY on today's active WorkDay (is_active=True). If no WorkDay or
-    closed → alert "Сегодня окно не открыто, используйте /openday или 📅 Сегодня".
+    Works ONLY on today's active WorkDay (is_active=True). If no WorkDay →
+    alert "Сегодня окно не открыто. Используйте /openday" (S1 fix — убрана
+    misleading «🗓 Открыть неделю», она открывает неделю, не сегодня). If
+    closed → alert "Сегодня день закрыт. Откройте через /openday".
 
     update_workday (services/workday.py:131) handles booking conflict check —
     expansion skips shrink check (start earlier / end later never cuts
