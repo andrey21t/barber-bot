@@ -265,17 +265,19 @@ def admin_reply_keyboard() -> ReplyKeyboardMarkup:
 
     Кнопки:
     - 📋 Меню → cmd_menu (F.text match, StateFilter("*")) — escape hatch из любого
-      FSM state, показывает inline menu с 7 actions в сообщении.
+      FSM state, показывает inline menu с 7 actions в сообщении. Дублирует
+      функцию ❌ Отмена (state.clear + menu) — единственный escape после UX-баг 4
+      (Session 2026-09-14): reply keyboard ❌ Отмена убрана, 📋 Меню работает как
+      universal «отмена + меню» в одном тапе.
     - 📅 Сегодня → cmd_today (F.text match, StateFilter("*")) — список записей на
       сегодня. Read-only, безопасно чистит FSM state если admin был mid-flow.
     - 🗓 Неделя → cmd_week (F.text match, StateFilter("*")) — список записей на
       ближайшие 7 дней. Read-only, безопасно чистит FSM state.
-    - ❌ Отмена → admin_cancel_msg (F.text match, StateFilter(AdminStates)) +
-      admin_cancel_no_state (F.text match, StateFilter(None)). Universal escape
-      hatch из mid-FSM (Session 5.62+) и вежливое "Нечего отменять" вне FSM.
-      Донор-ресёрч (winnerxxx13, UznetDev) — dedicated cancel button не standard
-      у single-master ботов, это наша инновация для elderly-user UX (Екатерина
-      не понимала как выйти из зависшего FSM состояния).
+
+    ❌ Отмена убрана из reply keyboard (UX-баг 4, Session 2026-09-14). Раньше была
+    отдельной кнопкой (admin_cancel_msg → state.clear + «Админ-режим отменён»),
+    дублировала 📋 Меню. /cancel command остаётся как power-user text command
+    (admin_cancel_msg ловит or_f(F.text == "❌ Отмена", Command("cancel"))).
 
     Остальные actions (/addslots, /openday, /openweek, /closeday, /services) —
     через inline menu (tap "📋 Меню" → inline keyboard в сообщении). Они требуют
@@ -292,7 +294,6 @@ def admin_reply_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton(text="📋 Меню"),
                 KeyboardButton(text="📅 Сегодня"),
                 KeyboardButton(text="🗓 Неделя"),
-                KeyboardButton(text="❌ Отмена"),
             ]
         ],
         resize_keyboard=True,

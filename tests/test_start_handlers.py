@@ -95,15 +95,18 @@ async def test_cmd_start_admin_shows_welcome_and_reply_keyboard() -> None:
     assert isinstance(reply_markup, ReplyKeyboardMarkup), (
         "5.62: admin /start must use reply keyboard (always-on, not inline)"
     )
-    # Reply keyboard has 4 buttons: 📋 Меню / 📅 Сегодня / 🗓 Неделя / ❌ Отмена
+    # Reply keyboard has 3 buttons: 📋 Меню / 📅 Сегодня / 🗓 Неделя.
+    # Session 2026-09-14, UX-баг 4: ❌ Отмена убрана — 📋 Меню берёт функцию «отмена + меню».
     flat_buttons = [btn for row in reply_markup.keyboard for btn in row]
     button_texts = {btn.text for btn in flat_buttons}
     assert "📋 Меню" in button_texts
     assert "📅 Сегодня" in button_texts
     assert "🗓 Неделя" in button_texts
-    assert "❌ Отмена" in button_texts, "2026-09-13: 4-я кнопка ❌ Отмена (escape hatch)"
-    assert len(flat_buttons) == 4, (
-        f"2026-09-13: expected exactly 4 reply buttons, got {len(flat_buttons)}: "
+    assert "❌ Отмена" not in button_texts, (
+        "2026-09-14 UX-баг 4: ❌ Отмена убрана из reply keyboard (📋 Меню = escape + menu)"
+    )
+    assert len(flat_buttons) == 3, (
+        f"2026-09-14: expected exactly 3 reply buttons, got {len(flat_buttons)}: "
         f"{button_texts}"
     )
     assert reply_markup.is_persistent, "5.62: reply keyboard must be always-on (is_persistent=True)"

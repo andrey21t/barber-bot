@@ -2363,31 +2363,39 @@ async def test_cmd_today_non_admin_silent_with_state(
 # сейчас меню — кнопка работает всегда, либо отменяет FSM, либо открывает меню).
 # Донор-ресёрч (winnerxxx13, UznetDev) — dedicated cancel button не standard
 # у single-master ботов, наша инновация для elderly-user UX.
+#
+# Session 2026-09-14, UX-баг 4: ❌ Отмена убрана из reply keyboard (3 кнопки
+# вместо 4). 📋 Меню берёт на себя функцию «отмена + меню» (cmd_menu state.clear
+# + inline menu). /cancel command остаётся как power-user text command.
+# Тесты на ❌ Отмена как TEXT input (F.text == "❌ Отмена") остаются — handler
+# admin_cancel_msg ловит оба: Command("cancel") и текст «❌ Отмена» (если user
+# введёт вручную, без UI-кнопки).
 # ============================================================
 
 
-def test_admin_reply_keyboard_has_4_buttons_in_one_row() -> None:
-    """admin_reply_keyboard() имеет 4 кнопки в 1 ряду (regression guard).
+def test_admin_reply_keyboard_has_3_buttons_in_one_row() -> None:
+    """admin_reply_keyboard() имеет 3 кнопки в 1 ряду (regression guard).
 
-    Session 2026-09-13: добавлена 4-я кнопка ❌ Отмена. Guard от случайного
-    удаления кнопки или изменения layout (например, переход на 2 ряда).
-    resize_keyboard=True shrink'нет до компактных кнопок, 4 кнопки в 1 ряду
+    Session 2026-09-13: добавлена 4-я кнопка ❌ Отмена. Session 2026-09-14
+    (UX-баг 4): ❌ Отмена убрана — 📋 Меню берёт на себя функцию «отмена + меню».
+    Guard от случайного добавления/удаления кнопок или изменения layout.
+    resize_keyboard=True shrink'нет до компактных кнопок, 3 кнопки в 1 ряду
     умещаются на обычных телефонах.
     """
     from bot.keyboards.admin import admin_reply_keyboard
 
     kb = admin_reply_keyboard()
-    # 1 ряд (len(kb.keyboard) == 1) с 4 кнопками
+    # 1 ряд (len(kb.keyboard) == 1) с 3 кнопками
     assert len(kb.keyboard) == 1, (
         f"expected 1 row, got {len(kb.keyboard)} rows: "
         f"{[[btn.text for btn in row] for row in kb.keyboard]}"
     )
     row = kb.keyboard[0]
-    assert len(row) == 4, (
-        f"expected 4 buttons in 1 row, got {len(row)}: {[btn.text for btn in row]}"
+    assert len(row) == 3, (
+        f"expected 3 buttons in 1 row, got {len(row)}: {[btn.text for btn in row]}"
     )
     button_texts = [btn.text for btn in row]
-    assert button_texts == ["📋 Меню", "📅 Сегодня", "🗓 Неделя", "❌ Отмена"], (
+    assert button_texts == ["📋 Меню", "📅 Сегодня", "🗓 Неделя"], (
         f"unexpected button order/text: {button_texts}"
     )
     assert kb.is_persistent, "always-on reply keyboard (is_persistent=True)"
