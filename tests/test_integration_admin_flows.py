@@ -1162,6 +1162,122 @@ async def test_admin_state_catchall_text_works_in_admin_move_selecting_date_stat
 
 
 @pytest.mark.asyncio
+async def test_admin_state_catchall_callback_works_in_admin_move_selecting_date_state(
+    integration_dispatcher: tuple[Dispatcher, MagicMock],
+    session_factory: Any,
+) -> None:
+    """Session 2026-09-14 (W6 fix): stale callback тап в AdminMoveStates.
+    selecting_date → admin_state_catchall_callback wins (callback.answer
+    "Используйте /cancel"), NOT silent failure (loading spinner остаётся,
+    callback.answer не вызывается — pre-fix бот молчал).
+
+    Pre-fix: admin_state_catchall_callback filter был `StateFilter(AdminStates)`
+    only (admin.py:4725) — НЕ покрывал AdminMoveStates (3 states: selecting_date/
+    selecting_slot/confirming). stale callback тап в admin_move flow while still
+    in AdminMoveStates (например, callback `admin_window_cancel` от adding_slots
+    confirm keyboard — handler 1482 требует StateFilter(AdminStates), не матчит
+    в AdminMoveStates) → без catchall бот МОЛЧИТ, loading spinner остаётся на
+    кнопке. Fix: admin_state_catchall_callback filter расширен на
+    StateFilter(AdminStates, AdminMoveStates) — mirror W4 (admin_cancel_msg
+    line 4645) и W5 (admin_state_catchall_text line 4699) — единый catchall
+    для всех 15 admin FSM states в обоих buckets (message + callback).
+    Catchall НЕ поглощает legitimate input (specific CallbackData.filter() +
+    registered раньше → top-down first-match в aiogram 3.x), НЕ меняет state,
+    НЕ триггерит DB writes.
+
+    Test mirror W5 test_admin_state_catchall_text_works_in_admin_move_selecting_
+    date_state но с stale callback (callback_query) вместо arbitrary text
+    (message). Test scenario: stale callback `admin_window_cancel` (из
+    adding_slots flow) тапнут while in AdminMoveStates.selecting_date —
+    НЕ матчит specific AdminMoveStates CallbackData.filter() (calendar/slot/
+    confirm), НЕ матчит admin_window_cancel_cb (StateFilter(AdminStates), не
+    покрывает AdminMoveStates) → catchall wins.
+
+    Regression guards:
+    1. AnswerCallbackQuery вызывается (callback.answer срабатывает — НЕ silent)
+    2. Exactly 1 AnswerCallbackQuery call (только catchall ответил, top-down
+       first-match — один handler)
+    3. Hint text "Используйте /cancel для отмены" (правильный hint)
+    4. State сохраняется AdminMoveStates.selecting_date — "❌ Отмена" в
+       следующем step всё ещё попадает в admin_cancel_msg → "Админ-режим
+       отменён" (catchall НЕ чистит state — callback.answer только)
+    """
+    from aiogram.methods import AnswerCallbackQuery
+    from freezegun import freeze_time
+
+    with freeze_time("2026-08-25 14:00:00", tz_offset=0):
+        dp, bot = integration_dispatcher
+        await _seed_today_with_booking(session_factory)
+
+        # Step 1: /today → admin_today_keyboard with [🔄 Перенести] button.
+        await dp.feed_update(bot, _make_text_update("/today", user_id=ADMIN_TG_ID))
+        today_text = _extract_send_text(bot)
+        assert "Записи на сегодня" in today_text, f"expected today list, got: {today_text!r}"
+
+        # Step 2: tap [🔄 Перенести] → AdminMoveStates.selecting_date (calendar).
+        move_btn = await _find_button_by_label(bot, "🔄")
+        assert move_btn is not None, (
+            f"Expected [🔄 Перенести] button. Got markup: {bot.last_reply_markup!r}"
+        )
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(move_btn, user_id=ADMIN_TG_ID))
+        cal_text = _extract_send_text(bot)
+        assert "Выберите новую дату" in cal_text or "Выберите дату" in cal_text, (
+            f"After [🔄 Перенести] tap must be in AdminMoveStates.selecting_date. Got: {cal_text!r}"
+        )
+
+        # Step 3 (THE TEST): stale callback tap "admin_window_cancel" (old
+        # admin_window_cancel callback от previous keyboard, требует
+        # StateFilter(AdminStates) — не матчит в AdminMoveStates) → catchall
+        # admin_state_catchall_callback wins → callback.answer.
+        bot.reset()
+        stale_update = Update(
+            update_id=2,
+            callback_query=CallbackQuery(
+                id="2",
+                chat_instance=str(ADMIN_TG_ID),
+                data="admin_window_cancel",
+                from_user=User(id=ADMIN_TG_ID, is_bot=False, first_name=""),
+                message=Message(
+                    message_id=1,
+                    date=datetime.now(UTC),
+                    chat=Chat(id=ADMIN_TG_ID, type="private"),
+                    text="",
+                ),
+            ),
+        )
+        await dp.feed_update(bot, stale_update)
+        answer_calls = [c for c in bot.calls if isinstance(c, AnswerCallbackQuery)]
+        assert answer_calls, (
+            "W6: stale callback в AdminMoveStates must NOT be silent — "
+            "callback.answer must fire (убирает loading spinner). Pre-fix бот "
+            f"молчал. Got calls: {[type(c).__name__ for c in bot.calls]!r}"
+        )
+        assert len(answer_calls) == 1, (
+            "W6: only catchall must answer (top-down first-match в aiogram 3.x — "
+            "один handler заматчится). Multiple AnswerCallbackQuery calls suggest "
+            f"another handler also matched. Got: {len(answer_calls)} calls"
+        )
+        assert answer_calls[0].text == "Используйте /cancel для отмены", (
+            "W6: stale callback в AdminMoveStates must reach "
+            f"admin_state_catchall_callback (hint 'Используйте /cancel'). "
+            f"Got: {answer_calls[0].text!r}"
+        )
+
+        # Step 4 (regression guard): state preserved — "❌ Отмена" в следующем
+        # step всё ещё попадает в admin_cancel_msg (W4) → "Админ-режим отменён".
+        # Catchall НЕ чистит state (только callback.answer).
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("❌ Отмена", user_id=ADMIN_TG_ID))
+        post_texts = _extract_all_send_texts(bot)
+        assert any("Админ-режим отменён" in t for t in post_texts), (
+            "W6 regression: after stale callback hint, state must still be "
+            "AdminMoveStates — '❌ Отмена' must reach admin_cancel_msg (W4). "
+            f"Got: {post_texts!r}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_cancel_button_text_works_in_entering_name_state(
     integration_dispatcher: tuple[Dispatcher, MagicMock],
     session_factory: Any,

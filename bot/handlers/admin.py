@@ -4722,12 +4722,32 @@ async def admin_state_catchall_text(message: Message) -> None:
     await message.answer("Используйте /cancel для отмены")
 
 
-@router.callback_query(StateFilter(AdminStates))
+@router.callback_query(StateFilter(AdminStates, AdminMoveStates))
 async def admin_state_catchall_callback(callback: CallbackQuery) -> None:
     """Catch-all для stale callback в admin FSM state.
 
     Stale calendar tap после отмены flow (callback от старого keyboard).
     Без catch-all бот молчит, callback.answer() убирает loading spinner.
+
+    W6 fix (Session 2026-09-14): до расширения AdminMoveStates НЕ покрывались
+    (3 states: selecting_date/selecting_slot/confirming, bot/states.py:85-108).
+    stale callback тап в admin_move flow while still in AdminMoveStates (state
+    уже не тот, что требует specific handler — например, после transition
+    selecting_date → selecting_slot, тап по старому календарю: calendar 2742
+    требует selecting_date, не матчит в selecting_slot) НЕ ловится ни одним
+    @router.callback_query с specific CallbackData.filter() → без catchall бот
+    МОЛЧИТ, loading spinner остаётся на кнопке. Fix: расширить StateFilter как
+    W4 (admin_cancel_msg line 4645) и W5 (admin_state_catchall_text line 4699)
+    — единый catchall для всех 15 admin FSM states в обоих buckets (message +
+    callback). Catchall НЕ поглощает legitimate input (specific CallbackData.
+    filter() + registered раньше → top-down first-match в aiogram 3.x), НЕ
+    меняет state, НЕ триггерит DB writes.
+
+    NB: post-exit stale callbacks (после /cancel или ✅ Да — state.clear()
+    → State(None)) НЕ покрываются этим catchall (StateFilter(AdminStates,
+    AdminMoveStates) НЕ матчит State(None)). Stale callback в State(None)
+    — отдельный edge case, не покрывается W4/W5/W6 (нет callback catchall
+    для State(None), admin_no_state_catchall_text line 4773 — message handler).
     """
     if not _is_admin_callback(callback):
         await callback.answer()
