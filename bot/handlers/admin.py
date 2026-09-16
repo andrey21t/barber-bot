@@ -66,7 +66,6 @@ from bot.keyboards.admin import (
     AdminServiceAddEntryCallbackData,
     AdminServiceDeleteCallbackData,
     AdminServicesCallbackData,
-    AdminShiftWindowCallbackData,
     AdminWindowConfirmCallbackData,
     AdminWindowSlot30CallbackData,
     BookedSlot,
@@ -266,8 +265,9 @@ async def admin_menu_cb(callback: CallbackQuery) -> None:
 
     AdminMenuCallbackData (keyboards/admin.py:28) — empty callback для
     кнопки '📋 Меню' в welcome. Кнопка пока НЕ добавлена в admin_inline_menu()
-    (5 кнопок по spec.md 251), но callback handler зарегистрирован для
-    будущего использования (если пользователь добавит 6-ю кнопку).
+    (3 кнопки после Session 2026-09-16 — откат UX-баг 5), но callback handler
+    зарегистрирован для будущего использования (если пользователь добавит
+    4-ю кнопку).
     StateFilter("*") — матчит в любом state (включая admin FSM), НЕ чистит
     state (только re-show menu — пользователь может вернуться к flow).
     """
@@ -1057,161 +1057,6 @@ async def admin_addslots_cb(callback: CallbackQuery, state: FSMContext) -> None:
             "📅 Выберите дату для открытия слотов:",
             reply_markup=await admin_calendar_keyboard(*_admin_calendar_range(tz)),
         )
-    await callback.answer()
-
-
-# ============================================================
-# Quick shift window (UX-баг 5, Session 2026-09-14)
-# ============================================================
-# Two inline buttons in admin_inline_menu: «⬅️ Расширить влево» / «➡️ Расширить
-# вправо». Instant callback (no FSM) — shift today's active WorkDay start_time
-# or end_time by 30 min. Expansion skips shrink check (update_workday):
-# start earlier / end later never cuts existing bookings, BUT conflict check
-# remains as defensive. If no WorkDay / closed / bounds hit (00:00 / 23:30) →
-# show_alert with explanation. After successful shift → edit_message_text with
-# new window + re-show inline menu (admin can shift again without re-tap 📋 Меню).
-# ============================================================
-
-
-@router.callback_query(AdminShiftWindowCallbackData.filter(), StateFilter("*"))
-async def admin_shift_window_cb(
-    callback: CallbackQuery,
-    callback_data: AdminShiftWindowCallbackData,
-    state: FSMContext,
-) -> None:
-    """«⬅️ Расширить влево» / «➡️ Расширить вправо» — quick shift today's window.
-
-    Instant callback (no FSM). 30-min step. Direction from callback_data.
-    Defensive state.clear() — works mid-FSM (mirror admin_addslots_cb:1051).
-
-    Bounds:
-    - left: new_start = start - 30 min. If start < 00:30 → alert (need >= 30
-      min for safe subtraction; sub-30-min start would OverflowError on
-      date.min - 30min, code-reviewer W1 fix Session 2026-09-14).
-    - right: new_end = end + 30 min. If end >= 23:30 → alert (23:30 + 30 min
-      = 24:00 = next day, blocked).
-
-    Error states:
-    - No WorkDay today → alert "Сегодня окно не открыто, используйте /openday".
-    - WorkDay is_active=False → alert "Сегодня день закрыт, откройте через /openday".
-    - WorkDayShrinkError (defensive — expansion shouldn't trigger, but check
-      remains) → alert with conflict list.
-
-    Success: edit_message_text with new window + admin_inline_menu (re-tappable
-    for repeated shift). Fallback to answer if message not editable (>48h / deleted).
-    """
-    if not _is_admin_callback(callback):
-        await callback.answer()
-        return
-    assert callback.from_user is not None
-    resolved = await _resolve_master_and_business(callback.from_user.id)
-    if resolved is None:
-        await callback.answer("❌ Мастер не найден", show_alert=True)
-        return
-    master_id, _business_id, tz = resolved
-
-    # Defensive clear — works mid-FSM (user might tap shift mid-flow).
-    await state.clear()
-
-    today_local = datetime.now(ZoneInfo(tz)).date()
-    async with async_session_factory() as session:
-        workday = await select_workday(session, master_id, today_local)
-        if workday is None:
-            await callback.answer(
-                "Сегодня окно не открыто. Используйте /openday",
-                show_alert=True,
-            )
-            return
-        if not workday.is_active:
-            await callback.answer(
-                "Сегодня день закрыт. Откройте через /openday",
-                show_alert=True,
-            )
-            return
-
-        # Compute new window by direction.
-        # Bounds checks BEFORE datetime arithmetic — `datetime.combine(date.min,
-        # time(0,0)) - timedelta(minutes=30)` raises OverflowError (date.min is
-        # year=1, MINYEAR=1). Code-reviewer F1 (Session 2026-09-14): explicit
-        # time comparison avoids the overflow.
-        if callback_data.direction == "left":
-            # Minimum start: 00:30 (need >= 30 min for safe -30min subtraction;
-            # == dt_time(0, 0) only catches exact midnight — sub-30-min start
-            # like time(0, 15) would OverflowError on date.min - 30min).
-            # Code-reviewer W1 fix (Session 2026-09-14): < dt_time(0, 30) catches
-            # all start_times that can't be safely shifted left by 30 min.
-            if workday.start_time < dt_time(0, 30):
-                await callback.answer(
-                    f"Старт уже в {workday.start_time.strftime('%H:%M')}, "
-                    f"нельзя расширить влево",
-                    show_alert=True,
-                )
-                return
-            current_start_dt = datetime.combine(date.min, workday.start_time)
-            new_start_dt = current_start_dt - timedelta(minutes=30)
-            new_start_time = new_start_dt.time()
-            new_end_time = workday.end_time
-            shift_label = "⬅️ Расширено влево"
-        elif callback_data.direction == "right":
-            # Maximum end: 23:30 (23:30 + 30 min = 24:00 = next day, blocked).
-            if workday.end_time >= dt_time(23, 30):
-                await callback.answer(
-                    f"Конец уже в {workday.end_time.strftime('%H:%M')}, "
-                    f"нельзя расширить вправо",
-                    show_alert=True,
-                )
-                return
-            current_end_dt = datetime.combine(date.min, workday.end_time)
-            new_end_dt = current_end_dt + timedelta(minutes=30)
-            new_start_time = workday.start_time
-            new_end_time = new_end_dt.time()
-            shift_label = "➡️ Расширено вправо"
-        else:
-            # Defensive — callback_data validation. Should never reach here
-            # (CallbackData filter ensures direction matches schema), but
-            # guard against future schema changes.
-            await callback.answer(
-                f"❌ Неизвестное направление: {callback_data.direction}",
-                show_alert=True,
-            )
-            return
-
-        try:
-            updated = await update_workday(
-                session, workday.id, new_start_time, new_end_time, tz
-            )
-        except WorkDayShrinkError as exc:
-            # Defensive — expansion shouldn't trigger (start earlier / end
-            # later never cuts bookings), but WorkDayShrinkError could occur
-            # if booking logic changed in future. Show conflicts.
-            conflicts_text = _render_shrink_conflicts(exc, tz)
-            await callback.answer(
-                f"🔒 Есть запись в конфликте:\n{conflicts_text}",
-                show_alert=True,
-            )
-            return
-        except ValueError as exc:
-            # new_end_time <= new_start_time (shouldn't happen for expansion,
-            # but guard).
-            await callback.answer(f"❌ {exc}", show_alert=True)
-            return
-
-        success_text = (
-            f"{shift_label}\n"
-            f"📅 {today_local.strftime('%d.%m.%Y')}\n"
-            f"🕒 Окно: {updated.start_time.strftime('%H:%M')}–{updated.end_time.strftime('%H:%M')}"
-        )
-
-    if callback.message is not None:
-        # isinstance check — narrow Message vs InaccessibleMessage (mypy
-        # union-attr on edit_text; pattern from admin_openweek_start_cb:3439).
-        if isinstance(callback.message, Message):
-            try:
-                await callback.message.edit_text(success_text, reply_markup=admin_inline_menu())
-            except TelegramBadRequest:
-                await callback.message.answer(success_text, reply_markup=admin_inline_menu())
-        else:
-            await callback.message.answer(success_text, reply_markup=admin_inline_menu())
     await callback.answer()
 
 

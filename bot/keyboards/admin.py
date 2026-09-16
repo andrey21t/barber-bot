@@ -61,37 +61,6 @@ class AdminAddslotsCallbackData(CallbackData, prefix="admin_addslots"):
     """
 
 
-class AdminShiftWindowCallbackData(CallbackData, prefix="admin_shift_window"):
-    """Quick shift today's workday window — «⬅️ Расширить влево» / «➡️ Расширить
-    вправо» inline buttons (Session 2026-09-14, UX-баг 5).
-
-    direction="left" → start_time -= 30 min (расширение влево — раньше).
-    direction="right" → end_time += 30 min (расширение вправо — позже).
-
-    Single handler admin_shift_window_cb (admin.py) — мгновенный callback, no
-    FSM. Bounds checks:
-    - left: new_start_time >= 00:30 (need >= 30 min for safe -30min subtraction;
-      sub-30-min start would OverflowError on date.min - 30min). Если
-      start_time < 00:30 → alert "Старт уже в HH:MM, нельзя расширить влево".
-      (Code-reviewer W1 fix Session 2026-09-14: < dt_time(0, 30) вместо
-      == dt_time(0, 0) — ловит sub-30-min start_time.)
-    - right: new_end_time < 24:00 (через datetime arithmetics — time + 30min
-      не должно перейти на следующий день). Если end_time >= 23:30 → alert
-      "Конец уже в HH:MM, нельзя расширить вправо".
-
-    Works ONLY on today's active WorkDay (is_active=True). If no WorkDay →
-    alert "Сегодня окно не открыто. Используйте /openday" (S1 fix — убрана
-    misleading «🗓 Открыть неделю», она открывает неделю, не сегодня). If
-    closed → alert "Сегодня день закрыт. Откройте через /openday".
-
-    update_workday (services/workday.py:131) handles booking conflict check —
-    expansion skips shrink check (start earlier / end later never cuts
-    existing bookings), но conflict check остаётся как defensive.
-    """
-
-    direction: str
-
-
 class AdminServicesCallbackData(CallbackData, prefix="admin_services"):
     """Show services list (Session 2026-09-13, Баг 1 от Екатерины).
 
@@ -173,7 +142,8 @@ class AdminMoveConfirmCallbackData(CallbackData, prefix="admin_move_confirm"):
 
 
 def admin_inline_menu() -> InlineKeyboardMarkup:
-    """Inline keyboard с 5 кнопками для мастера (Session 2026-09-14 — UX-баг 5).
+    """Inline keyboard с 3 кнопками для мастера (Session 2026-09-16 — удаление
+    UX-баг 5).
 
     Session 5.62 (пункт 2 от Екатерины): кнопка «Открыть день» (старый
     текстовый формат с HH:MM input) УДАЛЕНА. CREATE day теперь только через
@@ -193,28 +163,18 @@ def admin_inline_menu() -> InlineKeyboardMarkup:
     - 🗓 Открыть неделю (требует StateFilter(None), batch CREATE)
     - 💹 Услуги (entering_service flow, StateFilter(None))
 
-    Session 2026-09-14 (UX-баг 5): добавлены 2 кнопки quick-shift для сегодня —
-    «⬅️ Расширить влево» и «➡️ Расширить вправо». Мгновенный callback (no FSM):
-    каждая кнопка сдвигает start_time (или end_time) сегодняшнего активного
-    WorkDay на 30 мин. Если сегодня нет активного дня → alert. Если уже
-    00:00 / 23:30 → alert «нельзя расширить».
+    Session 2026-09-16 (откат UX-баг 5): кнопки «⬅️ Расширить влево» и
+    «➡️ Расширить вправо» УДАЛЕНЫ — владелец решил, что quick-shift не нужен.
+    Layout вернулся к 3 кнопкам (2+1).
 
-    Layout: 2 + 2 + 1 (3 rows). Row 1: ➕ Изменить окно, 🗓 Открыть неделю.
-    Row 2: ⬅️ Расширить влево, ➡️ Расширить вправо. Row 3: 💹 Услуги.
+    Layout: 2 + 1 (2 rows). Row 1: ➕ Изменить окно, 🗓 Открыть неделю.
+    Row 2: 💹 Услуги.
     """
     builder = InlineKeyboardBuilder()
     builder.button(text="➕ Изменить окно", callback_data=AdminAddslotsCallbackData().pack())
     builder.button(text="🗓 Открыть неделю", callback_data=AdminOpenWeekEntryCallbackData().pack())
-    builder.button(
-        text="⬅️ Расширить влево",
-        callback_data=AdminShiftWindowCallbackData(direction="left").pack(),
-    )
-    builder.button(
-        text="➡️ Расширить вправо",
-        callback_data=AdminShiftWindowCallbackData(direction="right").pack(),
-    )
     builder.button(text="💇 Услуги", callback_data=AdminServicesCallbackData().pack())
-    builder.adjust(2, 2, 1)
+    builder.adjust(2, 1)
     return builder.as_markup()
 
 
