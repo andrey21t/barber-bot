@@ -2541,9 +2541,11 @@ def test_admin_inline_menu_has_3_buttons_after_duplication_cleanup() -> None:
         f"got {len(flat_texts)}: {flat_texts}"
     )
     # Ожидаемые 3 кнопки (порядок имеет значение — layout 2+1)
+    # Session 2026-09-17: «Открыть неделю» перенесена влево (первая позиция),
+    # «Изменить окно» вправо (вторая позиция).
     expected = [
-        "➕ Изменить окно",
         "🗓 Открыть неделю",
+        "➕ Изменить окно",
         "💇 Услуги",
     ]
     assert flat_texts == expected, (

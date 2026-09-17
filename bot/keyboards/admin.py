@@ -167,12 +167,16 @@ def admin_inline_menu() -> InlineKeyboardMarkup:
     «➡️ Расширить вправо» УДАЛЕНЫ — владелец решил, что quick-shift не нужен.
     Layout вернулся к 3 кнопкам (2+1).
 
-    Layout: 2 + 1 (2 rows). Row 1: ➕ Изменить окно, 🗓 Открыть неделю.
+    Session 2026-09-17: layout change — «🗓 Открыть неделю» перемещена
+    влево (на первое место), «➕ Изменить окно» вправо (на второе). Это
+    первая кнопка, которую тапает владелец — даём ей приоритетную позицию.
+
+    Layout: 2 + 1 (2 rows). Row 1: 🗓 Открыть неделю, ➕ Изменить окно.
     Row 2: 💹 Услуги.
     """
     builder = InlineKeyboardBuilder()
-    builder.button(text="➕ Изменить окно", callback_data=AdminAddslotsCallbackData().pack())
     builder.button(text="🗓 Открыть неделю", callback_data=AdminOpenWeekEntryCallbackData().pack())
+    builder.button(text="➕ Изменить окно", callback_data=AdminAddslotsCallbackData().pack())
     builder.button(text="💇 Услуги", callback_data=AdminServicesCallbackData().pack())
     builder.adjust(2, 1)
     return builder.as_markup()
