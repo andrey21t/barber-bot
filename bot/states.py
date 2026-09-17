@@ -106,3 +106,24 @@ class AdminMoveStates(StatesGroup):
     selecting_date = State()
     selecting_slot = State()
     confirming = State()
+
+
+class AdminCloseOtherDayStates(StatesGroup):
+    """FSM states for admin close-other-day flow (Вариант B, Session 5.65).
+
+    Calendar-driven alternative to ``/closeday YYYY-MM-DD`` text command.
+    Entry: ``admin_today_keyboard`` → [🔒 Закрыть другой день] →
+    ``AdminCloseOtherDayEntryCallbackData`` → ``admin_close_other_entry_cb``
+    sets ``selecting_date`` + shows SimpleCalendar.
+
+    Calendar dispatch via ``StateFilter(AdminCloseOtherDayStates.selecting_date)``
+    (mirror ``AdminMoveStates.selecting_date``) — distinct from other calendar
+    handlers so aiogram dispatch by state, no collision.
+
+    Confirm is stateless via ``AdminCloseOtherDayConfirmCallbackData(workday_id)``
+    in callback_data (mirror ``AdminCloseTodayConfirmCallbackData``) — race-safe
+    vs state loss between confirm render and tap. ``close_workday_with_cancellations``
+    handles concurrent close (returns ``was_already_closed=True``).
+    """
+
+    selecting_date = State()

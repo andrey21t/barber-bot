@@ -45,6 +45,9 @@ from bot.config import get_settings
 from bot.db import async_session_factory
 from bot.keyboards.admin import (
     AdminAddslotsCallbackData,
+    AdminCloseOtherDayCancelCallbackData,
+    AdminCloseOtherDayConfirmCallbackData,
+    AdminCloseOtherDayEntryCallbackData,
     AdminCloseTodayCallbackData,
     AdminCloseTodayCancelCallbackData,
     AdminCloseTodayConfirmCallbackData,
@@ -71,6 +74,7 @@ from bot.keyboards.admin import (
     BookedSlot,
     OpenedDay,
     admin_calendar_keyboard,
+    admin_close_other_confirm_keyboard,
     admin_close_today_confirm_keyboard,
     admin_inline_menu,
     admin_move_confirm_keyboard,
@@ -128,7 +132,7 @@ from bot.services.workday import (
     select_workday,
     update_workday,
 )
-from bot.states import AdminMoveStates, AdminStates
+from bot.states import AdminCloseOtherDayStates, AdminMoveStates, AdminStates
 
 logger = logging.getLogger(__name__)
 
@@ -1027,6 +1031,23 @@ def _admin_calendar_range(business_timezone: str) -> tuple[datetime, datetime]:
     today_local = datetime.now(tz).replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
     max_local = today_local + timedelta(days=365)
     return today_local, max_local
+
+
+def _admin_close_calendar_range(business_timezone: str) -> tuple[datetime, datetime]:
+    """(min_date, max_date) для close-other-day SimpleCalendar (Вариант B).
+
+    Unlike ``_admin_calendar_range`` (for /addslots — opening slots in past is
+    meaningless), close-other-day needs PAST dates visible: master who forgot
+    to close a past WorkDay should be able to close it via UI, not just via
+    ``/closeday YYYY-MM-DD`` text command. Range: today_local - 30d to
+    today_local + 365d. 30d past covers typical "forgot to close yesterday
+    or last week" cases without flooding the calendar with stale WorkDays.
+    """
+    tz = ZoneInfo(business_timezone)
+    today_local = datetime.now(tz).replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
+    min_local = today_local - timedelta(days=30)
+    max_local = today_local + timedelta(days=365)
+    return min_local, max_local
 
 
 @router.callback_query(AdminAddslotsCallbackData.filter(), StateFilter("*"))
@@ -4324,6 +4345,375 @@ async def admin_close_today_cancel_cb(
     """[❌ Не закрывать] in today-close confirm step (Session 5.63, пункт 3).
 
     Clears FSM state (if any) and shows "Закрытие отменено" + admin_inline_menu.
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    await state.clear()
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_text(
+                "❌ Закрытие дня отменено. /menu для меню",
+                reply_markup=admin_inline_menu(),
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                "❌ Закрытие дня отменено. /menu для меню",
+                reply_markup=admin_inline_menu(),
+            )
+    await callback.answer()
+
+
+# ============================================================
+# Вариант B — close other day via SimpleCalendar (Session 5.65)
+#
+# Calendar-driven alternative to ``/closeday YYYY-MM-DD`` text power-user
+# shortcut. Entry from admin_today_keyboard [🔒 Закрыть другой день] →
+# SimpleCalendar → pick date → confirm (if active bookings) or close
+# immediately (no bookings) → close_workday_with_cancellations + notify +
+# summary. Reuses _notify_cancelled_clients + _format_closeday_summary +
+# close_workday_with_cancellations WITHOUT modification.
+#
+# Pattern mirrors admin_close_today_cb / admin_close_today_confirm_cb /
+# admin_close_today_cancel_cb (stateless confirm via workday_id in
+# callback_data) + admin_move_simple_calendar_cb (calendar dispatch via
+# StateFilter).
+# ============================================================
+
+
+@router.callback_query(AdminCloseOtherDayEntryCallbackData.filter(), StateFilter("*"))
+async def admin_close_other_entry_cb(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """[🔒 Закрыть другой день] tap from admin_today_keyboard (Вариант B).
+
+    Clears state (defensive — mirror admin_close_today_cb:4168) and shows
+    SimpleCalendar with ``_admin_close_calendar_range`` (past 30 days visible
+    for closing forgotten WorkDays). Sets ``AdminCloseOtherDayStates.selecting_date``
+    so the calendar handler dispatches by state, not by callback_data prefix
+    (no collision with admin_addslots or admin_move calendar handlers).
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await state.clear()
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    _master_id, _business_id, tz = resolved
+
+    await state.clear()
+    await state.set_state(AdminCloseOtherDayStates.selecting_date)
+
+    if isinstance(callback.message, Message):
+        text = "📅 Выберите день для закрытия:"
+        try:
+            await callback.message.edit_text(
+                text,
+                reply_markup=await admin_calendar_keyboard(*_admin_close_calendar_range(tz)),
+            )
+        except TelegramBadRequest:
+            await callback.message.answer(
+                text,
+                reply_markup=await admin_calendar_keyboard(*_admin_close_calendar_range(tz)),
+            )
+    await callback.answer()
+
+
+@router.callback_query(
+    SimpleCalendarCallback.filter(), StateFilter(AdminCloseOtherDayStates.selecting_date)
+)
+async def admin_close_other_calendar_cb(
+    callback: CallbackQuery,
+    callback_data: SimpleCalendarCallback,
+    state: FSMContext,
+    scheduler: AsyncIOScheduler,
+) -> None:
+    """SimpleCalendar navigation + day select for close-other-day flow (Вариант B).
+
+    Mirror ``admin_move_simple_calendar_cb`` structure: act=ignore/today+same-month
+    → answer(cache_time=60); act=day → fetch WorkDay, branch None/inactive/active;
+    act=cancel → state.clear + "Закрытие отменено"; navigation → lib edit_reply_markup.
+
+    ``scheduler`` is required because the no-bookings branch calls
+    ``_notify_cancelled_clients`` for scheduler job cleanup (mirror
+    ``admin_close_today_cb`` which always calls it — for empty bookings it is
+    a no-op, but the param is required by the helper signature).
+
+    Branches on day-select:
+    - WorkDay not found → "не открыт, нечего закрывать" + re-show calendar.
+    - is_active=False → "уже закрыт" + re-show calendar.
+    - Active + no bookings → close immediately + summary + state.clear.
+    - Active + bookings → show list + admin_close_other_confirm_keyboard
+      (workday_id in callback_data, no FSM state needed — race-safe vs state
+      loss, mirror admin_close_today_cb:4227-4253).
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await state.clear()
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    master_id, _business_id, tz = resolved
+
+    if callback_data.act == SimpleCalAct.ignore:
+        await callback.answer(cache_time=60)
+        return
+    if callback_data.act == SimpleCalAct.today:
+        today_sys = datetime.now().replace(tzinfo=None)
+        if today_sys.year == callback_data.year and today_sys.month == callback_data.month:
+            await callback.answer(cache_time=60)
+            return
+
+    cal = SimpleCalendar(locale="ru_RU.UTF-8", cancel_btn="Отмена", today_btn="Сегодня")
+    cal.set_dates_range(*_admin_close_calendar_range(tz))
+    selected, selected_date = await cal.process_selection(callback, callback_data)
+
+    if callback_data.act == SimpleCalAct.day:
+        if not selected:
+            return
+        work_date = selected_date.date()
+
+        async with async_session_factory() as session:
+            workday = await select_workday(session, master_id, work_date)
+
+        if workday is None:
+            if isinstance(callback.message, Message):
+                hint = (
+                    f"❌ На {work_date.strftime('%d %B %Y')} рабочий день не открыт. "
+                    "Нечего закрывать."
+                )
+                try:
+                    await callback.message.edit_text(
+                        hint,
+                        reply_markup=await admin_calendar_keyboard(
+                            *_admin_close_calendar_range(tz)
+                        ),
+                    )
+                except TelegramBadRequest:
+                    await callback.message.answer(
+                        hint,
+                        reply_markup=await admin_calendar_keyboard(
+                            *_admin_close_calendar_range(tz)
+                        ),
+                    )
+            await callback.answer()
+            return
+
+        if not workday.is_active:
+            if isinstance(callback.message, Message):
+                hint = f"❌ День {work_date.strftime('%d %B %Y')} уже закрыт."
+                try:
+                    await callback.message.edit_text(
+                        hint,
+                        reply_markup=await admin_calendar_keyboard(
+                            *_admin_close_calendar_range(tz)
+                        ),
+                    )
+                except TelegramBadRequest:
+                    await callback.message.answer(
+                        hint,
+                        reply_markup=await admin_calendar_keyboard(
+                            *_admin_close_calendar_range(tz)
+                        ),
+                    )
+            await callback.answer()
+            return
+
+        # WorkDay active → fetch bookings to decide confirm vs immediate close.
+        async with async_session_factory() as session:
+            active_bookings = await get_active_bookings_for_workday(session, workday, tz)
+
+        if not active_bookings:
+            # Mirror admin_close_today_cb:4197-4225 — close immediately, no confirm.
+            async with async_session_factory() as session:
+                try:
+                    result = await close_workday_with_cancellations(
+                        session, workday.id, business_tz=tz
+                    )
+                except SQLAlchemyError:
+                    if isinstance(callback.message, Message):
+                        await callback.message.answer(
+                            "❌ Ошибка БД. Попробуйте позже через /menu"
+                        )
+                    await callback.answer()
+                    return
+            if result is None:
+                # Concurrent close won — already closed.
+                if isinstance(callback.message, Message):
+                    try:
+                        await callback.message.edit_text(
+                            f"❌ День {work_date.strftime('%d %B %Y')} уже закрыт.",
+                            reply_markup=admin_inline_menu(),
+                        )
+                    except TelegramBadRequest:
+                        await callback.message.answer(
+                            f"❌ День {work_date.strftime('%d %B %Y')} уже закрыт.",
+                            reply_markup=admin_inline_menu(),
+                        )
+                await state.clear()
+                await callback.answer()
+                return
+            # Mirror admin_close_today_cb:4214-4218 — always call _notify_cancelled_clients
+            # for scheduler job cleanup. With empty cancelled_bookings the loop is a
+            # no-op (notified_count=0), but the call keeps the flow consistent with
+            # admin_close_today_cb and avoids divergence (deep-analysis-critic pass 1).
+            notified_count = await _notify_cancelled_clients(
+                result.cancelled_bookings, tz, callback.bot, scheduler
+            )
+            cancelled_count = len(result.cancelled_bookings)
+            summary = _format_closeday_summary(result.work_date, cancelled_count, notified_count)
+            if isinstance(callback.message, Message):
+                try:
+                    await callback.message.edit_text(summary, reply_markup=admin_inline_menu())
+                except TelegramBadRequest:
+                    await callback.message.answer(summary, reply_markup=admin_inline_menu())
+            await state.clear()
+            await callback.answer()
+            return
+
+        # Active bookings → show confirm with list + admin_close_other_confirm_keyboard.
+        tz_obj = ZoneInfo(tz)
+        bookings_text_lines: list[str] = []
+        for b in active_bookings:
+            local_time = b.start_at.replace(tzinfo=UTC).astimezone(tz_obj)
+            when = local_time.strftime("%H:%M")
+            bookings_text_lines.append(
+                f"• {when} — {b.client_name_snapshot}, {b.service_title_snapshot}"
+            )
+        bookings_list = "\n".join(bookings_text_lines)
+        confirm_text = (
+            f"📅 <b>{work_date.strftime('%d %B %Y')}</b>\n\n"
+            f"В этот день {len(active_bookings)} запис(ь/и/ей):\n"
+            f"{bookings_list}\n\n"
+            f"Закрыть день и отменить все записи?"
+        )
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(
+                    confirm_text,
+                    reply_markup=admin_close_other_confirm_keyboard(workday.id),
+                )
+            except TelegramBadRequest:
+                await callback.message.answer(
+                    confirm_text,
+                    reply_markup=admin_close_other_confirm_keyboard(workday.id),
+                )
+        await callback.answer()
+        return
+
+    if callback_data.act == SimpleCalAct.cancel:
+        await state.clear()
+        if isinstance(callback.message, Message):
+            try:
+                await callback.message.edit_text(
+                    "❌ Закрытие дня отменено. /menu для меню",
+                    reply_markup=admin_inline_menu(),
+                )
+            except TelegramBadRequest:
+                await callback.message.answer(
+                    "❌ Закрытие дня отменено. /menu для меню",
+                    reply_markup=admin_inline_menu(),
+                )
+        await callback.answer()
+        return
+
+    # Navigation (prev_y/next_y/prev_m/next_m/today-diff-month): lib did
+    # edit_reply_markup, handler answers.
+    await callback.answer()
+
+
+@router.callback_query(
+    AdminCloseOtherDayConfirmCallbackData.filter(), StateFilter("*")
+)
+async def admin_close_other_confirm_cb(
+    callback: CallbackQuery,
+    scheduler: AsyncIOScheduler,
+    callback_data: AdminCloseOtherDayConfirmCallbackData,
+    state: FSMContext,
+) -> None:
+    """[✅ Да, закрыть день] in close-other-day confirm step (Вариант B).
+
+    Mirror ``admin_close_today_confirm_cb`` — reads ``workday_id`` from
+    callback_data (race-safe vs FSM state loss between confirm render and
+    tap), calls ``close_workday_with_cancellations`` (which handles
+    None/already-closed races internally via ``was_already_closed``), then
+    ``_notify_cancelled_clients`` + ``_format_closeday_summary`` + edit_text
+    with admin_inline_menu. Clears state (defensive — calendar left
+    selecting_date but the confirm closed the flow).
+    """
+    if not _is_admin_callback(callback):
+        await callback.answer()
+        return
+    assert callback.from_user is not None
+    resolved = await _resolve_master_and_business(callback.from_user.id)
+    if resolved is None:
+        await state.clear()
+        await callback.answer("❌ Мастер не найден", show_alert=True)
+        return
+    _master_id, _business_id, tz = resolved
+
+    await state.clear()
+
+    try:
+        workday_id = UUID(callback_data.workday_id)
+    except (ValueError, TypeError):
+        if isinstance(callback.message, Message):
+            await callback.message.answer("❌ Ошибка данных кнопки. /closeday чтобы закрыть день")
+        await callback.answer()
+        return
+
+    async with async_session_factory() as session:
+        try:
+            result = await close_workday_with_cancellations(session, workday_id, business_tz=tz)
+        except SQLAlchemyError:
+            if isinstance(callback.message, Message):
+                await callback.message.answer("❌ Ошибка БД. Попробуйте позже через /menu")
+            await callback.answer()
+            return
+
+    if result is None:
+        if isinstance(callback.message, Message):
+            await callback.message.answer(
+                "❌ Рабочий день не найден (возможно уже закрыт). /today чтобы проверить",
+                reply_markup=admin_inline_menu(),
+            )
+        await callback.answer()
+        return
+
+    notified_count = await _notify_cancelled_clients(
+        result.cancelled_bookings, tz, callback.bot, scheduler
+    )
+    cancelled_count = len(result.cancelled_bookings)
+    summary = _format_closeday_summary(result.work_date, cancelled_count, notified_count)
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_text(summary, reply_markup=admin_inline_menu())
+        except TelegramBadRequest:
+            await callback.message.answer(summary, reply_markup=admin_inline_menu())
+    elif callback.message is not None:
+        # InaccessibleMessage (>48h or deleted) — send summary as new message.
+        # Mirror admin_close_today_confirm_cb:4335-4336.
+        await callback.message.answer(summary, reply_markup=admin_inline_menu())
+    await callback.answer()
+
+
+@router.callback_query(AdminCloseOtherDayCancelCallbackData.filter(), StateFilter("*"))
+async def admin_close_other_cancel_cb(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """[❌ Не закрывать] in close-other-day confirm step (Вариант B).
+
+    Mirror ``admin_close_today_cancel_cb`` — clears FSM state (if any) and
+    shows "Закрытие отменено" + admin_inline_menu.
     """
     if not _is_admin_callback(callback):
         await callback.answer()

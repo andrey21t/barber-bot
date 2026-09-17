@@ -333,6 +333,13 @@ def admin_today_keyboard(
     → close_workday_with_cancellations). Replaces the old "📅 Закрыть день"
     button that lived in admin_inline_menu (deleted in пункт 3).
 
+    Вариант B (Session 5.65): adds [🔒 Закрыть другой день] button in a
+    separate row ALWAYS visible (not gated by today_workday). Tap →
+    admin_close_other_entry_cb → SimpleCalendar → pick date → confirm →
+    close_workday_with_cancellations. Calendar-based alternative to the
+    ``/closeday YYYY-MM-DD`` text power-user shortcut. Today-close button
+    (above) is kept — the new button is ADDITIVE, not a replacement.
+
     Telegram inline keyboard limit 100 buttons/row × N rows — pet-project
     single-tenant (Екатерина < 10 bookings/day), no pagination needed. If > 30
     bookings — would need pagination (defer until pain).
@@ -393,6 +400,16 @@ def admin_today_keyboard(
                 callback_data=AdminCloseTodayCallbackData().pack(),
             )
         )
+    # Вариант B: separate row, always visible — calendar path for closing
+    # ANY active WorkDay (today or future or past). Not gated by today_workday
+    # because master may want to close a future day even if today's WorkDay
+    # is inactive or absent.
+    builder.row(
+        InlineKeyboardButton(
+            text="🔒 Закрыть другой день",
+            callback_data=AdminCloseOtherDayEntryCallbackData().pack(),
+        )
+    )
     return builder.as_markup()
 
 
@@ -638,6 +655,43 @@ class AdminCloseTodayCancelCallbackData(CallbackData, prefix="admin_close_today_
     """[❌ Не закрывать] in today-close confirm step (Session 5.63, пункт 3).
 
     No payload — handler clears state (if any) and shows admin_inline_menu.
+    """
+
+
+class AdminCloseOtherDayEntryCallbackData(CallbackData, prefix="admin_close_other"):
+    """[🔒 Закрыть другой день] tap from admin_today_keyboard (Вариант B).
+
+    No payload — entry handler shows SimpleCalendar for picking the date to
+    close. Calendar dispatch is then routed via
+    ``StateFilter(AdminCloseOtherDayStates.selecting_date)`` (distinct from
+    ``AdminStates.adding_slots_date`` and ``AdminMoveStates.selecting_date``).
+
+    Wire format: ``admin_close_other`` = 18 bytes < 64.
+    """
+
+
+class AdminCloseOtherDayConfirmCallbackData(CallbackData, prefix="admin_close_other_confirm"):
+    """[✅ Да, закрыть день] in close-other-day confirm step (Вариант B).
+
+    Carries ``workday_id`` in callback_data — race-safe vs FSM state loss
+    between confirm render and tap. Mirror ``AdminCloseTodayConfirmCallbackData``
+    and ``AdminOpenweekDeleteConfirmCallbackData`` patterns (both pass
+    ``workday_id`` UUID, NOT ``work_date_iso``). ``close_workday_with_cancellations``
+    handles None (returns None) and already-closed (returns
+    ``was_already_closed=True``) internally — no need to duplicate race-check
+    logic in the handler.
+
+    Wire format: ``admin_close_other_confirm:<UUID>`` = 25 + 1 + 36 = 62 bytes < 64.
+    """
+
+    workday_id: str
+
+
+class AdminCloseOtherDayCancelCallbackData(CallbackData, prefix="admin_close_other_cancel"):
+    """[❌ Не закрывать] in close-other-day confirm step (Вариант B).
+
+    No payload — handler clears state (if any) and shows "Закрытие отменено" +
+    admin_inline_menu.
     """
 
 
@@ -1169,6 +1223,35 @@ def admin_close_today_confirm_keyboard(workday_id: UUID) -> InlineKeyboardMarkup
     builder.button(
         text="❌ Не закрывать",
         callback_data=AdminCloseTodayCancelCallbackData().pack(),
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_close_other_confirm_keyboard(workday_id: UUID) -> InlineKeyboardMarkup:
+    """[✅ Да, закрыть день] / [❌ Не закрывать] keyboard for close-other-day
+    confirm step (Вариант B).
+
+    Mirror ``admin_close_today_confirm_keyboard`` — ``workday_id`` UUID in
+    callback_data (race-safe vs FSM state loss). ``AdminCloseOtherDayConfirmCallbackData``
+    uses the same ``workday_id`` payload pattern as
+    ``AdminCloseTodayConfirmCallbackData`` and
+    ``AdminOpenweekDeleteConfirmCallbackData`` — service
+    ``close_workday_with_cancellations`` handles None/already-closed races
+    internally, so the confirm handler does NOT duplicate race-check logic.
+
+    Args:
+        workday_id: UUID of the WorkDay to close (the active WorkDay for the
+            date picked via SimpleCalendar).
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="✅ Да, закрыть день",
+        callback_data=AdminCloseOtherDayConfirmCallbackData(workday_id=str(workday_id)).pack(),
+    )
+    builder.button(
+        text="❌ Не закрывать",
+        callback_data=AdminCloseOtherDayCancelCallbackData().pack(),
     )
     builder.adjust(1)
     return builder.as_markup()

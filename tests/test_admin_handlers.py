@@ -5934,6 +5934,520 @@ async def test_admin_close_today_cancel_cb_clears_state(
 
 
 # ============================================================
+# Вариант B (Session 5.65) — close-other-day via SimpleCalendar
+#
+# Mirror admin_close_today tests (5760-5933) + admin_move calendar tests
+# (2640-2722). Pattern: patch aiogram_calendar.SimpleCalendar.process_selection
+# to return (True, future_date), construct SimpleCalendarCallback(act=day,
+# year=Y, month=M, day=D), invoke handler, assert on edit_text/answer calls.
+# ============================================================
+
+
+def test_admin_today_keyboard_has_close_other_day_button() -> None:
+    """Regression guard: admin_today_keyboard includes [🔒 Закрыть другой день]
+    button in a separate row, ALWAYS visible (not gated by today_workday).
+
+    Distinct from [🔒 Закрыть день] (today only, gated by today_workday.is_active).
+    """
+    from bot.keyboards.admin import admin_today_keyboard
+
+    kb = admin_today_keyboard(bookings=[], business_timezone=TZ, today_workday=None)
+    assert isinstance(kb, InlineKeyboardMarkup)
+    flat_texts = [btn.text for row in kb.inline_keyboard for btn in row]
+    assert "🔒 Закрыть другой день" in flat_texts, (
+        f"Missing close-other-day button, got {flat_texts!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_admin_close_other_entry_cb_shows_calendar(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[🔒 Закрыть другой день] tap → state.set_state(selecting_date) +
+    SimpleCalendar shown via edit_text with admin_calendar_keyboard reply_markup.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    from bot.keyboards.admin import AdminCloseOtherDayEntryCallbackData
+    from bot.states import AdminCloseOtherDayStates
+
+    cb_data = AdminCloseOtherDayEntryCallbackData()
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+
+    await admin_handlers.admin_close_other_entry_cb(callback, state)
+
+    state.clear.assert_called_once()
+    state.set_state.assert_called_once_with(AdminCloseOtherDayStates.selecting_date)
+    # edit_text called with calendar reply_markup.
+    assert callback.message.edit_text.called
+    rm = callback.message.edit_text.call_args.kwargs.get("reply_markup")
+    assert rm is not None, "calendar reply_markup missing"
+
+
+@pytest.mark.asyncio
+async def test_admin_close_other_calendar_cb_no_workday_alerts(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Day select with NO WorkDay for that date → alert 'не открыт, нечего
+    закрывать' + re-show calendar (state stays selecting_date — user can pick
+    another date).
+    """
+    from unittest.mock import patch
+
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    # Pick a date with no WorkDay seeded — far future to avoid range boundary.
+    future = (datetime.now(UTC) + timedelta(days=60)).date()
+    future_dt = datetime.combine(future, datetime.min.time())
+    cal_cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=future_dt.year,
+        month=future_dt.month,
+        day=future_dt.day,
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+    scheduler = MagicMock()
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(True, future_dt),
+    ):
+        await admin_handlers.admin_close_other_calendar_cb(
+            callback, cal_cb_data, state, scheduler
+        )
+
+    # state.set_state NOT called again (stays selecting_date — user can retry).
+    state.set_state.assert_not_called()
+    # edit_text called with 'не открыт' hint + calendar reply_markup.
+    assert callback.message.edit_text.called
+    text = str(callback.message.edit_text.call_args.args[0])
+    assert "не открыт" in text
+    assert "Нечего закрывать" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_close_other_calendar_cb_already_closed_alerts(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Day select with is_active=False WorkDay → alert 'уже закрыт' + re-show
+    calendar.
+    """
+    from unittest.mock import patch
+
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        # Seed a CLOSED workday (is_active=False — closed via /closeday earlier).
+        await _seed_workday(session, ctx=ctx, work_date=tomorrow, is_active=False)
+
+    tomorrow_dt = datetime.combine(tomorrow, datetime.min.time())
+    cal_cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=tomorrow_dt.year,
+        month=tomorrow_dt.month,
+        day=tomorrow_dt.day,
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+    scheduler = MagicMock()
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(True, tomorrow_dt),
+    ):
+        await admin_handlers.admin_close_other_calendar_cb(
+            callback, cal_cb_data, state, scheduler
+        )
+
+    state.set_state.assert_not_called()
+    assert callback.message.edit_text.called
+    text = str(callback.message.edit_text.call_args.args[0])
+    assert "уже закрыт" in text
+
+
+@pytest.mark.asyncio
+async def test_admin_close_other_calendar_cb_cancel_via_calendar_button(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """SimpleCalendar 'Отмена' button (act=cancel) → state.clear + 'Закрытие
+    отменено' + admin_inline_menu.
+    """
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cal_cb_data = SimpleCalendarCallback(act=SimpleCalAct.cancel)
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+    scheduler = MagicMock()
+
+    # Mirror existing admin_move_simple_calendar_cb tests: patch
+    # process_selection because (a) the real lib requires year/month/day
+    # even for act=cancel (line 150 `datetime(int(data.year), int(data.month), 1)`
+    # raises TypeError on None) and (b) the real lib calls
+    # `await query.message.delete_reply_markup()` for cancel, which is a
+    # MagicMock not AsyncMock on our mock. Patch returns (False, None) —
+    # the exact value the real lib returns for act=cancel — so the
+    # handler's cancel branch executes unchanged.
+    from unittest.mock import patch
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(False, None),
+    ):
+        await admin_handlers.admin_close_other_calendar_cb(
+            callback, cal_cb_data, state, scheduler
+        )
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "отменено" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_admin_close_other_confirm_cb_closes_and_notifies(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[✅ Да, закрыть день] → close_workday_with_cancellations + send_message
+    per cancelled booking + remove_jobs_for_booking per booking + summary
+    (mirror admin_close_today_confirm_cb happy path).
+    """
+    from unittest.mock import AsyncMock as _AsyncMock
+    from unittest.mock import patch
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        future = (datetime.now(UTC) + timedelta(days=18)).date()
+        workday = await _seed_workday(session, ctx=ctx, work_date=future, is_active=True)
+        slot = await _seed_slot(
+            session, master_id=ctx["master_id"], slot_date=future, hour=14, status="booked"
+        )
+        future_local = datetime.combine(future, datetime.min.time(), ZoneInfo(TZ))
+        booking = await _seed_booking(
+            session,
+            ctx=ctx,
+            slot=slot,
+            start_at_utc_naive=future_local.replace(hour=14).astimezone(UTC).replace(tzinfo=None),
+            status="confirmed",
+        )
+
+    from bot.keyboards.admin import AdminCloseOtherDayConfirmCallbackData
+
+    cb_data = AdminCloseOtherDayConfirmCallbackData(workday_id=str(workday.id))
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.bot.send_message = _AsyncMock()
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+    scheduler = MagicMock()
+
+    with patch("bot.handlers.admin.remove_jobs_for_booking") as rm_jobs:
+        await admin_handlers.admin_close_other_confirm_cb(callback, scheduler, cb_data, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "✅" in text and "закрыт" in text
+    assert "отменено" in text.lower()
+    assert callback.bot.send_message.called
+    rm_jobs.assert_called_once()
+    call_args = rm_jobs.call_args
+    assert call_args.args[0] == scheduler
+    assert call_args.args[1] == booking.id
+
+    async with session_factory() as session:
+        from bot.models import WorkDay as _WD
+
+        wd = await session.scalar(
+            select(_WD).where(_WD.master_id == ctx["master_id"], _WD.work_date == future)
+        )
+    assert wd is not None and wd.is_active is False
+
+
+@pytest.mark.asyncio
+async def test_admin_close_other_confirm_cb_no_bookings(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """[✅ Да, закрыть день] on active workday with NO active bookings →
+    close + summary "0 отменено, 0 уведомлено" (no client notifications sent,
+    remove_jobs_for_booking NOT called — no bookings to clean up jobs for).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        future = (datetime.now(UTC) + timedelta(days=20)).date()
+        workday = await _seed_workday(session, ctx=ctx, work_date=future, is_active=True)
+
+    from bot.keyboards.admin import AdminCloseOtherDayConfirmCallbackData
+
+    cb_data = AdminCloseOtherDayConfirmCallbackData(workday_id=str(workday.id))
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.bot.send_message = AsyncMock()
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+    scheduler = MagicMock()
+
+    await admin_handlers.admin_close_other_confirm_cb(callback, scheduler, cb_data, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "✅" in text and "закрыт" in text
+    assert "не было" in text  # _format_closeday_summary: 0 bookings branch.
+    # No client notifications — send_message NOT called.
+    assert not callback.bot.send_message.called
+
+    async with session_factory() as session:
+        from bot.models import WorkDay as _WD
+
+        wd = await session.scalar(
+            select(_WD).where(_WD.master_id == ctx["master_id"], _WD.work_date == future)
+        )
+    assert wd is not None and wd.is_active is False
+
+
+@pytest.mark.asyncio
+async def test_admin_close_other_confirm_cb_already_closed_race(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Race condition: confirm_cb tapped after workday already closed by
+    concurrent /closeday (different tab). close_workday_with_cancellations
+    returns ClosedDayResult(was_already_closed=True, cancelled_bookings=[]).
+    Handler shows summary (no error message — close was successful, just
+    not by THIS tap) per service's idempotent contract.
+
+    Mirror admin_close_today_confirm_cb:4295-4302 which uses 'None' branch
+    for missing workday. Here we test the was_already_closed branch — service
+    returns a result, handler treats it as success (idempotent close).
+    """
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        future = (datetime.now(UTC) + timedelta(days=15)).date()
+        workday = await _seed_workday(session, ctx=ctx, work_date=future, is_active=True)
+
+    from bot.keyboards.admin import AdminCloseOtherDayConfirmCallbackData
+
+    cb_data = AdminCloseOtherDayConfirmCallbackData(workday_id=str(workday.id))
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.bot.send_message = AsyncMock()
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+    scheduler = MagicMock()
+
+    # Pre-close the workday to simulate race: another tab closed it between
+    # confirm render and THIS tap. By the time this tap is processed, the
+    # workday is is_active=False in DB.
+    async with session_factory() as session:
+        from bot.models import WorkDay as _WD
+        from sqlalchemy import update as sa_update
+
+        await session.execute(
+            sa_update(_WD).where(_WD.id == workday.id).values(is_active=False)
+        )
+        await session.commit()
+
+    await admin_handlers.admin_close_other_confirm_cb(callback, scheduler, cb_data, state)
+
+    state.clear.assert_called_once()
+    # service returns was_already_closed=True with cancelled_bookings=[] →
+    # _notify_cancelled_clients (no-op) + _format_closeday_summary "не было".
+    text = callback_answer_text(callback)
+    assert "✅" in text and "закрыт" in text
+    assert "не было" in text  # 0 cancelled bookings.
+    # No client notifications sent.
+    assert not callback.bot.send_message.called
+
+
+@pytest.mark.asyncio
+async def test_admin_close_other_cancel_cb_clears_state(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """W2: [❌ Не закрывать] tap on admin_close_other_confirm_keyboard →
+    state.clear + 'Закрытие отменено' + admin_inline_menu.
+
+    Mirror ``test_admin_close_today_cancel_cb_clears_state:5914-5933``.
+    Tests the AdminCloseOtherDayCancelCallbackData handler (NOT the calendar
+    'Отмена' button — that is SimpleCalAct.cancel in
+    test_admin_close_other_calendar_cb_cancel_via_calendar_button).
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    from bot.keyboards.admin import AdminCloseOtherDayCancelCallbackData
+
+    cb_data = AdminCloseOtherDayCancelCallbackData()
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+
+    await admin_handlers.admin_close_other_cancel_cb(callback, state)
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "отменено" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_admin_close_other_calendar_cb_with_bookings_shows_confirm(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """W3: admin_close_other_calendar_cb on active workday WITH active bookings →
+    show confirm text + admin_close_other_confirm_keyboard (carrying workday_id).
+
+    Mirror ``test_admin_close_today_cb_with_bookings_shows_confirm:5801-5849``.
+    Verifies the active+bookings branch (admin.py:4582-4610) renders the
+    confirm prompt with the bookings list and a [✅ Да, закрыть день] button
+    whose callback_data carries workday_id (race-safe vs FSM state loss).
+    """
+    from unittest.mock import patch
+
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        future = (datetime.now(UTC) + timedelta(days=20)).date()
+        workday = await _seed_workday(session, ctx=ctx, work_date=future, is_active=True)
+        slot = await _seed_slot(
+            session, master_id=ctx["master_id"], slot_date=future, hour=14, status="booked"
+        )
+        future_local = datetime.combine(future, datetime.min.time(), ZoneInfo(TZ))
+        await _seed_booking(
+            session,
+            ctx=ctx,
+            slot=slot,
+            start_at_utc_naive=future_local.replace(hour=14).astimezone(UTC).replace(tzinfo=None),
+            status="confirmed",
+        )
+    cal_cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=future.year,
+        month=future.month,
+        day=future.day,
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+    scheduler = MagicMock()
+
+    # Patch process_selection (mirror existing admin_move calendar tests) —
+    # see test_admin_close_other_calendar_cb_cancel_via_calendar_button for
+    # rationale: library requires year/month/day (we provide them) AND calls
+    # delete_reply_markup which isn't AsyncMock on our mock.
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(True, datetime.combine(future, datetime.min.time())),
+    ):
+        await admin_handlers.admin_close_other_calendar_cb(
+            callback, cal_cb_data, state, scheduler
+        )
+
+    # active+bookings branch does NOT clear state — keeps selecting_date so
+    # the confirm_cb's StateFilter("*") still dispatches (defensive against
+    # state loss too — workday_id is in callback_data, not FSM).
+    state.clear.assert_not_called()
+    # Confirm text shown via edit_text (with bookings list).
+    assert callback.message.edit_text.called
+    text = str(callback.message.edit_text.call_args.args[0])
+    assert "Закрыть день" in text
+    assert "отменить" in text.lower()
+    # Verify reply_markup is admin_close_other_confirm_keyboard (carries
+    # workday_id in AdminCloseOtherDayConfirmCallbackData).
+    rm = callback.message.edit_text.call_args.kwargs.get("reply_markup")
+    assert rm is not None
+    flat = [btn for row in rm.inline_keyboard for btn in row]
+    confirm_btn = next((b for b in flat if "✅" in b.text), None)
+    assert confirm_btn is not None, f"Missing ✅ button: {[b.text for b in flat]}"
+    cancel_btn = next((b for b in flat if "отмен" in b.text.lower() or "❌" in b.text), None)
+    assert cancel_btn is not None, f"Missing cancel button: {[b.text for b in flat]}"
+    # callback_data carries workday_id (AdminCloseOtherDayConfirmCallbackData).
+    assert str(workday.id) in confirm_btn.callback_data, (
+        f"workday_id {workday.id} not in callback_data: {confirm_btn.callback_data!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_admin_close_other_calendar_cb_no_bookings_closes_immediately(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """W4: admin_close_other_calendar_cb on active workday with NO active bookings →
+    close immediately + summary (no confirm step) + state.clear.
+
+    Mirror ``test_admin_close_today_cb_no_bookings_closes_immediately:5760-5797``.
+    Verifies the not-active_bookings branch (admin.py:4534-4580) — direct
+    close_workday_with_cancellations call + _notify_cancelled_clients (no-op
+    with empty list) + _format_closeday_summary + state.clear. Distinct from
+    test_admin_close_other_confirm_cb_no_bookings (which tests confirm_cb).
+    """
+    from unittest.mock import patch
+
+    from aiogram_calendar import SimpleCalendarCallback
+    from aiogram_calendar.schemas import SimpleCalAct
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        future = (datetime.now(UTC) + timedelta(days=22)).date()
+        await _seed_workday(session, ctx=ctx, work_date=future, is_active=True)
+
+    cal_cb_data = SimpleCalendarCallback(
+        act=SimpleCalAct.day,
+        year=future.year,
+        month=future.month,
+        day=future.day,
+    )
+    callback = _make_callback(ADMIN_TG_ID, callback_data=cal_cb_data)
+    callback.bot.send_message = AsyncMock()
+    callback.message.edit_text = AsyncMock()
+    state = _make_mock_state()
+    scheduler = MagicMock()
+
+    with patch(
+        "aiogram_calendar.SimpleCalendar.process_selection",
+        return_value=(True, datetime.combine(future, datetime.min.time())),
+    ):
+        await admin_handlers.admin_close_other_calendar_cb(
+            callback, cal_cb_data, state, scheduler
+        )
+
+    state.clear.assert_called_once()
+    text = callback_answer_text(callback)
+    assert "✅" in text and "закрыт" in text
+    assert "не было" in text  # 0 active bookings → no cancellations
+    # No client notifications (empty cancelled_bookings list — no-op loop).
+    assert not callback.bot.send_message.called
+
+    async with session_factory() as session:
+        from bot.models import WorkDay as _WD
+
+        wd = await session.scalar(
+            select(_WD).where(_WD.master_id == ctx["master_id"], _WD.work_date == future)
+        )
+    assert wd is not None and wd.is_active is False
+
+
+# ============================================================
 # Session 5.46 (B.10) — phone in /today + /week render
 # _render_bookings: client_phones dict → "📞 +7..." or "без телефона" suffix
 # cmd_today: end-to-end booking with Client.phone set → render shows phone
