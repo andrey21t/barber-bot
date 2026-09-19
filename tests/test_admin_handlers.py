@@ -1072,7 +1072,7 @@ async def test_cmd_closeslot_already_closed_idempotent(
 
 
 # ============================================================
-# cmd_today — 4 branches
+# cmd_today — 4 branches + Session 5.66: 3 пустых состояния (empty states)
 # ============================================================
 
 
@@ -1157,6 +1157,94 @@ async def test_cmd_today_no_bookings_shows_empty_message(
 
     text = _answer_text(msg)
     assert "На сегодня записей нет" in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("workday_state"),
+    ["no_workday", "closed_workday", "active_workday"],
+)
+async def test_cmd_today_no_bookings_renders_empty_state_keyboard(
+    session_factory: Any,
+    patched_session_factory: Any,
+    workday_state: str,
+) -> None:
+    """Regression (Session 5.66): no bookings → answer still renders
+    admin_today_keyboard with [🔒 Закрыть другой день] in ALL THREE empty
+    states, each with its own status text (distinguishable, no lying).
+
+    Bug: после закрытия дня /today уходил в else-ветку с голым текстом
+    (без reply_markup) — кнопка «Закрыть другой день» пропадала.
+    Инвариант Варианта B (keyboards/admin.py:336): [🔒 Закрыть другой день]
+    always visible.
+
+    Три под-случая (Session 5.66, S2 — empty state per Nielsen #1):
+    - no_workday: WorkDay отсутствует (день сегодня не открывали)
+    - closed_workday: WorkDay есть, is_active=False (канонический баг
+      «закрыл сегодня — кнопка пропала»)
+    - active_workday: WorkDay активен (открыт-пустой) — самая частая ветка,
+      текст «Дата открыта — можно закрыть день.» ранее не пинился ни одним
+      тестом (gap из code review).
+
+    freeze_time (W1 из code review): тест сидирует WorkDay на «сегодня» и
+    handler дважды читает datetime.now (admin.py:612, :619) — без freeze полночь
+    MSK между сидом и select_workday уводит в wrong-ветку. Паттерн уже в файле
+    (freeze_time на :429, :3860).
+    """
+    with freeze_time("2026-03-17 12:00:00", tz_offset=3):  # Moscow UTC+3
+        async with session_factory() as session:
+            ctx = await _seed_admin_stack(session)
+            if workday_state != "no_workday":
+                await _seed_workday(
+                    session,
+                    ctx=ctx,
+                    work_date=datetime.now(ZoneInfo(TZ)).date(),
+                    is_active=(workday_state == "active_workday"),
+                )
+
+        msg = _make_message(user_id=ADMIN_TG_ID, text="/today")
+        await admin_handlers.cmd_today(msg, _make_mock_state())
+
+    text = _answer_text(msg)
+    assert "На сегодня записей нет" in text
+    # Каждый под-случай пинит свой статусный текст (Session 5.66: три пустых
+    # состояния distinguishable). Гипотетический рефактор elif → раздельные
+    # ветки с голым текстом упадёт здесь, а не у Екатерины в проде.
+    status_phrases = {
+        "active_workday": "Дата открыта — можно закрыть день.",
+        "closed_workday": "Сегодня уже закрыт.",
+        "no_workday": "День сегодня не открывался.",
+    }
+    for state_name, phrase in status_phrases.items():
+        if state_name == workday_state:
+            assert phrase in text, (
+                f"{state_name} под-случай должен объяснять статус "
+                f"(empty state): нет «{phrase}» в {text!r}"
+            )
+        else:
+            assert phrase not in text, (
+                f"{state_name}: ложь о статусе — фраза «{phrase}» из "
+                f"{state_name} просочилась в текст {text!r}"
+            )
+    # reply_markup обязательна: без неё кнопка «Закрыть другой день» пропадает.
+    _, kwargs = msg.answer.call_args
+    assert "reply_markup" in kwargs, (
+        "cmd_today no-bookings ветки должна рендерить admin_today_keyboard "
+        "(иначе теряется кнопка «🔒 Закрыть другой день» — bug Session 5.66)"
+    )
+    kb = kwargs["reply_markup"]
+    flat_texts = [b.text for row in kb.inline_keyboard for b in row]
+    assert "🔒 Закрыть другой день" in flat_texts, (
+        f"Кнопка должна быть always visible по Варианту B. Got: {flat_texts}"
+    )
+    if workday_state == "active_workday":
+        assert "🔒 Закрыть день" in flat_texts, (
+            f"close-today должен быть видим при активном дне. Got: {flat_texts}"
+        )
+    else:
+        assert "🔒 Закрыть день" not in flat_texts, (
+            f"close-today скрыт когда день закрыт/отсутствует. Got: {flat_texts}"
+        )
 
 
 # ============================================================

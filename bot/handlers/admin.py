@@ -620,16 +620,24 @@ async def cmd_today(message: Message, state: FSMContext) -> None:
         today_workday = await select_workday(session, master_id, today_local)
 
     if not bookings:
-        # No bookings today — still show [🔒 Закрыть день] if today_workday is
-        # active (admin can close an empty day). Mirror admin_today_keyboard
-        # signature (bookings list + today_workday).
+        # Session 5.66: три разных пустых состояния — текст объясняет статус и
+        # привязывает кнопки ниже (паттерн empty state: что произошло → что можно
+        # сделать). Вариант B инвариант (keyboards/admin.py:336): [🔒 Закрыть
+        # другой день] always visible — раньше в закрытом/неоткрытом дне был
+        # голый текст без reply_markup, кнопка пропадала (bug feedback
+        # Екатерины). close-today по-прежнему гейтится is_active внутри клавиатуры.
+        head = "На сегодня записей нет."
+        other_hint = "Кнопкой ниже можно закрыть другой день — забытый или запланированный."
         if today_workday is not None and today_workday.is_active:
-            await message.answer(
-                "На сегодня записей нет.\n\nДата открыта — можно закрыть день.",
-                reply_markup=admin_today_keyboard(bookings, tz, today_workday=today_workday),
-            )
-        else:
-            await message.answer("На сегодня записей нет.")
+            text = head + "\n\nДата открыта — можно закрыть день."
+        elif today_workday is not None:  # был открыт и закрыт (is_active=False)
+            text = head + "\n\nСегодня уже закрыт. " + other_hint
+        else:  # WorkDay нет — день сегодня не открывали
+            text = head + "\n\nДень сегодня не открывался. " + other_hint
+        await message.answer(
+            text,
+            reply_markup=admin_today_keyboard(bookings, tz, today_workday=today_workday),
+        )
         return
 
     await message.answer(
