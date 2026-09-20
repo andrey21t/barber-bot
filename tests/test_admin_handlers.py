@@ -5709,6 +5709,73 @@ async def test_admin_today_keyboard_hides_close_button_if_already_closed(
 
 
 @pytest.mark.asyncio
+async def test_admin_today_keyboard_no_complete_no_show_buttons_after_bb107_reject(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Regression guard: [✅ Завершить] / [❌ Неявка] NOT in admin_today_keyboard
+    after BB-107 rejection (Session 5.71 — single-master Екатерина, completed
+    через /closeday вместо per-booking manual taps).
+
+    Bug 9 (commit b0657b3) propagated [✅]/[❌] from /today to /week — Bug 9
+    was wrong per BB-107. This test prevents re-introduction.
+    """
+    from bot.keyboards.admin import admin_today_keyboard
+    from bot.models import Booking, WorkDay
+
+    # Seed 1 confirmed past booking to trigger per-booking rendering.
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+        now_local = datetime.now(ZoneInfo(TZ))
+        today_local_at_10 = now_local.replace(hour=10, minute=0, second=0, microsecond=0)
+        slot = await _seed_slot(
+            session,
+            master_id=ctx["master_id"],
+            slot_date=today_local_at_10.date(),
+            hour=10,
+            status="open",
+        )
+        await _seed_booking(
+            session,
+            ctx=ctx,
+            slot=slot,
+            start_at_utc_naive=_local_to_utc_naive(today_local_at_10),
+            status="confirmed",
+        )
+
+    workday = WorkDay(
+        master_id=ctx["master_id"],
+        work_date=today_local_at_10.date(),
+        start_time=dt_time(10, 0),
+        end_time=dt_time(20, 0),
+        max_concurrent_clients=1,
+        is_active=True,
+    )
+
+    # Fetch the booking we just created.
+    from sqlalchemy import select
+
+    async with session_factory() as session:
+        bookings = (await session.execute(
+            select(Booking).where(Booking.status == "confirmed")
+        )).scalars().all()
+
+    kb = admin_today_keyboard(
+        bookings=list(bookings),
+        business_timezone=TZ,
+        today_workday=workday,
+    )
+    flat = [btn for row in kb.inline_keyboard for btn in row]
+    texts = [b.text for b in flat]
+
+    # [✅ Завершить] / [❌ Неявка] must NOT be present — BB-107 rejection.
+    assert "✅ Завершить" not in texts, f"[✅ Завершить] leaked after BB-107 reject: {texts}"
+    assert "❌ Неявка" not in texts, f"[❌ Неявка] leaked after BB-107 reject: {texts}"
+    # [🔄 Перенести] must be present — only per-booking button after BB-107.
+    assert any("🔄" in t for t in texts), f"[🔄 Перенести] missing: {texts}"
+
+
+@pytest.mark.asyncio
 async def test_cmd_closeday_text_no_args_closes_today(
     session_factory: Any,
     patched_session_factory: Any,

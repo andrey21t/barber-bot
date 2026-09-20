@@ -480,8 +480,12 @@ def admin_today_keyboard(
 
     [✅ Завершить] / [❌ Неявка] buttons were REMOVED (Session 5.71 — BB-107
     rejection 2026-08-31 confirmed). Single-master Екатерина с 1-3 записями/день
-    не проставляет per-booking статусы руками — completed через /closeday
-    (auto-complete всех confirmed past bookings за день, 1 тап/день).
+    не проставляет per-booking статусы руками. /closeday ОТМЕНЯЕТ все активные
+    брони на дне (status='cancelled', не 'completed') — close_workday_with_
+    cancellations (workday.py:355). Статус 'completed'/'no_show' теперь НЕ
+    достигается из UI/текстовых команд/scheduler — handlers admin_complete_cb
+    / admin_no_show_cb сохранены для back-compat со stale callback_data из
+    inline-сообщений, отправленных ДО Session 5.71.
 
     Uses explicit ``builder.row()`` per booking (NOT ``adjust(1, 2)`` — that
     would group buttons 1+2+2+... across bookings, mixing buttons from
@@ -501,10 +505,10 @@ def admin_today_keyboard(
     (above) is kept — the new button is ADDITIVE, not a replacement.
 
     Bug 9 fix (2026-09-20): show_close_buttons parameter. /week uses this
-    keyboard for [🔄 Перенести]/[✅ Завершить]/[❌ Неявка] buttons (Bug 9 —
-    /week was text-only before), but doesn't need [🔒 Закрыть день] /
-    [🔒 Закрыть другой день] (those are /today-specific — closing future
-    days from /week would be surprising UX). Default True (backwards-compat
+    keyboard for [🔄 Перенести] button (Bug 9 — /week was text-only before),
+    but doesn't need [🔒 Закрыть день] / [🔒 Закрыть другой день] (those are
+    /today-specific — closing future days from /week would be surprising UX).
+    Default True (backwards-compat
     for /today callers).
 
     Telegram inline keyboard limit 100 buttons/row × N rows — pet-project
@@ -551,10 +555,12 @@ def admin_today_keyboard(
         )
         # [✅ Завершить] / [❌ Неявка] buttons REMOVED (Session 5.71 — BB-107
         # rejection 2026-08-31 confirmed). Single-master Екатерина с 1-3
-        # записями/день не проставляет per-booking статусы руками — completed
-        # происходит через /closeday (auto-complete всех confirmed past
-        # bookings за день). Callback классы AdminCompleteCallbackData /
-        # AdminNoShowCallbackData сохранены для service layer + history.
+        # записями/день не проставляет per-booking статусы руками. /closeday
+        # ОТМЕНЯЕТ брони (status='cancelled', workday.py:355), не завершает их.
+        # Статус 'completed'/'no_show' теперь недостижим из UI/текста/scheduler —
+        # callback классы AdminCompleteCallbackData / AdminNoShowCallbackData и
+        # handlers admin_complete_cb / admin_no_show_cb сохранены для back-compat
+        # со stale callback_data из inline-сообщений, отправленных ДО Session 5.71.
     # Bug 9 fix: close-buttons gated by show_close_buttons. /week uses this
     # keyboard for [🔄] but doesn't need [🔒] buttons (closing future
     # days from /week would be surprising UX — close-actions belong to /today).
