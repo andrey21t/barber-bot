@@ -28,6 +28,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.base import BaseStorage
 from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
+from aiogram.types import BotCommand
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from scheduler import _set_bot_ref, build_scheduler, on_startup_scan
 
@@ -85,6 +86,11 @@ async def _on_startup(bot: Bot, scheduler: AsyncIOScheduler) -> None:
     # on_startup_scan — async, requires started scheduler for jobs to be
     # scheduled immediately (Phase 1: overdue reminders, Phase 2: upcoming)
     await on_startup_scan(scheduler, async_session_factory, bot)
+    # Register bot commands for Telegram UI (Bug 6 fix): without set_my_commands
+    # new clients see empty chat — no "Start" button, no /start in command picker.
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Открыть меню"),
+    ])
     logger.info("Scheduler started, on_startup_scan complete")
 
 
