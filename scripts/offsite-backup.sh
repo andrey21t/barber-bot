@@ -6,6 +6,10 @@
 
 set -euo pipefail
 
+# launchd не наследует PATH из shell (sshpass живёт в homebrew) —
+# инцидент 2026-09-12..20: offsite падал 9 дней подряд "sshpass: command not found".
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
 CRED_FILE="$HOME/.config/opencode/references/barber-bot-deploy-credentials.md"
 VPS_USER="root"
 REMOTE_DIR="/opt/barber-bot/backups"
