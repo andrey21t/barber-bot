@@ -27,9 +27,28 @@ from sqlalchemy.ext.asyncio import (
 # FORCE override (не setdefault) — setdefault не срабатывает если shell env уже выставлен,
 # например `export DATABASE_URL=postgresql://...` для smoke-test против Postgres →
 # тесты падали бы на SQLAlchemyJobStore. Smoke против Postgres делается ВНЕ pytest.
+#
+# Escape hatch для race-тестов (scripts/race-tests.sh): флаг POSTGRES_RACE_TESTS=1
+# + DATABASE_URL=postgresql(+asyncpg)://... → форс-override НЕ срабатывает,
+# гонки реально едут на Postgres (advisory lock семантика). Всё остальное — sqlite.
+# Логи­ка hard-fail: флаг без postgres-URL = конфиг-противоречие → падаем громко
+# (иначе race-тесты молча skip'аются и прогон «зелёный ни о чём»).
+# NOTE (known-limit): под этим флагом тесты, создающие engine из Settings/модулей
+# (bot.db, scheduler build_scheduler), увидят Postgres — поэтому race-скрипт
+# запускает ТОЛЬКО `tests/test_multi_client.py -k concurrent_race_postgres`.
+_POSTGRES_RACE_TESTS = os.environ.get("POSTGRES_RACE_TESTS") == "1"
+_RACE_URL = os.environ.get("DATABASE_URL", "")
+
+if _POSTGRES_RACE_TESTS and not _RACE_URL.startswith("postgresql"):
+    raise RuntimeError(
+        "POSTGRES_RACE_TESTS=1 требует DATABASE_URL=postgresql://... "
+        "(запускай через scripts/race-tests.sh, не вручную)"
+    )
+
 os.environ["BOT_TOKEN"] = "test:TOKEN"
 os.environ["ADMIN_ID"] = "461355056"
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./barber.db"
+if not _POSTGRES_RACE_TESTS:
+    os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./barber.db"
 
 from bot.db import Base  # noqa: E402
 from bot.models import Business, Client, Master, Slot, WorkDay  # noqa: E402
@@ -54,7 +73,7 @@ async def session_factory(
 
 @pytest_asyncio.fixture
 async def engine_concurrent(tmp_path: Path) -> AsyncIterator[AsyncEngine]:
-    """File-based SQLite engine for concurrent-race tests.
+    """Concurrent-race engine: Postgres (under race flag) or file-based SQLite.
 
     In-memory SQLite + default QueuePool gives each new connection its own DB
     (sessions can't share state). File-based SQLite supports multiple real
@@ -62,12 +81,26 @@ async def engine_concurrent(tmp_path: Path) -> AsyncIterator[AsyncEngine]:
     writes serialize via SQLite's database-level lock. After a writer commits,
     new statements on other connections see the committed state.
 
+    POSTGRES_RACE_TESTS=1 (scripts/race-tests.sh): engine is built from
+    DATABASE_URL (postgresql+asyncpg) — advisory-lock race semantics are real.
+    Без флага — file-based SQLite (advisory lock — no-op, race-тесты skip'аются
+    своим skipif).
+
     Used by test_transfer_booking_concurrent_race_runtime to faithfully test
     the WHERE-clause pin (Booking.start_at ==) at runtime, replacing the
     static-invariant test (inspect.getsource). Closes Pass 3 [blocker] finding.
     """
-    db_file = tmp_path / "test_concurrent.db"
-    eng = create_async_engine(f"sqlite+aiosqlite:///{db_file}", future=True)
+    if _POSTGRES_RACE_TESTS:
+        # One shared Postgres for the whole race-run → per-test isolation
+        # = drop + create (аналог свежего tmp-file на SQLite).
+        # Тестов всего 3, в контейнере — дешево.
+        eng = create_async_engine(_RACE_URL, future=True)
+        async with eng.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+            await conn.run_sync(Base.metadata.create_all)
+    else:
+        db_file = tmp_path / "test_concurrent.db"
+        eng = create_async_engine(f"sqlite+aiosqlite:///{db_file}", future=True)
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield eng

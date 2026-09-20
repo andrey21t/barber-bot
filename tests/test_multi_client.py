@@ -42,6 +42,7 @@ from bot.services.booking import (
     create_booking,
     transfer_booking,
 )
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # Postgres-only race tests: pg_advisory_xact_lock semantics are Postgres-only.
@@ -671,28 +672,35 @@ async def test_create_booking_concurrent_race_postgres(
     session_factory_concurrent (file-based). We re-seed inside the test using the
     concurrent engine. This is a known setup cost for race tests.
     """
-    # Set up schema + seed via session_factory_concurrent
+    # Set up schema + seed via session_factory_concurrent.
+    # Staged flush: PostgreSQL требует реальные FK id (biz.id/master.id) —
+    # конструирование children до flush родителя даёт NULL business_id
+    # (латентный баг: тесты никогда не выполнялись, всегда skip на SQLite).
     from bot.models import Business, Client, Master
 
-    biz = Business(name="Test", telegram_owner_id=461355056, timezone="Europe/Moscow")
-    master = Master(business_id=biz.id, name="Екатерина", telegram_id=461355056, role="owner")
-    client = Client(telegram_id=999888777, name="Test")
-    new_date = (datetime.now(UTC) + timedelta(days=20)).date()
-    workday = WorkDay(
-        master_id=master.id,
-        work_date=new_date,
-        start_time=dt_time(10, 0),
-        end_time=dt_time(20, 0),
-        max_concurrent_clients=1,
-        is_active=True,
-    )
-    slot1 = Slot(master_id=master.id, slot_date=new_date, slot_hour=14, status="open")
-    slot2 = Slot(master_id=master.id, slot_date=new_date, slot_hour=15, status="open")
-    service_long = Service(
-        business_id=biz.id, name="long", duration_minutes=90, price=None, is_active=True
-    )
     async with session_factory_concurrent() as setup_session:
-        setup_session.add_all([biz, master, client, workday, slot1, slot2, service_long])
+        biz = Business(name="Test", telegram_owner_id=461355056, timezone="Europe/Moscow")
+        setup_session.add(biz)
+        await setup_session.flush()
+        master = Master(business_id=biz.id, name="Екатерина", telegram_id=461355056, role="owner")
+        setup_session.add(master)
+        await setup_session.flush()
+        client = Client(telegram_id=999888777, name="Test")
+        new_date = (datetime.now(UTC) + timedelta(days=20)).date()
+        workday = WorkDay(
+            master_id=master.id,
+            work_date=new_date,
+            start_time=dt_time(10, 0),
+            end_time=dt_time(20, 0),
+            max_concurrent_clients=1,
+            is_active=True,
+        )
+        slot1 = Slot(master_id=master.id, slot_date=new_date, slot_hour=14, status="open")
+        slot2 = Slot(master_id=master.id, slot_date=new_date, slot_hour=15, status="open")
+        service_long = Service(
+            business_id=biz.id, name="long", duration_minutes=90, price=None, is_active=True
+        )
+        setup_session.add_all([client, workday, slot1, slot2, service_long])
         await setup_session.commit()
 
     # Two concurrent create_booking calls — both target overlapping ranges
@@ -749,38 +757,41 @@ async def test_transfer_booking_concurrent_race_postgres(
     """
     from bot.models import Business, Client, Master
 
-    biz = Business(name="Test", telegram_owner_id=461355056, timezone="Europe/Moscow")
-    master = Master(business_id=biz.id, name="Екатерина", telegram_id=461355056, role="owner")
-    client1 = Client(telegram_id=111222333, name="c1")
-    client2 = Client(telegram_id=444555666, name="c2")
-
-    # Date 1: holds booking1 (to be transferred). Slot already 'booked'.
-    date1 = (datetime.now(UTC) + timedelta(days=20)).date()
-    slot_old1 = Slot(master_id=master.id, slot_date=date1, slot_hour=10, status="booked")
-    # Date 2: holds booking2. Slot already 'booked'.
-    date2 = (datetime.now(UTC) + timedelta(days=21)).date()
-    slot_old2 = Slot(master_id=master.id, slot_date=date2, slot_hour=10, status="booked")
-    # Date 3: target date for transfer. WorkDay cap=1, 2 free slots.
-    date3 = (datetime.now(UTC) + timedelta(days=22)).date()
-    workday = WorkDay(
-        master_id=master.id,
-        work_date=date3,
-        start_time=dt_time(10, 0),
-        end_time=dt_time(20, 0),
-        max_concurrent_clients=1,
-        is_active=True,
-    )
-    slot_a = Slot(master_id=master.id, slot_date=date3, slot_hour=14, status="open")
-    slot_b = Slot(master_id=master.id, slot_date=date3, slot_hour=15, status="open")
-    service_long = Service(
-        business_id=biz.id, name="long", duration_minutes=90, price=None, is_active=True
-    )
-
+    # Staged flush — см. пример в test_create_booking_concurrent_race_postgres.
     async with session_factory_concurrent() as setup_session:
+        biz = Business(name="Test", telegram_owner_id=461355056, timezone="Europe/Moscow")
+        setup_session.add(biz)
+        await setup_session.flush()
+        master = Master(business_id=biz.id, name="Екатерина", telegram_id=461355056, role="owner")
+        setup_session.add(master)
+        await setup_session.flush()
+        client1 = Client(telegram_id=111222333, name="c1")
+        client2 = Client(telegram_id=444555666, name="c2")
+
+        # Date 1: holds booking1 (to be transferred). Slot already 'booked'.
+        date1 = (datetime.now(UTC) + timedelta(days=20)).date()
+        slot_old1 = Slot(master_id=master.id, slot_date=date1, slot_hour=10, status="booked")
+        # Date 2: holds booking2. Slot already 'booked'.
+        date2 = (datetime.now(UTC) + timedelta(days=21)).date()
+        slot_old2 = Slot(master_id=master.id, slot_date=date2, slot_hour=10, status="booked")
+        # Date 3: target date for transfer. WorkDay cap=1, 2 free slots.
+        date3 = (datetime.now(UTC) + timedelta(days=22)).date()
+        workday = WorkDay(
+            master_id=master.id,
+            work_date=date3,
+            start_time=dt_time(10, 0),
+            end_time=dt_time(20, 0),
+            max_concurrent_clients=1,
+            is_active=True,
+        )
+        slot_a = Slot(master_id=master.id, slot_date=date3, slot_hour=14, status="open")
+        slot_b = Slot(master_id=master.id, slot_date=date3, slot_hour=15, status="open")
+        service_long = Service(
+            business_id=biz.id, name="long", duration_minutes=90, price=None, is_active=True
+        )
+
         setup_session.add_all(
             [
-                biz,
-                master,
                 client1,
                 client2,
                 slot_old1,
@@ -853,3 +864,145 @@ async def test_transfer_booking_concurrent_race_postgres(
     )
     successes = sum(1 for ok, _ in results if ok)
     assert successes == 1, f"Expected 1 success, got {successes}: {results}"
+
+
+# ---------------------------------------------------------------------------
+# Test 12: cross-operation race — create_booking × transfer_booking — skipif SQLite
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not POSTGRES_TESTS_ENABLED,
+    reason="Race tests require Postgres pg_advisory_xact_lock; SQLite serializes via DB-level lock",
+)
+@pytest.mark.asyncio
+async def test_create_vs_transfer_concurrent_race_postgres(
+    session_factory_concurrent: Any,
+) -> None:
+    """Concurrent create_booking × transfer_booking on overlapping target: only one wins.
+
+    Postgres-only (see test_create_booking_concurrent_race_postgres for rationale).
+
+    Both operations lock the SAME key space — (master, target_date) — before the
+    capacity check (create: booking.py:530; transfer: booking.py:1202/:1240),
+    so cross-operation races must serialize exactly like create×create and
+    transfer×transfer. This test pins that contract: if either operation ever
+    changes its lock key (e.g. locks old date instead of target), a double-
+    booking window opens and this test catches it.
+
+    Setup:
+    - date1 (+20d): booking1 confirmed [10:00, 11:30] (to be transferred).
+    - date3 (+22d): WorkDay cap=1, slot_a (open, 14:00), slot_b (open, 15:00).
+    - service 90min → transfer target slot_b [15:00, 16:30];
+      new create on slot_a [14:00, 15:30] → overlap [15:00, 15:30] on date3.
+    - Concurrently: transfer_booking(booking1 → slot_b) and
+      create_booking(new client3 → slot_a).
+
+    Expected: exactly 1 success; loser raises WorkDayCapacityExceededError;
+    exactly 1 active booking on date3 afterwards.
+    """
+    from bot.models import Business, Client, Master
+
+    # Staged flush — см. пример в test_create_booking_concurrent_race_postgres.
+    async with session_factory_concurrent() as setup_session:
+        biz = Business(name="Test", telegram_owner_id=461355056, timezone="Europe/Moscow")
+        setup_session.add(biz)
+        await setup_session.flush()
+        master = Master(business_id=biz.id, name="Екатерина", telegram_id=461355056, role="owner")
+        setup_session.add(master)
+        await setup_session.flush()
+        client1 = Client(telegram_id=111222333, name="c1")
+
+        # date1: holds booking1 (to be transferred).
+        date1 = (datetime.now(UTC) + timedelta(days=20)).date()
+        slot_old1 = Slot(master_id=master.id, slot_date=date1, slot_hour=10, status="booked")
+        # date3: target date (cap=1, two free overlapping slots).
+        date3 = (datetime.now(UTC) + timedelta(days=22)).date()
+        workday = WorkDay(
+            master_id=master.id,
+            work_date=date3,
+            start_time=dt_time(10, 0),
+            end_time=dt_time(20, 0),
+            max_concurrent_clients=1,
+            is_active=True,
+        )
+        slot_a = Slot(master_id=master.id, slot_date=date3, slot_hour=14, status="open")
+        slot_b = Slot(master_id=master.id, slot_date=date3, slot_hour=15, status="open")
+        service_long = Service(
+            business_id=biz.id, name="long", duration_minutes=90, price=None, is_active=True
+        )
+        setup_session.add_all(
+            [client1, slot_old1, workday, slot_a, slot_b, service_long]
+        )
+        await setup_session.commit()
+        b1 = Booking(
+            slot_id=slot_old1.id,
+            business_id=biz.id,
+            master_id=master.id,
+            client_id=client1.id,
+            service_id=service_long.id,
+            service_title_snapshot="long",
+            client_name_snapshot="c1",
+            start_at=_local_to_utc(date1, 10, 0),
+            end_at=_local_to_utc(date1, 11, 30),
+            status="confirmed",
+        )
+        setup_session.add(b1)
+        await setup_session.commit()
+        booking1_id = b1.id
+        client1_id = client1.id
+        slot_a_id = slot_a.id
+        slot_b_id = slot_b.id
+
+    mock_scheduler = AsyncIOScheduler(jobstores={"default": MemoryJobStore()})
+
+    async def _transfer() -> tuple[bool, str | None]:
+        async with session_factory_concurrent() as s:
+            try:
+                await transfer_booking(s, booking1_id, slot_b_id, client1_id, mock_scheduler)
+                return True, None
+            except WorkDayCapacityExceededError as e:
+                return False, str(e)
+
+    async def _create() -> tuple[bool, str | None]:
+        async with session_factory_concurrent() as s:
+            payload = await _make_payload(slot_a_id, service_id=service_long.id)
+            try:
+                await create_booking(
+                    s,
+                    payload,
+                    business_id=biz.id,
+                    master_id=master.id,
+                    telegram_id=777888999,
+                )
+                return True, None
+            except WorkDayCapacityExceededError as e:
+                return False, str(e)
+
+    results = await asyncio.gather(_transfer(), _create())
+    successes = sum(1 for ok, _ in results if ok)
+    assert successes == 1, f"Expected exactly 1 success, got {successes}: {results}"
+    loser_msg = next(msg for ok, msg in results if not ok)
+    assert loser_msg and "capacity 1 exceeded" in loser_msg
+
+    # DB invariant: exactly 1 active booking on date3 (start_at in date3 LOCAL window).
+    date3_start_utc = _local_to_utc(date3, 0, 0)
+    date3_end_utc = _local_to_utc(date3, 23, 59)
+    async with session_factory_concurrent() as s:
+        active_on_date3 = (
+            (
+                await s.execute(
+                    select(Booking).where(
+                        Booking.start_at >= date3_start_utc,
+                        Booking.start_at <= date3_end_utc,
+                        Booking.status.in_(["confirmed", "transferred"]),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(active_on_date3) == 1, (
+        f"Expected exactly 1 active booking on date3, got {len(active_on_date3)}: "
+        f"{[(str(b.start_at), b.status) for b in active_on_date3]}"
+    )
