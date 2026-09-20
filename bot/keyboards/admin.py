@@ -473,12 +473,15 @@ def admin_today_keyboard(
     today_workday: WorkDay | None = None,
     show_close_buttons: bool = True,
 ) -> InlineKeyboardMarkup:
-    """Inline keyboard with [🔄 Перенести] + [✅ Завершить] + [❌ Неявка] buttons per booking (B.3).
+    """Inline keyboard with [🔄 Перенести] button per booking.
 
-    Per booking, 2 rows:
+    Per booking, 1 row:
     - Row 1: [🔄 {time} — {name}, {service}] (single button, AdminMoveCallbackData)
-    - Row 2: [✅ Завершить] [❌ Неявка] (paired buttons, AdminCompleteCallbackData +
-      AdminNoShowCallbackData)
+
+    [✅ Завершить] / [❌ Неявка] buttons were REMOVED (Session 5.71 — BB-107
+    rejection 2026-08-31 confirmed). Single-master Екатерина с 1-3 записями/день
+    не проставляет per-booking статусы руками — completed через /closeday
+    (auto-complete всех confirmed past bookings за день, 1 тап/день).
 
     Uses explicit ``builder.row()`` per booking (NOT ``adjust(1, 2)`` — that
     would group buttons 1+2+2+... across bookings, mixing buttons from
@@ -546,22 +549,14 @@ def admin_today_keyboard(
                 callback_data=AdminMoveCallbackData(booking_id=b.id).pack(),
             )
         )
-        # Row 2: complete + no_show (paired per booking) — B.3 transitions.
-        # Past-only policy enforced in service (transition_booking_status),
-        # not in keyboard — master sees buttons for future bookings too,
-        # but tap raises BookingNotStartedYetError with friendly UI message.
-        builder.row(
-            InlineKeyboardButton(
-                text="✅ Завершить",
-                callback_data=AdminCompleteCallbackData(booking_id=b.id).pack(),
-            ),
-            InlineKeyboardButton(
-                text="❌ Неявка",
-                callback_data=AdminNoShowCallbackData(booking_id=b.id).pack(),
-            ),
-        )
+        # [✅ Завершить] / [❌ Неявка] buttons REMOVED (Session 5.71 — BB-107
+        # rejection 2026-08-31 confirmed). Single-master Екатерина с 1-3
+        # записями/день не проставляет per-booking статусы руками — completed
+        # происходит через /closeday (auto-complete всех confirmed past
+        # bookings за день). Callback классы AdminCompleteCallbackData /
+        # AdminNoShowCallbackData сохранены для service layer + history.
     # Bug 9 fix: close-buttons gated by show_close_buttons. /week uses this
-    # keyboard for [🔄]/[✅]/[❌] but doesn't need [🔒] buttons (closing future
+    # keyboard for [🔄] but doesn't need [🔒] buttons (closing future
     # days from /week would be surprising UX — close-actions belong to /today).
     if show_close_buttons:
         if today_workday is not None and getattr(today_workday, "is_active", False):
