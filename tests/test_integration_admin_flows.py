@@ -114,6 +114,11 @@ class RecordingBot:
 
     def __init__(self) -> None:
         self.calls: list[Any] = []  # list of aiogram method objects
+        # Direct bot.send_message(...) targets: list of (chat_id, text).
+        # SEPARATE registry — self.calls не трогаем (helpers
+        # _extract_send_text/_extract_all_send_texts фильтруют calls по
+        # SendMessage; вливание туда ломало бы 1952 строки ассертов).
+        self.sent_direct: list[tuple[int, str]] = []
         self.id = 1
         self.username = "test_bot"
 
@@ -160,6 +165,7 @@ class RecordingBot:
 
     def reset(self) -> None:
         self.calls.clear()
+        self.sent_direct.clear()
 
     async def edit_message_reply_markup(self, *args: Any, **kwargs: Any) -> Any:
         """Stub for bot.edit_message_reply_markup (W3 cancel_msg strip of the
@@ -180,13 +186,16 @@ class RecordingBot:
 
     async def send_message(self, *args: Any, **kwargs: Any) -> Any:
         """Stub for callback.bot.send_message (used by confirm_cb to notify
-        master). Returns a stub Message — handler doesn't await on it.
+        master AND by _notify_cancelled_clients to notify clients).
+        Records (chat_id, text) into self.sent_direct; returns a stub
+        Message — handler doesn't await on it.
         """
         from aiogram.types import Chat
         from aiogram.types import Message as AioMessage
 
         chat_id = kwargs.get("chat_id") or (args[0] if args else 1)
         text = kwargs.get("text", "")
+        self.sent_direct.append((chat_id, text))
         return AioMessage(
             message_id=1,
             date=datetime.now(UTC),
@@ -1854,6 +1863,22 @@ async def test_e2e_admin_close_today_with_active_booking_cancels_it(
         texts = _extract_all_send_texts(bot)
         assert any("закрыт" in t.lower() and "Отменено записей: 1" in t for t in texts), (
             f"Step 3: ожидали summary «День закрыт. Отменено записей: 1», got: {texts!r}"
+        )
+        # notified_count прокидывается в summary админу (а не только в лог).
+        assert any("Клиентов уведомлено: 1" in t for t in texts), (
+            f"Step 3: summary должен содержать «Клиентов уведомлено: 1», got: {texts!r}"
+        )
+        # Step 3b: клиенту РЕАЛЬНО ушёл send_message на его chat_id
+        # (sent_direct registry —RecordingBot.send_message; до этого ассерта
+        # E2E не отличал «уведомлено» от «счётчик сказали»).
+        client_tg = seeded["client_telegram_id"]
+        direct_to_client = [txt for cid, txt in bot.sent_direct if cid == client_tg]
+        assert direct_to_client, (
+            f"Step 3b: bot.send_message на chat_id={client_tg} не вызывался "
+            f"(sent_direct={bot.sent_direct!r})"
+        )
+        assert "Ваша запись отменена мастером" in direct_to_client[0], (
+            f"Step 3b: текст уведомления клиенту неверен: {direct_to_client[0]!r}"
         )
 
         # --- Step 4: DB — workday inactive + booking cancelled ---

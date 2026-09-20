@@ -29,7 +29,11 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 from aiogram.filters import Command, CommandObject, StateFilter, or_f
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
@@ -3148,14 +3152,14 @@ async def admin_move_confirm_cb(
                         text=client_text,
                         reply_markup=client_book_kb(),
                     )
-                except (TelegramBadRequest, TelegramRetryAfter):
+                except (TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter):
                     logger.warning(
                         "admin_move: client %s blocked the bot after retry — notification skipped "
                         "(booking %s moved)",
                         result.client_telegram_id,
                         result.booking_id,
                     )
-            except TelegramBadRequest:
+            except (TelegramBadRequest, TelegramForbiddenError):
                 # Client blocked the bot — log and skip (booking is still moved).
                 logger.warning(
                     "admin_move: client %s blocked the bot — notification skipped "
@@ -4041,14 +4045,18 @@ async def _notify_cancelled_clients(
                         reply_markup=client_book_kb(),
                     )
                     notified_count += 1
-                except (TelegramBadRequest, TelegramRetryAfter):
+                except (TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter):
                     logger.warning(
                         "closeday: client %s blocked the bot after retry - notification skipped "
                         "(booking %s cancelled)",
                         client.telegram_id,
                         booking.id,
                     )
-            except TelegramBadRequest:
+            except (TelegramBadRequest, TelegramForbiddenError):
+                # 400 → некорректный chat; 403 → клиент заблокировал бота (aiogram
+                # кидает Forbidden, не BadRequest — до фикса цикл уведомлений
+                # падал на первом заблокировавшем, сегодняшний день уже закрыт).
+                # Прецедент: scheduler.py:223 ловит оба.
                 logger.warning(
                     "closeday: client %s blocked the bot - notification skipped "
                     "(booking %s cancelled)",
