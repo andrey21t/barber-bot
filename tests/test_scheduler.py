@@ -44,13 +44,24 @@ def _start_scheduler(s: AsyncIOScheduler) -> None:
 
 
 async def _seed_booking(session: AsyncSession, start_at: datetime) -> Booking:
-    """Seed a confirmed booking with given start_at (UTC)."""
+    """Seed a confirmed booking with given start_at (UTC).
+
+    telegram_id клиента фиксирован (111222333) — для второго звонка в том же
+    тесте используй _seed_booking_client (UNIQUE constraint на telegram_id).
+    """
+    return await _seed_booking_client(session, start_at, client_tg=111222333)
+
+
+async def _seed_booking_client(
+    session: AsyncSession, start_at: datetime, *, client_tg: int
+) -> Booking:
+    """Seed confirmed booking с произвольным client telegram_id (UNIQUE-safe)."""
     biz = Business(name="Test", telegram_owner_id=461355056, timezone="Europe/Moscow")
     session.add(biz)
     await session.flush()
 
     master = Master(business_id=biz.id, name="Екатерина", telegram_id=461355056)
-    client = Client(telegram_id=111222333)
+    client = Client(telegram_id=client_tg)
     session.add_all([master, client])
     await session.flush()
 
@@ -558,6 +569,69 @@ async def test_send_reminder_invalid_timezone_logs_error(
 
 
 @pytest.mark.asyncio
+async def test_on_startup_scan_twice_is_idempotent(
+    session_factory: Any, session: AsyncSession, scheduler: AsyncIOScheduler
+) -> None:
+    """Scenario рестарт-цикла (BB-012): on_startup_scan дважды подряд.
+
+    Инварианты:
+    - Phase 1: overdue-напоминание уходит РОВНО один раз — Второй скан видит
+      notifications_log (UNIQUE(booking_id, kind)) через NOT EXISTS-фильтр и
+      НЕ дублирует send_message. Дубликат = спам клиенту.
+    - Phase 2: джобы НЕ дублируются (replace_existing=True) — 2 джобы, не 4.
+      Без replace_existing двойной скан валил бы бот ConflictingIdError при
+      рестарте с незакрытым гриппом jobstore.
+
+    Frozen 2026-01-15T12:00:00Z — детерминизм (паттерн из
+    test_on_startup_scan_phase_2_reschedules_upcoming).
+    """
+    with freeze_time("2026-01-15T12:00:00Z"):
+        _start_scheduler(scheduler)
+
+        # Overdue: start 10h назад, confirmed, БЕЗ remind_24h лога → Phase 1.
+        overdue_start = datetime(2026, 1, 15, 2, 0, tzinfo=UTC)
+        await _seed_booking_client(session, overdue_start, client_tg=111222333)
+
+        # Upcoming: 23h вперёд → Phase 2 (внутри 25h окна).
+        upcoming_start = datetime(2026, 1, 16, 11, 0, tzinfo=UTC)
+        upcoming_booking = await _seed_booking_client(session, upcoming_start, client_tg=444555666)
+
+        bot_scan1 = AsyncMock()
+        bot_scan2 = AsyncMock()
+        with (
+            patch("scheduler._bot_ref", bot_scan1),
+            patch("bot.db.async_session_factory", session_factory),
+        ):
+            await on_startup_scan(scheduler, session_factory, bot=bot_scan1)
+
+        # Скан 1: overdue отправлен (1 send_message), 2 джобы для upcoming.
+        assert bot_scan1.send_message.await_count == 1
+        assert len(scheduler.get_jobs()) == 2
+
+        # --- Скан 2: рестарт-цикл / двойной вызов ---
+        with (
+            patch("scheduler._bot_ref", bot_scan2),
+            patch("bot.db.async_session_factory", session_factory),
+        ):
+            await on_startup_scan(scheduler, session_factory, bot=bot_scan2)
+
+        assert bot_scan2.send_message.await_count == 0, (
+            "Второй скан не должен дублировать overdue-напоминание "
+            f"(got {bot_scan2.send_message.await_count} sends)"
+        )
+        assert len(scheduler.get_jobs()) == 2, (
+            f"replace_existing=True: джобы не дублируются, got {scheduler.get_jobs()}"
+        )
+        # Джобы остались от правильного букинга (не пересозданы под новым id).
+        assert {j.id for j in scheduler.get_jobs()} == {
+            f"remind_24h_{upcoming_booking.id}",
+            f"remind_1h_{upcoming_booking.id}",
+        }
+
+        scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
 async def test_on_startup_scan_phase_2_reschedules_upcoming(
     session_factory: Any, session: AsyncSession, scheduler: AsyncIOScheduler
 ) -> None:
@@ -594,6 +668,21 @@ async def test_on_startup_scan_phase_2_reschedules_upcoming(
         jobs = scheduler.get_jobs()
         assert len(jobs) == 2
         assert f"remind_24h_{booking.id}" in {j.id for j in jobs}
+
+        # Extension (критик F12/NF4): джоб не просто «существует» — он встанет
+        # на РОВНО нужное время. Ловит подмену trigger'а/coast'а между
+        # schedule_for_booking и APScheduler (например, если напоминание
+        # уедет на remind_at = now вместо start_at - 24h).
+        job_24h = scheduler.get_job(f"remind_24h_{booking.id}")
+        job_1h = scheduler.get_job(f"remind_1h_{booking.id}")
+        assert job_24h is not None
+        assert job_1h is not None
+        assert job_24h.next_run_time == start_at - timedelta(hours=24), (
+            f"remind_24h должен стрелять в start_at-24h, got {job_24h.next_run_time}"
+        )
+        assert job_1h.next_run_time == start_at - timedelta(hours=1), (
+            f"remind_1h должен стрелять в start_at-1h, got {job_1h.next_run_time}"
+        )
 
         scheduler.shutdown(wait=False)
 
