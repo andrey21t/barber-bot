@@ -88,13 +88,12 @@ async def _on_startup(bot: Bot, scheduler: AsyncIOScheduler) -> None:
     await on_startup_scan(scheduler, async_session_factory, bot)
     # Register bot commands for Telegram UI (Bug 6 fix): without set_my_commands
     # new clients see empty chat — no "Start" button, no /start in command picker.
-    # 3 commands so client can skip /start and go straight to /book or /mybookings
-    # from command picker (Menu button). /start still needed as escape hatch
-    # (state.clear() in start.py:46 resets stuck FSM — verified Olesya case).
+    # Only /start registered — it's the escape hatch (state.clear() in start.py:46
+    # resets stuck FSM, verified Olesya case 2026-09-20). Reply-keyboard buttons
+    # "Записаться"/"Мои записи" are the primary UI (always-on, 1 tap); command
+    # picker is escape-hatch-only, no need to duplicate /book + /mybookings.
     await bot.set_my_commands([
         BotCommand(command="start", description="Открыть меню"),
-        BotCommand(command="book", description="Записаться"),
-        BotCommand(command="mybookings", description="Мои записи"),
     ])
     logger.info("Scheduler started, on_startup_scan complete")
 
