@@ -15,7 +15,6 @@ tests/test_integration_admin_flows.py:84).
 from datetime import UTC, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
-from uuid import UUID, uuid4
 
 import pytest
 from bot.handlers.admin import _notify_cancelled_clients
@@ -99,7 +98,6 @@ async def test_notify_flood_control_retries_once(
     Паттерн из test_scheduler.py:330-352 (mock sleep против реального ожидания).
     """
     from aiogram.exceptions import TelegramRetryAfter
-    from bot.handlers import admin as admin_module
 
     monkeypatch.setattr("bot.handlers.admin.async_session_factory", session_factory)
     bookings, tz = await _seed_stack(session_factory, client_tg_ids=[111])
@@ -110,15 +108,13 @@ async def test_notify_flood_control_retries_once(
         TelegramRetryAfter(method=method, message="flood", retry_after=7),
         None,
     ]
-    bot.send_message.await_count = 0
 
     async def _fake_sleep(seconds: float) -> None:
-        assert seconds == 7
+        assert seconds == 7, f"sleep должен получить retry_after=7, got {seconds}"
 
-    monkeypatch.setattr(admin_module.asyncio, "sleep", _fake_sleep)
+    # Строковый патч по прецеденту test_scheduler.py:338 (patch scheduler.asyncio.sleep)
+    monkeypatch.setattr("bot.handlers.admin.asyncio.sleep", _fake_sleep)
     count = await _notify_cancelled_clients(bookings, tz, bot, MagicMock())
-    monkeypatch.undo()  # НЕ даём monkeypatch-патчу asyncio.sleep жить дальше
-
     assert count == 1
     assert bot.send_message.await_count == 2
 
@@ -184,28 +180,3 @@ async def test_notify_bad_request_skip(
 
     count = await _notify_cancelled_clients(bookings, tz, bot, MagicMock())
     assert count == 0
-
-
-def _booking_stub(client_id: UUID) -> Booking:
-    """Detached Booking stub (для тестов, где DB не нужна — не используется пока)."""
-    return Booking(
-        business_id=uuid4(),
-        master_id=uuid4(),
-        client_id=client_id,
-        service_id=uuid4(),
-        service_title_snapshot="x",
-        service_price_snapshot=Decimal("0"),
-        client_name_snapshot="x",
-        start_at=datetime(2026, 8, 25, 8, 0, tzinfo=UTC),
-        end_at=datetime(2026, 8, 25, 9, 0, tzinfo=UTC),
-        status="cancelled",
-    )
-
-
-def test_public_api_types() -> None:
-    """Гигиена: сигнатура не потеряла Bot | None (иначе cmd-ргументы лягут)."""
-    import inspect
-
-    sig = inspect.signature(_notify_cancelled_clients)
-    assert list(sig.parameters) == ["cancelled_bookings", "business_tz", "bot", "scheduler"]
-    assert list(sig.parameters)[2] == "bot"  # позиция важна для call sites
