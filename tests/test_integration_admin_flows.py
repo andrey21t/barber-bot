@@ -1667,7 +1667,10 @@ async def test_e2e_ekaterina_day_cycle_close_today_then_close_other(
         assert "Выберите день" in text, f"Step 4: ожидали календарь, got: {text!r}"
 
         # --- Step 5: выбор завтрашней даты в SimpleCalendar ---
-        # SimpleCalendar рендерит кнопки дат с callback_data "cal-..."
+        # Кнопка дня матчаится по тексту (номер дня) И по callback_data
+        # (год/месяц) — иначе «18» из любого другого месяца (если календарь
+        # открылся не на март, как в import-time баге) прошёл бы отбор.
+        expected_cb = f"simple_calendar:DAY:{tomorrow.year}:{tomorrow.month}:{tomorrow.day}"
         markup = _extract_reply_markup(bot)
         tomorrow_btn = None
         from aiogram.types import InlineKeyboardMarkup
@@ -1675,16 +1678,16 @@ async def test_e2e_ekaterina_day_cycle_close_today_then_close_other(
         assert isinstance(markup, InlineKeyboardMarkup)
         for row in markup.inline_keyboard:
             for b in row:
-                # кнопки дат: номер дня месяца (1-31); lib callback: simple_calendar:DAY:...
-                if b.text.strip() == str(tomorrow.day) and (b.callback_data or "").startswith(
-                    "simple_calendar:DAY"
+                if (
+                    b.text.strip() == str(tomorrow.day)
+                    and (b.callback_data or "") == expected_cb
                 ):
                     tomorrow_btn = b
                     break
             if tomorrow_btn:
                 break
         assert tomorrow_btn is not None, (
-            f"Step 5: в календаре нет кнопки дня {tomorrow.day} "
+            f"Step 5: в календаре нет кнопки {expected_cb!r} "
             f"(дата {tomorrow}). Календарь: {markup!r}"
         )
 
