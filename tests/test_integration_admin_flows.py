@@ -1510,3 +1510,440 @@ async def test_cancel_button_text_works_in_entering_service_state(
         assert "Начните запись через /book" in _extract_send_text(bot), (
             "After ❌ Отмена the FSM must be State(None) — plain text hits the fallback"
         )
+
+
+# ============================================================
+# Session 5.66 E2E — сценарий «дня Екатерины»: полный цикл
+# /today (день открыт) → закрыть день → /today снова (баг-состояние)
+# → кнопка «Закрыть другой день» жива → календарь → закрыть завтрашний день
+# Ловит через real Dispatcher то, что unit-тесты не видят: router wiring,
+# callback_data маршрутизацию, FSM-переходы AdminCloseOtherDayStates.
+# ============================================================
+
+
+async def _seed_today_workday_active(
+    session_factory: Any,
+) -> dict[str, Any]:
+    """Seed admin stack + ACTIVE WorkDay на сегодня (10-20 MSK), без броней."""
+    from datetime import time as dt_time
+
+    from bot.models import Service
+
+    async with session_factory() as session:
+        biz = Business(name="Test", telegram_owner_id=ADMIN_TG_ID, timezone=TZ)
+        session.add(biz)
+        await session.flush()
+        master = Master(business_id=biz.id, name="T", telegram_id=ADMIN_TG_ID, role="owner")
+        session.add(master)
+        await session.flush()
+        client = Client(telegram_id=999888777, name="Client")
+        session.add(client)
+        await session.flush()
+
+        today = datetime.now(ZoneInfo(TZ)).date()
+        wd = WorkDay(
+            master_id=master.id,
+            work_date=today,
+            start_time=dt_time(10, 0),
+            end_time=dt_time(20, 0),
+            is_active=True,
+            max_concurrent_clients=1,
+        )
+        session.add(wd)
+        await session.flush()
+
+        svc = Service(business_id=biz.id, name="Стрижка", duration_minutes=60, is_active=True)
+        session.add(svc)
+        await session.commit()
+        return {
+            "master_id": master.id,
+            "business_id": biz.id,
+            "client_id": client.id,
+            "workday_id": wd.id,
+        }
+
+
+@pytest.mark.asyncio
+async def test_e2e_ekaterina_day_cycle_close_today_then_close_other(
+    integration_dispatcher: Any,
+    session_factory: Any,
+) -> None:
+    """E2E: после закрытия сегодня кнопка «Закрыть другой день» не пропадает,
+    и через неё реально закрывается завтрашний день (Variant B flow жив).
+
+    Сценарий ( буквальный баг-репорт Екатерины ):
+    1. /today при открытом пустом дне → обе кнопки, текст «Дата открыта»
+    2. Тап [🔒 Закрыть день] → confirm (пустой день → закрывается сразу)
+    3. /today снова → НОВЫЙ текст «Сегодня уже закрыт» + кнопка жива
+       (до фикса — голый текст, кнопки не было)
+    4. Тап [🔒 Закрыть другой день] → календарь
+    5. Выбор завтрашней даты в календаре → пустой день закрывается сразу
+
+    freeze_time на весь тест: сид должен работать с той же «сегодняшней»
+    датой, что и handler (иначе workday сидится вне frozen-даты → бот
+    честно говорит «не открывался» — поймано первым прогоном).
+    """
+    from bot.models import Service
+    from freezegun import freeze_time
+
+    dp, bot = integration_dispatcher
+
+    from datetime import time as dt_time
+
+    with freeze_time("2026-03-17 12:00:00", tz_offset=3):  # Moscow UTC+3
+        today = datetime.now(ZoneInfo(TZ)).date()
+        tomorrow = today + timedelta(days=1)
+        async with session_factory() as session:
+            biz = Business(name="Test", telegram_owner_id=ADMIN_TG_ID, timezone=TZ)
+            session.add(biz)
+            await session.flush()
+            master = Master(business_id=biz.id, name="T", telegram_id=ADMIN_TG_ID, role="owner")
+            session.add(master)
+            await session.flush()
+            ctx = {"master_id": master.id, "business_id": biz.id}
+            session.add(
+                WorkDay(
+                    master_id=master.id,
+                    work_date=today,
+                    start_time=dt_time(10, 0),
+                    end_time=dt_time(20, 0),
+                    is_active=True,
+                    max_concurrent_clients=1,
+                )
+            )
+            session.add(
+                WorkDay(
+                    master_id=master.id,
+                    work_date=tomorrow,
+                    start_time=dt_time(10, 0),
+                    end_time=dt_time(20, 0),
+                    is_active=True,
+                    max_concurrent_clients=1,
+                )
+            )
+            session.add(
+                Service(business_id=biz.id, name="Стрижка", duration_minutes=60, is_active=True)
+            )
+            await session.commit()
+
+        # --- Step 1: /today — день открыт, записей нет ---
+        await dp.feed_update(bot, _make_text_update("/today"))
+        text = _extract_send_text(bot)
+        assert "Дата открыта" in text, f"Step 1: ожидали «Дата открыта», got: {text!r}"
+        btn_close = await _find_button_by_label(bot, "🔒 Закрыть день")
+        btn_other = await _find_button_by_label(bot, "🔒 Закрыть другой день")
+        assert btn_close is not None, "Step 1: кнопка «Закрыть день» должна быть"
+        assert btn_other is not None, "Step 1: кнопка «Закрыть другой день» должна быть"
+
+        # --- Step 2: тап «Закрыть день» — пустой день закрывается сразу ---
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(btn_close))
+        texts = _extract_all_send_texts(bot)
+        assert any("закрыт" in t.lower() for t in texts), (
+            f"Step 2: ожидали summary «День ... закрыт», got: {texts!r}"
+        )
+
+        # --- Step 3: /today снова — THE BUG-STATE ---
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("/today"))
+        text = _extract_send_text(bot)
+        assert "Сегодня уже закрыт" in text, (
+            f"Step 3: до фикса был голый «записей нет» без клавиатуры; "
+            f"теперь ожидаем «Сегодня уже закрыт»: {text!r}"
+        )
+        btn_other = await _find_button_by_label(bot, "🔒 Закрыть другой день")
+        assert btn_other is not None, (
+            f"Step 3: РЕГРЕССИЯ — кнопка «Закрыть другой день» пропала после "
+            f"закрытия дня (исходный баг Session 5.66)! markup: "
+            f"{bot.last_reply_markup!r}"
+        )
+        btn_close = await _find_button_by_label(bot, "🔒 Закрыть день")
+        assert btn_close is None, "Step 3: «Закрыть день» должна скрыться"
+
+        # --- Step 4: тап «Закрыть другой день» → календарь ---
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(btn_other))
+        text = _extract_send_text(bot)
+        assert "Выберите день" in text, f"Step 4: ожидали календарь, got: {text!r}"
+
+        # --- Step 5: выбор завтрашней даты в SimpleCalendar ---
+        # SimpleCalendar рендерит кнопки дат с callback_data "cal-..."
+        markup = _extract_reply_markup(bot)
+        tomorrow_btn = None
+        from aiogram.types import InlineKeyboardMarkup
+
+        assert isinstance(markup, InlineKeyboardMarkup)
+        for row in markup.inline_keyboard:
+            for b in row:
+                # кнопки дат: номер дня месяца (1-31); lib callback: simple_calendar:DAY:...
+                if b.text.strip() == str(tomorrow.day) and (b.callback_data or "").startswith(
+                    "simple_calendar:DAY"
+                ):
+                    tomorrow_btn = b
+                    break
+            if tomorrow_btn:
+                break
+        assert tomorrow_btn is not None, (
+            f"Step 5: в календаре нет кнопки дня {tomorrow.day} "
+            f"(дата {tomorrow}). Календарь: {markup!r}"
+        )
+
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(tomorrow_btn))
+        # Завтрашний день ПУСТОЙ → закрывается сразу (no confirm step)
+        texts = _extract_all_send_texts(bot)
+        assert any("закрыт" in t.lower() for t in texts), (
+            f"Step 5: ожидали закрытие завтрашнего дня, got: {texts!r}"
+        )
+
+        # --- Step 6: финальная сверка БД — оба дня inactive ---
+        async with session_factory() as session:
+            from sqlalchemy import select
+
+            stmt = select(WorkDay).where(WorkDay.master_id == ctx["master_id"])
+            rows = (await session.execute(stmt)).scalars().all()
+            active = [r for r in rows if r.is_active]
+            assert not active, (
+                f"Step 6: оба WorkDay должны быть закрыты, активны: "
+                f"{[(r.work_date, r.is_active) for r in rows]}"
+            )
+
+
+@pytest.mark.asyncio
+async def test_e2e_client_cancels_own_booking_via_mybookings(
+    integration_dispatcher: tuple[Dispatcher, MagicMock],
+    session_factory: Any,
+) -> None:
+    """E2E happy-path УДАЛЕНИЯ записи со стороны клиента:
+
+    /mybookings → список с [❌ Отменить] → тап → запись отменена в БД.
+
+    Verifies:
+    - mybookings_msg dispatches (StateFilter(None)) and renders the booking
+    - mybookings_keyboard carries MyBookingsCancelCallbackData for THIS booking
+    - mybookings_cancel_cb: cancel_booking flips status confirmed→cancelled
+      (ownership via client.telegram_id resolve)
+    - Bot confirms to the client ('✅ Запись отменена')
+
+    Freeze 2026-08-25 14:00 UTC; booking tomorrow 11:00-12:00 MSK ensures
+    `get_client_bookings` upcoming-filter (start_at > now) keeps it visible.
+    """
+    from decimal import Decimal
+
+    from bot.models import Booking, Client
+    from freezegun import freeze_time
+
+    CLIENT_TG = 999_888_771
+    with freeze_time("2026-08-25 14:00:00", tz_offset=0):
+        dp, bot = integration_dispatcher
+        ctx = await _seed_workday_tomorrow(session_factory)  # workday 2026-08-26 10-12
+
+        tomorrow = (datetime.now(ZoneInfo(TZ)) + timedelta(days=1)).date()
+        from datetime import time as dt_time
+
+        async with session_factory() as session:
+            client = Client(telegram_id=CLIENT_TG, name="Паша Клиент")
+            session.add(client)
+            await session.flush()
+            start_local = datetime.combine(tomorrow, dt_time(11, 0), tzinfo=ZoneInfo(TZ))
+            end_local = datetime.combine(tomorrow, dt_time(12, 0), tzinfo=ZoneInfo(TZ))
+            booking = Booking(
+                business_id=ctx["business_id"],
+                master_id=ctx["master_id"],
+                client_id=client.id,
+                service_id=ctx["service1_id"],
+                service_title_snapshot="Стрижка",
+                service_price_snapshot=Decimal("0"),
+                client_name_snapshot="Паша Клиент",
+                start_at=start_local.astimezone(UTC),
+                end_at=end_local.astimezone(UTC),
+                status="confirmed",
+            )
+            session.add(booking)
+            await session.commit()
+            booking_id = booking.id
+
+        # --- Step 1: /mybookings → список + [❌ Отменить ...] кнопка ---
+        await dp.feed_update(bot, _make_text_update("/mybookings", user_id=CLIENT_TG))
+        text = _extract_send_text(bot)
+        assert "Ваши записи" in text, f"Step 1: ожидали список записей, got: {text!r}"
+        assert "Стрижка" in text, f"Step 1: услуга должна быть в списке, got: {text!r}"
+        cancel_btn = await _find_button_by_label(bot, "❌ Отменить")
+        assert cancel_btn is not None, (
+            f"Step 1: кнопка [❌ Отменить] должна быть в mybookings_keyboard, "
+            f"markup: {bot.last_reply_markup!r}"
+        )
+
+        # --- Step 2: тап [❌ Отменить] → «Запись отменена» ---
+        bot.reset()
+        await dp.feed_update(
+            bot, _make_callback_update_from_button(cancel_btn, user_id=CLIENT_TG)
+        )
+        texts = _extract_all_send_texts(bot)
+        assert any("Запись отменена" in t for t in texts), (
+            f"Step 2: ожидали подтверждение отмены, got: {texts!r}"
+        )
+
+        # --- Step 3: DB — статус cancelled ---
+        async with session_factory() as session:
+            booking_after = await session.scalar(select(Booking).where(Booking.id == booking_id))
+        assert booking_after is not None and booking_after.status == "cancelled", (
+            f"Step 3: booking.status должен стать cancelled, got: "
+            f"{booking_after.status if booking_after else None}"
+        )
+
+        # --- Step 4: повторный /mybookings → пустой список (upcoming filter) ---
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("/mybookings", user_id=CLIENT_TG))
+        text = _extract_send_text(bot)
+        assert "нет активных записей" in text.lower(), (
+            f"Step 4: после отмены записей быть не должно, got: {text!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_e2e_admin_close_today_with_active_booking_cancels_it(
+    integration_dispatcher: tuple[Dispatcher, MagicMock],
+    session_factory: Any,
+) -> None:
+    """E2E: админ закрывает СЕГОДНЯШНИЙ день с активной записью —
+    confirm → день закрыт + запись отменена в БД.
+
+    Дополняет test_e2e_ekaterina_day_cycle... (там оба дня ПУСТЫЕ): здесь
+    покрыта ветка active bookings → admin_close_today_confirm_keyboard →
+    admin_close_today_confirm_cb.
+
+    1. freeze 06:00 UTC (09:00 MSK — ДО окна 10-12, booking 11:00 ещё upcoming)
+    2. _seed_today_with_booking: workday today 10-12 + booking 11:00-12:00
+    3. admin /today → [🔒 Закрыть день]
+    4. тап → confirm «В этот день 1 запис... Закрыть день и отменить все записи?»
+    5. тап [✅ Да, отменить записи] → summary «Отменено записей: 1»
+    6. DB: WorkDay inactive + Booking cancelled
+    """
+    from bot.models import Booking
+    from freezegun import freeze_time
+
+    with freeze_time("2026-08-25 06:00:00", tz_offset=0):
+        dp, bot = integration_dispatcher
+        seeded = await _seed_today_with_booking(session_factory)
+        booking_id = seeded["booking_id"]
+
+        # --- Step 1: admin /today ---
+        await dp.feed_update(bot, _make_text_update("/today"))
+        btn_close = await _find_button_by_label(bot, "🔒 Закрыть день")
+        assert btn_close is not None, (
+            f"Step 1: [🔒 Закрыть день] должна быть (workday active), "
+            f"text: {_extract_send_text(bot)!r}"
+        )
+
+        # --- Step 2: тап → confirm с перечнем записей ---
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(btn_close))
+        text = _extract_send_text(bot)
+        assert "В этот день 1 запис" in text, f"Step 2: ожидали confirm-список, got: {text!r}"
+        assert "Закрыть день и отменить все записи?" in text
+        confirm_btn = await _find_button_by_label(bot, "✅ Да, отменить записи")
+        assert confirm_btn is not None, "Step 2: [✅ Да, отменить записи] должна быть"
+
+        # --- Step 3: тап confirm → summary с числом отменённых ---
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(confirm_btn))
+        texts = _extract_all_send_texts(bot)
+        assert any("закрыт" in t.lower() and "Отменено записей: 1" in t for t in texts), (
+            f"Step 3: ожидали summary «День закрыт. Отменено записей: 1», got: {texts!r}"
+        )
+
+        # --- Step 4: DB — workday inactive + booking cancelled ---
+        async with session_factory() as session:
+            master = await session.scalar(select(Master))
+            workdays = (
+                await session.execute(select(WorkDay).where(WorkDay.master_id == master.id))
+            ).scalars().all()
+            assert workdays and all(wd.is_active is False for wd in workdays), (
+                f"Step 4: workday должен стать inactive, got: "
+                f"{[(wd.work_date, wd.is_active) for wd in workdays]}"
+            )
+            booking_after = await session.scalar(select(Booking).where(Booking.id == booking_id))
+        assert booking_after is not None and booking_after.status == "cancelled", (
+            f"Step 4: booking должен стать cancelled, got: {booking_after.status!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_e2e_second_client_does_not_see_occupied_slot(
+    integration_dispatcher: tuple[Dispatcher, MagicMock],
+    session_factory: Any,
+) -> None:
+    """E2E граничный: занятый слот НЕ показывается второму клиенту.
+
+    Slot picker строится из реальных Booking в БД: после записи первого
+    клиента (завтра 10:00-11:00, Стрижка 60 мин) второй клиент в том же
+    окне не должен видеть слот 10:00 — только 11:00.
+
+    1. seed workday tomorrow 10-12 + booking 10:00-11:00 (client_1)
+    2. client_2: /slots → календарь → завтра → сервис-пикер
+    3. тап Стрижка (60 мин) → слот-пикер
+    4. слота 10:00 НЕТ, слот 11:00 ЕСТЬ
+    """
+    from decimal import Decimal
+
+    from bot.models import Booking, Client
+    from freezegun import freeze_time
+
+    CLIENT1_TG = 111_111_111
+    CLIENT2_TG = 999_888_772
+    with freeze_time("2026-08-25 14:00:00", tz_offset=0):
+        dp, bot = integration_dispatcher
+        ctx = await _seed_workday_tomorrow(session_factory)
+
+        tomorrow = (datetime.now(ZoneInfo(TZ)) + timedelta(days=1)).date()
+        from datetime import time as dt_time
+
+        async with session_factory() as session:
+            client1 = Client(telegram_id=CLIENT1_TG, name="Первый Клиент")
+            session.add(client1)
+            await session.flush()
+            start_local = datetime.combine(tomorrow, dt_time(10, 0), tzinfo=ZoneInfo(TZ))
+            end_local = datetime.combine(tomorrow, dt_time(11, 0), tzinfo=ZoneInfo(TZ))
+            session.add(
+                Booking(
+                    business_id=ctx["business_id"],
+                    master_id=ctx["master_id"],
+                    client_id=client1.id,
+                    service_id=ctx["service1_id"],
+                    service_title_snapshot="Стрижка",
+                    service_price_snapshot=Decimal("0"),
+                    client_name_snapshot="Первый Клиент",
+                    start_at=start_local.astimezone(UTC),
+                    end_at=end_local.astimezone(UTC),
+                    status="confirmed",
+                )
+            )
+            await session.commit()
+
+        # --- Step 1: client_2 /slots → календарь ---
+        await dp.feed_update(bot, _make_text_update("/slots", user_id=CLIENT2_TG))
+        assert "Выберите дату" in _extract_send_text(bot)
+
+        # --- Step 2: выбор завтрашнего дня → сервис-пикер ---
+        bot.reset()
+        await dp.feed_update(bot, _make_calendar_day_update(tomorrow, user_id=CLIENT2_TG))
+        assert "Выберите услугу" in _extract_send_text(bot)
+        haircut_btn = await _find_button_by_label(bot, "Стрижка")
+        assert haircut_btn is not None, "Step 2: кнопка Стрижка должна быть в пикере"
+
+        # --- Step 3: тап Стрижка (60 мин) → слот-пикер ---
+        bot.reset()
+        await dp.feed_update(
+            bot, _make_callback_update_from_button(haircut_btn, user_id=CLIENT2_TG)
+        )
+        assert "Выберите время" in _extract_send_text(bot)
+
+        # --- Step 4: занятый 10:00 скрыт, свободный 11:00 виден ---
+        occupied_btn = await _find_button_by_label(bot, "10:00")
+        assert occupied_btn is None, (
+            f"Step 4: слот 10:00 занят booking'ом client_1 — не должен "
+            f"предлагаться. markup: {bot.last_reply_markup!r}"
+        )
+        free_btn = await _find_button_by_label(bot, "11:00")
+        assert free_btn is not None, "Step 4: свободный слот 11:00 должен быть виден"

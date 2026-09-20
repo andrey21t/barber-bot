@@ -1084,7 +1084,7 @@ async def admin_addslots_cb(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.message is not None:
         await callback.message.answer(
             "📅 Выберите дату для открытия слотов:",
-            reply_markup=await admin_calendar_keyboard(*_admin_calendar_range(tz)),
+            reply_markup=await admin_calendar_keyboard(*_admin_calendar_range(tz), tz=tz),
         )
     await callback.answer()
 
@@ -2759,7 +2759,7 @@ async def admin_move_select_cb(
     if callback.message is not None:
         await callback.message.answer(
             "📅 Выберите новую дату для переноса:",
-            reply_markup=await admin_calendar_keyboard(*_admin_calendar_range(tz)),
+            reply_markup=await admin_calendar_keyboard(*_admin_calendar_range(tz), tz=tz),
         )
     await callback.answer()
 
@@ -2823,7 +2823,7 @@ async def admin_move_simple_calendar_cb(
             if callback.message is not None:
                 await callback.message.answer(
                     "❌ Мастер не работает в этот день. Выберите другую дату.",
-                    reply_markup=await admin_calendar_keyboard(*_admin_calendar_range(tz)),
+                    reply_markup=await admin_calendar_keyboard(*_admin_calendar_range(tz), tz=tz),
                 )
             await callback.answer()
             return
@@ -2831,7 +2831,7 @@ async def admin_move_simple_calendar_cb(
             if callback.message is not None:
                 await callback.message.answer(
                     "❌ Этот день закрыт. Выберите другую дату.",
-                    reply_markup=await admin_calendar_keyboard(*_admin_calendar_range(tz)),
+                    reply_markup=await admin_calendar_keyboard(*_admin_calendar_range(tz), tz=tz),
                 )
             await callback.answer()
             return
@@ -4421,12 +4421,12 @@ async def admin_close_other_entry_cb(
         try:
             await callback.message.edit_text(
                 text,
-                reply_markup=await admin_calendar_keyboard(*_admin_close_calendar_range(tz)),
+                reply_markup=await admin_calendar_keyboard(*_admin_close_calendar_range(tz), tz=tz),
             )
         except TelegramBadRequest:
             await callback.message.answer(
                 text,
-                reply_markup=await admin_calendar_keyboard(*_admin_close_calendar_range(tz)),
+                reply_markup=await admin_calendar_keyboard(*_admin_close_calendar_range(tz), tz=tz),
             )
     await callback.answer()
 
@@ -4502,14 +4502,14 @@ async def admin_close_other_calendar_cb(
                     await callback.message.edit_text(
                         hint,
                         reply_markup=await admin_calendar_keyboard(
-                            *_admin_close_calendar_range(tz)
+                            *_admin_close_calendar_range(tz), tz=tz
                         ),
                     )
                 except TelegramBadRequest:
                     await callback.message.answer(
                         hint,
                         reply_markup=await admin_calendar_keyboard(
-                            *_admin_close_calendar_range(tz)
+                            *_admin_close_calendar_range(tz), tz=tz
                         ),
                     )
             await callback.answer()
@@ -4522,14 +4522,14 @@ async def admin_close_other_calendar_cb(
                     await callback.message.edit_text(
                         hint,
                         reply_markup=await admin_calendar_keyboard(
-                            *_admin_close_calendar_range(tz)
+                            *_admin_close_calendar_range(tz), tz=tz
                         ),
                     )
                 except TelegramBadRequest:
                     await callback.message.answer(
                         hint,
                         reply_markup=await admin_calendar_keyboard(
-                            *_admin_close_calendar_range(tz)
+                            *_admin_close_calendar_range(tz), tz=tz
                         ),
                     )
             await callback.answer()

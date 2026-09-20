@@ -225,13 +225,24 @@ def admin_services_list_keyboard(services: list[Service]) -> InlineKeyboardMarku
     return builder.as_markup()
 
 
-async def admin_calendar_keyboard(min_date: datetime, max_date: datetime) -> InlineKeyboardMarkup:
+async def admin_calendar_keyboard(
+    min_date: datetime,
+    max_date: datetime,
+    tz: str | None = None,
+) -> InlineKeyboardMarkup:
     """SimpleCalendar для admin FSM (adding_slots_date / closing_slot_date).
 
     locale='ru_RU.UTF-8' — точное имя локали (как в `locale -a`). Без суффикса
     .UTF-8 setlocale падает на python:3.12-slim даже после locale-gen
     (incident Session 5.9 smoke test).
     Caller must `await` this function и strip tzinfo via .replace(tzinfo=None).
+
+    tz (business timezone) → календарь открывается на ТЕКУЩЕМ месяце по
+    часам бизнеса. Без этого aiogram_calendar.start_calendar(year=..., month=...)
+    использует дефолтные аргументы, вычисленные в IMPORT time (classic Python
+    default-args trap): процесс, живущий дольше месяца без рестарта, показывал
+    бы в календаре месяц последнего деплоя — вскрыто E2E тестом
+    test_e2e_ekaterina_day_cycle_close_today_then_close_other (Session 5.67).
     """
     cal = SimpleCalendar(
         locale="ru_RU.UTF-8",
@@ -239,8 +250,11 @@ async def admin_calendar_keyboard(min_date: datetime, max_date: datetime) -> Inl
         today_btn="Сегодня",
     )
     cal.set_dates_range(min_date=min_date, max_date=max_date)
+    now = datetime.now(ZoneInfo(tz)).replace(tzinfo=None) if tz else datetime.now()
     # aiogram_calendar has no type stubs — cast to satisfy mypy.
-    return cast(InlineKeyboardMarkup, await cal.start_calendar())
+    return cast(
+        InlineKeyboardMarkup, await cal.start_calendar(year=now.year, month=now.month)
+    )
 
 
 def admin_keyboard() -> ReplyKeyboardMarkup:
