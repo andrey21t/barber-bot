@@ -175,10 +175,12 @@ class SimpleCalendarNoYearNav(SimpleCalendar):
     async def process_selection(self, query, data: SimpleCalendarCallback) -> tuple:
         """Игнор prev_y/next_y — годовые стрелки скрыты (Баг 5).
 
+        Возвращает (False, None) БЕЗ query.answer() — handler fall-through
+        (admin.py:1268/2952/4674) сам ответит на callback. Раннее answer тут
+        привело бы к double-answer → TelegramBadRequest (code-review C1).
         Остальные act'ы делегируем в SimpleCalendar.process_selection.
         """
         if data.act in (SimpleCalAct.prev_y, SimpleCalAct.next_y):
-            await query.answer(cache_time=60)
             return (False, None)
         return await super().process_selection(query, data)
 

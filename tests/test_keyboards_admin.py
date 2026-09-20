@@ -6,18 +6,24 @@ Covers:
 - admin_window_slot_picker_keyboard mode='end' without picked_start_minute → ValueError (line 481)
 - admin_window_slot_picker_keyboard unknown mode → ValueError (line 485)
 - admin_window_slot_picker_keyboard empty candidates → "Нет слотов" button (line 502-503)
-- admin_window_slot_picker_keyboard with booked_slots → busy_minutes (494-497) + 🔒 label (516)
+- admin_window_slot_picker_keyboard with booked_slots → busy_minutes (494-497) + 🔒 label (line 516)
 - render_booked_header with non-empty booked_slots (410-415)
+- SimpleCalendarNoYearNav.start_calendar — no `<<`/`>>` year buttons (Баг 5)
+- SimpleCalendarNoYearNav.process_selection — ignores prev_y/next_y (Баг 5)
 """
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
 from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
+from aiogram_calendar import SimpleCalendarCallback
+from aiogram_calendar.schemas import SimpleCalAct
 from bot.keyboards.admin import (
     BookedSlot,
+    SimpleCalendarNoYearNav,
     _minute_to_time,
     admin_keyboard,
     admin_window_slot_picker_keyboard,
@@ -122,3 +128,56 @@ def test_render_booked_header_with_non_empty_booked_slots_returns_locked_header(
 def test_render_booked_header_empty_returns_empty_string() -> None:
     """render_booked_header([]) → '' (line 408-409, sanity check)."""
     assert render_booked_header([]) == ""
+
+
+# ============================================================
+# SimpleCalendarNoYearNav — Баг 5 regression tests (Session 5.71)
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_start_calendar_no_year_buttons() -> None:
+    """start_calendar не рендерит `<<` / `>>` (годовые стрелки).
+
+    Upstream SimpleCalendar.start_calendar (simple_calendar.py:60-74) всегда
+    добавляет years_row с `<<` и `>>`. Subclass должен убрать эту строку.
+    Проверка через text кнопок — защита от upstream drift (если вернут
+    years_row в новой версии aiogram_calendar, тест упадёт).
+    """
+    cal = SimpleCalendarNoYearNav(locale="ru_RU.UTF-8", cancel_btn="Отмена", today_btn="Сегодня")
+    markup: InlineKeyboardMarkup = await cal.start_calendar(year=2026, month=9)
+    all_texts = [btn.text for row in markup.inline_keyboard for btn in row]
+    assert "<<" not in all_texts, f"<< leaked: {all_texts}"
+    assert ">>" not in all_texts, f">> leaked: {all_texts}"
+    # Месячная навигация `<` и `>` должна остаться
+    assert "<" in all_texts, "month nav `<` missing"
+    assert ">" in all_texts, "month nav `>` missing"
+
+
+@pytest.mark.asyncio
+async def test_process_selection_prev_y_returns_false_none_without_answer() -> None:
+    """process_selection для prev_y возвращает (False, None) БЕЗ query.answer.
+
+    Code-review C1 (Session 5.71): ранний query.answer в override приводил к
+    double-answer с handler fall-through → TelegramBadRequest. Тест гарантирует
+    что override НЕ answer'ит — handler fall-through (admin.py:1268/2952/4674)
+    ответит один раз.
+    """
+    cal = SimpleCalendarNoYearNav(locale="ru_RU.UTF-8", cancel_btn="Отмена", today_btn="Сегодня")
+    query = MagicMock()
+    query.answer = AsyncMock()
+    data = SimpleCalendarCallback(act=SimpleCalAct.prev_y, year=2026, month=9, day=1)
+    result = await cal.process_selection(query, data)
+    assert result == (False, None)
+    query.answer.assert_not_called(), "override must NOT answer — handler fall-through does"
+
+
+@pytest.mark.asyncio
+async def test_process_selection_next_y_returns_false_none_without_answer() -> None:
+    """process_selection для next_y — mirror of prev_y test."""
+    cal = SimpleCalendarNoYearNav(locale="ru_RU.UTF-8", cancel_btn="Отмена", today_btn="Сегодня")
+    query = MagicMock()
+    query.answer = AsyncMock()
+    data = SimpleCalendarCallback(act=SimpleCalAct.next_y, year=2026, month=9, day=1)
+    result = await cal.process_selection(query, data)
+    assert result == (False, None)
+    query.answer.assert_not_called()
