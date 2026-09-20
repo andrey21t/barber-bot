@@ -1194,6 +1194,50 @@ async def test_cancel_button_text_works_in_admin_move_selecting_date_state(
 
 
 @pytest.mark.asyncio
+async def test_today_twice_state_stable_no_duplicates(
+    integration_dispatcher: tuple[Dispatcher, MagicMock],
+    session_factory: Any,
+) -> None:
+    """Smoke item 7 (NEXT_SESSION_PROMPT): /today два раза — рендер стабильный,
+    задвоенных записей нет. Просмотр не мутирует данные: второй /today
+    рендерит идентичный список, booking count и status не меняются.
+    """
+    from bot.models import Booking
+    from freezegun import freeze_time
+    from sqlalchemy import func
+
+    with freeze_time("2026-08-25 14:00:00", tz_offset=0):
+        dp, bot = integration_dispatcher
+        await _seed_today_with_booking(session_factory)
+
+        async with session_factory() as session:
+            count_before = await session.scalar(select(func.count()).select_from(Booking))
+
+        # /today #1
+        await dp.feed_update(bot, _make_text_update("/today", user_id=ADMIN_TG_ID))
+        text1 = _extract_send_text(bot)
+        assert "Записи на сегодня" in text1, f"expected today list, got: {text1!r}"
+
+        # /today #2 — тот же список, без side-effects
+        bot.reset()
+        await dp.feed_update(bot, _make_text_update("/today", user_id=ADMIN_TG_ID))
+        text2 = _extract_send_text(bot)
+        assert "Записи на сегодня" in text2, f"second /today broken: {text2!r}"
+        assert text1 == text2, f"/today #2 must render identical list. #1={text1!r} vs #2={text2!r}"
+
+        # Задвоенных записей нет: 1 booking, статус untouched
+        async with session_factory() as session:
+            count_after = await session.scalar(select(func.count()).select_from(Booking))
+            booking = await session.scalar(select(Booking))
+        assert count_before == count_after == 1, (
+            f"/today must not create bookings: before={count_before} after={count_after}"
+        )
+        assert booking is not None and booking.status == "confirmed", (
+            f"/today must not mutate booking status. Got: {booking!r}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_admin_state_catchall_text_works_in_admin_move_selecting_date_state(
     integration_dispatcher: tuple[Dispatcher, MagicMock],
     session_factory: Any,
