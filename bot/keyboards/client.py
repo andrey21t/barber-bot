@@ -624,7 +624,9 @@ def name_pre_fill_keyboard(first_name: str) -> InlineKeyboardMarkup:
             (keeps callback_data minimal, avoids stale-name race).
 
     Returns:
-        InlineKeyboardMarkup with 2 buttons on one row (adjust(2)).
+        InlineKeyboardMarkup with 2 buttons on separate rows (adjust(1)).
+        Was adjust(2) (shared row) — Баг 8 fix changed to adjust(1) to avoid
+        "👤 Другое имя" truncation on narrow screens.
     """
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Да, это я", callback_data=NamePreFillYesCallbackData().pack())
