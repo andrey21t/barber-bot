@@ -200,6 +200,23 @@ def _bookings_to_booked_slots(bookings: list[Booking], business_tz: str) -> list
     return result
 
 
+def pluralize_records(n: int) -> str:
+    """Russian plural form for "запись" — Bug 4 fix.
+
+    Rules: 1=запись, 2-4=записи, 5-20=записей, 21=запись, 22=записи, ...
+    Used in 3 admin confirmation screens (close-today, close-other-day,
+    openweek-delete) — was hardcoded "запис(ь/и/ей)" placeholder before.
+    """
+    if n % 100 in (11, 12, 13, 14):
+        return f"{n} записей"
+    last = n % 10
+    if last == 1:
+        return f"{n} запись"
+    if 2 <= last <= 4:
+        return f"{n} записи"
+    return f"{n} записей"
+
+
 def _is_admin(message: Message) -> bool:
     """MVP auth: single-master check against settings.ADMIN_ID.
 
@@ -2108,7 +2125,7 @@ async def admin_openweek_delete_day_cb(
     date_label = work_date.strftime("%d.%m")
     confirm_text = (
         f"🗑 <b>Удалить {day_label} {date_label}?</b>\n\n"
-        f"В этот день {len(active_bookings)} запис(ь/и/ей):\n"
+        f"В этот день {pluralize_records(len(active_bookings))}:\n"
         f"{bookings_list}\n\n"
         f"Все записи будут отменены, клиентам придёт уведомление."
     )
@@ -4272,7 +4289,7 @@ async def admin_close_today_cb(
     bookings_list = "\n".join(bookings_text_lines)
     confirm_text = (
         f"📅 <b>{today_local.strftime('%d %B %Y')}</b>\n\n"
-        f"В этот день {len(active_bookings)} запис(ь/и/ей):\n"
+        f"В этот день {pluralize_records(len(active_bookings))}:\n"
         f"{bookings_list}\n\n"
         f"Закрыть день и отменить все записи?"
     )
@@ -4607,7 +4624,7 @@ async def admin_close_other_calendar_cb(
         bookings_list = "\n".join(bookings_text_lines)
         confirm_text = (
             f"📅 <b>{work_date.strftime('%d %B %Y')}</b>\n\n"
-            f"В этот день {len(active_bookings)} запис(ь/и/ей):\n"
+            f"В этот день {pluralize_records(len(active_bookings))}:\n"
             f"{bookings_list}\n\n"
             f"Закрыть день и отменить все записи?"
         )

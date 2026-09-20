@@ -629,7 +629,11 @@ def name_pre_fill_keyboard(first_name: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Да, это я", callback_data=NamePreFillYesCallbackData().pack())
     builder.button(text="👤 Другое имя", callback_data=NamePreFillOtherCallbackData().pack())
-    builder.adjust(2)
+    # Bug 8 fix: adjust(1) — each button on its own row. With adjust(2) both
+    # buttons shared one row, "👤 Другое имя" got truncated to "Другое им" on
+    # narrow screens (verified user screenshot 2026-09-20). Separate rows
+    # give each button full width — no truncation.
+    builder.adjust(1)
     return builder.as_markup()
 
 
