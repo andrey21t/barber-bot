@@ -38,9 +38,149 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram_calendar import SimpleCalendar
+from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback
+from aiogram_calendar.schemas import SimpleCalAct, highlight, superscript
 
 from bot.models import Booking, Service, WorkDay
+
+
+class SimpleCalendarNoYearNav(SimpleCalendar):
+    """SimpleCalendar без годовых стрелок `<< {year} >>` (Баг 5, Session 5.71).
+
+    aiogram_calendar 0.6.0 рендерит ряд `<< >>` всегда (simple_calendar.py:61-74),
+    флага скрытия нет. Для барбера бронь до 60d вперёд (= MAX_BOOKING_DAYS_AHEAD)
+    — переключать года не нужно. Подкласс переопределяет start_calendar() (без
+    years_row) и process_selection() (игнор prev_y/next_y — защита от закэшированных
+    callback_data старого календаря, тапнутых после деплоя).
+
+    Совместим с callback_data SimpleCalendar: Telegram шлёт act=prev_y/next_y, наш
+    override просто игнорирует (callback.answer без перерисовки).
+    """
+
+    async def start_calendar(
+        self,
+        year: int = datetime.now().year,
+        month: int = datetime.now().month,
+    ) -> InlineKeyboardMarkup:
+        """SimpleCalendar.start_calendar минус years_row.
+
+        Копия SimpleCalendar.start_calendar (simple_calendar.py:15-127) без строк
+        60-74 (years_row). Если upstream изменит layout — обновить копию вручную
+        (покрыто test_admin_calendar_no_year_nav).
+        """
+        import calendar as _calendar
+
+        today = datetime.now()
+        now_weekday = self._labels.days_of_week[today.weekday()]
+        now_month, now_year, now_day = today.month, today.year, today.day
+
+        def highlight_month():
+            month_str = self._labels.months[month - 1]
+            if now_month == month and now_year == year:
+                return highlight(month_str)
+            return month_str
+
+        def highlight_weekday():
+            if now_month == month and now_year == year and now_weekday == weekday:
+                return highlight(weekday)
+            return weekday
+
+        def format_day_string():
+            date_to_check = datetime(year, month, day)
+            if (self.min_date and date_to_check < self.min_date) or (
+                self.max_date and date_to_check > self.max_date
+            ):
+                return superscript(str(day))
+            return str(day)
+
+        def highlight_day():
+            day_string = format_day_string()
+            if now_month == month and now_year == year and now_day == day:
+                return highlight(day_string)
+            return day_string
+
+        kb: list[list[InlineKeyboardButton]] = []
+
+        # Month nav row (нет years_row — отличие от SimpleCalendar)
+        month_row = [
+            InlineKeyboardButton(
+                text="<",
+                callback_data=SimpleCalendarCallback(
+                    act=SimpleCalAct.prev_m, year=year, month=month, day=1
+                ).pack(),
+            ),
+            InlineKeyboardButton(
+                text=highlight_month(),
+                callback_data=self.ignore_callback,
+            ),
+            InlineKeyboardButton(
+                text=">",
+                callback_data=SimpleCalendarCallback(
+                    act=SimpleCalAct.next_m, year=year, month=month, day=1
+                ).pack(),
+            ),
+        ]
+        kb.append(month_row)
+
+        # Week days row (regular for — чтобы weekday был в замыкании highlight_weekday).
+        # `weekday` используется в замыкании highlight_weekday() — ruff B007 false positive.
+        week_days_labels_row = []
+        for weekday in self._labels.days_of_week:  # noqa: B007
+            week_days_labels_row.append(
+                InlineKeyboardButton(
+                    text=highlight_weekday(), callback_data=self.ignore_callback
+                )
+            )
+        kb.append(week_days_labels_row)
+
+        # Days rows
+        for week in _calendar.monthcalendar(year, month):
+            days_row: list[InlineKeyboardButton] = []
+            for day in week:
+                if day == 0:
+                    days_row.append(
+                        InlineKeyboardButton(text=" ", callback_data=self.ignore_callback)
+                    )
+                    continue
+                days_row.append(
+                    InlineKeyboardButton(
+                        text=highlight_day(),
+                        callback_data=SimpleCalendarCallback(
+                            act=SimpleCalAct.day, year=year, month=month, day=day
+                        ).pack(),
+                    )
+                )
+            kb.append(days_row)
+
+        # Cancel + today row
+        cancel_row = [
+            InlineKeyboardButton(
+                text=self._labels.cancel_caption,
+                callback_data=SimpleCalendarCallback(
+                    act=SimpleCalAct.cancel, year=year, month=month, day=day
+                ).pack(),
+            ),
+            InlineKeyboardButton(text=" ", callback_data=self.ignore_callback),
+            InlineKeyboardButton(
+                text=self._labels.today_caption,
+                callback_data=SimpleCalendarCallback(
+                    act=SimpleCalAct.today, year=year, month=month, day=day
+                ).pack(),
+            ),
+        ]
+        kb.append(cancel_row)
+
+        return InlineKeyboardMarkup(row_width=7, inline_keyboard=kb)
+
+    async def process_selection(self, query, data: SimpleCalendarCallback) -> tuple:
+        """Игнор prev_y/next_y — годовые стрелки скрыты (Баг 5).
+
+        Остальные act'ы делегируем в SimpleCalendar.process_selection.
+        """
+        if data.act in (SimpleCalAct.prev_y, SimpleCalAct.next_y):
+            await query.answer(cache_time=60)
+            return (False, None)
+        return await super().process_selection(query, data)
 
 
 class AdminMenuCallbackData(CallbackData, prefix="admin_menu"):
@@ -244,7 +384,7 @@ async def admin_calendar_keyboard(
     бы в календаре месяц последнего деплоя — вскрыто E2E тестом
     test_e2e_ekaterina_day_cycle_close_today_then_close_other (Session 5.67).
     """
-    cal = SimpleCalendar(
+    cal = SimpleCalendarNoYearNav(
         locale="ru_RU.UTF-8",
         cancel_btn="Отмена",
         today_btn="Сегодня",

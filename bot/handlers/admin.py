@@ -37,7 +37,7 @@ from aiogram.exceptions import (
 from aiogram.filters import Command, CommandObject, StateFilter, or_f
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
-from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback
+from aiogram_calendar import SimpleCalendarCallback
 from aiogram_calendar.schemas import SimpleCalAct
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from scheduler import remove_jobs_for_booking
@@ -77,6 +77,7 @@ from bot.keyboards.admin import (
     AdminWindowSlot30CallbackData,
     BookedSlot,
     OpenedDay,
+    SimpleCalendarNoYearNav,
     admin_calendar_keyboard,
     admin_close_other_confirm_keyboard,
     admin_close_today_confirm_keyboard,
@@ -1055,14 +1056,18 @@ def _render_bookings(
 def _admin_calendar_range(business_timezone: str) -> tuple[datetime, datetime]:
     """(min_date, max_date) для admin SimpleCalendar — naive local midnight.
 
-    min = today_local @ 00:00, max = today_local + 365d @ 00:00.
+    min = today_local @ 00:00, max = today_local + 60d @ 00:00.
     Аналог _calendar_range в client.py:77, но использует business.timezone
     из DB (а не settings.TIMEZONE) — MVP single-master совпадают, но
     семантически calendar должен следовать бизнес-таймзоне.
+
+    60d = MAX_BOOKING_DAYS_AHEAD (config.py:26) — бронь дальше не создаётся,
+    годовые стрелки `<< >>` скрыты (SimpleCalendarNoYearNav, Баг 5). Листать
+    12 месяцев вручную через < > тоже не нужно — 60d покрывает horizon.
     """
     tz = ZoneInfo(business_timezone)
     today_local = datetime.now(tz).replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
-    max_local = today_local + timedelta(days=365)
+    max_local = today_local + timedelta(days=60)
     return today_local, max_local
 
 
@@ -1073,13 +1078,15 @@ def _admin_close_calendar_range(business_timezone: str) -> tuple[datetime, datet
     meaningless), close-other-day needs PAST dates visible: master who forgot
     to close a past WorkDay should be able to close it via UI, not just via
     ``/closeday YYYY-MM-DD`` text command. Range: today_local - 30d to
-    today_local + 365d. 30d past covers typical "forgot to close yesterday
+    today_local + 60d. 30d past covers typical "forgot to close yesterday
     or last week" cases without flooding the calendar with stale WorkDays.
+    60d future = MAX_BOOKING_DAYS_AHEAD (Баг 5 — годовые стрелки скрыты, листать
+    12 месяцев через < > вручную не нужно).
     """
     tz = ZoneInfo(business_timezone)
     today_local = datetime.now(tz).replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
     min_local = today_local - timedelta(days=30)
-    max_local = today_local + timedelta(days=365)
+    max_local = today_local + timedelta(days=60)
     return min_local, max_local
 
 
@@ -1174,7 +1181,7 @@ async def admin_addslots_calendar_cb(
             await callback.answer(cache_time=60)
             return  # same-month: lib бы answer cache_time=60, handler вместо
 
-    cal = SimpleCalendar(locale="ru_RU.UTF-8", cancel_btn="Отмена", today_btn="Сегодня")
+    cal = SimpleCalendarNoYearNav(locale="ru_RU.UTF-8", cancel_btn="Отмена", today_btn="Сегодня")
     cal.set_dates_range(*_admin_calendar_range(tz))
     selected, selected_date = await cal.process_selection(callback, callback_data)
 
@@ -2830,7 +2837,7 @@ async def admin_move_simple_calendar_cb(
             await callback.answer(cache_time=60)
             return  # same-month: lib answer cache_time=60, handler вместо
 
-    cal = SimpleCalendar(locale="ru_RU.UTF-8", cancel_btn="Отмена", today_btn="Сегодня")
+    cal = SimpleCalendarNoYearNav(locale="ru_RU.UTF-8", cancel_btn="Отмена", today_btn="Сегодня")
     cal.set_dates_range(*_admin_calendar_range(tz))
     selected, selected_date = await cal.process_selection(callback, callback_data)
 
@@ -4509,7 +4516,7 @@ async def admin_close_other_calendar_cb(
             await callback.answer(cache_time=60)
             return
 
-    cal = SimpleCalendar(locale="ru_RU.UTF-8", cancel_btn="Отмена", today_btn="Сегодня")
+    cal = SimpleCalendarNoYearNav(locale="ru_RU.UTF-8", cancel_btn="Отмена", today_btn="Сегодня")
     cal.set_dates_range(*_admin_close_calendar_range(tz))
     selected, selected_date = await cal.process_selection(callback, callback_data)
 
