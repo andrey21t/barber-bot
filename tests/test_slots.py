@@ -694,6 +694,59 @@ async def test_get_available_slots_30_min_duration_filter(
     assert available_narrow == []
 
 
+@pytest.mark.asyncio
+async def test_get_available_slots_30_tz_edge_evening_boundary(
+    session: AsyncSession,
+    seed_data: dict[str, Any],
+) -> None:
+    """P1-B tz-edge: window 12:00–23:30 MSK, service 30 min → slot 23:00 is
+    visible, slot 23:30 is not, and last slot start_at == 20:00 UTC of the
+    SAME calendar date.
+
+    Real-world late-evening scene (Ekaterina's window up to 23:30;
+    CheckConstraint end_time > start_time allows it, models.py:165).
+    Catches three distinct tz/boundary bugs at once:
+
+    - BUG2 boundary `<=` (slots.py:196): slot 23:00+30min == 23:30 ==
+      end_time must be KEPT. An off-by-one `<` would hide the last
+      evening slot (23:00) from every late-window day.
+    - Half-open grid generation (slots.py:102): a slot starting exactly
+      at end_time does not exist — "23:30" never appears even without
+      the duration filter.
+    - LOCAL→UTC conversion: 23:00 MSK == 20:00 UTC of the SAME date.
+      Full-datetime equality (not just .hour) also catches a sign-
+      flipped tz conversion (23:00+3h → 02:00 NEXT day UTC).
+    """
+    work_date = _future_workdate()
+    wd = WorkDay(
+        master_id=seed_data["master_id"],
+        work_date=work_date,
+        start_time=dt_time(12, 0),
+        end_time=dt_time(23, 30),
+        max_concurrent_clients=1,
+        is_active=True,
+    )
+    session.add(wd)
+    await session.commit()
+
+    available = await get_available_slots_30(session, wd, BUSINESS_TZ, min_duration_min=30)
+    labels = [s.label for s in available]
+
+    # Grid 12:00..23:00 step 30 min = 23 slots; last is 23:00.
+    assert len(available) == 23
+    assert labels[-1] == "23:00"
+    assert "23:30" not in labels
+
+    # 23:00 MSK = 20:00 UTC same calendar date (NOT previous/next day).
+    last = available[-1]
+    expected = datetime(work_date.year, work_date.month, work_date.day, 20, 0, tzinfo=UTC)
+    assert last.start_at_utc == expected
+    assert last.start_at_utc.date() == work_date
+    # Label renders local (Moscow) time, not UTC.
+    assert last.label == "23:00"
+    assert last.start_time_local == dt_time(23, 0)
+
+
 # ============================================================
 # BB-110 (Session 5.28) — get_bookable_dates pre-filtering
 # ============================================================

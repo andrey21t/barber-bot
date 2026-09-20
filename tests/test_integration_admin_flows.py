@@ -26,6 +26,7 @@ Coverage (Session 5.27):
 from __future__ import annotations
 
 import os
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock
@@ -516,8 +517,7 @@ async def test_openweek_cancel_clears_state(
     await dp.feed_update(bot, _make_text_update("/cancel"))
     text = _extract_send_text(bot)
     assert "Админ-режим отменён" in text, (
-        f"/cancel command must clear state + show 'Админ-режим отменён'; "
-        f"got: {text!r}"
+        f"/cancel command must clear state + show 'Админ-режим отменён'; got: {text!r}"
     )
 
     # State cleared — fresh /openweek re-enters cleanly.
@@ -585,6 +585,53 @@ async def _seed_workday_tomorrow(
             "service2_id": svc2.id,
             "service3_id": svc3.id,
             "service4_id": svc4.id,
+        }
+
+
+async def _seed_workday_tomorrow_tz_edge(
+    session_factory: Any,
+    *,
+    start_time_str: str = "12:00",
+    end_time_str: str = "23:30",
+) -> dict[str, Any]:
+    """P1-B tz-edge seed: WorkDay TOMORROW 12:00–23:30 LOCAL + ONE 30-min
+    service. Late-evening window where the last grid slot (23:00) only
+    survives the BUG2 duration filter when service is 30 min
+    (23:00+30 == 23:30 end, boundary `<=`).
+    """
+    from datetime import time as dt_time
+
+    from bot.models import Service
+
+    async with session_factory() as session:
+        biz = Business(name="Test", telegram_owner_id=ADMIN_TG_ID, timezone=TZ)
+        session.add(biz)
+        await session.flush()
+        master = Master(business_id=biz.id, name="T", telegram_id=ADMIN_TG_ID, role="owner")
+        session.add(master)
+        await session.flush()
+
+        tomorrow = (datetime.now(ZoneInfo(TZ)) + timedelta(days=1)).date()
+        wd = WorkDay(
+            master_id=master.id,
+            work_date=tomorrow,
+            start_time=dt_time.fromisoformat(start_time_str),
+            end_time=dt_time.fromisoformat(end_time_str),
+            is_active=True,
+            max_concurrent_clients=1,
+        )
+        session.add(wd)
+        await session.flush()
+
+        svc = Service(business_id=biz.id, name="Экспресс 30", duration_minutes=30)
+        session.add(svc)
+        await session.commit()
+
+        return {
+            "business_id": biz.id,
+            "master_id": master.id,
+            "workday_id": wd.id,
+            "service_id": svc.id,
         }
 
 
@@ -826,6 +873,64 @@ async def test_booking_flow_with_service_picker_creates_booking(
         assert duration == 120, (
             f"end_at - start_at must be 120 min (Окрашивание duration), "
             f"got {duration} min — service_id not propagated to _build_end_at?"
+        )
+
+
+@pytest.mark.asyncio
+async def test_booking_tz_edge_2300_slot_visible_in_picker(
+    integration_dispatcher: tuple[Dispatcher, MagicMock],
+    session_factory: Any,
+) -> None:
+    """P1-B mini-E2E (coverage plan, critic DEEP_ENOUGH): late window
+    12:00–23:30 LOCAL, 30-min service → client slot picker must render the
+    boundary slot labeled "23:00" (LOCAL Moscow label, NOT 20:00 UTC).
+
+    Chain under test (service → picker → slot grid):
+    service_picker_cb → get_available_slots_30(min_duration_min=30) →
+    BUG2 filter boundary `<=` keeps 23:00 (23:00+30 == 23:30 end) →
+    slot_30_cb renders TimeSlot30.label. Grid generation is half-open, so
+    "23:30" must NOT exist as a button.
+
+    Companion unit test: test_slots.py::test_get_available_slots_30_tz_edge_
+    evening_boundary (asserts start_at_utc == 20:00 UTC same date).
+    This E2E covers the RENDER path: dispatcher wiring + FSM + keyboard.
+    """
+    from freezegun import freeze_time
+
+    # Freeze 14:00 UTC = 17:00 MSK — tomorrow fully future for the picker.
+    with freeze_time("2026-08-25 14:00:00", tz_offset=0):
+        dp, bot = integration_dispatcher
+        await _seed_workday_tomorrow_tz_edge(session_factory)
+
+        client_tg = 999_888_777
+
+        # Step 1: /slots → SimpleCalendar (selecting_date).
+        await dp.feed_update(bot, _make_text_update("/slots", user_id=client_tg))
+        assert "Выберите дату" in _extract_send_text(bot)
+
+        # Step 2: tap tomorrow → service picker.
+        tomorrow = (datetime.now(ZoneInfo(TZ)) + timedelta(days=1)).date()
+        bot.reset()
+        await dp.feed_update(bot, _make_calendar_day_update(tomorrow, user_id=client_tg))
+        step2 = _extract_send_text(bot)
+        assert "Выберите услугу" in step2, f"Expected service picker, got: {step2!r}"
+        svc_btn = await _find_button_by_label(bot, "Экспресс 30")
+        assert svc_btn is not None, "Экспресс 30 button in the service picker"
+
+        # Step 3: tap the 30-min service → slot picker renders the boundary slot.
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(svc_btn, user_id=client_tg))
+        step3 = _extract_send_text(bot)
+        assert "Выберите время" in step3, f"service tap → slot picker. Got: {step3!r}"
+        slot_btn = await _find_button_by_label(bot, "23:00")
+        assert slot_btn is not None, (
+            "Boundary slot 23:00 (23:00+30 == 23:30 end, `<=`) must be visible "
+            "with its LOCAL label — BUG2 off-by-one would hide it. "
+            f"Got text: {step3!r}"
+        )
+        # Half-open grid: slot starting exactly at end_time does not exist.
+        assert await _find_button_by_label(bot, "23:30") is None, (
+            "Slot 23:30 (== end_time) must not be rendered"
         )
 
 
@@ -1687,10 +1792,7 @@ async def test_e2e_ekaterina_day_cycle_close_today_then_close_other(
         assert isinstance(markup, InlineKeyboardMarkup)
         for row in markup.inline_keyboard:
             for b in row:
-                if (
-                    b.text.strip() == str(tomorrow.day)
-                    and (b.callback_data or "") == expected_cb
-                ):
+                if b.text.strip() == str(tomorrow.day) and (b.callback_data or "") == expected_cb:
                     tomorrow_btn = b
                     break
             if tomorrow_btn:
@@ -1788,9 +1890,7 @@ async def test_e2e_client_cancels_own_booking_via_mybookings(
 
         # --- Step 2: тап [❌ Отменить] → «Запись отменена» ---
         bot.reset()
-        await dp.feed_update(
-            bot, _make_callback_update_from_button(cancel_btn, user_id=CLIENT_TG)
-        )
+        await dp.feed_update(bot, _make_callback_update_from_button(cancel_btn, user_id=CLIENT_TG))
         texts = _extract_all_send_texts(bot)
         assert any("Запись отменена" in t for t in texts), (
             f"Step 2: ожидали подтверждение отмены, got: {texts!r}"
@@ -1885,8 +1985,10 @@ async def test_e2e_admin_close_today_with_active_booking_cancels_it(
         async with session_factory() as session:
             master = await session.scalar(select(Master))
             workdays = (
-                await session.execute(select(WorkDay).where(WorkDay.master_id == master.id))
-            ).scalars().all()
+                (await session.execute(select(WorkDay).where(WorkDay.master_id == master.id)))
+                .scalars()
+                .all()
+            )
             assert workdays and all(wd.is_active is False for wd in workdays), (
                 f"Step 4: workday должен стать inactive, got: "
                 f"{[(wd.work_date, wd.is_active) for wd in workdays]}"
@@ -1894,6 +1996,255 @@ async def test_e2e_admin_close_today_with_active_booking_cancels_it(
             booking_after = await session.scalar(select(Booking).where(Booking.id == booking_id))
         assert booking_after is not None and booking_after.status == "cancelled", (
             f"Step 4: booking должен стать cancelled, got: {booking_after.status!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_e2e_admin_move_full_flow_booking_transferred_client_notified(
+    integration_dispatcher: tuple[Dispatcher, MagicMock],
+    session_factory: Any,
+) -> None:
+    """P2-A (coverage plan): полный admin_move E2E через integration_dispatcher:
+    /today → [🔄 Перенести] → календарь (тап завтра) → слот → [✅ Перенести] →
+    booking.status == 'transferred'.
+
+    Flow-level покрытие (router wiring, callback_data, FSM-переходы
+    AdminMoveStates.selecting_date → selecting_slot → confirming) поверх
+    15 юнитов test_admin_move.py (service-level, без dispatcher).
+
+    Каналы уведомлений (критик NF5 — НЕ смешивать):
+    - КЛИЕНТ: handler шлёт через callback.bot.send_message (admin.py:3135)
+      → RecordingBot.send_message → bot.sent_direct, chat_id=999888777.
+    - МАСТЕР: callback.message.answer → bot.__call__ → bot.calls
+      (SendMessage-объекты, «✅ Запись перенесена на ... Клиент уведомлён.»).
+
+    Source booking (workday-only, slot_id=None): ассерт «slot_id изменился»
+    из плана неприменим — slot_id stays None (mirror unit-теста
+    test_admin_move.py:230); перенос фиксируем через start_at/end_at UTC.
+
+    Сцена: freeze 06:00 UTC (09:00 MSK) — today booking 11:00-12:00
+    upcoming; цель — завтра 11:00 (слоты 10:00/10:30/11:00 при
+    min_duration 60 от услуги 'Стрижка').
+    """
+    from datetime import time as dt_time
+
+    from bot.models import Booking, NotificationLog
+    from freezegun import freeze_time
+
+    with freeze_time("2026-08-25 06:00:00", tz_offset=0):
+        dp, bot = integration_dispatcher
+        seeded = await _seed_today_with_booking(session_factory)
+        booking_id = seeded["booking_id"]
+        client_tg = seeded["client_telegram_id"]
+
+        tomorrow = (datetime.now(ZoneInfo(TZ)) + timedelta(days=1)).date()
+        # Целевой WorkDay ЗАВТРА 10:00–12:00 (workday-only путь переноса).
+        async with session_factory() as session:
+            master = await session.scalar(select(Master))
+            wd_new = WorkDay(
+                master_id=master.id,
+                work_date=tomorrow,
+                start_time=dt_time(10, 0),
+                end_time=dt_time(12, 0),
+                is_active=True,
+                max_concurrent_clients=1,
+            )
+            session.add(wd_new)
+            await session.commit()
+
+        # --- Step 1: /today → список с [🔄 Перенести] ---
+        await dp.feed_update(bot, _make_text_update("/today"))
+        today_text = _extract_send_text(bot)
+        assert "Записи на сегодня" in today_text, f"Step 1: got: {today_text!r}"
+        move_btn = await _find_button_by_label(bot, "🔄")
+        assert move_btn is not None, (
+            f"Step 1: [🔄 Перенести] должна быть в /today. Got markup: {bot.last_reply_markup!r}"
+        )
+
+        # --- Step 2: тап [🔄 Перенести] → календарь (selecting_date) ---
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(move_btn))
+        cal_text = _extract_send_text(bot)
+        assert "Выберите новую дату" in cal_text or "Выберите дату" in cal_text, (
+            f"Step 2: после тапа [🔄 Перенести] ждём календарь, got: {cal_text!r}"
+        )
+
+        # --- Step 3: тап завтра в календаре → слот-пикер (selecting_slot) ---
+        bot.reset()
+        await dp.feed_update(bot, _make_calendar_day_update(tomorrow))
+        slots_text = _extract_send_text(bot)
+        assert "Выберите новое время" in slots_text, (
+            f"Step 3: тап дня → слот-пикер, got: {slots_text!r}"
+        )
+        slot_btn = await _find_button_by_label(bot, "11:00")
+        assert slot_btn is not None, (
+            f"Step 3: слот 11:00 должен быть в пикере (10:00/10:30/11:00 при "
+            f"min_duration 60). Got: {slots_text!r}"
+        )
+
+        # --- Step 4: тап слота → summary (confirming) с [✅ Перенести] ---
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(slot_btn))
+        summary_text = _extract_send_text(bot)
+        assert "Подтвердите перенос" in summary_text, (
+            f"Step 4: слот тап → summary. Got: {summary_text!r}"
+        )
+        # Locale-агностично: %b зависит от LC_TIME процесса («Aug» / «авг.»).
+        # bot/main.py ставит ru_RU.UTF-8 при старте — полный прогон ловит обе.
+        assert re.search(r"25 \S+ 2026, 11:00", summary_text), "Step 4: 'Было' = today 11:00 MSK"
+        assert re.search(r"26 \S+ 2026, 11:00", summary_text), (
+            "Step 4: 'Станет' = tomorrow 11:00 MSK"
+        )
+        confirm_btn = await _find_button_by_label(bot, "✅ Перенести")
+        assert confirm_btn is not None, "Step 4: [✅ Перенести] должна быть"
+
+        # --- Step 5: тап [✅ Перенести] → сервис + уведомления ---
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(confirm_btn))
+
+        # 5a. КЛИЕНТ уведомлён через bot.send_message → sent_direct (НЕ calls).
+        direct_to_client = [txt for cid, txt in bot.sent_direct if cid == client_tg]
+        assert direct_to_client, (
+            f"Step 5a: клиенту (chat_id={client_tg}) не ушёл send_message. "
+            f"sent_direct={bot.sent_direct!r}"
+        )
+        assert "Ваша запись перенесена мастером" in direct_to_client[0], (
+            f"Step 5a: текст клиенту неверен: {direct_to_client[0]!r}"
+        )
+        assert re.search(r"26 \S+ 2026, 11:00", direct_to_client[0]), (
+            f"Step 5a: дата переноса не найдена: {direct_to_client[0]!r}"
+        )
+
+        # 5b. МАСТЕР получил summary через message.answer → calls (SendMessage).
+        master_texts = _extract_all_send_texts(bot)
+        assert any(
+            re.search(r"26 \S+ 2026, 11:00", t) and "Клиент уведомлён" in t for t in master_texts
+        ), f"Step 5b: master summary не найден в calls. Got: {master_texts!r}"
+        # NF5 guard: мастеру НЕ шлется прямой send_message (sent_direct только клиент).
+        assert not any(cid == ADMIN_TG_ID for cid, _ in bot.sent_direct), (
+            f"Step 5b: master не должен получать send_message. sent_direct={bot.sent_direct!r}"
+        )
+
+        # --- Step 6: DB — booking transferred на завтра 11:00 MSK = 08:00 UTC ---
+        async with session_factory() as session:
+            booking_after = await session.scalar(select(Booking).where(Booking.id == booking_id))
+        assert booking_after is not None
+        assert booking_after.status == "transferred", (
+            f"Step 6: status должен стать transferred, got: {booking_after.status!r}"
+        )
+        # SQLite хранит naive UTC — нормализуем как в юнитах (test_admin_move.py:217).
+        actual_start = booking_after.start_at
+        if actual_start.tzinfo is None:
+            actual_start = actual_start.replace(tzinfo=UTC)
+        actual_end = booking_after.end_at
+        if actual_end.tzinfo is None:
+            actual_end = actual_end.replace(tzinfo=UTC)
+        assert actual_start == datetime(2026, 8, 26, 8, 0, tzinfo=UTC), (
+            f"Step 6: start_at = 26 авг 08:00 UTC (11:00 MSK), got: {actual_start!r}"
+        )
+        assert actual_end == datetime(2026, 8, 26, 9, 0, tzinfo=UTC), (
+            f"Step 6: end_at = 26 авг 09:00 UTC (12:00 MSK), got: {actual_end!r}"
+        )
+        # slot_id stays None — workday-only source (mirror test_admin_move.py:230)
+        assert booking_after.slot_id is None
+
+        # --- Step 7: NotificationLog 'client_moved' ровно 1 строка ---
+        async with session_factory() as session:
+            notif_rows = (
+                (
+                    await session.execute(
+                        select(NotificationLog).where(
+                            NotificationLog.booking_id == booking_id,
+                            NotificationLog.kind == "client_moved",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert len(notif_rows) == 1, f"Step 7: клиент_moved лог ровно 1, got: {len(notif_rows)}"
+
+
+@pytest.mark.asyncio
+async def test_e2e_month_boundary_client_books_feb_1st_from_jan_31st(
+    integration_dispatcher: tuple[Dispatcher, MagicMock],
+    session_factory: Any,
+) -> None:
+    """P2-B (coverage plan): month-boundary E2E — freeze 31 янв 2026 20:00 MSK,
+    клиент /slots → даты записи содержат 1 ФЕВРАЛЯ → тап → слот-пикер показывает
+    слоты на 1 фев. Ловит реальный переход месяца в клиентском booking flow.
+
+    NB (давиация от плана — план писался до сверки кода):
+    1. «/book → календарь»: с BB-110 /book и /slots НЕ рендерят SimpleCalendar —
+       это flat list дат (date_picker_keyboard, callback 'book_date:YYYY-MM-DD',
+       client.py:491-493). Визуального «февраля» не существует; month boundary
+       ловим по КОНКРЕТНОЙ дате 2026-02-01 в списке и в callback_data.
+       Клиентский SimpleCalendar жив только в /transfer (BB-110 scope).
+    2. freeze из плана «20:00 tz_offset=3» даёт freezegun-ловушку: строка
+       трактуется как UTC+3 → frozen 23:00 UTC = 02:00 MSK 1 ФЕВРАЛЯ (месяц уже
+       сменился — verified). Честная заморозка 20:00 MSK 31 янв = 17:00 UTC
+       tz_offset=0 (паттерн всех integration-тестов).
+
+    Import-time календарный фикс f45ee2b — про admin_calendar_keyboard
+    (month на момент вызова), покрыт своими E2E; клиентский /slots здесь
+    проверяет границу месяца в date-фильтрах (get_bookable_dates:409-422,
+    book_date_cb → слот-пикер).
+    """
+    from freezegun import freeze_time
+
+    # 17:00 UTC = 20:00 MSK суббота 31 янв 2026. Завтра = ВС 1 ФЕВРАЛЯ.
+    with freeze_time("2026-01-31 17:00:00", tz_offset=0):
+        dp, bot = integration_dispatcher
+        # WorkDay ЗАВТРА (1 фев) 10:00–12:00 + услуга «Экспресс 30» (30 мин).
+        await _seed_workday_tomorrow_tz_edge(
+            session_factory, start_time_str="10:00", end_time_str="12:00"
+        )
+
+        client_tg = 999_888_777
+
+        # --- Step 1: /slots → flat list дат, среди них 1 ФЕВРАЛЯ ---
+        await dp.feed_update(bot, _make_text_update("/slots", user_id=client_tg))
+        step1 = _extract_send_text(bot)
+        assert "Выберите дату" in step1, f"Step 1: /slots → date picker, got: {step1!r}"
+
+        markup = _extract_reply_markup(bot)
+        assert isinstance(markup, InlineKeyboardMarkup)
+        feb_1_btn: InlineKeyboardButton | None = None
+        for row in markup.inline_keyboard:
+            for btn in row:
+                if btn.callback_data == "book_date:2026-02-01":
+                    feb_1_btn = btn
+                    break
+            if feb_1_btn is not None:
+                break
+        assert feb_1_btn is not None, (
+            f"Step 1: кнопка 1 февраля (book_date:2026-02-01) должна быть в "
+            f"списке. markup: {markup.inline_keyboard!r}"
+        )
+        # Label содержит дату февраля в формате %d.%m (не январскую старую).
+        assert "01.02" in feb_1_btn.text, (
+            f"Step 1: label кнопки 1 фев должен содержать '01.02', got: {feb_1_btn.text!r}"
+        )
+
+        # --- Step 2: тап 1 февраля → service picker (WorkDay сидирован) ---
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(feb_1_btn, user_id=client_tg))
+        step2 = _extract_send_text(bot)
+        assert "Выберите услугу" in step2, (
+            f"Step 2: тап 1 фев → service picker (workday есть, не «мастер не "
+            f"работает»). got: {step2!r}"
+        )
+        svc_btn = await _find_button_by_label(bot, "Экспресс 30")
+        assert svc_btn is not None, "Step 2: услуга «Экспресс 30» в пикере"
+
+        # --- Step 3: тап услуги → слот-пикер с PACLотами НА 1 ФЕВ ---
+        bot.reset()
+        await dp.feed_update(bot, _make_callback_update_from_button(svc_btn, user_id=client_tg))
+        step3 = _extract_send_text(bot)
+        assert "Выберите время" in step3, f"Step 3: услуга → слот-пикер, got: {step3!r}"
+        slot_btn = await _find_button_by_label(bot, "10:00")
+        assert slot_btn is not None, (
+            f"Step 3: слот 10:00 на 1 фев должен быть в пикере. got: {step3!r}"
         )
 
 
