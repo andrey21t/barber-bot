@@ -329,6 +329,7 @@ def admin_today_keyboard(
     bookings: list[Booking],
     business_timezone: str = "Europe/Moscow",
     today_workday: WorkDay | None = None,
+    show_close_buttons: bool = True,
 ) -> InlineKeyboardMarkup:
     """Inline keyboard with [🔄 Перенести] + [✅ Завершить] + [❌ Неявка] buttons per booking (B.3).
 
@@ -354,6 +355,13 @@ def admin_today_keyboard(
     ``/closeday YYYY-MM-DD`` text power-user shortcut. Today-close button
     (above) is kept — the new button is ADDITIVE, not a replacement.
 
+    Bug 9 fix (2026-09-20): show_close_buttons parameter. /week uses this
+    keyboard for [🔄 Перенести]/[✅ Завершить]/[❌ Неявка] buttons (Bug 9 —
+    /week was text-only before), but doesn't need [🔒 Закрыть день] /
+    [🔒 Закрыть другой день] (those are /today-specific — closing future
+    days from /week would be surprising UX). Default True (backwards-compat
+    for /today callers).
+
     Telegram inline keyboard limit 100 buttons/row × N rows — pet-project
     single-tenant (Екатерина < 10 bookings/day), no pagination needed. If > 30
     bookings — would need pagination (defer until pain).
@@ -361,6 +369,9 @@ def admin_today_keyboard(
     today_workday: WorkDay | None — today's WorkDay row. If is_active=True,
     a [🔒 Закрыть день] button is appended as a separate row. If None or
     is_active=False, no close button (nothing to close today).
+
+    show_close_buttons: bool — if False, skip both [🔒 Закрыть день] and
+    [🔒 Закрыть другой день] buttons. Used by /week (Bug 9 fix).
 
     NB: workday-only bookings (slot_id is None) AND legacy slot-based bookings
     BOTH get [🔄 Перенести] button — admin_move_booking handles both paths
@@ -407,23 +418,27 @@ def admin_today_keyboard(
                 callback_data=AdminNoShowCallbackData(booking_id=b.id).pack(),
             ),
         )
-    if today_workday is not None and getattr(today_workday, "is_active", False):
+    # Bug 9 fix: close-buttons gated by show_close_buttons. /week uses this
+    # keyboard for [🔄]/[✅]/[❌] but doesn't need [🔒] buttons (closing future
+    # days from /week would be surprising UX — close-actions belong to /today).
+    if show_close_buttons:
+        if today_workday is not None and getattr(today_workday, "is_active", False):
+            builder.row(
+                InlineKeyboardButton(
+                    text="🔒 Закрыть день",
+                    callback_data=AdminCloseTodayCallbackData().pack(),
+                )
+            )
+        # Вариант B: separate row, always visible — calendar path for closing
+        # ANY active WorkDay (today or future or past). Not gated by today_workday
+        # because master may want to close a future day even if today's WorkDay
+        # is inactive or absent.
         builder.row(
             InlineKeyboardButton(
-                text="🔒 Закрыть день",
-                callback_data=AdminCloseTodayCallbackData().pack(),
+                text="🔒 Закрыть другой день",
+                callback_data=AdminCloseOtherDayEntryCallbackData().pack(),
             )
         )
-    # Вариант B: separate row, always visible — calendar path for closing
-    # ANY active WorkDay (today or future or past). Not gated by today_workday
-    # because master may want to close a future day even if today's WorkDay
-    # is inactive or absent.
-    builder.row(
-        InlineKeyboardButton(
-            text="🔒 Закрыть другой день",
-            callback_data=AdminCloseOtherDayEntryCallbackData().pack(),
-        )
-    )
     return builder.as_markup()
 
 

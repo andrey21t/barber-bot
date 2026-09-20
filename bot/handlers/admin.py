@@ -698,7 +698,11 @@ async def cmd_week(message: Message, state: FSMContext) -> None:
         return
 
     await message.answer(
-        _render_bookings("📅 Ближайшие записи:", bookings, tz, client_usernames=client_usernames)
+        _render_bookings("📅 Ближайшие записи:", bookings, tz, client_usernames=client_usernames),
+        # Bug 9 fix: /week was text-only before. Reuse admin_today_keyboard
+        # for [🔄]/[✅]/[❌] buttons, but hide [🔒] close-actions (closing
+        # future days from /week would be surprising UX).
+        reply_markup=admin_today_keyboard(bookings, tz, show_close_buttons=False),
     )
 
 
