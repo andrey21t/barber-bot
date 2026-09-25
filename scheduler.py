@@ -98,12 +98,17 @@ async def send_reminder(booking_id: UUID, kind: str, bot: Any = None) -> None:
 
     Flow (spec.md 322-326, 358-396):
       1. Resolve bot (param > _bot_ref). None → return (startup not complete).
-      2. SELECT booking + client + business (selectinload, single query).
-      3. log_notification UNIQUE guard — False = already sent, return.
+      2. SELECT booking + client + business (explicit JOIN, single query —
+         no Master join since 2026-09-25, name not rendered to clients).
+      3. Validate business.timezone (ZoneInfo) — invalid → log error + return
+         BEFORE the UNIQUE insert, so retry stays possible.
       4. Build text per kind:
-         - remind_24h: "Напоминаю: завтра в 14:00" (local time in business.timezone)
-         - remind_1h: "Через час: 14:00"
-      5. bot.send_message with try/except:
+         - remind_24h: "Напоминаю: завтра в 14:00 — 💇 {service}"
+           (time converted to business.timezone; service = pre-escaped
+           service_title_snapshot from booking.py:511)
+         - remind_1h: "Через час в 14:00 — 💇 {service}"
+      5. log_notification UNIQUE guard — False = already sent, return.
+      6. bot.send_message with try/except:
          - TelegramRetryAfter → asyncio.sleep(retry_after) + retry once
          - TelegramForbiddenError / TelegramBadRequest → log warning, return
          - Other TelegramAPIError → log error, return
