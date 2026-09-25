@@ -40,8 +40,13 @@ async def _seed_stack(
         master = Master(business_id=biz.id, name="T", telegram_id=461355056, role="owner")
         session.add(master)
         await session.flush()
-        svc = Service(business_id=biz.id, name="Стрижка", duration_minutes=60,
-                      price=Decimal("0"), is_active=True)
+        svc = Service(
+            business_id=biz.id,
+            name="Стрижка",
+            duration_minutes=60,
+            price=Decimal("0"),
+            is_active=True,
+        )
         session.add(svc)
         await session.flush()
 

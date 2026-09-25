@@ -295,6 +295,7 @@ def test_build_fsm_storage_postgres_url_returns_postgres_storage(
     storage = _build_fsm_storage(settings)
     # PostgresStorage imported from bot.fsm_storage (see main.py:36)
     from bot.fsm_storage import PostgresStorage
+
     assert isinstance(storage, PostgresStorage)
 
 
@@ -333,6 +334,5 @@ async def test_main_logs_telegram_api_proxy_when_base_url_non_empty(
         await main()
 
     assert any(
-        "Telegram API via proxy" in r.message and "my-worker" in r.message
-        for r in caplog.records
+        "Telegram API via proxy" in r.message and "my-worker" in r.message for r in caplog.records
     ), f"expected proxy log, got {[r.message for r in caplog.records]}"

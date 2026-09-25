@@ -452,11 +452,7 @@ async def deactivate_service(
             already_inactive=already_inactive,
         )
 
-    await session.execute(
-        update(Service)
-        .where(Service.id.in_(active_ids))
-        .values(is_active=False)
-    )
+    await session.execute(update(Service).where(Service.id.in_(active_ids)).values(is_active=False))
     await session.commit()
 
     return ServiceDeactivationResult(

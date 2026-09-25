@@ -613,9 +613,7 @@ async def create_booking(
     else:
         contact_line = f"👤 {escaped_name} (ID: {telegram_id})\n"
     master_text = (
-        f"Новая запись:\n📅 {formatted_time}\n"
-        f"{contact_line}"
-        f"💇 {escaped_service}\n"
+        f"Новая запись:\n📅 {formatted_time}\n{contact_line}💇 {escaped_service}\n"
     ).rstrip("\n")
 
     return BookingCreatedData(
@@ -954,9 +952,7 @@ async def transition_booking_status(
         # context) if accessed. Return fresh_booking instead of the stale
         # identity-mapped object.
         await session.rollback()
-        recheck = await session.execute(
-            select(Booking).where(Booking.id == booking_id)
-        )
+        recheck = await session.execute(select(Booking).where(Booking.id == booking_id))
         fresh_booking = recheck.scalar_one_or_none()
         if fresh_booking is None:
             # Concurrent delete (shouldn't happen in practice — defense-in-depth).

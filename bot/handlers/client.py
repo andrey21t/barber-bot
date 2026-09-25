@@ -1166,8 +1166,7 @@ async def slot_cb(
             # но reply-кнопки все равно убираем для визуальной чистоты — inline
             # [✅ Да] / [👤 Другое имя] заменяют их на этом шаге.
             await callback.message.answer(
-                f"Записать на <b>{_html_escape(first_name)}</b>? "
-                "(ваше имя в Telegram)",
+                f"Записать на <b>{_html_escape(first_name)}</b>? (ваше имя в Telegram)",
                 reply_markup=ReplyKeyboardRemove(),
             )
             await callback.message.answer(
@@ -1248,8 +1247,7 @@ async def slot_30_cb(
         await state.set_state(BookingStates.entering_name_pre_fill)
         if callback.message is not None:
             await callback.message.answer(
-                f"Записать на <b>{_html_escape(first_name)}</b>? "
-                "(ваше имя в Telegram)",
+                f"Записать на <b>{_html_escape(first_name)}</b>? (ваше имя в Telegram)",
                 reply_markup=ReplyKeyboardRemove(),
             )
             await callback.message.answer(
@@ -1358,9 +1356,7 @@ async def name_pre_fill_other_cb(
     await _clear_source_keyboard(callback)
     await state.set_state(BookingStates.entering_name)
     if callback.message is not None:
-        await callback.message.answer(
-            "На чьё имя записываем? (например: Паша, я сам, сын 5 лет)"
-        )
+        await callback.message.answer("На чьё имя записываем? (например: Паша, я сам, сын 5 лет)")
     await callback.answer()
 
 
@@ -1394,9 +1390,7 @@ async def book_back_to_service_cb(callback: CallbackQuery, state: FSMContext) ->
         if not services:
             await state.clear()
             if callback.message is not None:
-                await callback.message.answer(
-                    "Мастер пока не настроил услуги. Загляните позже 🙏"
-                )
+                await callback.message.answer("Мастер пока не настроил услуги. Загляните позже 🙏")
             await callback.answer()
             return
     await state.set_state(BookingStates.entering_service)

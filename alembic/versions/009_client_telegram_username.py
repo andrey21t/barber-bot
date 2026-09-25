@@ -18,9 +18,8 @@ Downgrade is one-way door (mirror migration 007:30-33):
   для rollback scenario. @username восстановится при следующих bookings.
 """
 
-from alembic import op
 import sqlalchemy as sa
-
+from alembic import op
 
 revision = "009_client_telegram_username"
 down_revision = "008_status_completed_no_show"

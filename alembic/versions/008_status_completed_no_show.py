@@ -42,7 +42,6 @@ Downgrade is one-way door (mirror 007:82):
 
 from alembic import op
 
-
 # revision identifiers, used by Alembic.
 revision = "008_status_completed_no_show"
 down_revision = "007_notif_log_client_moved"
@@ -70,9 +69,7 @@ _OLD_NOTIF_CHECK = (
 _NOTIF_CONSTRAINT_NAME = "ck_notifications_kind"
 
 # New ck_booking_status — ALL 5 statuses (existing 3 + 2 new terminal).
-_BOOKING_STATUS_CHECK = (
-    "status IN ('confirmed','cancelled','completed','no_show','transferred')"
-)
+_BOOKING_STATUS_CHECK = "status IN ('confirmed','cancelled','completed','no_show','transferred')"
 _BOOKING_STATUS_NAME = "ck_booking_status"
 
 
@@ -114,9 +111,7 @@ def downgrade() -> None:
     # rollback scenario — admin complete/no_show actions lost from log,
     # bookings themselves remain with status='completed'/'no_show', but
     # ck_booking_status is dropped next so they're not constrained).
-    op.execute(
-        "DELETE FROM notifications_log WHERE kind IN ('admin_completed', 'admin_no_show')"
-    )
+    op.execute("DELETE FROM notifications_log WHERE kind IN ('admin_completed', 'admin_no_show')")
 
     bind = op.get_bind()
     dialect = bind.dialect.name

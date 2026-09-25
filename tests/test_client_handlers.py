@@ -319,9 +319,7 @@ async def test_mybookings_msg_with_soon_booking(
 
     msg.answer.assert_called_once()
     text = _answer_text(msg)
-    assert "⚠️ Запись скоро" in text, (
-        "booking within 24h must show soft warning in /mybookings list"
-    )
+    assert "⚠️ Запись скоро" in text, "booking within 24h must show soft warning in /mybookings list"
     # Inline keyboard IS present — cancel is available even for soon bookings.
     assert _answer_reply_markup(msg) is not None, (
         "soon booking must produce inline keyboard (cancel always available)"
@@ -2869,9 +2867,9 @@ def test_noop_cb_registered_after_no_state_fallback() -> None:
         getattr(h.callback, "__name__", repr(h.callback))
         for h in client_handlers.router.callback_query.handlers
     ]
-    assert handler_names.index("no_state_callback_fallback") < handler_names.index(
-        "noop_cb"
-    ), f"no_state_callback_fallback must be registered before noop_cb: {handler_names}"
+    assert handler_names.index("no_state_callback_fallback") < handler_names.index("noop_cb"), (
+        f"no_state_callback_fallback must be registered before noop_cb: {handler_names}"
+    )
 
 
 def test_cancel_msg_registered_after_state_catch_alls() -> None:
@@ -4883,8 +4881,8 @@ async def test_book_confirm_success_bare_text_no_inline_keyboard(
     # Session 5.51: no inline keyboard), (2) reply-keyboard restore.
     assert cb.message.answer.await_count == 2
     first_call = cb.message.answer.await_args_list[0]
-    first_text = str(first_call.args[0]) if first_call.args else str(
-        first_call.kwargs.get("text", "")
+    first_text = (
+        str(first_call.args[0]) if first_call.args else str(first_call.kwargs.get("text", ""))
     )
     assert "Вы записаны" in first_text
     reply_markup = first_call.kwargs.get("reply_markup")
@@ -5103,8 +5101,8 @@ async def test_slot_cb_pre_fill_yes_path(
     # 2 messages: (1) prompt with ReplyKeyboardRemove, (2) 'Выберите:' with inline.
     assert cb.message.answer.await_count == 2
     first_call = cb.message.answer.await_args_list[0]
-    first_text = str(first_call.args[0]) if first_call.args else str(
-        first_call.kwargs.get("text", "")
+    first_text = (
+        str(first_call.args[0]) if first_call.args else str(first_call.kwargs.get("text", ""))
     )
     assert "Записать на" in first_text
     assert "Андрей" in first_text
@@ -5115,8 +5113,8 @@ async def test_slot_cb_pre_fill_yes_path(
         "1st message must hide reply keyboard (would obstruct inline pre-fill buttons)"
     )
     second_call = cb.message.answer.await_args_list[1]
-    second_text = str(second_call.args[0]) if second_call.args else str(
-        second_call.kwargs.get("text", "")
+    second_text = (
+        str(second_call.args[0]) if second_call.args else str(second_call.kwargs.get("text", ""))
     )
     assert second_text == "Выберите:"
     second_rm = second_call.kwargs.get("reply_markup")
@@ -5167,6 +5165,7 @@ async def test_reply_book_msg_starts_booking_flow(
     assert "Выберите дату" in text
     reply_markup = _answer_reply_markup(msg)
     assert isinstance(reply_markup, InlineKeyboardMarkup), "date picker is inline keyboard"
+
 
 @pytest.mark.asyncio
 async def test_reply_book_msg_master_guard(
@@ -5427,14 +5426,14 @@ async def test_cancel_msg_restores_reply_keyboard(
     assert msg.answer.await_count == 2
     # 1st message: hint
     first_call = msg.answer.await_args_list[0]
-    first_text = str(first_call.args[0]) if first_call.args else str(
-        first_call.kwargs.get("text", "")
+    first_text = (
+        str(first_call.args[0]) if first_call.args else str(first_call.kwargs.get("text", ""))
     )
     assert "Ввод отменён" in first_text
     # 2nd message: reply keyboard restore
     second_call = msg.answer.await_args_list[1]
-    second_text = str(second_call.args[0]) if second_call.args else str(
-        second_call.kwargs.get("text", "")
+    second_text = (
+        str(second_call.args[0]) if second_call.args else str(second_call.kwargs.get("text", ""))
     )
     assert "Кнопки внизу" in second_text
     second_rm = second_call.kwargs.get("reply_markup")
@@ -5572,9 +5571,7 @@ async def test_transfer_slot_30_cb_happy_path(
     async with session_factory() as verify_session:
         b = await verify_session.get(Booking, booking_id)
         assert b is not None
-        assert b.status == "transferred", (
-            f"booking status must be 'transferred', got {b.status!r}"
-        )
+        assert b.status == "transferred", f"booking status must be 'transferred', got {b.status!r}"
 
 
 @pytest.mark.asyncio
@@ -5612,9 +5609,7 @@ async def test_transfer_slot_30_cb_invalid_start_minute(
     state.clear.assert_awaited()
     # Client gets error message.
     text = _answer_text(cb.message)
-    assert "❌ Ошибка выбора времени" in text, (
-        f"expected range-check error, got {text!r}"
-    )
+    assert "❌ Ошибка выбора времени" in text, f"expected range-check error, got {text!r}"
     # NO master notification (early return before service call).
     cb.bot.send_message.assert_not_called()
     # callback.answer called (Telegram ACK even on error).
@@ -5775,8 +5770,11 @@ async def test_transfer_simple_calendar_cb_is_slots_path_workday_active_no_slots
     async with session_factory() as session:
         ctx = await _seed_full_stack(session)
         await _seed_workday(
-            session, ctx, work_date=target_date,
-            start_time=time(10, 0), end_time=time(10, 30),
+            session,
+            ctx,
+            work_date=target_date,
+            start_time=time(10, 0),
+            end_time=time(10, 30),
         )
 
     target_dt = datetime.combine(target_date, time(12, 0))
@@ -6088,8 +6086,10 @@ def _patch_transfer_raises(
     exc_cls: type[Exception],
 ) -> None:
     """Monkeypatch transfer_booking to raise given exception."""
+
     async def _raise(*args: Any, **kwargs: Any) -> None:
         raise exc_cls("test")
+
     monkeypatch.setattr(client_handlers, "transfer_booking", _raise)
 
 
@@ -6102,6 +6102,7 @@ async def test_transfer_slot_30_cb_booking_not_found(
 ) -> None:
     """T4.2: BookingNotFoundError → callback.answer('Запись не найдена') (2743-2745)."""
     from bot.services.booking import BookingNotFoundError
+
     booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
     _patch_transfer_raises(monkeypatch, BookingNotFoundError)
     cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
@@ -6124,6 +6125,7 @@ async def test_transfer_slot_30_cb_booking_already_cancelled(
 ) -> None:
     """T4.2: BookingAlreadyCancelledError → callback.answer('Запись уже отменена') (2746-2748)."""
     from bot.services.booking import BookingAlreadyCancelledError
+
     booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
     _patch_transfer_raises(monkeypatch, BookingAlreadyCancelledError)
     cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
@@ -6145,6 +6147,7 @@ async def test_transfer_slot_30_cb_cancel_too_late(
 ) -> None:
     """T4.2: CancelTooLateError → '❌ Перенос возможен только за 24+ часов' (2749-2753)."""
     from bot.services.booking import CancelTooLateError
+
     booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
     _patch_transfer_raises(monkeypatch, CancelTooLateError)
     cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
@@ -6166,6 +6169,7 @@ async def test_transfer_slot_30_cb_already_transferred(
 ) -> None:
     """T4.2: BookingAlreadyTransferredError → '❌ Запись уже перенесена' (2754-2761)."""
     from bot.services.booking import BookingAlreadyTransferredError
+
     booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
     _patch_transfer_raises(monkeypatch, BookingAlreadyTransferredError)
     cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
@@ -6188,6 +6192,7 @@ async def test_transfer_slot_30_cb_slot_already_booked(
 ) -> None:
     """T4.2: SlotAlreadyBookedError → '😔 Это время только что заняли' (2762-2768)."""
     from bot.services.booking import SlotAlreadyBookedError
+
     booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
     _patch_transfer_raises(monkeypatch, SlotAlreadyBookedError)
     cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
@@ -6210,6 +6215,7 @@ async def test_transfer_slot_30_cb_slot_in_past(
 ) -> None:
     """T4.2: SlotInPastError → '❌ Это время уже прошло' (2769-2773)."""
     from bot.services.booking import SlotInPastError
+
     booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
     _patch_transfer_raises(monkeypatch, SlotInPastError)
     cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
@@ -6231,6 +6237,7 @@ async def test_transfer_slot_30_cb_workday_not_found(
 ) -> None:
     """T4.2: WorkDayNotFoundError → '❌ Этот день не найден' (2774-2778)."""
     from bot.services.booking import WorkDayNotFoundError
+
     booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
     _patch_transfer_raises(monkeypatch, WorkDayNotFoundError)
     cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
@@ -6252,6 +6259,7 @@ async def test_transfer_slot_30_cb_workday_inactive(
 ) -> None:
     """T4.2: WorkDayInactiveError → '❌ День закрыт мастером' (2779-2783)."""
     from bot.services.booking import WorkDayInactiveError
+
     booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
     _patch_transfer_raises(monkeypatch, WorkDayInactiveError)
     cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
@@ -6273,6 +6281,7 @@ async def test_transfer_slot_30_cb_booking_outside_workday(
 ) -> None:
     """T4.2: BookingOutsideWorkDayError → '❌ Время вне рабочего дня' (2784-2790)."""
     from bot.services.booking import BookingOutsideWorkDayError
+
     booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
     _patch_transfer_raises(monkeypatch, BookingOutsideWorkDayError)
     cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
@@ -6294,6 +6303,7 @@ async def test_transfer_slot_30_cb_workday_capacity_exceeded(
 ) -> None:
     """T4.2: WorkDayCapacityExceededError → '❌ Нет мест на это время' (2791-2795)."""
     from bot.services.booking import WorkDayCapacityExceededError
+
     booking_id, workday_id = await _seed_transfer_slot_30_setup(session_factory)
     _patch_transfer_raises(monkeypatch, WorkDayCapacityExceededError)
     cb, callback_data = _make_slot_30_callback(workday_id=workday_id, start_minute=900)
@@ -6304,4 +6314,3 @@ async def test_transfer_slot_30_cb_workday_capacity_exceeded(
 
     assert "Нет мест на это время" in _answer_text(cb.message)
     cb.answer.assert_awaited()
-

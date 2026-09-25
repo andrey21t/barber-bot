@@ -4584,9 +4584,7 @@ async def admin_close_other_calendar_cb(
                     )
                 except SQLAlchemyError:
                     if isinstance(callback.message, Message):
-                        await callback.message.answer(
-                            "❌ Ошибка БД. Попробуйте позже через /menu"
-                        )
+                        await callback.message.answer("❌ Ошибка БД. Попробуйте позже через /menu")
                     await callback.answer()
                     return
             if result is None:
@@ -4674,9 +4672,7 @@ async def admin_close_other_calendar_cb(
     await callback.answer()
 
 
-@router.callback_query(
-    AdminCloseOtherDayConfirmCallbackData.filter(), StateFilter("*")
-)
+@router.callback_query(AdminCloseOtherDayConfirmCallbackData.filter(), StateFilter("*"))
 async def admin_close_other_confirm_cb(
     callback: CallbackQuery,
     scheduler: AsyncIOScheduler,

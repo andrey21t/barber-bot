@@ -127,9 +127,7 @@ class SimpleCalendarNoYearNav(SimpleCalendar):
         week_days_labels_row = []
         for weekday in self._labels.days_of_week:  # noqa: B007
             week_days_labels_row.append(
-                InlineKeyboardButton(
-                    text=highlight_weekday(), callback_data=self.ignore_callback
-                )
+                InlineKeyboardButton(text=highlight_weekday(), callback_data=self.ignore_callback)
             )
         kb.append(week_days_labels_row)
 
@@ -394,9 +392,7 @@ async def admin_calendar_keyboard(
     cal.set_dates_range(min_date=min_date, max_date=max_date)
     now = datetime.now(ZoneInfo(tz)).replace(tzinfo=None) if tz else datetime.now()
     # aiogram_calendar has no type stubs — cast to satisfy mypy.
-    return cast(
-        InlineKeyboardMarkup, await cal.start_calendar(year=now.year, month=now.month)
-    )
+    return cast(InlineKeyboardMarkup, await cal.start_calendar(year=now.year, month=now.month))
 
 
 def admin_keyboard() -> ReplyKeyboardMarkup:
@@ -1284,9 +1280,7 @@ def admin_openweek_edit_keyboard(opened_days: list[OpenedDay]) -> InlineKeyboard
             )
         )
     # ✅ Готово в отдельном ряду — builder.row() гарантирует отдельную строку.
-    builder.row(
-        InlineKeyboardButton(text="✅ Готово", callback_data="admin_openweek_done")
-    )
+    builder.row(InlineKeyboardButton(text="✅ Готово", callback_data="admin_openweek_done"))
     return builder.as_markup()
 
 

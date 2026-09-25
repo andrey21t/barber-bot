@@ -174,13 +174,7 @@ def test_build_session_flag_on_routes_via_proxy_with_secret_prefix(
 
     session = build_session()
 
-    assert (
-        session.api.api_url(token="T", method="sendMessage")
-        == f"{proxy}/botT/sendMessage"
-    )
-    assert (
-        session.api.file_url(token="T", path="f/p")
-        == f"{proxy}/file/botT/f/p"
-    )
+    assert session.api.api_url(token="T", method="sendMessage") == f"{proxy}/botT/sendMessage"
+    assert session.api.file_url(token="T", path="f/p") == f"{proxy}/file/botT/f/p"
     # corp CA context still applied (proxy does not disable TLS inspection fix).
     assert isinstance(session._connector_init["ssl"], ssl.SSLContext)

@@ -75,7 +75,9 @@ def test_admin_window_slot_picker_mode_end_with_start_ge_1200_returns_empty_butt
     """mode='end' + picked_start_minute=1200 → empty candidates →
     'Нет слотов' button (line 502-503)."""
     kb = admin_window_slot_picker_keyboard(
-        uuid4(), mode="end", picked_start_minute=1200,
+        uuid4(),
+        mode="end",
+        picked_start_minute=1200,
     )
     assert isinstance(kb, InlineKeyboardMarkup)
     flat_texts = [btn.text for row in kb.inline_keyboard for btn in row]
@@ -88,14 +90,18 @@ def test_admin_window_slot_picker_with_booked_slots_marks_busy_as_locked() -> No
 
     booked_slots=[BookedSlot(540..600)] → 09:00, 09:30 marked as 🔒, others free.
     """
-    booked = [BookedSlot(
-        start_minute=540,  # 09:00
-        end_minute=600,    # 10:00 — half-open: 540, 570 busy (09:00, 09:30)
-        client_name="Иван",
-        service_title="Стрижка",
-    )]
+    booked = [
+        BookedSlot(
+            start_minute=540,  # 09:00
+            end_minute=600,  # 10:00 — half-open: 540, 570 busy (09:00, 09:30)
+            client_name="Иван",
+            service_title="Стрижка",
+        )
+    ]
     kb = admin_window_slot_picker_keyboard(
-        uuid4(), mode="start", booked_slots=booked,
+        uuid4(),
+        mode="start",
+        booked_slots=booked,
     )
     assert isinstance(kb, InlineKeyboardMarkup)
     flat_texts = [btn.text for row in kb.inline_keyboard for btn in row]
@@ -111,12 +117,14 @@ def test_render_booked_header_with_non_empty_booked_slots_returns_locked_header(
     """render_booked_header with 1+ booked_slots →
     '🔒 Занято:' + '• HH:MM–HH:MM Имя (услуга)' (lines 410-415).
     """
-    booked = [BookedSlot(
-        start_minute=540,
-        end_minute=600,
-        client_name="Иван",
-        service_title="Стрижка",
-    )]
+    booked = [
+        BookedSlot(
+            start_minute=540,
+            end_minute=600,
+            client_name="Иван",
+            service_title="Стрижка",
+        )
+    ]
     header = render_booked_header(booked)
     assert "🔒" in header
     assert "Занято:" in header
@@ -133,6 +141,7 @@ def test_render_booked_header_empty_returns_empty_string() -> None:
 # ============================================================
 # SimpleCalendarNoYearNav — Баг 5 regression tests (Session 5.71)
 # ============================================================
+
 
 @pytest.mark.asyncio
 async def test_start_calendar_no_year_buttons() -> None:

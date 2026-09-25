@@ -368,5 +368,3 @@ async def test_openday_accepts_dot_comma_colon_separators(
         assert len(workdays) == 1
         assert workdays[0].start_time == dt_time(11, 0)
         assert workdays[0].end_time == dt_time(18, 0)
-
-

@@ -21,10 +21,10 @@ Cloudflare до api.telegram.org ходит надёжно, VPS до Cloudflare 
 
 ```bash
 cd deploy
-npx wrangler login          # откроет браузер, login в твой CF-аккаунт
+npx wrangler@4.121.0 login          # откроет браузер, login в твой CF-аккаунт
 # Сгенерируй секрет: openssl rand -hex 16
-npx wrangler secret put WORKER_SECRET   # вставь секрет
-npx wrangler deploy
+npx wrangler@4.121.0 secret put WORKER_SECRET   # вставь секрет
+npx wrangler@4.121.0 deploy
 ```
 
 Вывод deploy даст URL вида `https://telegram-proxy.<account>.workers.dev`.

@@ -2618,8 +2618,7 @@ def test_admin_inline_menu_has_3_buttons_after_duplication_cleanup() -> None:
         "2026-09-13: 'Неделя' removed from inline menu — duplicate of admin_reply_keyboard button"
     )
     assert "⬅️ Расширить влево" not in flat_texts, (
-        "2026-09-16: 'Расширить влево' removed (откат UX-баг 5 — quick-shift "
-        "не нужен владельцу)"
+        "2026-09-16: 'Расширить влево' removed (откат UX-баг 5 — quick-shift не нужен владельцу)"
     )
     assert "➡️ Расширить вправо" not in flat_texts, (
         "2026-09-16: 'Расширить вправо' removed (откат UX-баг 5)"
@@ -5756,9 +5755,11 @@ async def test_admin_today_keyboard_no_complete_no_show_buttons_after_bb107_reje
     from sqlalchemy import select
 
     async with session_factory() as session:
-        bookings = (await session.execute(
-            select(Booking).where(Booking.status == "confirmed")
-        )).scalars().all()
+        bookings = (
+            (await session.execute(select(Booking).where(Booking.status == "confirmed")))
+            .scalars()
+            .all()
+        )
 
     kb = admin_today_keyboard(
         bookings=list(bookings),
@@ -6178,9 +6179,7 @@ async def test_admin_close_other_calendar_cb_no_workday_alerts(
         "aiogram_calendar.SimpleCalendar.process_selection",
         return_value=(True, future_dt),
     ):
-        await admin_handlers.admin_close_other_calendar_cb(
-            callback, cal_cb_data, state, scheduler
-        )
+        await admin_handlers.admin_close_other_calendar_cb(callback, cal_cb_data, state, scheduler)
 
     # state.set_state NOT called again (stays selecting_date — user can retry).
     state.set_state.assert_not_called()
@@ -6226,9 +6225,7 @@ async def test_admin_close_other_calendar_cb_already_closed_alerts(
         "aiogram_calendar.SimpleCalendar.process_selection",
         return_value=(True, tomorrow_dt),
     ):
-        await admin_handlers.admin_close_other_calendar_cb(
-            callback, cal_cb_data, state, scheduler
-        )
+        await admin_handlers.admin_close_other_calendar_cb(callback, cal_cb_data, state, scheduler)
 
     state.set_state.assert_not_called()
     assert callback.message.edit_text.called
@@ -6270,9 +6267,7 @@ async def test_admin_close_other_calendar_cb_cancel_via_calendar_button(
         "aiogram_calendar.SimpleCalendar.process_selection",
         return_value=(False, None),
     ):
-        await admin_handlers.admin_close_other_calendar_cb(
-            callback, cal_cb_data, state, scheduler
-        )
+        await admin_handlers.admin_close_other_calendar_cb(callback, cal_cb_data, state, scheduler)
 
     state.clear.assert_called_once()
     text = callback_answer_text(callback)
@@ -6415,9 +6410,7 @@ async def test_admin_close_other_confirm_cb_already_closed_race(
         from bot.models import WorkDay as _WD
         from sqlalchemy import update as sa_update
 
-        await session.execute(
-            sa_update(_WD).where(_WD.id == workday.id).values(is_active=False)
-        )
+        await session.execute(sa_update(_WD).where(_WD.id == workday.id).values(is_active=False))
         await session.commit()
 
     await admin_handlers.admin_close_other_confirm_cb(callback, scheduler, cb_data, state)
@@ -6514,9 +6507,7 @@ async def test_admin_close_other_calendar_cb_with_bookings_shows_confirm(
         "aiogram_calendar.SimpleCalendar.process_selection",
         return_value=(True, datetime.combine(future, datetime.min.time())),
     ):
-        await admin_handlers.admin_close_other_calendar_cb(
-            callback, cal_cb_data, state, scheduler
-        )
+        await admin_handlers.admin_close_other_calendar_cb(callback, cal_cb_data, state, scheduler)
 
     # active+bookings branch does NOT clear state — keeps selecting_date so
     # the confirm_cb's StateFilter("*") still dispatches (defensive against
@@ -6582,9 +6573,7 @@ async def test_admin_close_other_calendar_cb_no_bookings_closes_immediately(
         "aiogram_calendar.SimpleCalendar.process_selection",
         return_value=(True, datetime.combine(future, datetime.min.time())),
     ):
-        await admin_handlers.admin_close_other_calendar_cb(
-            callback, cal_cb_data, state, scheduler
-        )
+        await admin_handlers.admin_close_other_calendar_cb(callback, cal_cb_data, state, scheduler)
 
     state.clear.assert_called_once()
     text = callback_answer_text(callback)

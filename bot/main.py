@@ -92,9 +92,11 @@ async def _on_startup(bot: Bot, scheduler: AsyncIOScheduler) -> None:
     # resets stuck FSM, verified Olesya case 2026-09-20). Reply-keyboard buttons
     # "Записаться"/"Мои записи" are the primary UI (always-on, 1 tap); command
     # picker is escape-hatch-only, no need to duplicate /book + /mybookings.
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Открыть меню"),
-    ])
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Открыть меню"),
+        ]
+    )
     logger.info("Scheduler started, on_startup_scan complete")
 
 
@@ -117,9 +119,7 @@ async def main() -> None:
     # Session 5.53: log the API routing mode — direct vs Worker proxy
     # (TELEGRAM_API_BASE_URL feature flag; see bot/session.py build_session).
     if settings.TELEGRAM_API_BASE_URL.strip():
-        logger.info(
-            "Telegram API via proxy: %s", settings.TELEGRAM_API_BASE_URL.strip()
-        )
+        logger.info("Telegram API via proxy: %s", settings.TELEGRAM_API_BASE_URL.strip())
     else:
         logger.info("Telegram API: direct api.telegram.org")
     dp = Dispatcher(

@@ -106,8 +106,7 @@ async def test_cmd_start_admin_shows_welcome_and_reply_keyboard() -> None:
         "2026-09-14 UX-баг 4: ❌ Отмена убрана из reply keyboard (📋 Меню = escape + menu)"
     )
     assert len(flat_buttons) == 3, (
-        f"2026-09-14: expected exactly 3 reply buttons, got {len(flat_buttons)}: "
-        f"{button_texts}"
+        f"2026-09-14: expected exactly 3 reply buttons, got {len(flat_buttons)}: {button_texts}"
     )
     assert reply_markup.is_persistent, "5.62: reply keyboard must be always-on (is_persistent=True)"
 

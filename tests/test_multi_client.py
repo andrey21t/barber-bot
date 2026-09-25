@@ -931,9 +931,7 @@ async def test_create_vs_transfer_concurrent_race_postgres(
         service_long = Service(
             business_id=biz.id, name="long", duration_minutes=90, price=None, is_active=True
         )
-        setup_session.add_all(
-            [client1, slot_old1, workday, slot_a, slot_b, service_long]
-        )
+        setup_session.add_all([client1, slot_old1, workday, slot_a, slot_b, service_long])
         await setup_session.commit()
         b1 = Booking(
             slot_id=slot_old1.id,
