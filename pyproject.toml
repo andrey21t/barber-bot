@@ -11,7 +11,7 @@ dependencies = [
     "aiogram>=3.4",
     "pydantic-settings>=2.1",
     "aiosqlite>=0.19",
-    "SQLAlchemy>=2.0",
+    "SQLAlchemy>=2.0,<2.1",  # <2.1: 2.1.1 dropped auto-greenlet → ImportError crash (2026-09-25 prod)
     "APScheduler>=3.10",
     "aiogram-calendar>=0.6",
 ]
