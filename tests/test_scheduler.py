@@ -240,10 +240,12 @@ async def test_on_startup_scan_phase_1_sends_overdue(
     assert mock_bot.send_message.await_count == 1
     chat_id, text = mock_bot.send_message.await_args.args
     assert chat_id == 111222333  # client.telegram_id from _seed_booking
-    # Text format (5.56): "Напоминаю: завтра в HH:MM — 💇 <service>, мастер <name>"
+    # Text format (2026-09-25): "Напоминаю: завтра в HH:MM — 💇 <service>"
+    # Master name removed from reminders (generic multi-tenant bot).
     assert text.startswith("Напоминаю: завтра в ")
     assert "💇 Test" in text
-    assert "мастер Екатерина" in text
+    assert "мастер" not in text
+    assert "Екатерина" not in text
 
     # log_notification should have recorded remind_24h (UNIQUE guard inside send_reminder)
     stmt = select(NotificationLog).where(
@@ -407,32 +409,33 @@ async def test_send_reminder_happy_path(
     assert mock_bot.send_message.await_count == 1
     chat_id, text = mock_bot.send_message.await_args.args
     assert chat_id == 111222333
-    # Text format (5.56): "Напоминаю: завтра в HH:MM — 💇 <service>, мастер <name>"
+    # Text format (2026-09-25): "Напоминаю: завтра в HH:MM — 💇 <service>"
+    # Master name removed from reminders (generic multi-tenant bot).
     assert text.startswith("Напоминаю: завтра в ")
     assert "💇 Test" in text
-    assert "мастер Екатерина" in text
+    assert "мастер" not in text
+    assert "Екатерина" not in text
     scheduler.shutdown(wait=False)
 
 
 @pytest.mark.asyncio
-async def test_send_reminder_escapes_master_name_html_metachars(
+async def test_send_reminder_master_name_not_leaked_unsafe_name(
     session_factory: Any, session: AsyncSession, scheduler: AsyncIOScheduler
 ) -> None:
-    """Regression test for F1 (code-review 5.56): master.name with HTML
-    metacharacters (<, >, &) must be html.escape()'d in reminder text.
+    """Regression (2026-09-25): master.name must NOT appear in reminder text
+    at all — name removed from reminders (generic multi-tenant bot).
 
-    Bot's default parse_mode=ParseMode.HTML (main.py:104). Without escape,
-    a master name like "A & B" or "<script>" would fail Telegram HTML parse →
-    TelegramBadRequest → log_notification UNIQUE(booking_id, kind) blocks retry
-    forever → silent reminder loss.
-
-    Fix (5.56): scheduler.py:181 escapes master.name via html.escape(name, quote=False),
-    mirroring booking.py:510-511 pattern for client_name_snapshot.
+    History: F1 (5.56) escaped master.name via html.escape() because bot's
+    parse_mode=ParseMode.HTML (main.py:104) — an unsafe name would fail
+    Telegram parse → TelegramBadRequest → log_notification UNIQUE(booking_id,
+    kind) blocks retry forever → silent reminder loss. Stronger contract now:
+    reminder renders service_title_snapshot only (escaped at write,
+    booking.py:511), so master.name can't break the send in any form.
 
     Test seeds booking with safe master.name="Екатерина" (default _seed_booking),
-    then UPDATEs Master.name to "A & B <b>" via direct SQL (simulates future
-    /addmaster or DB-side edit with unsafe chars). Asserts the reminder text
-    contains the escaped form "A &amp; B &lt;b&gt;" — NOT the raw metacharacters.
+    then UPDATEs Master.name to "A & B <b>" + newline + "SecondLine" via direct
+    SQL (simulates future /addmaster or DB-side edit with unsafe chars).
+    Asserts the reminder contains service only — no name leak, no metachars.
     """
     _start_scheduler(scheduler)
     booking_start = datetime.now(UTC) - timedelta(hours=12)
@@ -442,9 +445,8 @@ async def test_send_reminder_escapes_master_name_html_metachars(
     from bot.models import Master
     from sqlalchemy import update
 
-    # Two unsafe scenarios in one: HTML metacharacters + newline.
-    # html.escape(quote=False) handles & < >; .replace("\n", " ") handles newline
-    # (mirrors admin.py:881 pattern for client_name_snapshot).
+    # Two unsafe scenarios in one: HTML metacharacters + newline —
+    # if the name ever leaks back into reminders, this maximizes breakage.
     unsafe_name = "A & B <b>\nSecondLine"
     await session.execute(
         update(Master).where(Master.id == booking.master_id).values(name=unsafe_name)
@@ -460,19 +462,22 @@ async def test_send_reminder_escapes_master_name_html_metachars(
 
     assert mock_bot.send_message.await_count == 1
     _, text = mock_bot.send_message.await_args.args
-    # Escaped form — html.escape(name, quote=False) replaces & < > but not " '.
-    # Newline replaced with space → single-line reminder (admin.py:881 pattern).
-    expected_escaped = "A &amp; B &lt;b&gt; SecondLine"
-    assert expected_escaped in text, (
-        f"Expected escaped+squashed master name {expected_escaped!r} in reminder, got {text!r}. "
-        "If you see raw '& B <b>' — F1 regression: master.name NOT escape'd → "
-        "TelegramBadRequest on parse_mode=HTML → silent reminder loss. "
-        "If you see '\\n' — W2 regression: newline NOT squashed → multi-line reminder."
+    # Reminder = service title only. Master name must not leak in ANY form:
+    assert "мастер" not in text, (
+        f"Master name reference leaked into reminder: {text!r}. "
+        "Reminder must not mention master (removed 2026-09-25) — reintroducing "
+        "the name resurrects F1 (unsafe name → TelegramBadRequest on "
+        "parse_mode=HTML → silent reminder loss)."
     )
-    # Ensure raw metacharacters are NOT present (only escaped forms).
-    assert "A & B <b>" not in text, (
-        f"Raw HTML metacharacters leaked into reminder text: {text!r}"
-    )
+    # Unsafe name fragments — neither raw...
+    assert "A & B" not in text
+    assert "<b>" not in text
+    assert "SecondLine" not in text
+    # ...nor escaped remnants.
+    assert "&amp;" not in text
+    assert "&lt;" not in text
+    # Core format intact: service title present.
+    assert "💇 Test" in text
     scheduler.shutdown(wait=False)
 
 
@@ -524,10 +529,10 @@ async def test_send_reminder_timezone_utc_to_moscow(
     assert mock_bot.send_message.await_count == 1
     _, text = mock_bot.send_message.await_args.args
     # 11:00 UTC → 14:00 Europe/Moscow (UTC+3, no DST in January).
-    # Strict match (5.56) verifies both TZ conversion AND the new reminder format
-    # ("Напоминаю: завтра в HH:MM — 💇 <service>, мастер <name>").
-    assert text == "Напоминаю: завтра в 14:00 — 💇 Test, мастер Екатерина", (
-        f"Expected 'Напоминаю: завтра в 14:00 — 💇 Test, мастер Екатерина' "
+    # Strict match verifies both TZ conversion AND the reminder format
+    # ("Напоминаю: завтра в HH:MM — 💇 <service>"; master name removed 2026-09-25).
+    assert text == "Напоминаю: завтра в 14:00 — 💇 Test", (
+        f"Expected 'Напоминаю: завтра в 14:00 — 💇 Test' "
         f"(11:00 UTC → 14:00 MSK), got {text!r}. "
         "If you see '11:00' — F1 regression: booking.start_at treated as system-local TZ."
     )
@@ -798,10 +803,10 @@ async def test_schedule_for_booking_keeps_both_when_far_future(
 async def test_send_reminder_remind_1h_text(
     session_factory: Any, session: AsyncSession, scheduler: AsyncIOScheduler
 ) -> None:
-    """send_reminder: remind_1h text branch — "Через час в HH:MM — 💇 ..., мастер ...".
+    """send_reminder: remind_1h text branch — "Через час в HH:MM — 💇 <service>".
 
     Mirror of test_send_reminder_happy_path but with kind="remind_1h" to cover
-    the elif branch (scheduler.py:192-193). Critical path: remind_1h fires for
+    the elif branch (scheduler.py:184-185). Critical path: remind_1h fires for
     every booking (1 hour before start), so the text format must be verified
     independently from remind_24h.
     """
@@ -819,10 +824,12 @@ async def test_send_reminder_remind_1h_text(
     assert mock_bot.send_message.await_count == 1
     chat_id, text = mock_bot.send_message.await_args.args
     assert chat_id == 111222333
-    # Text format (5.56): "Через час в HH:MM — 💇 <service>, мастер <name>"
+    # Text format (2026-09-25): "Через час в HH:MM — 💇 <service>"
+    # Master name removed from reminders (generic multi-tenant bot).
     assert text.startswith("Через час в ")
     assert "💇 Test" in text
-    assert "мастер Екатерина" in text
+    assert "мастер" not in text
+    assert "Екатерина" not in text
     scheduler.shutdown(wait=False)
 
 
@@ -832,7 +839,7 @@ async def test_send_reminder_unknown_kind_skips(
 ) -> None:
     """send_reminder: unknown kind (e.g. "remind_week") → log warning, return.
 
-    Covers defensive else branch (scheduler.py:195-196). Returns BEFORE
+    Covers defensive else branch (scheduler.py:187-188). Returns BEFORE
     log_notification → UNIQUE(booking_id, kind) not poisoned → retry with
     correct kind still works. Without this guard, a typo in kind would
     silently INSERT into notifications_log and block valid retries.
@@ -862,7 +869,9 @@ async def test_send_reminder_unknown_kind_skips(
 
 @pytest.mark.asyncio
 async def test_send_reminder_retry_after_exhausted(
-    session_factory: Any, session: AsyncSession, scheduler: AsyncIOScheduler,
+    session_factory: Any,
+    session: AsyncSession,
+    scheduler: AsyncIOScheduler,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """send_reminder: both attempts fail with TelegramRetryAfter → log error, return.
@@ -910,7 +919,9 @@ async def test_send_reminder_retry_after_exhausted(
 
 @pytest.mark.asyncio
 async def test_send_reminder_generic_telegram_api_error(
-    session_factory: Any, session: AsyncSession, scheduler: AsyncIOScheduler,
+    session_factory: Any,
+    session: AsyncSession,
+    scheduler: AsyncIOScheduler,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """send_reminder: generic TelegramAPIError (not Forbidden/BadRequest/RetryAfter)
