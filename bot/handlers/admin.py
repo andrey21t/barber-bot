@@ -2867,8 +2867,8 @@ async def admin_move_simple_calendar_cb(
             if callback.message is not None:
                 await callback.message.answer(
                     "❌ Мастер не работает в этот день.\n"
-                    "Можно открыть смену и перенести запись сразу — "
-                    "окно возьмём из последнего рабочего дня.",
+                    "Можно открыть смену и перенести запись сразу — окно "
+                    "возьмём из последнего рабочего дня или стандартное 09:00-18:00.",
                     reply_markup=admin_move_open_day_keyboard(slot_date),
                 )
             await callback.answer()
@@ -3005,9 +3005,12 @@ async def admin_move_open_day_cb(
 
     Race-safety: date comes from callback_data (packed at hint render), NOT
     from FSM — admin can't tap a stale button from another date after
-    re-picking. open_workday is idempotent (UNIQUE index upsert) — если
-    WorkDay между хинтом и тапом уже создан (например, /openday с другой
-    сессии), UPDATE-путь безопасен (same window → no shrink conflicts).
+    re-picking. If the day was opened elsewhere between hint render and tap
+    (e.g. /openday in another session) — re-check select_workday first: an
+    ACTIVE day keeps THEIR window and goes straight to the slot picker
+    (template never overwrites a custom window — review W2); a closed day
+    falls through to open_workday → re-open with the template window
+    (bookings protected by shrink checks).
 
     Error mapping mirrors cmd_openday (ValueError → window invalid,
     SQLAlchemyError → DB hiccup, both retryable via «Другая дата»).
@@ -3020,10 +3023,32 @@ async def admin_move_open_day_cb(
     # Session 2026-09-29: lost flow data → bail BEFORE open_workday — открытие
     # смены это мутация расписания, недопустимая как side-effect мёртвого флоу.
     state_data = await state.get_data()
-    if not state_data.get("admin_move_booking_id"):
+    booking_id_str = state_data.get("admin_move_booking_id")
+    if not booking_id_str:
         await state.clear()
         if callback.message is not None:
             await callback.message.answer("❌ Данные потеряны. /today чтобы начать")
+        await callback.answer()
+        return
+    # Session 2026-09-29 (review W3+S3): validate UUID + booking existence
+    # BEFORE the mutation — испорченный id или удалённая запись не должны
+    # оставлять лишнюю смену (раньше UUID парсился в пикере ПОСЛЕ open_workday).
+    try:
+        booking_id = UUID(str(booking_id_str))
+    except (ValueError, TypeError):
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer("❌ Данные потеряны. /today чтобы начать")
+        await callback.answer()
+        return
+    async with async_session_factory() as session:
+        guard_booking = (
+            await session.execute(select(Booking).where(Booking.id == booking_id))
+        ).scalar_one_or_none()
+    if guard_booking is None:
+        await state.clear()
+        if callback.message is not None:
+            await callback.message.answer("❌ Запись не найдена. /today чтобы начать")
         await callback.answer()
         return
 
@@ -3034,7 +3059,30 @@ async def admin_move_open_day_cb(
         return
     master_id, _business_id, tz = resolved
 
-    slot_date = date.fromisoformat(callback_data.date_iso)
+    try:
+        slot_date = date.fromisoformat(callback_data.date_iso)
+    except (ValueError, TypeError):
+        # Session 2026-09-29 (review W1): forged/stale callback must not crash
+        # the handler — alert as in openweek delete-day cb, FSM stays alive,
+        # админ перебирает дату заново («📅 Другая дата» всё ещё на экране).
+        await callback.answer("❌ Ошибка данных кнопки. /today чтобы начать", show_alert=True)
+        return
+
+    # Session 2026-09-29 (review W2): re-check the day after the hint was
+    # rendered — /openday в другой сессии мог создать смену с кастомным окном.
+    # Их окно НЕ перезаписываем шаблоном — сразу в slot picker. Закрытый день
+    # (is_active=False) идёт дальше в open_workday → re-open окном-шаблоном.
+    async with async_session_factory() as session:
+        existing_workday = await select_workday(session, master_id, slot_date)
+    if existing_workday is not None and existing_workday.is_active:
+        if callback.message is not None:
+            await callback.message.answer(
+                f"☑️ Смена на {slot_date.strftime('%d.%m')} уже открыта: "
+                f"{existing_workday.start_time.strftime('%H:%M')}-"
+                f"{existing_workday.end_time.strftime('%H:%M')}."
+            )
+        await _admin_move_render_slot_picker(callback, state, existing_workday, tz)
+        return
 
     # Template window: last WorkDay (any is_active) → fallback Settings defaults.
     async with async_session_factory() as session:

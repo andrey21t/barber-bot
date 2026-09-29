@@ -3091,6 +3091,290 @@ async def test_admin_move_other_date_cb_reshows_calendar(
 
 
 @pytest.mark.asyncio
+async def test_admin_move_open_day_cb_invalid_date_iso_alerts(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Review W1 (Session 2026-09-29): forged/stale callback with garbage
+    date_iso → alert «Ошибка данных кнопки», no crash, FSM alive (re-pickable).
+    """
+    from datetime import time as dt_time
+
+    from bot.keyboards.admin import AdminMoveOpenDayCallbackData
+    from bot.models import Booking, WorkDay
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+
+        # Booking must exist: the W3+S3 guard runs BEFORE the date parse.
+        tz = ZoneInfo(TZ)
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        start_local = datetime.combine(tomorrow, dt_time(16, 0), tzinfo=tz)
+        booking = Booking(
+            business_id=ctx["business_id"],
+            master_id=ctx["master_id"],
+            client_id=ctx["client_id"],
+            service_id=None,
+            service_title_snapshot="Стрижка",
+            client_name_snapshot="Паша",
+            start_at=start_local.astimezone(UTC),
+            end_at=(start_local + timedelta(hours=1)).astimezone(UTC),
+            status="confirmed",
+        )
+        session.add(booking)
+        await session.commit()
+        booking_id = str(booking.id)
+
+    cb = MagicMock(spec=["from_user", "message", "bot", "answer"])
+    cb.from_user = _make_user(ADMIN_TG_ID)
+    cb.message = MagicMock()
+    cb.message.answer = AsyncMock()
+    cb.answer = AsyncMock()
+
+    state = _make_mock_state(data={"admin_move_booking_id": booking_id})
+    open_cb_data = AdminMoveOpenDayCallbackData(date_iso="garbage-not-a-date")
+
+    await admin_handlers.admin_move_open_day_cb(cb, open_cb_data, state)
+
+    cb.answer.assert_awaited_once()
+    args, kwargs = cb.answer.call_args
+    assert "Ошибка данных кнопки" in str(args[0] if args else kwargs.get("text"))
+    assert kwargs.get("show_alert") is True
+    cb.message.answer.assert_not_awaited()
+    state.clear.assert_not_awaited()
+    state.set_state.assert_not_awaited()
+
+    # No shift was created.
+    async with session_factory() as session:
+        from sqlalchemy import select as sa_select
+
+        count = len(
+            (await session.execute(sa_select(WorkDay).where(WorkDay.master_id == ctx["master_id"])))
+            .scalars()
+            .all()
+        )
+        assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_admin_move_open_day_cb_existing_active_workday_preserves_window(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Review W2 (Session 2026-09-29): stale «🔓» tap after /openday (another
+    session) opened the target day with a custom window → THEIR window kept
+    (NOT overwritten by the template from the latest WorkDay) → slot picker.
+    """
+    from datetime import time as dt_time
+
+    from bot.keyboards.admin import AdminMoveOpenDayCallbackData
+    from bot.models import Booking, WorkDay
+    from bot.states import AdminMoveStates
+
+    move_date = (datetime.now(UTC) + timedelta(days=30)).date()
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+
+        # Custom window opened by ANOTHER session on the target date.
+        existing_wd = WorkDay(
+            master_id=ctx["master_id"],
+            work_date=move_date,
+            start_time=dt_time(11, 0),
+            end_time=dt_time(17, 0),
+            max_concurrent_clients=1,
+            is_active=True,
+        )
+        session.add(existing_wd)
+
+        # LATER WorkDay — the would-be template on regression (max work_date).
+        later_wd = WorkDay(
+            master_id=ctx["master_id"],
+            work_date=move_date + timedelta(days=7),
+            start_time=dt_time(10, 0),
+            end_time=dt_time(20, 0),
+            max_concurrent_clients=1,
+            is_active=True,
+        )
+        session.add(later_wd)
+
+        tz = ZoneInfo(TZ)
+        tomorrow = (datetime.now(UTC) + timedelta(days=1)).date()
+        start_local = datetime.combine(tomorrow, dt_time(16, 0), tzinfo=tz)
+        booking = Booking(
+            business_id=ctx["business_id"],
+            master_id=ctx["master_id"],
+            client_id=ctx["client_id"],
+            service_id=None,
+            service_title_snapshot="Стрижка",
+            client_name_snapshot="Паша",
+            start_at=start_local.astimezone(UTC),
+            end_at=(start_local + timedelta(hours=1)).astimezone(UTC),
+            status="confirmed",
+        )
+        session.add(booking)
+        await session.commit()
+        booking_id = str(booking.id)
+
+    cb = MagicMock(spec=["from_user", "message", "bot", "answer"])
+    cb.from_user = _make_user(ADMIN_TG_ID)
+    cb.message = MagicMock()
+    cb.message.answer = AsyncMock()
+    cb.answer = AsyncMock()
+
+    state = _make_mock_state(data={"admin_move_booking_id": booking_id})
+    open_cb_data = AdminMoveOpenDayCallbackData(date_iso=move_date.isoformat())
+
+    await admin_handlers.admin_move_open_day_cb(cb, open_cb_data, state)
+
+    # Custom window preserved — template NOT applied.
+    async with session_factory() as session:
+        from sqlalchemy import select as sa_select
+
+        wd = (
+            await session.execute(
+                sa_select(WorkDay).where(
+                    WorkDay.master_id == ctx["master_id"], WorkDay.work_date == move_date
+                )
+            )
+        ).scalar_one()
+        assert wd.start_time == dt_time(11, 0)
+        assert wd.end_time == dt_time(17, 0)
+
+    answer_texts = [str(c.args[0]) for c in cb.message.answer.call_args_list if c.args]
+    assert any("уже открыта" in t for t in answer_texts)
+    assert any("Выберите новое время" in t for t in answer_texts)
+    state.set_state.assert_awaited_once_with(AdminMoveStates.selecting_slot)
+
+
+@pytest.mark.asyncio
+async def test_admin_move_open_day_cb_corrupt_booking_id_clears_without_mutation(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Review W3 (Session 2026-09-29): non-UUID admin_move_booking_id in FSM
+    (corrupted storage) → «Данные потеряны» + clear BEFORE open_workday.
+    """
+    from bot.keyboards.admin import AdminMoveOpenDayCallbackData
+    from bot.models import WorkDay
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+
+    move_date = (datetime.now(UTC) + timedelta(days=30)).date()
+
+    cb = MagicMock(spec=["from_user", "message", "bot", "answer"])
+    cb.from_user = _make_user(ADMIN_TG_ID)
+    cb.message = MagicMock()
+    cb.message.answer = AsyncMock()
+    cb.answer = AsyncMock()
+
+    state = _make_mock_state(data={"admin_move_booking_id": "definitely-not-a-uuid"})
+    open_cb_data = AdminMoveOpenDayCallbackData(date_iso=move_date.isoformat())
+
+    await admin_handlers.admin_move_open_day_cb(cb, open_cb_data, state)
+
+    state.clear.assert_awaited_once()
+    text = callback_answer_text(cb)
+    assert "Данные потеряны" in text
+    state.set_state.assert_not_awaited()
+
+    async with session_factory() as session:
+        from sqlalchemy import select as sa_select
+
+        count = len(
+            (
+                await session.execute(
+                    sa_select(WorkDay).where(
+                        WorkDay.master_id == ctx["master_id"], WorkDay.work_date == move_date
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_admin_move_open_day_cb_deleted_booking_clears_without_mutation(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Review S3 (Session 2026-09-29): booking deleted between hint render
+    and tap → «Запись не найдена» + clear BEFORE open_workday — no orphan shift.
+    """
+    from uuid import uuid4
+
+    from bot.keyboards.admin import AdminMoveOpenDayCallbackData
+    from bot.models import WorkDay
+
+    async with session_factory() as session:
+        ctx = await _seed_admin_stack(session)
+
+    move_date = (datetime.now(UTC) + timedelta(days=30)).date()
+
+    cb = MagicMock(spec=["from_user", "message", "bot", "answer"])
+    cb.from_user = _make_user(ADMIN_TG_ID)
+    cb.message = MagicMock()
+    cb.message.answer = AsyncMock()
+    cb.answer = AsyncMock()
+
+    state = _make_mock_state(data={"admin_move_booking_id": str(uuid4())})
+    open_cb_data = AdminMoveOpenDayCallbackData(date_iso=move_date.isoformat())
+
+    await admin_handlers.admin_move_open_day_cb(cb, open_cb_data, state)
+
+    state.clear.assert_awaited_once()
+    text = callback_answer_text(cb)
+    assert "Запись не найдена" in text
+    state.set_state.assert_not_awaited()
+
+    async with session_factory() as session:
+        from sqlalchemy import select as sa_select
+
+        count = len(
+            (
+                await session.execute(
+                    sa_select(WorkDay).where(
+                        WorkDay.master_id == ctx["master_id"], WorkDay.work_date == move_date
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_admin_move_other_date_cb_non_admin_silent(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """Review S2b (Session 2026-09-29): non-admin «📅 Другая дата» tap →
+    silent answer, no calendar, no state change.
+    """
+    async with session_factory() as session:
+        await _seed_admin_stack(session)
+
+    cb = MagicMock(spec=["from_user", "message", "bot", "answer"])
+    cb.from_user = _make_user(NON_ADMIN_TG_ID)
+    cb.message = MagicMock()
+    cb.message.answer = AsyncMock()
+    cb.answer = AsyncMock()
+
+    state = _make_mock_state(data={"admin_move_booking_id": "some-booking-id"})
+
+    await admin_handlers.admin_move_other_date_cb(cb, state)
+
+    cb.answer.assert_awaited_once()
+    cb.message.answer.assert_not_awaited()
+    state.clear.assert_not_awaited()
+    state.set_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_admin_move_simple_calendar_missing_booking_id_clears_state(
     session_factory: Any,
     patched_session_factory: Any,
