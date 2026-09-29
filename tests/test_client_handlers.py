@@ -5073,9 +5073,12 @@ async def test_slot_cb_pre_fill_yes_path(
     branch (entering_name_pre_fill, NOT entering_name).
 
     Verifies the 80% case (client books themselves, has a Telegram profile
-    name). slot_cb sends 2 messages: (1) prompt 'Записать на <b>Андрей</b>?
-    (ваше имя в Telegram)' with ReplyKeyboardRemove (hide reply keyboard),
-    (2) 'Выберите:' with name_pre_fill_keyboard (inline 2 buttons).
+    name). Сессия 2026-09-29 (клавиатура-фикс): slot_cb sends ONE message —
+    prompt 'Записать на <b>Андрей</b>? (ваше имя в Telegram)' with the
+    name_pre_fill_keyboard attached (inline 2 buttons). ReplyKeyboardRemove no
+    longer sent here: it forced the on-screen keyboard open the moment the
+    buttons appeared (репорт 13:40) — text input opens only on the
+    [👤 Другое имя] tap (covered in other_cb test).
     """
     from bot.keyboards.client import BookSlotCallbackData, NamePreFillYesCallbackData
 
@@ -5098,32 +5101,20 @@ async def test_slot_cb_pre_fill_yes_path(
     state.set_state.assert_awaited_once()
     assert state.set_state.call_args.args[0] == BookingStates.entering_name_pre_fill
 
-    # 2 messages: (1) prompt with ReplyKeyboardRemove, (2) 'Выберите:' with inline.
-    assert cb.message.answer.await_count == 2
-    first_call = cb.message.answer.await_args_list[0]
-    first_text = (
-        str(first_call.args[0]) if first_call.args else str(first_call.kwargs.get("text", ""))
-    )
-    assert "Записать на" in first_text
-    assert "Андрей" in first_text
-    first_rm = first_call.kwargs.get("reply_markup")
-    from aiogram.types import ReplyKeyboardRemove
-
-    assert isinstance(first_rm, ReplyKeyboardRemove), (
-        "1st message must hide reply keyboard (would obstruct inline pre-fill buttons)"
-    )
-    second_call = cb.message.answer.await_args_list[1]
-    second_text = (
-        str(second_call.args[0]) if second_call.args else str(second_call.kwargs.get("text", ""))
-    )
-    assert second_text == "Выберите:"
-    second_rm = second_call.kwargs.get("reply_markup")
+    # Сессия 2026-09-29 (клавиатура-фикс): ОДНО сообщение — промпт с inline
+    # pre-fill кнопками; ReplyKeyboardRemove больше НЕ отправляется.
+    assert cb.message.answer.await_count == 1
+    only_call = cb.message.answer.await_args_list[0]
+    only_text = str(only_call.args[0]) if only_call.args else str(only_call.kwargs.get("text", ""))
+    assert "Записать на" in only_text
+    assert "Андрей" in only_text
+    only_rm = only_call.kwargs.get("reply_markup")
     from aiogram.types import InlineKeyboardMarkup
 
-    assert isinstance(second_rm, InlineKeyboardMarkup), (
-        "2nd message carries pre-fill inline keyboard"
+    assert isinstance(only_rm, InlineKeyboardMarkup), (
+        "single pre-fill message carries the inline keyboard"
     )
-    flat = [btn for row in second_rm.inline_keyboard for btn in row]
+    flat = [btn for row in only_rm.inline_keyboard for btn in row]
     assert len(flat) == 2, f"pre-fill keyboard has 2 buttons, got {len(flat)}"
     # [✅ Да, это я] + [👤 Другое имя] — match the NamePreFill* callback data packs.
     assert flat[0].callback_data is not None, "yes button must carry callback_data"
@@ -5335,6 +5326,9 @@ async def test_name_pre_fill_other_cb_transitions_to_text_input(
     """B.13: client taps [👤 Другое имя] → state.set_state(entering_name) +
     'На чьё имя записываем?' prompt (no DB lookup, no state data update).
 
+    Сессия 2026-09-29 (клавиатура-фикс): prompt carries ReplyKeyboardRemove —
+    экранный ввод открывается только на этом тапе, не при показе кнопок.
+
     The text-input handler (name_msg) takes over from entering_name — same
     as the pre-B.13 flow. This covers the 20% case (booking child/husband/etc).
     """
@@ -5358,6 +5352,14 @@ async def test_name_pre_fill_other_cb_transitions_to_text_input(
     state.update_data.assert_not_awaited()
     text = _answer_text(cb.message)
     assert "На чьё имя записываем?" in text
+    # Сессия 2026-09-29 (клавиатура-фикс): экранный ввод открывается именно
+    # здесь — ReplyKeyboardRemove уходит вместе с этим промптом.
+    from aiogram.types import ReplyKeyboardRemove
+
+    last_call = cb.message.answer.await_args_list[-1]
+    assert isinstance(last_call.kwargs.get("reply_markup"), ReplyKeyboardRemove), (
+        "[👤 Другое имя] tap must open text input (ReplyKeyboardRemove)"
+    )
     cb.answer.assert_awaited()
 
 
@@ -5400,6 +5402,12 @@ async def test_name_pre_fill_yes_cb_race_first_name_becomes_empty(
     assert "client_name" not in state_update_kwargs
     text = _answer_text(cb.message)
     assert "На чьё имя записываем?" in text
+    # Сессия 2026-09-29 (клавиатура-фикс): текстовый ввод нужен прямо сейчас —
+    # ReplyKeyboardRemove уходит вместе с этим промптом (как в other_cb).
+    from aiogram.types import ReplyKeyboardRemove
+
+    last_call = cb.message.answer.await_args_list[-1]
+    assert isinstance(last_call.kwargs.get("reply_markup"), ReplyKeyboardRemove)
     cb.answer.assert_awaited()
 
 

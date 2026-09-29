@@ -1161,16 +1161,14 @@ async def slot_cb(
     if first_name:
         await state.set_state(BookingStates.entering_name_pre_fill)
         if callback.message is not None:
-            # ReplyKeyboardRemove — reply keyboard мешает текстовому вводу и
-            # занимает экран. Pre-fill state ловит только callback (не текст),
-            # но reply-кнопки все равно убираем для визуальной чистоты — inline
-            # [✅ Да] / [👤 Другое имя] заменяют их на этом шаге.
+            # Сессия 2026-09-29 (клавиатура-фикс): промпт + inline-кнопки ОДНИМ
+            # сообщением. ReplyKeyboardRemove здесь убран — его отправка
+            # заставляла клиент открывать экранный ввод в момент показа кнопок
+            # [✅ Да, это я] / [👤 Другое имя] (репорт 2026-09-29 13:40).
+            # Экранный ввод открывается только на тапе [👤 Другое имя] — там
+            # name_pre_fill_other_cb шлёт ReplyKeyboardRemove с промптом имени.
             await callback.message.answer(
                 f"Записать на <b>{_html_escape(first_name)}</b>? (ваше имя в Telegram)",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-            await callback.message.answer(
-                "Выберите:",
                 reply_markup=name_pre_fill_keyboard(first_name),
             )
     else:
@@ -1295,8 +1293,11 @@ async def name_pre_fill_yes_cb(
         # back to text input — safer than failing silently.
         await state.set_state(BookingStates.entering_name)
         if callback.message is not None:
+            # Сессия 2026-09-29 (клавиатура-фикс): текстовый ввод нужен прямо
+            # сейчас — reply-клавиатуру убираем, экранный ввод открывается.
             await callback.message.answer(
-                "На чьё имя записываем? (например: Паша, я сам, сын 5 лет)"
+                "На чьё имя записываем? (например: Паша, я сам, сын 5 лет)",
+                reply_markup=ReplyKeyboardRemove(),
             )
         await callback.answer()
         return
@@ -1347,16 +1348,21 @@ async def name_pre_fill_other_cb(
     entering_name_pre_fill to entering_name. The text input handler
     (name_msg) takes over from here, same as the old pre-B.13 flow.
 
-    NB: ReplyKeyboardRemove was already sent in slot_cb/slot_30_cb when
-    entering entering_name_pre_fill, so the reply keyboard is already
-    hidden — no need to send it again here.
+    NB (Сессия 2026-09-29, клавиатура-фикс): ReplyKeyboardRemove шлётся ЗДЕСЬ,
+    вместе с промптом имени — экранный ввод открывается ровно в момент, когда
+    нужно вписать имя. В slot_cb/slot_30_cb reply-клавиатуру больше не трогаем:
+    отправка ReplyKeyboardRemove открывала экранный ввод одновременно с
+    показом inline-кнопок [✅ Да, это я] / [👤 Другое имя].
 
     Session 5.51: strips the tapped [✅ Да, это я] keyboard.
     """
     await _clear_source_keyboard(callback)
     await state.set_state(BookingStates.entering_name)
     if callback.message is not None:
-        await callback.message.answer("На чьё имя записываем? (например: Паша, я сам, сын 5 лет)")
+        await callback.message.answer(
+            "На чьё имя записываем? (например: Паша, я сам, сын 5 лет)",
+            reply_markup=ReplyKeyboardRemove(),
+        )
     await callback.answer()
 
 
@@ -2040,9 +2046,11 @@ async def confirm_cb(
             "✅ Вы записаны. Напомню за 24ч и за 1ч.",
         )
         # Session 5.36 (B.13): restore client reply keyboard after booking.
-        # ReplyKeyboardRemove was sent in slot_cb/slot_30_cb; now that the
-        # booking is confirmed and state cleared, bring the always-on reply
-        # keyboard back. Skipped for master (they have admin_inline_menu).
+        # The name-input step may have hidden the reply keyboard
+        # (ReplyKeyboardRemove is sent only in the name-input steps —
+        # keyboard-fix 2026-09-29), so now that the booking is confirmed
+        # and state is cleared, bring the always-on reply keyboard back.
+        # Skipped for master (they have admin_inline_menu).
         # Guard: callback.message is Message | InaccessibleMessage — only
         # Message has .answer(), InaccessibleMessage is for old channel posts.
         if isinstance(callback.message, Message):
@@ -2165,10 +2173,12 @@ async def cancel_msg(message: Message, state: FSMContext) -> None:
         hint = "Ввод отменён. /book чтобы начать заново"
     await message.answer(hint)
     # Session 5.36 (B.13): restore client reply keyboard after /cancel.
-    # ReplyKeyboardRemove was sent in slot_cb/slot_30_cb when entering the
-    # booking flow — now that the user cancelled, bring the always-on reply
-    # keyboard back so they can tap [💇 Записаться] / [📋 Мои записи] again.
-    # Skipped for master (admin_inline_menu is master's UI, not reply keyboard).
+    # The name-input step may have hidden the reply keyboard
+    # (ReplyKeyboardRemove is sent only in the name-input steps —
+    # keyboard-fix 2026-09-29), so now that the user cancelled, bring the
+    # always-on reply keyboard back so they can tap [💇 Записаться] /
+    # [📋 Мои записи] again. Skipped for master (admin_inline_menu is
+    # master's UI, not reply keyboard).
     await _restore_reply_keyboard_async(message)
 
 
