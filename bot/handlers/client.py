@@ -1244,12 +1244,14 @@ async def slot_30_cb(
     if first_name:
         await state.set_state(BookingStates.entering_name_pre_fill)
         if callback.message is not None:
+            # Сессия 2026-09-29 (клавиатура-фикс): промпт + inline-кнопки ОДНИМ
+            # сообщением. ReplyKeyboardRemove здесь убран — его отправка
+            # заставляла клиент открывать экранный ввод в момент показа кнопок
+            # [✅ Да, это я] / [👤 Другое имя] (репорт 2026-09-29 13:40).
+            # Экранный ввод открывается только на тапе [👤 Другое имя] — там
+            # name_pre_fill_other_cb шлёт ReplyKeyboardRemove с промптом имени.
             await callback.message.answer(
                 f"Записать на <b>{_html_escape(first_name)}</b>? (ваше имя в Telegram)",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-            await callback.message.answer(
-                "Выберите:",
                 reply_markup=name_pre_fill_keyboard(first_name),
             )
     else:

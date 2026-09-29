@@ -2711,9 +2711,10 @@ async def test_cancel_msg_clears_state_and_answers(
     BEFORE answer (race) + 'Ввод отменён. /book чтобы начать заново'.
 
     B.13: cancel_msg now sends a 2nd message ('👇 Кнопки внизу' with reply
-    keyboard) via _restore_reply_keyboard_async — the reply keyboard was
-    hidden in slot_cb/slot_30_cb via ReplyKeyboardRemove when entering the
-    booking flow. Verify both messages via await_args_list.
+    keyboard) via _restore_reply_keyboard_async — the name-input step may
+    have hidden the reply keyboard via ReplyKeyboardRemove (keyboard-fix
+    2026-09-29: RKR is sent only in the name-input steps). Verify both
+    messages via await_args_list.
     """
     msg = _make_message(user_id=111222333, text="/cancel")
     state = _make_state()
@@ -5117,6 +5118,63 @@ async def test_slot_cb_pre_fill_yes_path(
     flat = [btn for row in only_rm.inline_keyboard for btn in row]
     assert len(flat) == 2, f"pre-fill keyboard has 2 buttons, got {len(flat)}"
     # [✅ Да, это я] + [👤 Другое имя] — match the NamePreFill* callback data packs.
+    assert flat[0].callback_data is not None, "yes button must carry callback_data"
+    NamePreFillYesCallbackData.unpack(flat[0].callback_data)
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_slot_30_cb_pre_fill_yes_path(
+    session_factory: Any,
+    patched_session_factory: Any,
+) -> None:
+    """B.13: slot_30_cb with from_user.first_name='Андрей' (truthy) → pre-fill
+    branch (entering_name_pre_fill, NOT entering_name).
+
+    Сессия 2026-09-29 (клавиатура-фикс, review C1): /slots — основной
+    клиентский путь (reply-кнопка [💇 Записаться] → date picker → 30-мин
+    WorkDay-слоты), но в 9841859 зеркалирование в slot_30_cb было потеряно —
+    репорт-баг (экранная клавиатура при показе кнопок) жил именно здесь.
+    Тест фиксирует контракт: ОДНО сообщение — промпт с inline кнопками,
+    БЕЗ ReplyKeyboardRemove.
+    """
+    from bot.keyboards.client import BookSlot30CallbackData, NamePreFillYesCallbackData
+
+    workday_id = UUID("12345678-1234-5678-1234-567812345678")
+    cb = MagicMock(spec=CallbackQuery)
+    # B.13: non-empty first_name triggers pre-fill branch.
+    cb.from_user = User(id=111222333, is_bot=False, first_name="Андрей")
+    cb.message = _make_message(111222333, text="<unused>")
+    cb.answer = AsyncMock()
+    cb.bot = AsyncMock()
+    callback_data = BookSlot30CallbackData(workday_id=workday_id, start_minute=600)
+
+    state = _make_state()
+    state.get_data = AsyncMock(return_value={"service_title": "Стрижка"})
+    await client_handlers.slot_30_cb(cb, callback_data, state)
+
+    state.update_data.assert_awaited_once()
+    assert state.update_data.call_args.kwargs.get("workday_id") == str(workday_id)
+    assert state.update_data.call_args.kwargs.get("start_minute") == 600
+    state.set_state.assert_awaited_once()
+    assert state.set_state.call_args.args[0] == BookingStates.entering_name_pre_fill
+
+    # Сессия 2026-09-29 (клавиатура-фикс): ОДНО сообщение — промпт с inline
+    # pre-fill кнопками; ReplyKeyboardRemove больше НЕ отправляется.
+    assert cb.message.answer.await_count == 1
+    only_call = cb.message.answer.await_args_list[0]
+    only_text = str(only_call.args[0]) if only_call.args else str(only_call.kwargs.get("text", ""))
+    assert "Записать на" in only_text
+    assert "Андрей" in only_text
+    only_rm = only_call.kwargs.get("reply_markup")
+    from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardRemove
+
+    assert isinstance(only_rm, InlineKeyboardMarkup), (
+        "single pre-fill message carries the inline keyboard, NOT ReplyKeyboardRemove"
+    )
+    assert not isinstance(only_rm, ReplyKeyboardRemove)
+    flat = [btn for row in only_rm.inline_keyboard for btn in row]
+    assert len(flat) == 2, f"pre-fill keyboard has 2 buttons, got {len(flat)}"
     assert flat[0].callback_data is not None, "yes button must carry callback_data"
     NamePreFillYesCallbackData.unpack(flat[0].callback_data)
     cb.answer.assert_awaited()
