@@ -20,18 +20,23 @@ Back-compat: admin_keyboard() (reply) оставлен как alias для те�
 
 Этап 5.9: admin_move keyboard + 3 callbacks (AdminMoveCallbackData,
 AdminMoveSlot30CallbackData, AdminMoveConfirmCallbackData).
+
+Session 2026-09-29: +AdminMoveOpenDayCallbackData — «Открыть смену и
+перенести» из admin_move flow (нет WorkDay на выбранную дату → открыть
+смену окном-шаблоном и сразу идти в slot picker, не выходя из переноса).
 """
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from datetime import date as dt_date
 from datetime import time as dt_time
-from typing import cast
+from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import (
+    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -44,7 +49,7 @@ from aiogram_calendar.schemas import SimpleCalAct, highlight, superscript
 from bot.models import Booking, Service, WorkDay
 
 
-class SimpleCalendarNoYearNav(SimpleCalendar):
+class SimpleCalendarNoYearNav(SimpleCalendar):  # type: ignore[misc]  # aiogram_calendar untyped
     """SimpleCalendar без годовых стрелок `<< {year} >>` (Баг 5, Session 5.71).
 
     aiogram_calendar 0.6.0 рендерит ряд `<< >>` всегда (simple_calendar.py:61-74),
@@ -74,29 +79,29 @@ class SimpleCalendarNoYearNav(SimpleCalendar):
         now_weekday = self._labels.days_of_week[today.weekday()]
         now_month, now_year, now_day = today.month, today.year, today.day
 
-        def highlight_month():
+        def highlight_month() -> str:
             month_str = self._labels.months[month - 1]
             if now_month == month and now_year == year:
-                return highlight(month_str)
-            return month_str
+                return str(highlight(month_str))
+            return str(month_str)
 
-        def highlight_weekday():
+        def highlight_weekday() -> str:
             if now_month == month and now_year == year and now_weekday == weekday:
-                return highlight(weekday)
-            return weekday
+                return str(highlight(weekday))
+            return str(weekday)
 
-        def format_day_string():
+        def format_day_string() -> str:
             date_to_check = datetime(year, month, day)
             if (self.min_date and date_to_check < self.min_date) or (
                 self.max_date and date_to_check > self.max_date
             ):
-                return superscript(str(day))
+                return str(superscript(str(day)))
             return str(day)
 
-        def highlight_day():
+        def highlight_day() -> str:
             day_string = format_day_string()
             if now_month == month and now_year == year and now_day == day:
-                return highlight(day_string)
+                return str(highlight(day_string))
             return day_string
 
         kb: list[list[InlineKeyboardButton]] = []
@@ -170,7 +175,11 @@ class SimpleCalendarNoYearNav(SimpleCalendar):
 
         return InlineKeyboardMarkup(row_width=7, inline_keyboard=kb)
 
-    async def process_selection(self, query, data: SimpleCalendarCallback) -> tuple:
+    async def process_selection(
+        self,
+        query: CallbackQuery,
+        data: SimpleCalendarCallback,
+    ) -> tuple[bool, Any]:
         """Игнор prev_y/next_y — годовые стрелки скрыты (Баг 5).
 
         Возвращает (False, None) БЕЗ query.answer() — handler fall-through
@@ -180,7 +189,9 @@ class SimpleCalendarNoYearNav(SimpleCalendar):
         """
         if data.act in (SimpleCalAct.prev_y, SimpleCalAct.next_y):
             return (False, None)
-        return await super().process_selection(query, data)
+        # aiogram_calendar untyped — launder Any через аннотированную переменную.
+        result: tuple[bool, Any] = await super().process_selection(query, data)
+        return result
 
 
 class AdminMenuCallbackData(CallbackData, prefix="admin_menu"):
@@ -279,6 +290,24 @@ class AdminMoveConfirmCallbackData(CallbackData, prefix="admin_move_confirm"):
     (stored in selecting_slot transition), NOT from callback payload — keeps
     callback_data small and avoids race where user could change FSM state mid-tap.
     """
+
+
+class AdminMoveOpenDayCallbackData(CallbackData, prefix="admin_move_open_day"):
+    """«Открыть смену и перенести» tap — open WorkDay on the picked date (Session 2026-09-29).
+
+    Shown by admin_move_simple_calendar_cb when NO WorkDay exists on the
+    selected date (master «не работает в этот день»). Tap → open_workday with
+    a template window (last WorkDay window or Settings defaults) → slot picker
+    — all WITHOUT leaving the admin_move FSM.
+
+    Payload (race-safe, mirror AdminCloseOtherDayConfirmCallbackData(workday_id)
+    pattern — callback_data is source of truth vs stale FSM):
+    - date_iso: str — ISO date (YYYY-MM-DD) the admin picked in the calendar.
+
+    Wire format: "admin_move_open_day:2026-10-15" = 17+1+10 = 28 bytes < 64 limit.
+    """
+
+    date_iso: str
 
 
 def admin_inline_menu() -> InlineKeyboardMarkup:
@@ -391,8 +420,9 @@ async def admin_calendar_keyboard(
     )
     cal.set_dates_range(min_date=min_date, max_date=max_date)
     now = datetime.now(ZoneInfo(tz)).replace(tzinfo=None) if tz else datetime.now()
-    # aiogram_calendar has no type stubs — cast to satisfy mypy.
-    return cast(InlineKeyboardMarkup, await cal.start_calendar(year=now.year, month=now.month))
+    # SimpleCalendarNoYearNav.start_calendar типизирован (наш override),
+    # aiogram.types.InlineKeyboardMarkup — cast больше не нужен.
+    return await cal.start_calendar(year=now.year, month=now.month)
 
 
 def admin_keyboard() -> ReplyKeyboardMarkup:
@@ -600,6 +630,26 @@ def admin_move_confirm_keyboard() -> InlineKeyboardMarkup:
     # Suppress unused import warning (InlineKeyboardButton kept for clarity
     # if someone wants to extend with custom rows later).
     _ = InlineKeyboardButton
+    return builder.as_markup()
+
+
+def admin_move_open_day_keyboard(slot_date: dt_date) -> InlineKeyboardMarkup:
+    """Build [🔓 Открыть смену и перенести] / [📅 Другая дата] keyboard (Session 2026-09-29).
+
+    Shown by admin_move_simple_calendar_cb when NO WorkDay exists on the
+    picked date. Tap on «Открыть» → admin_move_open_day_cb: open_workday with
+    template window (last WorkDay or Settings defaults) → slot picker, без
+    выхода из admin_move FSM. «Другая дата» → re-show calendar (plain string
+    callback "admin_move_other_date", mirror "admin_move_cancel" pattern —
+    no payload needed, state stays selecting_date).
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="🔓 Открыть смену и перенести",
+        callback_data=AdminMoveOpenDayCallbackData(date_iso=slot_date.isoformat()).pack(),
+    )
+    builder.button(text="📅 Другая дата", callback_data="admin_move_other_date")
+    builder.adjust(1)
     return builder.as_markup()
 
 
